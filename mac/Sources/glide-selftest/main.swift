@@ -119,21 +119,25 @@ func policyChecks() {
 
 func registryChecks() {
     final class S { let id: Int; init(_ i: Int) { id = i } }
-    let r = SessionRegistry<S>(maxPending: 2)
-    let a = S(1), b = S(2), c = S(3), d = S(4)
-    check(r.admit(a), "registry: admit first")
+    let r = SessionRegistry<S>(maxPending: 2, maxPendingPerSource: 2)
+    let a = S(1), b = S(2), c = S(3), d = S(4), e = S(5)
+    check(r.admit(a, source: "10.0.0.1") == nil, "registry: admit first")
     check(r.current == nil, "registry: unauthenticated is not current")
     let ra = r.authenticated(a)
     check(ra.promoted && ra.replaced == nil && r.current === a, "registry: authenticated -> current")
-    check(r.admit(b) && r.admit(c), "registry: admit two pending")
-    check(!r.admit(d), "registry: pending cap enforced")
+    check(r.admit(b, source: "10.0.0.2") == nil && r.admit(c, source: "10.0.0.3") == nil, "registry: admit two pending")
+    check(r.admit(d, source: "10.0.0.4") === b, "registry: full -> evicts oldest pending, never refuses")
     check(r.current === a, "registry: pending connections don't touch the active session")
-    r.ended(b)  // wrong password / auth timeout
-    check(r.current === a && r.pendingCount == 1, "registry: failed auth leaves active session alone")
+    let x1 = S(10), x2 = S(11), x3 = S(12)
+    let r2 = SessionRegistry<S>(maxPending: 8, maxPendingPerSource: 2)
+    r2.admit(x1, source: "x"); r2.admit(x2, source: "x")
+    check(r2.admit(x3, source: "x") === x1 && r2.pendingCount == 2, "registry: per-source cap evicts that source's oldest")
+    r.ended(b)  // evicted / wrong password / auth timeout
+    check(r.current === a && r.pendingCount == 2, "registry: failed auth leaves active session alone")
     let rc = r.authenticated(c)
     check(rc.promoted && rc.replaced === a && r.current === c, "registry: new viewer replaces old only after auth")
     check(!r.ended(a) && r.current === c, "registry: replaced session ending doesn't clear current")
-    check(!r.authenticated(d).promoted, "registry: never-admitted session can't be promoted")
+    check(!r.authenticated(e).promoted, "registry: never-admitted session can't be promoted")
     check(r.ended(c) && r.current == nil, "registry: active session ending clears current")
 }
 

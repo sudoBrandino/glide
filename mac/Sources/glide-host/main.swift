@@ -185,9 +185,15 @@ final class Server: @unchecked Sendable {
         let isPaused = paused
         lock.unlock()
         let s = Session(id: id, connection: conn, settings: settings)
-        guard !isPaused, sessions.admit(s) else {
-            log("server: refusing connection from \(conn.endpoint) (\(isPaused ? "paused" : "too many unauthenticated connections"))")
+        guard !isPaused else {
+            log("server: refusing connection from \(conn.endpoint) (paused)")
             conn.cancel(); extra?(); return
+        }
+        var source = "\(conn.endpoint)"
+        if case let .hostPort(host, _) = conn.endpoint { source = "\(host)" }
+        if let evicted = sessions.admit(s, source: source) {
+            log("server: too many unauthenticated connections; dropping pending session \(evicted.id)")
+            evicted.end()
         }
         log("server: connection \(id) with \(conn.endpoint) (authenticating)")
         s.onAuthenticated = { [weak self] s in
