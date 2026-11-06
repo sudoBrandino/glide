@@ -8,6 +8,9 @@ quality and responsiveness on a LAN. Native on both ends:
   client-side cursor shapes.
 - **`windows/`** — Rust viewer: Media Foundation hardware decode → D3D11 flip-model
   presentation, raw keyboard/mouse capture, host cursor applied as the native Windows cursor.
+- **Audio**: Mac system audio (ScreenCaptureKit, on the same capture stream) → 48 kHz stereo PCM →
+  WASAPI on the PC through a drift-correcting jitter buffer (protocol §3.2). `GLIDE_NO_AUDIO=1`
+  disables it on the host, `--no-audio` on the viewer.
 - **`docs/PROTOCOL.md`** — the wire protocol (normative). `docs/test-vectors.json` +
   `tools/gen_vectors.py` are the reference crypto vectors both sides must reproduce.
 

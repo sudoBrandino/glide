@@ -18,6 +18,10 @@ pub struct Args {
     probe: bool,
     /// Reverse-connect: listen on this port and let the host dial in.
     listen: Option<u16>,
+    /// Don't advertise/play audio.
+    no_audio: bool,
+    /// Headless WASAPI check (plays digital silence only), seconds.
+    audio_selftest: Option<f64>,
 }
 
 const USAGE: &str = "usage: glide-client <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--bench SECONDS] [--probe]
@@ -32,11 +36,15 @@ const USAGE: &str = "usage: glide-client <host[:port]> [--password PW] [--mode f
   --no-ctrl-as-cmd   don't swap Ctrl<->Win (default maps Ctrl->Cmd, Win->Control)
   --bench SECONDS    headless: connect, decode for N seconds, print one JSON line
   --probe            print decoder capabilities as JSON (no connection)
+  --no-audio         don't stream the Mac's sound (default: on; Ctrl+F11 or the window menu mutes)
+  --audio-selftest [SECONDS]
+                     headless: open the default output device and run the audio path on
+                     digital silence (inaudible) for N seconds (default 3); print JSON
 
-In the viewer: F11 or Alt+Enter toggles borderless fullscreen.";
+In the viewer: F11 or Alt+Enter toggles borderless fullscreen; Ctrl+F11 mutes/unmutes audio.";
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { host: None, password: None, mode: None, ctrl_as_cmd: true, bench: None, probe: false, listen: None };
+    let mut a = Args { host: None, password: None, mode: None, ctrl_as_cmd: true, bench: None, probe: false, listen: None, no_audio: false, audio_selftest: None };
     let mut it = std::env::args().skip(1).peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -55,6 +63,14 @@ fn parse_args() -> Result<Args, String> {
                 a.bench = Some(v.parse::<f64>().map_err(|_| format!("bad --bench value {v}"))?);
             }
             "--probe" => a.probe = true,
+            "--no-audio" => a.no_audio = true,
+            "--audio-selftest" => {
+                let secs = match it.peek() {
+                    Some(v) if v.parse::<f64>().is_ok() => it.next().unwrap().parse().unwrap(),
+                    _ => 3.0,
+                };
+                a.audio_selftest = Some(secs);
+            }
             "--listen" => {
                 // Optional PORT argument.
                 let port = match it.peek() {
@@ -73,7 +89,7 @@ fn parse_args() -> Result<Args, String> {
             }
         }
     }
-    if !a.probe && a.host.is_none() && a.listen.is_none() {
+    if !a.probe && a.audio_selftest.is_none() && a.host.is_none() && a.listen.is_none() {
         return Err("missing host".into());
     }
     Ok(a)
@@ -135,6 +151,20 @@ fn main() -> ExitCode {
         }
     }
 
+    if let Some(secs) = args.audio_selftest {
+        #[cfg(windows)]
+        {
+            println!("{}", glide::win::audio::selftest_json(secs));
+            return ExitCode::SUCCESS;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = secs;
+            eprintln!("--audio-selftest is only available on Windows");
+            return ExitCode::from(1);
+        }
+    }
+
     let host = match (&args.host, args.listen) {
         (Some(h), _) => h.clone(),
         (None, Some(p)) => format!("listen:{p}"),
@@ -150,6 +180,9 @@ fn main() -> ExitCode {
         if glide::win::probe::hevc444_supported() {
             caps |= protocol::CAP_HEVC_444;
         }
+    }
+    if !args.no_audio {
+        caps |= protocol::CAP_AUDIO_PCM;
     }
     let has444 = caps & protocol::CAP_HEVC_444 != 0;
     let mode = match args.mode {
@@ -196,7 +229,7 @@ fn main() -> ExitCode {
                 Some(port) => Target::Listen(port),
                 None => Target::Connect(host.clone()),
             };
-            let opts = Options { ctrl_as_cmd: args.ctrl_as_cmd, mode, host_label: host };
+            let opts = Options { ctrl_as_cmd: args.ctrl_as_cmd, mode, host_label: host, audio: !args.no_audio };
             return match glide::win::app::run(Connector { target, password, hello }, opts) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {

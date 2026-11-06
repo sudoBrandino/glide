@@ -16,6 +16,10 @@ public struct CodecCaps: OptionSet, Sendable {
     public static let hevc420 = CodecCaps(rawValue: 1 << 0)
     public static let hevc444 = CodecCaps(rawValue: 1 << 1)
     public static let h264 = CodecCaps(rawValue: 1 << 2)
+    /// Viewer plays PCM s16le audio (§3.2).
+    public static let audioPCM = CodecCaps(rawValue: 1 << 9)
+    /// Reserved: Opus audio.
+    public static let audioOpus = CodecCaps(rawValue: 1 << 10)
 }
 
 public struct VideoConfig: Equatable {
@@ -55,6 +59,7 @@ public enum ClientMessage {
     case setMode(mode: StreamMode, bitrateKbps: UInt32, maxFps: UInt8)
     case ping(clientTimeUs: UInt64)
     case clipboard(String)
+    case audioEnable(Bool)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -71,6 +76,7 @@ public enum ClientMessage {
         case let .setMode(m, br, fps): w.u8(0x21); w.u8(m.rawValue); w.u32(br); w.u8(fps)
         case let .ping(t): w.u8(0x30); w.u64(t)
         case let .clipboard(s): w.u8(0x50); w.str(s)
+        case let .audioEnable(on): w.u8(0x62); w.u8(on ? 1 : 0)
         }
         return w.data
     }
@@ -93,6 +99,7 @@ public enum ClientMessage {
         case 0x21: return .setMode(mode: StreamMode(rawValue: try r.u8()) ?? .fast, bitrateKbps: try r.u32(), maxFps: try r.u8())
         case 0x30: return .ping(clientTimeUs: try r.u64())
         case 0x50: return .clipboard(try r.str())
+        case 0x62: return .audioEnable(try r.u8() != 0)
         default: throw WireError.unknownMessage(t)
         }
     }
@@ -109,6 +116,9 @@ public enum HostMessage {
     case cursorShape(id: UInt32, w: UInt16, h: UInt16, hotX: UInt16, hotY: UInt16, bgra: Data)
     case cursorShapeRef(id: UInt32)
     case clipboard(String)
+    case audioConfig(AudioConfig)
+    /// `pcm`: interleaved s16le samples (codec 1).
+    case audioFrame(seq: UInt32, captureTimeUs: UInt64, pcm: Data)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -132,6 +142,10 @@ public enum HostMessage {
             w.u8(0x42); w.u32(id); w.u16(cw); w.u16(ch); w.u16(hx); w.u16(hy); w.bytes(bgra)
         case let .cursorShapeRef(id): w.u8(0x43); w.u32(id)
         case let .clipboard(s): w.u8(0x50); w.str(s)
+        case let .audioConfig(c): w.u8(0x60); c.write(&w)
+        case let .audioFrame(seq, t, pcm):
+            w = ByteWriter(capacity: pcm.count + 13)
+            w.u8(0x61); w.u32(seq); w.u64(t); w.bytes(pcm)
         }
         return w.data
     }
@@ -160,6 +174,8 @@ public enum HostMessage {
             return .cursorShape(id: id, w: cw, h: ch, hotX: hx, hotY: hy, bgra: try r.bytes(Int(cw) * Int(ch) * 4))
         case 0x43: return .cursorShapeRef(id: try r.u32())
         case 0x50: return .clipboard(try r.str())
+        case 0x60: return .audioConfig(try AudioConfig.read(&r))
+        case 0x61: return .audioFrame(seq: try r.u32(), captureTimeUs: try r.u64(), pcm: r.rest())
         default: throw WireError.unknownMessage(t)
         }
     }

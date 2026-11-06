@@ -1,3 +1,4 @@
+import CoreMedia
 import CryptoKit
 import Foundation
 import GlideCore
@@ -74,6 +75,118 @@ func run() throws {
     check(missing.isEmpty, "keymap coverage \(missing)")
 }
 
+// MARK: Audio (§3.2)
+
+/// Builds a linear-PCM CMSampleBuffer (what ScreenCaptureKit hands us) from per-channel samples.
+func makeAudioBuffer(channels ch: [[Float]], rate: Double, ptsUs: Int64, planar: Bool, s16: Bool) throws -> CMSampleBuffer {
+    let n = ch[0].count, nch = ch.count
+    let bps = s16 ? 2 : 4
+    var flags: AudioFormatFlags = (s16 ? kAudioFormatFlagIsSignedInteger : kAudioFormatFlagIsFloat) | kAudioFormatFlagIsPacked
+    if planar { flags |= kAudioFormatFlagIsNonInterleaved }
+    var asbd = AudioStreamBasicDescription(mSampleRate: rate, mFormatID: kAudioFormatLinearPCM, mFormatFlags: flags,
+                                           mBytesPerPacket: UInt32(planar ? bps : bps * nch), mFramesPerPacket: 1,
+                                           mBytesPerFrame: UInt32(planar ? bps : bps * nch), mChannelsPerFrame: UInt32(nch),
+                                           mBitsPerChannel: UInt32(bps * 8), mReserved: 0)
+    var fmt: CMAudioFormatDescription?
+    guard CMAudioFormatDescriptionCreate(allocator: nil, asbd: &asbd, layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &fmt) == noErr, let fmt else {
+        throw NSError(domain: "selftest", code: 1)
+    }
+    var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: CMTimeScale(rate)), presentationTimeStamp: CMTime(value: ptsUs, timescale: 1_000_000), decodeTimeStamp: .invalid)
+    var sb: CMSampleBuffer?
+    guard CMSampleBufferCreate(allocator: nil, dataBuffer: nil, dataReady: false, makeDataReadyCallback: nil, refcon: nil, formatDescription: fmt,
+                               sampleCount: n, sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sb) == noErr, let sb else {
+        throw NSError(domain: "selftest", code: 2)
+    }
+    // Raw bytes per buffer.
+    func bytes(_ values: [Float]) -> [UInt8] {
+        if s16 { return values.flatMap { v in withUnsafeBytes(of: Int16(v * 32767).littleEndian) { Array($0) } } }
+        return values.flatMap { v in withUnsafeBytes(of: v) { Array($0) } }
+    }
+    let buffers: [[UInt8]] = planar ? ch.map(bytes) : [bytes((0..<n).flatMap { f in ch.map { $0[f] } })]
+    let abl = AudioBufferList.allocate(maximumBuffers: buffers.count)
+    defer { for b in abl { b.mData?.deallocate() }; free(abl.unsafeMutablePointer) }
+    for (i, b) in buffers.enumerated() {
+        let p = UnsafeMutableRawPointer.allocate(byteCount: b.count, alignment: 16)
+        p.copyMemory(from: b, byteCount: b.count)
+        abl[i] = AudioBuffer(mNumberChannels: planar ? 1 : UInt32(nch), mDataByteSize: UInt32(b.count), mData: p)
+    }
+    let st = CMSampleBufferSetDataBufferFromAudioBufferList(sb, blockBufferAllocator: nil, blockBufferMemoryAllocator: nil, flags: 0, bufferList: abl.unsafePointer)
+    guard st == noErr else { throw NSError(domain: "selftest", code: Int(st)) }
+    return sb
+}
+
+func s16le(_ d: Data) -> [Int16] {
+    stride(from: 0, to: d.count - 1, by: 2).map { Int16(bitPattern: UInt16(d[d.startIndex + $0]) | UInt16(d[d.startIndex + $0 + 1]) << 8) }
+}
+
+func audioTests() throws {
+    // Wire encodings (docs/PROTOCOL.md §3.2 reference bytes; windows/src/protocol.rs checks the same).
+    let cfg = AudioConfig(codec: .pcmS16, sampleRate: 48000, channels: 2, frameSamples: 480)
+    check(HostMessage.audioConfig(cfg).encoded.hex == "600180bb000002e001", "AudioConfig encoding")
+    if case let .audioConfig(c) = try HostMessage.decode(Data(hex: "600180bb000002e001")!) { check(c == cfg, "AudioConfig decode") } else { check(false, "AudioConfig decode") }
+    let pcm = Data(hex: "0100ffffff7f0080")!
+    let frameHex = "610700000040420f00000000000100ffffff7f0080"
+    check(HostMessage.audioFrame(seq: 7, captureTimeUs: 1_000_000, pcm: pcm).encoded.hex == frameHex, "AudioFrame encoding")
+    if case let .audioFrame(seq, t, p) = try HostMessage.decode(Data(hex: frameHex)!) {
+        check(seq == 7 && t == 1_000_000 && s16le(p) == [1, -1, 32767, -32768], "AudioFrame decode")
+    } else { check(false, "AudioFrame decode") }
+    check(ClientMessage.audioEnable(false).encoded.hex == "6200", "AudioEnable encoding")
+    if case let .audioEnable(on) = try ClientMessage.decode(Data(hex: "6201")!) { check(on, "AudioEnable decode") } else { check(false, "AudioEnable decode") }
+    check(CodecCaps.audioPCM.rawValue == 0x200, "audio cap = bit 9")
+    if case let .audioConfig(c) = try HostMessage.decode(HostMessage.audioConfig(.off).encoded) { check(c.codec == .off, "AudioConfig off roundtrip") }
+
+    // Float -> s16 conversion: clipping, rounding, NaN.
+    check(AudioPCM.s16(0) == 0 && AudioPCM.s16(1) == 32767 && AudioPCM.s16(-1) == -32767, "s16 full scale")
+    check(AudioPCM.s16(2) == 32767 && AudioPCM.s16(-7) == -32767 && AudioPCM.s16(.infinity) == 32767, "s16 clipping")
+    check(AudioPCM.s16(.nan) == 0 && AudioPCM.s16(0.5) == 16384 && AudioPCM.s16(-0.5) == -16384 && AudioPCM.s16(1.0 / 32767) == 1, "s16 rounding")
+
+    // Chunking: ≤ max, near-equal, contiguous.
+    check(AudioPCM.chunkRanges(frames: 1024, maxFrames: 480) == [0..<342, 342..<683, 683..<1024], "chunk 1024 by 480")
+    check(AudioPCM.chunkRanges(frames: 480, maxFrames: 480) == [0..<480], "chunk exact")
+    check(AudioPCM.chunkRanges(frames: 960, maxFrames: 480) == [0..<480, 480..<960], "chunk 2x")
+    check(AudioPCM.chunkRanges(frames: 0, maxFrames: 480).isEmpty && AudioPCM.chunkRanges(frames: 7, maxFrames: 480) == [0..<7], "chunk small")
+    var ok = true
+    for n in 1...3000 {
+        let r = AudioPCM.chunkRanges(frames: n, maxFrames: 480)
+        let sizes = r.map(\.count)
+        if r.first?.lowerBound != 0 || r.last?.upperBound != n || sizes.max()! > 480 || sizes.max()! - sizes.min()! > 1 || zip(r, r.dropFirst()).contains(where: { $0.upperBound != $1.lowerBound }) { ok = false }
+    }
+    check(ok, "chunk invariants 1..3000")
+
+    // Real CMSampleBuffers through the packetizer (SCK delivers float32 planar stereo 48 kHz).
+    let n = 1024
+    let left = (0..<n).map { Float(sin(Double($0) * 2 * .pi * 440 / 48000) * 0.5) }
+    let right = (0..<n).map { Float($0 % 7) / 7 - 0.5 }
+    for (planar, s16) in [(true, false), (false, false), (true, true), (false, true)] {
+        let what = "\(s16 ? "s16" : "f32") \(planar ? "planar" : "interleaved")"
+        let sb = try makeAudioBuffer(channels: [left, right], rate: 48000, ptsUs: 5_000_000, planar: planar, s16: s16)
+        let (c, packets) = try AudioPCM.packetize(sb)
+        check(c == AudioConfig(codec: .pcmS16, sampleRate: 48000, channels: 2, frameSamples: 480), "packetize config (\(what))")
+        check(packets.map(\.frames) == [342, 341, 341], "packetize split (\(what))")
+        check(packets.map(\.captureUs) == [5_000_000, 5_007_125, 5_014_229], "packetize timestamps (\(what)) \(packets.map(\.captureUs))")
+        let all = packets.flatMap { s16le($0.pcm) }
+        let tol: Int = s16 ? 1 : 0
+        var maxErr = 0
+        for f in 0..<n {
+            let l = s16 ? Int(Int16(left[f] * 32767)) : Int(AudioPCM.s16(left[f]))
+            let r = s16 ? Int(Int16(right[f] * 32767)) : Int(AudioPCM.s16(right[f]))
+            maxErr = max(maxErr, abs(Int(all[2 * f]) - l), abs(Int(all[2 * f + 1]) - r))
+        }
+        check(all.count == 2 * n && maxErr <= tol, "packetize samples interleaved L,R (\(what), max err \(maxErr))")
+    }
+    // Mono and an unsupported format.
+    let mono = try makeAudioBuffer(channels: [Array(left[0..<100])], rate: 44100, ptsUs: 0, planar: true, s16: false)
+    let (mc, mp) = try AudioPCM.packetize(mono)
+    check(mc.channels == 1 && mc.sampleRate == 44100 && mc.frameSamples == 441 && mp.count == 1 && mp[0].pcm.count == 200, "packetize mono 44.1k")
+    // Throughput: 10 s of stereo 48 kHz in 1024-frame buffers.
+    let t0 = hostTimeMicros()
+    let sb = try makeAudioBuffer(channels: [left, right], rate: 48000, ptsUs: 0, planar: true, s16: false)
+    for _ in 0..<469 { _ = try AudioPCM.packetize(sb) }
+    let ms = Double(hostTimeMicros() - t0) / 1000
+    check(ms < 500, String(format: "packetize 10 s of audio in %.1f ms (%.3f ms per 21 ms buffer)", ms, ms / 469))
+}
+
 do { try run() } catch { failures += 1; print("  FAIL threw \(error)") }
+do { try audioTests() } catch { failures += 1; print("  FAIL audio threw \(error)") }
 print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)

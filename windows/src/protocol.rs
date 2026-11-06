@@ -11,6 +11,10 @@ pub const DEFAULT_PORT: u16 = 7420;
 pub const CAP_HEVC_420: u32 = 1 << 0;
 pub const CAP_HEVC_444: u32 = 1 << 1;
 pub const CAP_H264_420: u32 = 1 << 2;
+/// Viewer plays PCM s16le audio (§3.2).
+pub const CAP_AUDIO_PCM: u32 = 1 << 9;
+/// Reserved: Opus audio.
+pub const CAP_AUDIO_OPUS: u32 = 1 << 10;
 
 // Client -> Host message types
 pub const MSG_CLIENT_HELLO: u8 = 0x01;
@@ -24,6 +28,7 @@ pub const MSG_REQUEST_KEYFRAME: u8 = 0x20;
 pub const MSG_SET_MODE: u8 = 0x21;
 pub const MSG_PING: u8 = 0x30;
 pub const MSG_CLIPBOARD: u8 = 0x50;
+pub const MSG_AUDIO_ENABLE: u8 = 0x62;
 
 // Host -> Client message types
 pub const MSG_SERVER_HELLO: u8 = 0x02;
@@ -34,6 +39,13 @@ pub const MSG_VIDEO_FRAME: u8 = 0x40;
 pub const MSG_CURSOR_POS: u8 = 0x41;
 pub const MSG_CURSOR_SHAPE: u8 = 0x42;
 pub const MSG_CURSOR_SHAPE_REF: u8 = 0x43;
+pub const MSG_AUDIO_CONFIG: u8 = 0x60;
+pub const MSG_AUDIO_FRAME: u8 = 0x61;
+
+// AudioConfig codecs
+pub const AUDIO_CODEC_OFF: u8 = 0;
+pub const AUDIO_CODEC_PCM_S16: u8 = 1;
+pub const AUDIO_CODEC_OPUS: u8 = 2;
 
 pub const MOUSE_LEFT: u8 = 0;
 pub const MOUSE_RIGHT: u8 = 1;
@@ -115,6 +127,17 @@ impl VideoConfig {
     }
 }
 
+/// `AudioConfig` (0x60, §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioConfig {
+    /// AUDIO_CODEC_* (0 = host has no audio).
+    pub codec: u8,
+    pub sample_rate: u32,
+    pub channels: u8,
+    /// Nominal samples per channel per AudioFrame (informational).
+    pub frame_samples: u16,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientMsg {
     ClientHello {
@@ -137,6 +160,8 @@ pub enum ClientMsg {
     SetMode { mode: u8, bitrate_kbps: u32, max_fps: u8 },
     Ping { client_time_us: u64 },
     Clipboard { text: String },
+    /// Start (true) / stop (false, muted) audio.
+    AudioEnable { enabled: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +177,9 @@ pub enum HostMsg {
     CursorShape { shape_id: u32, w: u16, h: u16, hot_x: u16, hot_y: u16, bgra: Vec<u8> },
     CursorShapeRef { shape_id: u32 },
     Clipboard { text: String },
+    AudioConfig(AudioConfig),
+    /// `data`: interleaved s16le PCM (codec 1); `capture_time_us` is the first sample's host time.
+    AudioFrame { seq: u32, capture_time_us: u64, data: Vec<u8> },
     /// Unknown message type: ignored for forward compatibility.
     Unknown { msg_type: u8 },
 }
@@ -339,6 +367,7 @@ impl ClientMsg {
             ClientMsg::SetMode { mode, bitrate_kbps, max_fps } => Writer::new(MSG_SET_MODE).u8(*mode).u32(*bitrate_kbps).u8(*max_fps).finish(),
             ClientMsg::Ping { client_time_us } => Writer::new(MSG_PING).u64(*client_time_us).finish(),
             ClientMsg::Clipboard { text } => Writer::new(MSG_CLIPBOARD).str(text).finish(),
+            ClientMsg::AudioEnable { enabled } => Writer::new(MSG_AUDIO_ENABLE).u8(*enabled as u8).finish(),
         }
     }
 
@@ -366,6 +395,7 @@ impl ClientMsg {
             MSG_SET_MODE => ClientMsg::SetMode { mode: r.u8()?, bitrate_kbps: r.u32()?, max_fps: r.u8()? },
             MSG_PING => ClientMsg::Ping { client_time_us: r.u64()? },
             MSG_CLIPBOARD => ClientMsg::Clipboard { text: r.str()? },
+            MSG_AUDIO_ENABLE => ClientMsg::AudioEnable { enabled: r.u8()? != 0 },
             _ => return Err(DecodeError::BadLength(t)),
         })
     }
@@ -422,6 +452,18 @@ impl HostMsg {
             }
             MSG_CURSOR_SHAPE_REF => HostMsg::CursorShapeRef { shape_id: r.u32()? },
             MSG_CLIPBOARD => HostMsg::Clipboard { text: r.str()? },
+            MSG_AUDIO_CONFIG => HostMsg::AudioConfig(AudioConfig {
+                codec: r.u8()?,
+                sample_rate: r.u32()?,
+                channels: r.u8()?,
+                frame_samples: r.u16()?,
+            }),
+            MSG_AUDIO_FRAME => {
+                let seq = r.u32()?;
+                let capture_time_us = r.u64()?;
+                buf.drain(..1 + r.pos());
+                return Ok(HostMsg::AudioFrame { seq, capture_time_us, data: buf });
+            }
             other => HostMsg::Unknown { msg_type: other },
         };
         Ok(msg)
@@ -469,6 +511,12 @@ impl HostMsg {
             }
             HostMsg::CursorShapeRef { shape_id } => Writer::new(MSG_CURSOR_SHAPE_REF).u32(*shape_id).finish(),
             HostMsg::Clipboard { text } => Writer::new(MSG_CLIPBOARD).str(text).finish(),
+            HostMsg::AudioConfig(c) => {
+                Writer::new(MSG_AUDIO_CONFIG).u8(c.codec).u32(c.sample_rate).u8(c.channels).u16(c.frame_samples).finish()
+            }
+            HostMsg::AudioFrame { seq, capture_time_us, data } => {
+                Writer::new(MSG_AUDIO_FRAME).u32(*seq).u64(*capture_time_us).bytes(data).finish()
+            }
             HostMsg::Unknown { msg_type } => vec![*msg_type],
         }
     }
@@ -607,6 +655,29 @@ mod tests {
         assert_eq!(enc[0], 0x04);
         assert_eq!(HostMsg::decode(enc).unwrap(), m);
         assert_eq!(Mode::from_u8(2), Mode::Hybrid);
+    }
+
+    #[test]
+    fn audio_messages_match_reference_bytes() {
+        // docs/PROTOCOL.md §3.2 reference encodings (mac glide-selftest checks the same bytes).
+        let cfg = HostMsg::AudioConfig(AudioConfig { codec: AUDIO_CODEC_PCM_S16, sample_rate: 48000, channels: 2, frame_samples: 480 });
+        assert_eq!(crate::util::hex(&cfg.encode()), "600180bb000002e001");
+        assert_eq!(HostMsg::decode(crate::util::unhex("600180bb000002e001")).unwrap(), cfg);
+        let frame_hex = "610700000040420f00000000000100ffffff7f0080";
+        let m = HostMsg::decode(crate::util::unhex(frame_hex)).unwrap();
+        assert_eq!(m, HostMsg::AudioFrame { seq: 7, capture_time_us: 1_000_000, data: crate::util::unhex("0100ffffff7f0080") });
+        assert_eq!(crate::util::hex(&m.encode()), frame_hex);
+        assert_eq!(ClientMsg::AudioEnable { enabled: false }.encode(), vec![0x62, 0x00]);
+        assert_eq!(ClientMsg::decode(&[0x62, 0x01]).unwrap(), ClientMsg::AudioEnable { enabled: true });
+        assert!(ClientMsg::decode(&[0x62]).is_err());
+        // truncated headers are errors; an empty payload is a valid (empty) frame
+        assert!(HostMsg::decode(crate::util::unhex("600180bb000002e0")).is_err());
+        assert!(HostMsg::decode(crate::util::unhex("610700000040420f000000")).is_err());
+        assert_eq!(
+            HostMsg::decode(crate::util::unhex("610700000040420f0000000000")).unwrap(),
+            HostMsg::AudioFrame { seq: 7, capture_time_us: 1_000_000, data: vec![] }
+        );
+        assert_eq!(CAP_AUDIO_PCM, 0x200);
     }
 
     #[test]

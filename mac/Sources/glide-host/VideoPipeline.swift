@@ -37,6 +37,8 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     var onConfig: ((_ base: VideoConfig, _ sharp: VideoConfig?) -> Void)?
     /// Returns false when the network is backed up and new frames should be skipped.
     var canSend: () -> Bool = { true }
+    /// System audio rides on the base stream when set (see AudioPipeline). Set before `start()`.
+    var audio: AudioPipeline?
 
     let queue = DispatchQueue(label: "glide.video", qos: .userInteractive)
     private(set) var options: Options
@@ -154,8 +156,13 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         }
 
         let filter = SCContentFilter(display: display, excludingWindows: [])
-        let base = SCStream(filter: filter, configuration: streamConfig(bgra: baseChroma == .yuv444, fps: fps), delegate: self)
+        let baseCfg = streamConfig(bgra: baseChroma == .yuv444, fps: fps)
+        audio?.configure(baseCfg)
+        let base = SCStream(filter: filter, configuration: baseCfg, delegate: self)
         try base.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        if let audio {
+            do { try audio.attach(to: base) } catch { log("audio: cannot add audio output (\(error.localizedDescription)); continuing without audio") }
+        }
         var sharp: SCStream?
         if hybrid && ProcessInfo.processInfo.environment["GLIDE_NO_SHARP_STREAM"] != "1" {
             let s = SCStream(filter: filter, configuration: streamConfig(bgra: true, fps: fps), delegate: self)

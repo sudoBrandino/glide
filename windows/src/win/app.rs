@@ -4,6 +4,7 @@
 //! thread from `net`) and survives disconnects. Frames go network → render thread over a
 //! channel and are presented as soon as they decode.
 
+use super::audio::Audio;
 use super::cursor::{create_cursor, destroy_cursor, scale_image, CursorImage};
 use super::d3d::Gpu;
 use super::decoder::Decoder;
@@ -30,6 +31,8 @@ pub struct Options {
     pub ctrl_as_cmd: bool,
     pub mode: Mode,
     pub host_label: String,
+    /// Play the host's audio (§3.2); false with --no-audio.
+    pub audio: bool,
 }
 
 /// How the viewer reaches the host. The session thread retries forever.
@@ -54,6 +57,8 @@ const WM_APP_DISCONNECTED: u32 = WM_APP + 5;
 const TITLE_TIMER: usize = 1;
 const EXIT_TIMER: usize = 2;
 const VIEW_TIMER: usize = 3;
+/// Window-menu command: mute/unmute audio (low 4 bits zero, below 0xF000, as WM_SYSCOMMAND requires).
+const IDM_MUTE: usize = 0x1F10;
 
 enum RenderCmd {
     Frame { data: Vec<u8>, keyframe: bool, sharp: bool, rects: Option<Vec<protocol::Rect>> },
@@ -107,6 +112,8 @@ struct Shared {
     cursor: Mutex<CursorState>,
     stats: Stats,
     hwnd: AtomicIsize,
+    /// Audio output (None with --no-audio).
+    audio: Option<Audio>,
 }
 
 /// Process-wide UI context (the low-level keyboard hook has no user pointer).
@@ -441,6 +448,18 @@ fn handle_key(hwnd: HWND, vk: u32, scan: u32, extended: bool, down: bool) -> boo
         let s = s.borrow();
         s.keys_down.contains(&hid::HID_LALT) || s.keys_down.contains(&hid::HID_RALT)
     });
+    let ctrl_held = STATE.with(|s| {
+        let s = s.borrow();
+        s.keys_down.contains(&hid::HID_LCTRL) || s.keys_down.contains(&hid::HID_RCTRL)
+    });
+    if down && usage == 0x44 && ctrl_held && ui().shared.audio.is_some() {
+        // Ctrl+F11: mute/unmute audio (local hotkey, not forwarded).
+        STATE.with(|s| s.borrow_mut().swallow_up.insert(usage));
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_SYSCOMMAND, WPARAM(IDM_MUTE), LPARAM(0));
+        }
+        return true;
+    }
     let is_toggle = usage == 0x44 || (usage == 0x28 && alt_held);
     if down && is_toggle {
         STATE.with(|s| s.borrow_mut().swallow_up.insert(usage));
@@ -698,6 +717,12 @@ fn update_title(hwnd: HWND) {
     if errs > 0 {
         t.push_str(&format!(" — {errs} decode errors"));
     }
+    if let Some(a) = &sh.audio {
+        let at = a.status_text();
+        if !at.is_empty() {
+            t.push_str(&format!(" — {at}"));
+        }
+    }
     let (vw, vh, _) = *sh.view.lock().unwrap();
     t.push_str(&format!(" — view {vw}x{vh}"));
     if let Some(status) = sh.status.lock().unwrap().as_ref() {
@@ -708,6 +733,19 @@ fn update_title(hwnd: HWND) {
     unsafe {
         let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
     }
+}
+
+/// Mute/unmute: stops local playback and tells the host to stop/start sending (AudioEnable).
+fn toggle_mute(hwnd: HWND) {
+    let Some(a) = &ui().shared.audio else { return };
+    let muted = a.set_muted(!a.muted());
+    eprintln!("audio: {}", if muted { "muted" } else { "unmuted" });
+    send(ClientMsg::AudioEnable { enabled: !muted });
+    unsafe {
+        let menu = GetSystemMenu(hwnd, false);
+        let _ = CheckMenuItem(menu, IDM_MUTE as u32, (MF_BYCOMMAND | if muted { MF_CHECKED } else { MF_UNCHECKED }).0);
+    }
+    update_title(hwnd);
 }
 
 fn render_cmd(c: RenderCmd) {
@@ -830,6 +868,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_SYSCHAR | WM_CHAR => LRESULT(0),
         WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_KEYMENU => LRESULT(0),
+        WM_SYSCOMMAND if wparam.0 & 0xFFF0 == IDM_MUTE => {
+            toggle_mute(hwnd);
+            LRESULT(0)
+        }
         WM_TIMER if wparam.0 == TITLE_TIMER => {
             update_title(hwnd);
             LRESULT(0)
@@ -1126,6 +1168,16 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
                 drop(c);
                 post(hwnd_raw, WM_APP_CURSOR);
             }
+            NetEvent::Msg(HostMsg::AudioConfig(c)) => {
+                if let Some(a) = &shared.audio {
+                    a.on_config(&c);
+                }
+            }
+            NetEvent::Msg(HostMsg::AudioFrame { seq, capture_time_us, data }) => {
+                if let Some(a) = &shared.audio {
+                    a.on_frame(seq, capture_time_us, &data);
+                }
+            }
             NetEvent::Msg(HostMsg::CursorPos { visible, .. }) => {
                 let mut c = shared.cursor.lock().unwrap();
                 if c.visible != visible {
@@ -1141,6 +1193,13 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
         });
     }
     let _pinger = conn.spawn_pinger(Duration::from_secs(1));
+    if let Some(a) = &shared.audio {
+        a.on_connected(conn.clock.clone());
+        if a.muted() {
+            // Mute persists across reconnects; audio is on by default host-side.
+            let _ = conn.sender.send(&ClientMsg::AudioEnable { enabled: false });
+        }
+    }
     *shared.sender.lock().unwrap() = Some(conn.sender.clone());
     set_status(shared, tx, hwnd_raw, None);
     post(hwnd_raw, WM_APP_CONNECTED);
@@ -1158,6 +1217,9 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
     };
     *shared.sender.lock().unwrap() = None;
     *shared.clock.lock().unwrap() = None;
+    if let Some(a) = &shared.audio {
+        a.on_disconnected();
+    }
     conn.stop();
     post(hwnd_raw, WM_APP_DISCONNECTED);
     reason
@@ -1192,6 +1254,7 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         cursor: Mutex::new(CursorState { visible: true, ..Default::default() }),
         stats: Stats::default(),
         hwnd: AtomicIsize::new(0),
+        audio: opts.audio.then(Audio::start),
     });
     let (render_tx, render_rx) = mpsc::channel::<RenderCmd>();
     let _ = UI.set(UiCtx { ctrl_as_cmd: opts.ctrl_as_cmd, render_tx: Mutex::new(render_tx.clone()), shared: shared.clone() });
@@ -1248,6 +1311,13 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
     };
     let hwnd_raw = hwnd.0 as isize;
     shared.hwnd.store(hwnd_raw, Ordering::Relaxed);
+    if shared.audio.is_some() {
+        unsafe {
+            let menu = GetSystemMenu(hwnd, false);
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            let _ = AppendMenuW(menu, MF_STRING, IDM_MUTE, w!("Mute audio\tCtrl+F11"));
+        }
+    }
     check_view(hwnd); // view = the monitor the window actually opened on (before the first hello)
 
     // --- render thread
@@ -1300,6 +1370,9 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         s.shutdown();
     }
     let _ = render_tx.send(RenderCmd::Quit);
+    if let Some(a) = &shared.audio {
+        a.shutdown();
+    }
     let _ = rt.join();
     if exit_after.is_some() {
         let st = &shared.stats;

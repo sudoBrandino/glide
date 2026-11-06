@@ -14,7 +14,9 @@
 - [ ] Virtual display that matches the viewer (CGVirtualDisplay): e.g. 4K monitor →
       1920×1080 HiDPI at 120 Hz; drop BetterDisplay dependency
 - [ ] UDP video transport with NACK/FEC (TCP head-of-line blocking on loss)
-- [ ] Clipboard sync (text, then images/files), audio (SCK audio → Opus)
+- [ ] Clipboard sync (text, then images/files)
+- [x] Audio: SCK system audio → PCM s16le 48 kHz → WASAPI with jitter buffer (§3.2)
+- [ ] Audio: Opus (codec 2) for non-LAN links — needs a mingw-buildable Windows decoder
 - [ ] Multi-monitor, display picker
 - [ ] Signed `.app` bundle + LaunchAgent so TCC permissions stick to the host, menu-bar UI
 - [ ] Windows viewer UI: connection list, settings, HUD

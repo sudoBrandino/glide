@@ -12,6 +12,8 @@ final class Session: @unchecked Sendable {
     private let injector: InputInjector
     private let inputQueue = DispatchQueue(label: "glide.input", qos: .userInteractive)
     private var pipeline: VideoPipeline?
+    private var audio: AudioPipeline?
+    private var audioOff = false
     private let cursor = CursorMonitor()
     private var frameId: UInt32 = 0
     private var authed = false
@@ -119,6 +121,9 @@ final class Session: @unchecked Sendable {
                 catch { log("session \(self.id): restart failed: \(error)") }
             }
         case let .ping(t): send(.pong(clientTimeUs: t, hostTimeUs: hostTimeMicros()))
+        case let .audioEnable(on):
+            log("session \(id): viewer \(on ? "unmuted" : "muted") audio")
+            audio?.setEnabled(on)
         case .clipboard: break
         case .hello: break
         }
@@ -135,12 +140,15 @@ final class Session: @unchecked Sendable {
         pipeline = p
         let maxInFlight = settings.maxInFlightBytes
         p.canSend = { [weak self] in (self?.channel.bytesInFlight ?? 0) < maxInFlight }
+        if caps.contains(.audioPCM) { setUpAudio(p, maxInFlight: maxInFlight) }
         var sentHello = false
         p.onConfig = { [weak self] cfg, sharpCfg in
             guard let self else { return }
             if !sentHello {
                 sentHello = true
                 self.send(.serverHello(version: Handshake.version, hostName: Host.current().localizedName ?? "Mac", config: cfg))
+                if self.audioOff { self.send(.audioConfig(.off)) }
+                self.audio?.arm()
             } else {
                 self.send(.videoConfig(cfg))
             }
@@ -163,6 +171,25 @@ final class Session: @unchecked Sendable {
             }
         }
         Task { await self.captureLoop(p) }
+    }
+
+    /// System audio for viewers that advertise it (§3.2). GLIDE_NO_AUDIO=1 turns it off host-side.
+    private func setUpAudio(_ p: VideoPipeline, maxInFlight: Int) {
+        guard ProcessInfo.processInfo.environment["GLIDE_NO_AUDIO"] != "1" else {
+            log("session \(id): audio disabled on this host (GLIDE_NO_AUDIO=1)")
+            audioOff = true  // tell the viewer right after ServerHello
+            return
+        }
+        let a = AudioPipeline()
+        a.onConfig = { [weak self] cfg in
+            log("audio: -> \(cfg.codec) \(cfg.sampleRate) Hz \(cfg.channels) ch, \(cfg.frameSamples) samples/frame")
+            self?.send(.audioConfig(cfg))
+        }
+        a.onFrame = { [weak self] seq, us, pcm in self?.send(.audioFrame(seq: seq, captureTimeUs: us, pcm: pcm)) }
+        // Audio is tiny; drop it only when the backlog is far past the video limit.
+        a.canSend = { [weak self] in (self?.channel.bytesInFlight ?? 0) < maxInFlight * 2 }
+        p.audio = a
+        audio = a
     }
 
     /// Starts capture, retrying until it works or the session ends. The display can be unavailable

@@ -98,8 +98,9 @@ Any decrypt failure is fatal: close the connection.
 | `0x21` | SetMode | `u8 mode` (0 fast, 1 sharp), `u32 bitrate_kbps` (0 = auto), `u8 max_fps` (0 = keep) |
 | `0x30` | Ping | `u64 client_time_us` |
 | `0x50` | Clipboard | `str text` (reserved, v1.1) |
+| `0x62` | AudioEnable | `u8 enabled` — see §3.2 |
 
-`codec_caps` bits: `0` HEVC 4:2:0, `1` HEVC 4:4:4, `2` H.264 4:2:0.
+`codec_caps` bits: `0` HEVC 4:2:0, `1` HEVC 4:4:4, `2` H.264 4:2:0, `8` clipboard (reserved), `9` audio PCM, `10` audio Opus (reserved) — see §3.2.
 `mode`: `0` fast (4:2:0 only), `1` sharp (4:4:4 every frame), `2` **hybrid** (4:2:0 while the screen
 changes + a 4:4:4 refinement layer once it settles; see §3.1). Hybrid requires `codec_caps` bit 1;
 the host falls back to fast otherwise. Viewers that support it should default to hybrid.
@@ -120,6 +121,8 @@ the host injects exactly the HID usages it receives.
 | `0x42` | CursorShape | `u32 shape_id`, `u16 w`, `u16 h`, `u16 hot_x`, `u16 hot_y`, then `w*h*4` bytes BGRA, straight (non-premultiplied) alpha, top-down rows |
 | `0x43` | CursorShapeRef | `u32 shape_id` — switch to a previously sent shape |
 | `0x50` | Clipboard | `str text` (reserved, v1.1) |
+| `0x60` | AudioConfig | see §3.2 |
+| `0x61` | AudioFrame | see §3.2 |
 
 Rules:
 - Host sends `ServerHello` immediately after it successfully decrypts `ClientHello`.
@@ -156,6 +159,53 @@ large changes, and modes 0/1). bit3 with `n = 0` means "decode only, leave the c
 
 A `VideoConfig` resets the base decoder and the canvas and invalidates the sharp layer; in hybrid
 mode the host always follows it with a fresh `SharpLayerConfig`.
+
+## 3.2 Audio (v1.2)
+
+Host system audio (everything the Mac plays, except the host process itself) streamed to the
+viewer's speakers. One-way, host → client; lowest latency first.
+
+**Capability.** ClientHello `codec_caps` bit **9** = `AUDIO_PCM`: the viewer can play
+`AudioFrame`s with codec 1. Bit **10** = `AUDIO_OPUS` is reserved for codec 2 (not implemented).
+A viewer that sets neither bit never receives audio messages; a host without audio support
+ignores the bits. (Bits 0–2 are video codecs, bit 8 is reserved for clipboard.)
+
+| dir | type | name | payload |
+|----|----|----|----|
+| H→C | `0x60` | AudioConfig | `u8 codec` (0 off, 1 PCM s16le, 2 Opus — reserved), `u32 sample_rate` (Hz), `u8 channels`, `u16 frame_samples` (nominal samples per channel per `AudioFrame`; informational) |
+| H→C | `0x61` | AudioFrame | `u32 seq`, `u64 capture_time_us` (host monotonic clock — the same clock as `VideoFrame`/`Pong` — of the frame's **first** sample), then the payload. Codec 1: interleaved signed 16-bit little-endian samples, `n × channels × 2` bytes (`n` = payload bytes / (2 × channels)) |
+| C→H | `0x62` | AudioEnable | `u8 enabled` — 1 = send audio, 0 = stop sending (viewer muted) |
+
+Rules:
+- Audio is **on by default** when the viewer sets bit 9; no `AudioEnable` is needed to start it.
+- The host sends `AudioConfig` before the first `AudioFrame`, whenever the format changes, and
+  again before the first frame after each `AudioEnable(1)`. An `AudioConfig` starts a new
+  audio stream: the viewer flushes its jitter buffer (and reopens its output device if the
+  format changed). `codec = 0` means the host has no audio for this session (disabled or capture
+  unavailable): the viewer releases its output device.
+- Frames carry **at most 10 ms** of audio (≤ 480 samples at 48 kHz) and are sent as soon as
+  they are captured (no pacing). The host splits larger capture buffers into near-equal frames.
+- `seq` increments by 1 for every frame the host produces, **including frames it drops** (it
+  drops audio only when the connection backlog is far beyond the video backpressure limit). A
+  gap in `seq` is lost audio; the viewer plays the frames it got back-to-back (it does not
+  insert silence for the gap — that would only add latency).
+- A payload whose length is not a multiple of `2 × channels` is malformed; the viewer drops it.
+- `AudioEnable(0)`: the host stops sending `AudioFrame`s until `AudioEnable(1)`. Muting is the
+  viewer's job; the host never changes the Mac's own volume.
+
+Viewer playback (non-normative, what `windows/` does): WASAPI shared-mode, event-driven render
+keeping ~16 ms queued in the device (one 10 ms engine period + slack); a jitter buffer that primes to a **30 ms** target, holds that level
+by tiny resampling (≤ ±0.2 %) only when it drifts out of a ±8 ms dead band (bit-exact output
+otherwise), raises the target by 10 ms per underrun (max 120 ms, decaying back after 20 s
+without one), and drops audio outright if it ever holds more than target + 60 ms.
+
+Reference encodings (both implementations test these):
+
+```
+AudioConfig {codec 1, 48000 Hz, 2 ch, 480}              60 01 80bb0000 02 e001
+AudioFrame  {seq 7, t 1000000 µs, L/R 1,-1, 32767,-32768} 61 07000000 40420f0000000000 0100 ffff ff7f 0080
+AudioEnable {0}                                         62 00
+```
 
 ## 4. Test vectors
 
