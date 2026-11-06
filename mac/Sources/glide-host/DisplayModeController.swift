@@ -49,8 +49,11 @@ final class DisplayModeController: @unchecked Sendable {
     private var owner: Int?                    // session currently driving the policy
     private var viewer: (w: Int, h: Int)?
     private(set) var userOverride = false
-    private var expected: DisplayModeInfo?     // what we believe the mode is (to spot manual changes)
-    private var lastSwitchAt = Date.distantPast
+    /// Tells our own switches from the user's (GlideCore, unit-tested in glide-selftest).
+    private var tracker = DisplayChangeTracker(current: nil)
+    /// A screen-parameters notification arrived since the last switch began (it can arrive
+    /// re-entrantly, before CGCompleteDisplayConfiguration returns).
+    private var notifiedSinceSwitch = false
     private var pendingRestore: DispatchWorkItem?
     private var viewDebounce: DispatchWorkItem?
     private var settleWaiters: [() -> Void] = []
@@ -78,11 +81,11 @@ final class DisplayModeController: @unchecked Sendable {
             started = true
             self.displayID = displayID
             loadSettings()
-            expected = currentMode()
+            tracker.reset(current: currentMode())
             NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
                 self?.screenParametersChanged()
             }
-            log("display: policy \(settings.preference.rawValue) (4K viewers: \(settings.highDPIChoice.rawValue)), restore on disconnect \(settings.restoreEnabled ? "on" : "off"), current \(expected.map { "\($0)" } ?? "?")")
+            log("display: policy \(settings.preference.rawValue) (4K viewers: \(settings.highDPIChoice.rawValue)), restore on disconnect \(settings.restoreEnabled ? "on" : "off"), current \(tracker.expected.map { "\($0)" } ?? "?")")
             if let r = settings.restore {
                 // Left over from a previous run (crash/update mid-session). A reconnecting viewer cancels this.
                 log("display: pending restore to \(r) from a previous run (in \(Int(Self.startupRestoreGrace))s unless a viewer connects)")
@@ -102,7 +105,7 @@ final class DisplayModeController: @unchecked Sendable {
             owner = id
             userOverride = false
             viewer = (viewW, viewH)
-            expected = currentMode()
+            tracker.reset(current: currentMode())
             if applyPolicy(reason: "viewer connected") { waitForSettle(then) } else { then() }
         }
     }
@@ -188,7 +191,7 @@ final class DisplayModeController: @unchecked Sendable {
         if let cur, target.sameSize(cur) { return false }
         guard let mode = all.first(where: { $0.info == target })?.mode else { return false }
         if settings.restore == nil, let cur { setRestoreTarget(cur) }
-        let ok = configure(mode)
+        let ok = configure(mode, from: cur)
         let msg = "\(ok ? "switched" : "FAILED to switch") \(cur.map { "\($0)" } ?? "?") -> \(target) for viewer \(v.w)x\(v.h) (\(settings.preference.rawValue); \(reason))"
         log("display: " + msg)
         lastAction = msg
@@ -214,21 +217,26 @@ final class DisplayModeController: @unchecked Sendable {
         guard let mode = modes().first(where: { $0.info.sameSize(r) })?.mode else {
             log("display: can't restore \(r): mode no longer available"); return
         }
-        let ok = configure(mode)
+        let ok = configure(mode, from: currentMode())
         lastAction = "\(ok ? "restored" : "FAILED to restore") \(r) (\(reason))"
         log("display: " + lastAction!)
     }
 
-    private func configure(_ mode: CGDisplayMode) -> Bool {
+    private func configure(_ mode: CGDisplayMode, from: DisplayModeInfo?) -> Bool {
+        // Record the switch first: the screen-parameters notification can be delivered re-entrantly
+        // inside CGCompleteDisplayConfiguration, before it returns.
+        tracker.willSwitch(from: from, to: DisplayModeInfo(mode), now: ProcessInfo.processInfo.systemUptime)
+        notifiedSinceSwitch = false
         var cfg: CGDisplayConfigRef?
-        guard CGBeginDisplayConfiguration(&cfg) == .success else { return false }
-        CGConfigureDisplayWithDisplayMode(cfg, displayID, mode, nil)
-        // forSession: an automatic change never outlives the login session (the user's own
-        // permanent choice comes back after logout/reboot).
-        let r = CGCompleteDisplayConfiguration(cfg, .forSession)
-        lastSwitchAt = Date()
-        expected = DisplayModeInfo(mode)
-        return r == .success
+        var ok = CGBeginDisplayConfiguration(&cfg) == .success
+        if ok {
+            CGConfigureDisplayWithDisplayMode(cfg, displayID, mode, nil)
+            // forSession: an automatic change never outlives the login session (the user's own
+            // permanent choice comes back after logout/reboot).
+            ok = CGCompleteDisplayConfiguration(cfg, .forSession) == .success
+        }
+        tracker.didSwitch(ok: ok, actual: currentMode(), now: ProcessInfo.processInfo.systemUptime)
+        return ok
     }
 
     private func screenParametersChanged() {
@@ -236,12 +244,10 @@ final class DisplayModeController: @unchecked Sendable {
             let w = settleWaiters; settleWaiters = []
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { w.forEach { $0() } }
         }
-        guard let cur = currentMode() else { return }
-        defer { expected = cur }
-        guard let exp = expected, !cur.sameSize(exp) else { return }
-        // Shortly after our own switch the system may settle on a slightly different mode: accept it.
-        if Date().timeIntervalSince(lastSwitchAt) < 3 { return }
-        guard owner != nil || settings.restore != nil else { return }
+        notifiedSinceSwitch = true
+        guard let cur = currentMode(),
+              tracker.observe(current: cur, now: ProcessInfo.processInfo.systemUptime) == .manual,
+              owner != nil || settings.restore != nil else { return }
         if owner != nil {
             userOverride = true
             lastAction = "mode changed manually to \(cur); auto-switching paused until the next session"
@@ -257,6 +263,10 @@ final class DisplayModeController: @unchecked Sendable {
     private func waitForSettle(_ then: @escaping () -> Void) {
         var done = false
         let once = { if !done { done = true; then() } }
+        if notifiedSinceSwitch {  // already delivered (re-entrantly, during the switch)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { once() }
+            return
+        }
         settleWaiters.append(once)
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { once() }
     }

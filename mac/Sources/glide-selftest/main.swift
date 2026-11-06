@@ -415,9 +415,47 @@ func audioTests() throws {
     check(ms < 500, String(format: "packetize 10 s of audio in %.1f ms (%.3f ms per 21 ms buffer)", ms, ms / 469))
 }
 
+func trackerChecks() {
+    let crisp = DisplayModeInfo(width: 2560, height: 1440, pixelWidth: 2560, pixelHeight: 1440)
+    let retina = DisplayModeInfo(width: 1920, height: 1080, pixelWidth: 3840, pixelHeight: 2160)
+    let other = DisplayModeInfo(width: 1600, height: 900, pixelWidth: 1600, pixelHeight: 900)
+    // Live bug: the notification for our own switch arrives re-entrantly, before the switch returns.
+    var t = DisplayChangeTracker(current: crisp)
+    t.willSwitch(from: crisp, to: retina, now: 100)
+    check(t.observe(current: retina, now: 100.01) == .ours, "tracker: re-entrant notification during our switch is ours")
+    t.didSwitch(ok: true, actual: retina, now: 100.02)
+    check(t.observe(current: retina, now: 100.3) == .ours, "tracker: later notification for our switch is ours")
+    // Notification delivered while the display still reports the old mode.
+    var t2 = DisplayChangeTracker(current: crisp)
+    t2.willSwitch(from: crisp, to: retina, now: 10)
+    check(t2.observe(current: crisp, now: 10.01) == .ours, "tracker: old mode mid-switch is ours")
+    check(t2.observe(current: retina, now: 10.2) == .ours, "tracker: new mode after switch is ours")
+    // After the window, steady state; a different mode is the user's.
+    check(t2.observe(current: retina, now: 30) == .unchanged, "tracker: steady state unchanged")
+    check(t2.observe(current: other, now: 31) == .manual, "tracker: user change after switch is manual")
+    check(t2.observe(current: other, now: 32) == .unchanged, "tracker: user's mode becomes expected")
+    // A mode that is neither old nor target is manual even inside the window.
+    var t3 = DisplayChangeTracker(current: crisp)
+    t3.willSwitch(from: crisp, to: retina, now: 0)
+    check(t3.observe(current: other, now: 0.5) == .manual, "tracker: unrelated mode during switch is manual")
+    // Switching back to the old mode by hand after the window is manual.
+    var t4 = DisplayChangeTracker(current: crisp)
+    t4.willSwitch(from: crisp, to: retina, now: 0)
+    t4.didSwitch(ok: true, actual: retina, now: 0.1)
+    check(t4.observe(current: crisp, now: 60) == .manual, "tracker: manual revert after window is manual")
+    // Failed switch: the reported mode stays expected.
+    var t5 = DisplayChangeTracker(current: crisp)
+    t5.willSwitch(from: crisp, to: retina, now: 0)
+    t5.didSwitch(ok: false, actual: crisp, now: 0.1)
+    check(t5.observe(current: crisp, now: 0.2) == .unchanged, "tracker: failed switch keeps old mode expected")
+    var t6 = DisplayChangeTracker(current: crisp)
+    check(t6.observe(current: other, now: 1) == .manual, "tracker: change with no switch is manual")
+}
+
 do { try run() } catch { failures += 1; print("  FAIL threw \(error)") }
 policyChecks()
 registryChecks()
+trackerChecks()
 
 do { try clipboardTests() } catch { failures += 1; print("  FAIL clipboard threw \(error)") }
 pasteboardTests()
