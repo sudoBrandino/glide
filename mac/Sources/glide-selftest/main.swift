@@ -140,6 +140,7 @@ func registryChecks() {
     check(!r.ended(a) && r.current === c, "registry: replaced session ending doesn't clear current")
     check(!r.authenticated(e).promoted, "registry: never-admitted session can't be promoted")
     check(r.ended(c) && r.current == nil, "registry: active session ending clears current")
+}
 
 /// Clipboard sync (PROTOCOL.md §5): wire format, line endings, echo suppression.
 func clipboardTests() throws {
