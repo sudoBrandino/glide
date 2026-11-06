@@ -18,6 +18,8 @@ final class Session: @unchecked Sendable {
     private var displayAssertion: IOPMAssertionID?
     private var statsTimer: DispatchSourceTimer?
     private var clientName = "?"
+    /// Created at auth if the viewer advertised clipboard support; started after ServerHello.
+    private var clipboard: ClipboardSync?
     var onEnd: ((Session) -> Void)?
     /// Called (on the session queue) once the peer proved the password with a valid ClientHello,
     /// before streaming starts. Until then the session must not affect any other session.
@@ -82,6 +84,7 @@ final class Session: @unchecked Sendable {
         if let o = displayObserver { NotificationCenter.default.removeObserver(o) }
         displayRestart?.cancel()
         cursor.stop()
+        clipboard?.stop(); clipboard = nil
         inputQueue.async { self.injector.releaseAll() }
         if let p = pipeline { Task { await p.stop() } }
         pipeline = nil
@@ -107,6 +110,9 @@ final class Session: @unchecked Sendable {
             Power.wakeDisplay()
             displayAssertion = Power.preventDisplaySleep()
             log("session \(id): '\(name)' authenticated from \(peer) (proto v\(version), view \(vw)x\(vh), caps \(caps.rawValue), mode \(mode), fps \(maxFps))")
+            if caps.contains(.clipboard) {
+                clipboard = ClipboardSync(sessionId: id) { [weak self] c in self?.send(.clipboard(c)) }
+            }
             // Switch the Mac's display mode for this viewer first (if the policy says so), then capture once.
             DisplayModeController.shared.sessionBegan(id: id, viewW: Int(vw), viewH: Int(vh)) { [weak self] in
                 self?.channel.queue.async {
@@ -145,13 +151,13 @@ final class Session: @unchecked Sendable {
                 catch { log("session \(self.id): restart failed: \(error)") }
             }
         case let .ping(t): send(.pong(clientTimeUs: t, hostTimeUs: hostTimeMicros()))
-        case .clipboard: break
+        case let .clipboard(c): clipboard?.apply(c)
         case .hello: break
         }
     }
 
     private func startStreaming(caps: CodecCaps, mode: StreamMode, maxFps: UInt8, viewW: UInt16) {
-        let codec: Codec = caps.contains(.hevc420) || caps.isEmpty ? .hevc : .h264
+        let codec: Codec = caps.contains(.hevc420) || caps.intersection(.codecMask).isEmpty ? .hevc : .h264
         var m = mode
         if (m == .sharp || m == .hybrid) && !caps.contains(.hevc444) { m = .fast }
         let fps = maxFps > 0 ? min(Int(maxFps), settings.fps) : settings.fps
@@ -167,10 +173,16 @@ final class Session: @unchecked Sendable {
             if !sentHello {
                 sentHello = true
                 self.send(.serverHello(version: Handshake.version, hostName: Host.current().localizedName ?? "Mac", config: cfg))
+                if let sharpCfg { self.send(.sharpLayerConfig(sharpCfg)) }
+                if let clip = self.clipboard {
+                    // Only to viewers with caps bit 8 (PROTOCOL.md §5), and only after ServerHello.
+                    self.send(.clipboardCaps(formats: ClipboardData.capsText | ClipboardData.capsPNG, maxBytes: UInt32(ClipboardData.maxBytes)))
+                    clip.start()
+                }
             } else {
                 self.send(.videoConfig(cfg))
+                if let sharpCfg { self.send(.sharpLayerConfig(sharpCfg)) }
             }
-            if let sharpCfg { self.send(.sharpLayerConfig(sharpCfg)) }
             HostStatus.shared.video(id: self.id, config: cfg, hybrid: sharpCfg != nil)
             // Cursor bitmaps are in encoded pixels: backing scale x (encoded width / native width).
             let mode = CGDisplayCopyDisplayMode(self.settings.displayID)

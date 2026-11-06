@@ -70,6 +70,8 @@ Done:
   - The window survives disconnects and shows a status overlay over the dimmed last frame.
   - It releases held keys, then retries or re-listens.
   - Fullscreen is kept across reconnects.
+- [x] **Clipboard sync:** text + images (PNG) both directions with loop/echo suppression
+  (PROTOCOL.md §5).
 - [x] **CI:** a GitHub Actions workflow that runs:
   - the Mac release build and selftest;
   - Rust tests on Linux and Windows;
@@ -79,7 +81,6 @@ Done:
 
 In progress, on feature branches:
 
-- [ ] Clipboard sync (`feat/clipboard`): text first, then images and files
 - [ ] Audio (`feat/audio`): ScreenCaptureKit audio → Opus
 - [ ] Viewer UX (`feat/viewer-ux`)
 - [x] Host UX (merged): menu-bar status item, automatic display-mode policy (crisp 1x / Retina
@@ -95,6 +96,7 @@ Next:
 - [ ] **UDP video transport with NACK/FEC**, because TCP head-of-line blocking hurts on loss
 - [ ] Multi-monitor support and a display picker
 - [ ] Glass-to-glass latency measurement on the real LAN
+- [ ] Clipboard: files (with file transfer); chunked transfer so big images don't stall video
 
 ## v2 — beyond the LAN
 
