@@ -14,7 +14,7 @@ use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Thread-safe encrypted message writer. Cloning shares the same socket and counter.
 #[derive(Clone)]
@@ -84,9 +84,10 @@ impl ClockSync {
 
 /// Per-read timeout during the handshake (an idle pre-auth peer is dropped after this).
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long the viewer waits for the pairing to be confirmed (both users + the host's reply).
-/// The host gives up after 60 s (AuthResult 4), so this only fires if the host vanished.
-pub const PAIRING_TIMEOUT: Duration = Duration::from_secs(90);
+/// Total time for the user part of a pairing (both users compare + the host's verdict), counted
+/// from a verified PairReveal. The host gives up after 60 s (AuthResult 4); this bounds a host
+/// that goes silent. Matches the host's 2-minute pairing window.
+pub const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub enum NetEvent {
     Msg(HostMsg),
@@ -274,9 +275,54 @@ fn read_frame(r: &mut impl Read) -> Result<Vec<u8>, ConnectError> {
     Ok(m)
 }
 
-/// Read + decrypt + decode one host record during the auth phase.
-fn read_host_msg(opener: &mut Opener, r: &mut BufReader<TcpStream>, buf: &mut Vec<u8>) -> Result<HostMsg, ConnectError> {
-    let pt = match opener.read_record(r, buf) {
+/// Largest record body before the session is authenticated (ServerHello carries a name; the
+/// auth-phase messages are tiny).
+pub const PREAUTH_MAX_RECORD: usize = 64 * 1024;
+/// The first record of a pairing: PairReveal (1 + 32 bytes) or AuthResult (2), + 16-byte tag.
+pub const PAIR_REVEAL_MAX_RECORD: usize = 1 + 32 + crate::crypto::TAG_LEN;
+/// AuthResult after the codes were compared: 2 bytes + tag.
+pub const AUTH_RESULT_MAX_RECORD: usize = 2 + crate::crypto::TAG_LEN;
+
+/// A socket handle whose read timeout can be set (TcpStream, or the BufReader around one).
+trait HasSocket: Read {
+    fn socket(&self) -> &TcpStream;
+}
+impl HasSocket for TcpStream {
+    fn socket(&self) -> &TcpStream {
+        self
+    }
+}
+impl HasSocket for BufReader<TcpStream> {
+    fn socket(&self) -> &TcpStream {
+        self.get_ref()
+    }
+}
+
+/// Reads with a wall-clock deadline: every read() gets only the time left, so a peer that drips
+/// bytes can't stretch the phase (a per-read timeout alone would restart on every byte).
+struct Timed<'a, R: HasSocket> {
+    r: &'a mut R,
+    until: Instant,
+}
+
+impl<R: HasSocket> Read for Timed<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake deadline exceeded"));
+        }
+        self.r.socket().set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
+        self.r.read(buf)
+    }
+}
+
+fn timed<R: HasSocket>(r: &mut R, until: Instant) -> Timed<'_, R> {
+    Timed { r, until }
+}
+
+/// Read + decrypt + decode one host record during the auth phase (bounded size and time).
+fn read_host_msg(opener: &mut Opener, r: &mut BufReader<TcpStream>, buf: &mut Vec<u8>, max: usize, until: Instant) -> Result<HostMsg, ConnectError> {
+    let pt = match opener.read_record_max(&mut timed(r, until), buf, max) {
         Ok(pt) => pt,
         Err(CryptoError::Io(e)) => return Err(ConnectError::Io(e)),
         Err(e) => return Err(ConnectError::Crypto(e)),
@@ -313,11 +359,13 @@ impl Connection {
         Self::from_stream_timeout(stream, auth, hello, HANDSHAKE_TIMEOUT, &|| {})
     }
 
-    /// Like `from_stream`, with a per-read handshake timeout. Listen mode passes its pre-auth
-    /// deadline here: on Windows, shutting a socket down from another thread does not interrupt a
-    /// blocked recv(), so the read timeout itself must enforce the deadline. `on_pairing` runs
-    /// when the (authenticated) pairing phase starts, which may take up to `PAIRING_TIMEOUT`
-    /// (listen mode lifts its pre-auth deadline there).
+    /// Like `from_stream`, with an explicit pre-auth deadline. Everything up to the first
+    /// authenticated host record (ServerHello, or PairReveal with a valid commitment) must arrive
+    /// within `read_timeout` of wall-clock time, enforced through the socket read timeout (on
+    /// Windows, shutting a socket down from another thread does not interrupt a blocked recv()).
+    /// Only once the host has proven its pairing commitment does the user prompt start; it has its
+    /// own total deadline (`PAIRING_TIMEOUT`), and `on_pairing` runs then (listen mode lifts its
+    /// pre-auth timer there).
     pub fn from_stream_timeout(
         mut stream: TcpStream,
         auth: &Auth,
@@ -326,15 +374,14 @@ impl Connection {
         on_pairing: &dyn Fn(),
     ) -> Result<Connection, ConnectError> {
         stream.set_nodelay(true).map_err(ConnectError::Io)?;
-        let hs_timeout = read_timeout.min(HANDSHAKE_TIMEOUT).max(Duration::from_millis(50));
-        stream.set_read_timeout(Some(hs_timeout)).map_err(ConnectError::Io)?;
+        let preauth = Instant::now() + read_timeout.min(HANDSHAKE_TIMEOUT).max(Duration::from_millis(50));
 
         // -> ClientPreamble, msg1
         let mut hs = ViewerHandshake::new(auth.identity.secret(), &auth.name, None, None);
         stream.write_all(&hs.first_flight())?;
         // <- HostPreamble, msg2
         let mut pre = [0u8; HOST_PREAMBLE_LEN];
-        if let Err(e) = stream.read_exact(&mut pre) {
+        if let Err(e) = timed(&mut stream, preauth).read_exact(&mut pre) {
             return Err(if is_eof(&e) { ConnectError::HostIsV1 } else { ConnectError::Io(e) });
         }
         let version = match parse_host_preamble(&pre) {
@@ -343,7 +390,7 @@ impl Connection {
             Err(HsError::Status { version, status }) => return Err(ConnectError::Refused { status, version }),
             Err(e) => return Err(ConnectError::Handshake(e)),
         };
-        let msg2 = read_frame(&mut stream)?;
+        let msg2 = read_frame(&mut timed(&mut stream, preauth))?;
         let (host_key, info) = hs.read_msg2(&msg2, version).map_err(ConnectError::Handshake)?;
         if let Some(pinned) = auth.pinned {
             if pinned != host_key {
@@ -364,13 +411,12 @@ impl Connection {
         }
         stream.write_all(&out)?;
         let mut reader = BufReader::with_capacity(1 << 20, stream.try_clone().map_err(ConnectError::Io)?);
-        reader.get_ref().set_read_timeout(Some(hs_timeout)).map_err(ConnectError::Io)?;
         let mut buf = Vec::new();
+        let mut hello_deadline = preauth;
 
         if pairing {
-            on_pairing();
-            reader.get_ref().set_read_timeout(Some(PAIRING_TIMEOUT)).map_err(ConnectError::Io)?;
-            let n_h = match read_host_msg(&mut opener, &mut reader, &mut buf) {
+            // Still pre-auth: PairReveal must come within the same short deadline, and be small.
+            let n_h = match read_host_msg(&mut opener, &mut reader, &mut buf, PAIR_REVEAL_MAX_RECORD, preauth) {
                 Ok(HostMsg::PairReveal { nonce }) => nonce,
                 Ok(HostMsg::AuthResult { code }) => return Err(ConnectError::Rejected(code)),
                 Ok(other) => return Err(ConnectError::Protocol(format!("expected PairReveal, got {other:?}"))),
@@ -381,6 +427,9 @@ impl Connection {
                 let _ = stream.shutdown(Shutdown::Both);
                 return Err(ConnectError::PairingFailed("the host's pairing nonce doesn't match its commitment".into()));
             }
+            // The host has committed to this pairing: now (and only now) involve the user.
+            on_pairing();
+            let pairing_deadline = Instant::now() + PAIRING_TIMEOUT;
             let prompt = PairPrompt {
                 code: sas_text(sas_code(&est.handshake_hash, &n_v, &n_h)),
                 host_fingerprint: fingerprint(&host_key),
@@ -388,25 +437,30 @@ impl Connection {
                 target: auth.target.clone(),
             };
             eprintln!("pairing with {}: code {} (host key {})", prompt.target, prompt.code, prompt.host_fingerprint);
-            // The host's verdict may arrive while the prompt is open (declined/timeout on the Mac):
-            // read it on a helper thread so the prompt can be closed right away.
+            // The host's verdict may arrive while the prompt is open (declined/timeout on the Mac),
+            // and the whole pairing has a total deadline: a helper thread reads the verdict until
+            // then and closes the prompt as soon as it has one (or time is up).
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             let ui = auth.pairing.clone();
             let watcher = thread::spawn(move || {
                 let mut b = Vec::new();
-                let r = read_host_msg(&mut opener, &mut reader, &mut b);
+                let r = read_host_msg(&mut opener, &mut reader, &mut b, AUTH_RESULT_MAX_RECORD, pairing_deadline);
                 let _ = done_tx.send(());
                 ui.dismiss();
                 (r, opener, reader)
             });
             let matched = auth.pairing.confirm(&prompt);
             if done_rx.try_recv().is_ok() {
-                // The host ended it first.
+                // The host ended it first, or the deadline passed.
                 let (r, _, _) = watcher.join().expect("pairing watcher");
+                let _ = stream.shutdown(Shutdown::Both);
                 return Err(match r {
                     Ok(HostMsg::AuthResult { code }) if code != 0 => ConnectError::Rejected(code),
                     Ok(other) => ConnectError::Protocol(format!("unexpected {other:?} during pairing")),
                     Err(ConnectError::Io(e)) if is_eof(&e) => ConnectError::PairingFailed("the host closed the connection".into()),
+                    Err(ConnectError::Io(e)) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+                        ConnectError::PairingFailed("timed out waiting for the codes to be confirmed".into())
+                    }
                     Err(e) => e,
                 });
             }
@@ -426,15 +480,19 @@ impl Connection {
                 Ok(HostMsg::AuthResult { code }) => return Err(ConnectError::Rejected(code)),
                 Ok(other) => return Err(ConnectError::Protocol(format!("expected AuthResult, got {other:?}"))),
                 Err(ConnectError::Io(e)) if is_eof(&e) => return Err(ConnectError::PairingFailed("the host closed the connection".into())),
+                Err(ConnectError::Io(e)) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return Err(ConnectError::PairingFailed("timed out waiting for the Mac to confirm".into()));
+                }
                 Err(e) => return Err(e),
             }
             eprintln!("paired with {} (host key {})", prompt.target, prompt.host_fingerprint);
-            reader.get_ref().set_read_timeout(Some(HANDSHAKE_TIMEOUT)).map_err(ConnectError::Io)?;
+            hello_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
             stream.write_all(&sealer.seal(&hello.encode()))?;
         }
 
         // <- ServerHello (or AuthResult != 0)
-        let (host_name, config) = match read_host_msg(&mut opener, &mut reader, &mut buf) {
+        let (host_name, config) = match read_host_msg(&mut opener, &mut reader, &mut buf, PREAUTH_MAX_RECORD, hello_deadline) {
             Ok(HostMsg::ServerHello { version, host_name, config }) => {
                 if version != crate::protocol::PROTOCOL_VERSION {
                     return Err(ConnectError::Protocol(format!("host speaks protocol version {version}")));
@@ -674,6 +732,55 @@ pub(crate) mod tests {
         assert!(matches!(r, Err(ConnectError::Rejected(crate::protocol::AUTH_TIMEOUT))), "{:?}", r.err());
         assert!(ui.dismiss_calls.load(Ordering::SeqCst) >= 1);
         assert!(t0.elapsed() < Duration::from_secs(5), "prompt closed when the host gave up");
+    }
+
+    /// Security review: an unpaired / unauthenticated peer must not be able to hold the
+    /// connection for the pairing timeout. Until PairReveal arrives (small, with a valid
+    /// commitment) the short wall-clock pre-auth deadline applies and no prompt is shown.
+    #[test]
+    fn preauth_deadline_holds_until_a_valid_pair_reveal() {
+        let (host, viewer) = (Identity::generate(), Identity::generate());
+        let connect_with = |cfg: HostCfg, ui: Arc<TestUi>, deadline: Duration| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            let h = thread::spawn(move || serve(l.accept().unwrap().0, &cfg));
+            let paired_phase = Arc::new(AtomicBool::new(false));
+            let pp = paired_phase.clone();
+            let t0 = std::time::Instant::now();
+            let s = TcpStream::connect(addr).unwrap();
+            let r = Connection::from_stream_timeout(s, &auth(&viewer, None, ui), &hello(), deadline, &move || pp.store(true, Ordering::SeqCst));
+            let took = t0.elapsed();
+            let _ = h.join();
+            (r, took, paired_phase.load(Ordering::SeqCst))
+        };
+        let mut cfg = HostCfg::new(host.clone());
+        cfg.pairing_open = true;
+        // 1. silent after msg3: cut off by the 300 ms pre-auth deadline, not PAIRING_TIMEOUT
+        let mut c = cfg.clone();
+        c.stall_after_msg3 = Some(Duration::from_secs(3));
+        let ui = TestUi::new(true);
+        let (r, took, lifted) = connect_with(c, ui.clone(), Duration::from_millis(300));
+        assert!(matches!(r, Err(ConnectError::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock), "{:?}", r.err());
+        assert!(took < Duration::from_secs(2), "pre-auth deadline enforced ({took:?})");
+        assert!(!lifted && ui.shown.lock().unwrap().is_empty(), "no pairing phase, no prompt");
+        // 2. oversized first record: rejected by size before it is read
+        let mut c = cfg.clone();
+        c.oversize_reveal = true;
+        let ui = TestUi::new(true);
+        let (r, _, lifted) = connect_with(c, ui.clone(), Duration::from_secs(2));
+        assert!(matches!(r, Err(ConnectError::Crypto(CryptoError::BadRecordLength(n))) if n > PAIR_REVEAL_MAX_RECORD), "{:?}", r.err());
+        assert!(!lifted && ui.shown.lock().unwrap().is_empty());
+        // 3. a reveal that doesn't open the commitment: no prompt
+        let mut c = cfg.clone();
+        c.wrong_reveal = true;
+        let ui = TestUi::new(true);
+        let (r, _, lifted) = connect_with(c, ui.clone(), Duration::from_secs(2));
+        assert!(matches!(r, Err(ConnectError::PairingFailed(ref s)) if s.contains("commitment")), "{:?}", r.err());
+        assert!(!lifted && ui.shown.lock().unwrap().is_empty());
+        // 4. a valid reveal lifts the pre-auth deadline: a user slower than it still pairs
+        let ui = Arc::new(TestUi { delay: Duration::from_millis(700), ..Arc::try_unwrap(TestUi::new(true)).ok().unwrap() });
+        let (r, _, lifted) = connect_with(cfg, ui, Duration::from_millis(300));
+        assert!(r.unwrap().paired && lifted);
     }
 
     #[test]

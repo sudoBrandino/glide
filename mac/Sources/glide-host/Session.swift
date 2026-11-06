@@ -150,6 +150,7 @@ final class Session: @unchecked Sendable {
         let name = PairedViewer.displayName(acc.info.name)
         let fp = GlideHandshake.fingerprint(acc.viewerKey)
         clientName = name
+        channel.maxRecordBytes = SecureChannel.preAuthMaxRecord
         channel.startReceiving()
         let pc = PairingController.shared
         if acc.info.pairRequest {
@@ -268,6 +269,7 @@ final class Session: @unchecked Sendable {
             guard case let .hello(version, caps, vw, vh, mode, maxFps, _) = msg else { return }
             authed = true
             phase = .streaming
+            channel.maxRecordBytes = RecordCipher.maxRecord
             PairingController.shared.backoff.succeeded(address)
             let name = clientName
             if hostTestMode {

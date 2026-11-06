@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""Glide v1 mock host (docs/PROTOCOL.md), for testing the Windows client without the Mac host.
+"""Glide v2 mock host (docs/PROTOCOL.md), for testing the Windows client without the Mac host.
 
-- Performs the handshake + ChaCha20-Poly1305 record layer.
+- Security v2 (§1–2): Noise XX handshake (tools/glide_noise.py) with its own persistent key
+  (--key-file), a paired-viewer list (--paired-file), pairing (--pair SECONDS opens the window;
+  the 6-digit code is printed; --pair-confirm yes|no|ask decides the Mac side), and the
+  ChaCha20-Poly1305 record layer. A v1 viewer gets the "unsupported version 2" reply;
+  --v1-host instead behaves like an old v1 host (reads 54 bytes, closes) to test the viewer's
+  error message.
 - Replies to ClientHello with ServerHello, then streams an Annex-B file (looped)
   as VideoFrame records at --fps (default 60).
 - Picks the stream from the client's caps/mode: sharp + HEVC 4:4:4 cap -> 4:4:4 file,
@@ -22,7 +27,8 @@
   nothing for 1 s out of every 3 (like the Mac while silent). AudioEnable(0/1) stops/resumes.
 
 Usage:
-  GLIDE_PASSWORD=... python3 tools/mock_host.py [--port 7421 | --connect HOST:PORT [--once]] [--fps 60]
+  python3 tools/mock_host.py [--port 7421 | --connect HOST:PORT [--once]] [--fps 60]
+      [--pair SECONDS] [--pair-confirm yes|no|ask] [--key-file F] [--paired-file F] [--v1-host]
       [--hevc streams/hevc420_1440p.h265] [--hevc444 streams/hevc444_1440p.h265]
       [--h264 streams/h264_1440p.h264] [--switch-every SECONDS] [--quiet-input]
       [--clip-text TEXT | --clip-png FILE] [--clip-every SECONDS] [--clip-bounce] [--clip-save DIR]
@@ -31,13 +37,13 @@ Usage:
   python3 tools/mock_host.py --selftest
 Generate streams first with tools/make_streams.sh.
 """
-import argparse, array, hashlib, math, os, random, socket, struct, sys, threading, time
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+import argparse, array, datetime, hashlib, json, math, os, random, socket, struct, sys, threading, time
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes, serialization
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import glide_noise as gn  # noqa: E402
 T0 = time.monotonic_ns()
 
 
@@ -251,10 +257,54 @@ def _raises(f):
 
 # ---------------------------------------------------------------- session
 
+class Trust:
+    """Mock host identity + paired viewers + pairing window (docs/PROTOCOL.md §2.3)."""
+
+    def __init__(self, args):
+        self.args = args
+        self.lock = threading.Lock()
+        if os.path.exists(args.key_file):
+            self.key = gn.priv_from(bytes.fromhex(open(args.key_file).read().strip()))
+        else:
+            self.key = X25519PrivateKey.generate()
+            fd = os.open(args.key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            from cryptography.hazmat.primitives import serialization as ser
+            raw = self.key.private_bytes(ser.Encoding.Raw, ser.PrivateFormat.Raw, ser.NoEncryption())
+            os.write(fd, (raw.hex() + "\n").encode()); os.close(fd)
+        self.pub = gn.raw_pub(self.key)
+        self.paired = json.load(open(args.paired_file)) if os.path.exists(args.paired_file) else []
+        self.pair_until = time.monotonic() + args.pair if args.pair > 0 else 0
+        self.pairing_busy = False
+        log(f"mock host key {gn.fingerprint(self.pub)}; {len(self.paired)} paired viewer(s); "
+            f"pairing window {'open for %d s' % args.pair if args.pair > 0 else 'closed (--pair SECONDS opens it)'}")
+
+    def window_open(self):
+        return time.monotonic() < self.pair_until
+
+    def is_paired(self, key):
+        with self.lock:
+            return any(v["key"] == key.hex() for v in self.paired)
+
+    def add(self, name, key):
+        with self.lock:
+            self.paired = [v for v in self.paired if v["key"] != key.hex()]
+            self.paired.append({"name": name, "key": key.hex(),
+                                "paired": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+            json.dump(self.paired, open(self.args.paired_file, "w"), indent=2)
+            self.pair_until = 0  # one viewer per window, like the real host
+
+    def confirm(self, code, name):
+        mode = self.args.pair_confirm
+        if mode == "ask" and sys.stdin.isatty():
+            typed = input(f"Viewer {name!r} wants to pair. Type the code shown on the PC: ")
+            return typed.replace(" ", "") == f"{code:06d}"
+        return mode != "no"
+
+
 class Session:
-    def __init__(self, sock, addr, args, streams, password, salt):
+    def __init__(self, sock, addr, args, streams, trust):
         self.sock, self.addr, self.args, self.streams = sock, addr, args, streams
-        self.password, self.salt = password, salt
+        self.trust = trust
         self.lock = threading.Lock()
         self.send_ctr = 0
         self.recv_ctr = 0
@@ -283,6 +333,12 @@ class Session:
             ct = self.s2c.encrypt(nonce, pt, b"")
             self.sock.sendall(struct.pack("<I", len(ct)) + ct)
 
+    def recv_frame(self):
+        (n,) = struct.unpack("<H", self.recv_exact(2))
+        if n > gn.MAX_HANDSHAKE_MSG:
+            raise ValueError(f"handshake message too large ({n})")
+        return self.recv_exact(n)
+
     def recv_msg(self):
         (n,) = struct.unpack("<I", self.recv_exact(4))
         if not (17 <= n <= 32 << 20):
@@ -294,18 +350,74 @@ class Session:
         return pt
 
     def handshake(self):
-        chs = self.recv_exact(54)
-        if chs[:4] != b"GLD1" or struct.unpack("<H", chs[4:6])[0] != 1:
-            raise ValueError("bad client handshake")
-        priv = X25519PrivateKey.generate()
-        pub = priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        hhs = b"GLD1" + struct.pack("<H", 1) + pub + os.urandom(16) + self.salt
-        self.sock.sendall(hhs)
-        shared = priv.exchange(X25519PublicKey.from_public_bytes(chs[6:38]))
-        pw_key = hashlib.pbkdf2_hmac("sha256", self.password.encode(), self.salt, 100000, 32)
-        okm = HKDF(algorithm=hashes.SHA256(), length=64, salt=hashlib.sha256(chs + hhs).digest(),
-                   info=b"glide v1 session keys").derive(shared + pw_key)
-        self.c2s, self.s2c = ChaCha20Poly1305(okm[:32]), ChaCha20Poly1305(okm[32:])
+        """v2 handshake + auth phase (docs/PROTOCOL.md §1–2). Returns the ClientHello plaintext,
+        or None if the viewer was rejected / the pairing failed."""
+        magic = self.recv_exact(4)
+        if magic == gn.MAGIC_V1:
+            self.recv_exact(50)
+            self.sock.sendall(gn.MAGIC_V1 + struct.pack("<H", 2) + bytes(64))
+            log(f"{self.addr}: Glide v1 viewer (password protocol) -> told 'unsupported version 2'")
+            return None
+        if magic != gn.MAGIC_V2:
+            raise ValueError(f"bad magic {magic!r}")
+        preamble = magic + self.recv_exact(gn.CLIENT_PREAMBLE_LEN - 4)
+        hi, lo = struct.unpack("<HH", preamble[4:8])
+        msg1 = self.recv_frame()
+        if not lo <= gn.VERSION <= hi:
+            self.sock.sendall(gn.host_preamble(gn.VERSION, gn.ST_UNSUPPORTED_VERSION))
+            log(f"{self.addr}: viewer speaks versions {lo}..{hi}; refused")
+            return None
+        hs = gn.HandshakeXX(False, self.trust.key, preamble)
+        if hs.read_message(msg1) != b"":
+            raise ValueError("msg1 payload must be empty")
+        n_h = os.urandom(32)
+        flags = gn.HOST_FLAG_PAIRING_OPEN if self.trust.window_open() else 0
+        self.sock.sendall(gn.host_preamble() + gn.frame(hs.write_message(gn.msg2_payload(flags, n_h))))
+        try:
+            vflags, n_v, name = gn.parse_msg3_payload(hs.read_message(self.recv_frame()))
+        except EOFError:
+            log(f"{self.addr}: viewer hung up after msg2 (it has a different host key pinned?)")
+            return None
+        vkey = hs.rs
+        send, recv = hs.split()
+        self.s2c, self.c2s = ChaCha20Poly1305(send.k), ChaCha20Poly1305(recv.k)
+        fp = gn.fingerprint(vkey)
+
+        def reject(code, why):
+            log(f"{self.addr}: {why} -> AuthResult {code}")
+            self.send_msg(bytes([gn.MSG_AUTH_RESULT, code]))
+            return None
+
+        if vflags & gn.VIEWER_FLAG_PAIR_REQUEST:
+            if not self.trust.window_open():
+                return reject(gn.AUTH_PAIRING_CLOSED, f"viewer {name!r} ({fp}) asked to pair; window closed")
+            if self.trust.pairing_busy:
+                return reject(gn.AUTH_BUSY, "another pairing is in progress")
+            self.trust.pairing_busy = True
+            try:
+                code = gn.sas_code(hs.handshake_hash(), n_v, n_h)
+                log(f"{self.addr}: PAIRING with {name!r} ({fp}) — code {gn.sas_text(code)}")
+                self.send_msg(bytes([gn.MSG_PAIR_REVEAL]) + n_h)
+                self.sock.settimeout(90)
+                m = self.recv_msg()
+                if m[0] != gn.MSG_PAIR_CONFIRM:
+                    raise ValueError(f"expected PairConfirm, got {m[0]:#x}")
+                if not m[1]:
+                    log(f"{self.addr}: the viewer declined the code")
+                    return None
+                if not self.trust.confirm(code, name):
+                    return reject(gn.AUTH_DECLINED, "declined on the (mock) Mac")
+                self.trust.add(name, vkey)
+                log(f"{self.addr}: paired {name!r} ({fp}); saved to {self.args.paired_file}")
+                self.send_msg(bytes([gn.MSG_AUTH_RESULT, gn.AUTH_OK]))
+            finally:
+                self.trust.pairing_busy = False
+                self.sock.settimeout(None)
+        elif not self.trust.is_paired(vkey):
+            return reject(gn.AUTH_UNKNOWN_VIEWER, f"unknown viewer {name!r} ({fp})")
+        hello = self.recv_msg()
+        log(f"{self.addr}: viewer {name!r} ({fp}) authenticated")
+        return hello
 
     def pick_stream(self, caps, mode):
         if mode == 1 and caps & 2 and "hevc444" in self.streams:
@@ -339,11 +451,12 @@ class Session:
     def run(self):
         try:
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.handshake()
-            try:
-                hello = self.recv_msg()
-            except Exception:
-                log(f"{self.addr}: ClientHello decrypt failed (wrong password?) -> closing")
+            if self.args.v1_host:
+                self.recv_exact(54)  # an old v1 host: wrong magic -> close without a word
+                log(f"{self.addr}: --v1-host: closing like a v1 host would")
+                return
+            hello = self.handshake()
+            if hello is None:
                 return
             if hello[0] != 0x01:
                 raise ValueError("first message is not ClientHello")
@@ -355,7 +468,7 @@ class Session:
             st = self.streams["hevc"] if self.hybrid else self.pick_stream(caps, mode)
             self.caps = caps
             host = self.args.name.encode()
-            self.send_msg(bytes([0x02]) + struct.pack("<H", 1) + struct.pack("<H", len(host)) + host + self.config_body(st))
+            self.send_msg(bytes([0x02]) + struct.pack("<H", 2) + struct.pack("<H", len(host)) + host + self.config_body(st))
             if self.hybrid:
                 sharp = self.streams["hevc444"]
                 self.sharp_idrs = [au for au, k in sharp.aus if k]
@@ -627,7 +740,12 @@ def main():
     ap.add_argument("--connect", metavar="HOST:PORT",
                     help="reverse mode: dial out to a client running `glide-client --listen` (retries; re-dials after each session)")
     ap.add_argument("--once", action="store_true", help="with --connect: exit after one session")
-    ap.add_argument("--password-file", default=os.path.join(HERE, "../.dev/password"))
+    ap.add_argument("--key-file", default=os.path.join(HERE, ".mock-host-key"), help="mock host private key (created if missing)")
+    ap.add_argument("--paired-file", default=os.path.join(HERE, ".mock-paired.json"), help="paired viewers (JSON list)")
+    ap.add_argument("--pair", type=float, default=0, metavar="SECONDS", help="open the pairing window for N seconds at start")
+    ap.add_argument("--pair-confirm", choices=["yes", "no", "ask"], default="ask",
+                    help="the (mock) Mac user's answer to a pairing code; ask = type the code on this terminal (yes if not a tty)")
+    ap.add_argument("--v1-host", action="store_true", help="behave like an old v1 host (read 54 bytes, close)")
     ap.add_argument("--clip-text", help="clipboard text to push to the client ~2 s after connect")
     ap.add_argument("--clip-png", help="PNG file to push to the client ~2 s after connect")
     ap.add_argument("--clip-every", type=float, default=0, help="repeat the clipboard push every N s (text gets a counter)")
@@ -638,12 +756,7 @@ def main():
     if args.selftest:
         sys.exit(0 if selftest() else 1)
 
-    password = os.environ.get("GLIDE_PASSWORD")
-    if not password and os.path.exists(args.password_file):
-        password = open(args.password_file).read().strip()
-    if not password:
-        sys.exit("set GLIDE_PASSWORD or provide --password-file")
-    salt = hashlib.sha256(b"glide-mock-host-salt" + args.name.encode()).digest()[:16]  # persistent per host name
+    trust = Trust(args)
 
     streams = {}
     for key, path, codec, chroma in (("hevc", args.hevc, 1, 0), ("hevc444", args.hevc444, 1, 1), ("h264", args.h264, 2, 0)):
@@ -664,7 +777,7 @@ def main():
                 continue
             a = f"{h}:{p}"
             log(f"{a}: connected (outbound)")
-            Session(s, a, args, streams, password, salt).run()
+            Session(s, a, args, streams, trust).run()
             if args.once:
                 return
             time.sleep(1)
@@ -678,7 +791,7 @@ def main():
         s, addr = srv.accept()
         a = f"{addr[0]}:{addr[1]}"
         log(f"{a}: connected")
-        threading.Thread(target=Session(s, a, args, streams, password, salt).run, daemon=True).start()
+        threading.Thread(target=Session(s, a, args, streams, trust).run, daemon=True).start()
 
 
 if __name__ == "__main__":

@@ -133,6 +133,9 @@ final class PairingController: NSObject, @unchecked Sendable {
 
     func cancelWindow(source: String) {
         window.close()
+        // A pairing still waiting for its confirmation ends with the window.
+        lock.lock(); let p = pending; lock.unlock()
+        if let p { answer(false, via: "pairing window cancelled", sessionId: p.sessionId) }
         HostStatus.shared.update { $0.pairingUntil = nil }
         log("pairing: window closed (\(source))")
         broadcast("done closed")

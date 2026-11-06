@@ -100,10 +100,16 @@ impl Opener {
 
     /// Read one length-prefixed record from `r` and decrypt it.
     pub fn read_record<R: Read>(&mut self, r: &mut R, buf: &mut Vec<u8>) -> Result<Vec<u8>, CryptoError> {
+        self.read_record_max(r, buf, MAX_RECORD)
+    }
+
+    /// Like `read_record`, rejecting a record body (ciphertext + tag) longer than `max` before
+    /// reading it (pre-auth phases only expect small records).
+    pub fn read_record_max<R: Read>(&mut self, r: &mut R, buf: &mut Vec<u8>, max: usize) -> Result<Vec<u8>, CryptoError> {
         let mut len = [0u8; 4];
         r.read_exact(&mut len)?;
         let n = u32::from_le_bytes(len) as usize;
-        if !(MIN_RECORD..=MAX_RECORD).contains(&n) {
+        if !(MIN_RECORD..=max.min(MAX_RECORD)).contains(&n) {
             return Err(CryptoError::BadRecordLength(n));
         }
         buf.resize(n, 0);

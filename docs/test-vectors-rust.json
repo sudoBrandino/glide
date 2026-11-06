@@ -23,15 +23,15 @@
           "from": "viewer"
         },
         {
-          "bytes": "31000000626193d635cc30f6243e79ac4a5bcb9c077b726316cf703c25e08d7eb23c37e7ee204fd399809375292e1786b2e231a91b",
+          "bytes": "310000006d6193d635cc30f6243e79ac4a5bcb9c077b726316cf703c25e08d7eb23c37e7ee994545e3e00da1d300c67c574dd4c865",
           "from": "host"
         },
         {
-          "bytes": "12000000cfe2f2b446b6951f9903600057046d6d4174",
+          "bytes": "12000000c2e28c9d74ee0fffb235a82841f428056755",
           "from": "viewer"
         },
         {
-          "bytes": "12000000c0a278df453974e56d04cae12f891fb62580",
+          "bytes": "12000000cda2057b27a14031cb2fc8cd07785e88dd9e",
           "from": "host"
         },
         {
@@ -58,18 +58,18 @@
       "records": [
         {
           "dir": "s2c",
-          "plaintext": "0694979a9da0a3a6a9acafb2b5b8bbbec1c4c7cacdd0d3d6d9dcdfe2e5e8ebeef1",
-          "record": "31000000626193d635cc30f6243e79ac4a5bcb9c077b726316cf703c25e08d7eb23c37e7ee204fd399809375292e1786b2e231a91b"
+          "plaintext": "0994979a9da0a3a6a9acafb2b5b8bbbec1c4c7cacdd0d3d6d9dcdfe2e5e8ebeef1",
+          "record": "310000006d6193d635cc30f6243e79ac4a5bcb9c077b726316cf703c25e08d7eb23c37e7ee994545e3e00da1d300c67c574dd4c865"
         },
         {
           "dir": "c2s",
-          "plaintext": "0701",
-          "record": "12000000cfe2f2b446b6951f9903600057046d6d4174"
+          "plaintext": "0a01",
+          "record": "12000000c2e28c9d74ee0fffb235a82841f428056755"
         },
         {
           "dir": "s2c",
-          "plaintext": "0500",
-          "record": "12000000c0a278df453974e56d04cae12f891fb62580"
+          "plaintext": "0800",
+          "record": "12000000cda2057b27a14031cb2fc8cd07785e88dd9e"
         },
         {
           "dir": "c2s",

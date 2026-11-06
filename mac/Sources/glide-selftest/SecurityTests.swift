@@ -163,7 +163,7 @@ func wireUnitTests() throws {
     let back = try GlideHandshake.ViewerInfo.decode(long.encoded)
     check(back.name.utf8.count <= 255 && back.name.allSatisfy { $0 == "é" }, "viewer name truncated to 255 bytes on a character boundary")
     check(GlideHandshake.sasText(7) == "000 007" && GlideHandshake.sasText(123_456) == "123 456", "SAS formatting")
-    check(HostMessage.authResult(.unknownViewer).encoded.hex == "0501" && ClientMessage.pairConfirm(true).encoded.hex == "0701", "AuthResult / PairConfirm bytes")
+    check(HostMessage.authResult(.unknownViewer).encoded.hex == "0801" && ClientMessage.pairConfirm(true).encoded.hex == "0a01", "AuthResult / PairConfirm bytes")
 }
 
 func pairingLogicTests() {
@@ -271,6 +271,14 @@ func channelTests() throws {
         hostChannel?.send(HostMessage.authResult(.ok).encoded)
         _ = got.wait(timeout: .now() + 3); _ = got.wait(timeout: .now() + 3)
         check(hostGot == ClientMessage.pairConfirm(true).encoded && viewerGot == HostMessage.authResult(.ok).encoded, "records flow both ways after the handshake")
+        // Pre-auth record cap: the host drops a peer that sends a record over its limit.
+        var hostClosedWith: Error?
+        hostChannel?.maxRecordBytes = 64
+        hostChannel?.onClose = { e in hostClosedWith = e; got.signal() }
+        vch.send(Data(count: 200))
+        _ = got.wait(timeout: .now() + 3)
+        if case WireError.recordTooLarge(let n)? = hostClosedWith { check(n == 216, "oversized pre-auth record closes the connection (\(n) > 64)") }
+        else { check(false, "record cap: \(String(describing: hostClosedWith))") }
     } else {
         check(false, "loopback handshake: host \(String(describing: hostResult)), viewer \(String(describing: viewerResult))")
     }

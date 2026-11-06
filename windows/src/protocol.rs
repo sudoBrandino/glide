@@ -31,17 +31,17 @@ pub const MSG_SET_MODE: u8 = 0x21;
 pub const MSG_PING: u8 = 0x30;
 pub const MSG_CLIPBOARD: u8 = 0x50;
 pub const MSG_AUDIO_ENABLE: u8 = 0x62;
-/// Pairing: the user confirmed (1) / rejected (0) the code (§2.4).
-pub const MSG_PAIR_CONFIRM: u8 = 0x07;
+/// Pairing: the user confirmed (1) / rejected (0) the code (§2.4). 0x08–0x0F: auth phase.
+pub const MSG_PAIR_CONFIRM: u8 = 0x0A;
 
 // Host -> Client message types
 pub const MSG_SERVER_HELLO: u8 = 0x02;
 pub const MSG_VIDEO_CONFIG: u8 = 0x03;
 pub const MSG_SHARP_LAYER_CONFIG: u8 = 0x04;
 /// Auth phase (§2.4): `u8 code` (AUTH_*).
-pub const MSG_AUTH_RESULT: u8 = 0x05;
+pub const MSG_AUTH_RESULT: u8 = 0x08;
 /// Pairing: the host's 32-byte pairing nonce (opens the commitment from msg2).
-pub const MSG_PAIR_REVEAL: u8 = 0x06;
+pub const MSG_PAIR_REVEAL: u8 = 0x09;
 
 // AuthResult codes (§2.4)
 pub const AUTH_OK: u8 = 0;
@@ -692,14 +692,14 @@ mod tests {
 
     #[test]
     fn auth_phase_messages() {
-        assert_eq!(HostMsg::AuthResult { code: AUTH_UNKNOWN_VIEWER }.encode(), vec![0x05, 0x01]);
-        assert_eq!(HostMsg::decode(vec![0x05, 0x03]).unwrap(), HostMsg::AuthResult { code: AUTH_DECLINED });
+        assert_eq!(HostMsg::AuthResult { code: AUTH_UNKNOWN_VIEWER }.encode(), vec![0x08, 0x01]);
+        assert_eq!(HostMsg::decode(vec![0x08, 0x03]).unwrap(), HostMsg::AuthResult { code: AUTH_DECLINED });
         let r = HostMsg::PairReveal { nonce: [9; 32] };
         assert_eq!(r.encode().len(), 33);
         assert_eq!(HostMsg::decode(r.encode()).unwrap(), r);
-        assert!(HostMsg::decode(vec![0x06, 1, 2]).is_err());
-        assert_eq!(ClientMsg::PairConfirm { matched: true }.encode(), vec![0x07, 0x01]);
-        assert_eq!(ClientMsg::decode(&[0x07, 0x00]).unwrap(), ClientMsg::PairConfirm { matched: false });
+        assert!(HostMsg::decode(vec![0x09, 1, 2]).is_err());
+        assert_eq!(ClientMsg::PairConfirm { matched: true }.encode(), vec![0x0A, 0x01]);
+        assert_eq!(ClientMsg::decode(&[0x0A, 0x00]).unwrap(), ClientMsg::PairConfirm { matched: false });
     }
 
     #[test]

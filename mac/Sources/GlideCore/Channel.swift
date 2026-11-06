@@ -17,6 +17,11 @@ public final class SecureChannel: @unchecked Sendable {
     private var closed = false
 
     public var onMessage: ((Data) -> Void)?
+    /// Largest record body accepted. The host keeps this small until the viewer is authenticated
+    /// and paired (pre-auth peers only send tiny auth-phase messages and ClientHello).
+    public var maxRecordBytes = RecordCipher.maxRecord
+    /// Record body limit before authentication (docs/PROTOCOL.md §2.5).
+    public static let preAuthMaxRecord = 64 * 1024
     public var onClose: ((Error?) -> Void)?
 
     /// Bytes handed to the network stack but not yet confirmed processed.
@@ -218,7 +223,7 @@ public final class SecureChannel: @unchecked Sendable {
             guard case .success(let hdr) = res else { if case .failure(let e) = res { close(e) }; return }
             var r = ByteReader(hdr)
             let len = Int((try? r.u32()) ?? 0)
-            guard len >= 17, len <= RecordCipher.maxRecord else { close(WireError.recordTooLarge(len)); return }
+            guard len >= 17, len <= maxRecordBytes else { close(WireError.recordTooLarge(len)); return }
             readExactly(len) { [self] res in
                 switch res {
                 case .failure(let e): close(e)

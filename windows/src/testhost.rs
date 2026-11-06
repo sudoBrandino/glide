@@ -24,6 +24,13 @@ pub struct HostCfg {
     pub v1: bool,
     /// Send AuthResult(code) right after PairReveal (host declines/times out before the viewer answers).
     pub abort_after_reveal: Option<u8>,
+    /// Misbehaving/unauthenticated peer: after msg3 asking to pair, send nothing for this long
+    /// (instead of PairReveal).
+    pub stall_after_msg3: Option<Duration>,
+    /// Misbehaving peer: send an oversized record instead of PairReveal.
+    pub oversize_reveal: bool,
+    /// Misbehaving peer: send a PairReveal whose nonce doesn't match the msg2 commitment.
+    pub wrong_reveal: bool,
 }
 
 impl HostCfg {
@@ -37,6 +44,9 @@ impl HostCfg {
             status: ST_OK,
             v1: false,
             abort_after_reveal: None,
+            stall_after_msg3: None,
+            oversize_reveal: false,
+            wrong_reveal: false,
         }
     }
 }
@@ -110,6 +120,18 @@ pub fn serve(mut s: TcpStream, cfg: &HostCfg) -> Outcome {
         if !cfg.pairing_open {
             return reject(&mut s, &mut send, crate::protocol::AUTH_PAIRING_CLOSED);
         }
+        if let Some(d) = cfg.stall_after_msg3 {
+            std::thread::sleep(d);
+            return Outcome::Closed("stalled".into());
+        }
+        if cfg.oversize_reveal {
+            let mut big = vec![crate::protocol::MSG_PAIR_REVEAL];
+            big.extend(vec![0u8; 4096]);
+            let _ = s.write_all(&seal.seal(&big));
+            std::thread::sleep(Duration::from_millis(300));
+            return Outcome::Closed("sent oversized reveal".into());
+        }
+        let n_h = if cfg.wrong_reveal { [0x55; 32] } else { n_h };
         send(&mut s, HostMsg::PairReveal { nonce: n_h });
         if let Some(code) = cfg.abort_after_reveal {
             return reject(&mut s, &mut send, code);

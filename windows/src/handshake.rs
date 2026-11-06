@@ -433,11 +433,11 @@ mod tests {
         let mut flights: Vec<(&str, Vec<u8>)> = vec![("viewer", f1.clone()), ("host", f2.clone())];
         if pairing {
             flights.push(("viewer", f3.clone()));
-            let mut reveal = vec![0x06];
+            let mut reveal = vec![0x09];
             reveal.extend_from_slice(&n_h);
             flights.push(("host", rec("s2c", reveal)));
-            flights.push(("viewer", rec("c2s", vec![0x07, 1])));
-            flights.push(("host", rec("s2c", vec![0x05, 0])));
+            flights.push(("viewer", rec("c2s", vec![0x0A, 1])));
+            flights.push(("host", rec("s2c", vec![0x08, 0])));
             flights.push(("viewer", rec("c2s", client_hello(&g("viewer_name")))));
             flights.push(("host", rec("s2c", server_hello(&g("host_name")))));
         } else {
