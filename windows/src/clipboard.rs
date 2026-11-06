@@ -349,6 +349,49 @@ pub fn png_to_rgba(data: &[u8]) -> Result<Rgba, String> {
     Ok(Rgba { w, h, px })
 }
 
+/// Width/height from the PNG signature + IHDR (must be the first chunk), without decoding.
+pub fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    if data.len() < 33 || !data.starts_with(b"\x89PNG\r\n\x1a\n") || data[8..12] != [0, 0, 0, 13] || &data[12..16] != b"IHDR" {
+        return None;
+    }
+    let be = |o: usize| u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+    Some((be(16), be(20)))
+}
+
+/// Untrusted PNG from the peer: None if acceptable, else why not. Checked before decoding
+/// (decompression bombs); same 64 Mpx cap as the Mac host.
+pub fn png_refusal(data: &[u8]) -> Option<String> {
+    match png_dimensions(data) {
+        None => Some("received image is not a PNG".into()),
+        Some((0, _)) | Some((_, 0)) => Some("received PNG has an empty size".into()),
+        Some((w, h)) if w as u64 * h as u64 > MAX_PIXELS => Some(format!("received PNG is too large ({w}x{h} > {} Mpx)", MAX_PIXELS >> 20)),
+        Some(_) => None,
+    }
+}
+
+/// Clipboard privacy markers (registered format names) that apps such as password managers put
+/// next to secret content. `ExcludeClipboardContentFromMonitorProcessing` and
+/// `Clipboard Viewer Ignore` mean "don't monitor"; the `Can*` formats hold a DWORD, 0 = no.
+pub const PRIVACY_FORMATS: [&str; 4] =
+    ["ExcludeClipboardContentFromMonitorProcessing", "Clipboard Viewer Ignore", "CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"];
+
+/// Given the privacy formats present on the clipboard (with their DWORD value when readable),
+/// return the marker that makes the content private, if any.
+pub fn privacy_marker(present: &[(&str, Option<u32>)]) -> Option<&'static str> {
+    for &(name, value) in present {
+        let Some(&known) = PRIVACY_FORMATS.iter().find(|&&f| f == name) else { continue };
+        match known {
+            "CanIncludeInClipboardHistory" | "CanUploadToCloudClipboard" => {
+                if value == Some(0) {
+                    return Some(known);
+                }
+            }
+            _ => return Some(known),
+        }
+    }
+    None
+}
+
 /// Clipboard HGLOBALs can be larger than the PNG they hold: cut after the IEND chunk.
 pub fn png_trim(data: &[u8]) -> &[u8] {
     const SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
@@ -441,7 +484,7 @@ pub fn prepare_incoming(c: &ClipboardData) -> Result<Prepared, String> {
     }
     let mut p = Prepared { seq: c.seq, hash: data_hash(c), text_utf16: c.text.as_deref().map(wire_to_utf16_crlf), ..Default::default() };
     if let Some(png) = &c.png {
-        match png_to_rgba(png) {
+        match png_refusal(png).map_or_else(|| png_to_rgba(png), Err) {
             Ok(img) => {
                 p.dib = Some(rgba_to_dib(&img));
                 p.png = Some(png.clone());
@@ -617,6 +660,56 @@ mod tests {
         assert!(dib_to_rgba(&dib(40, 1, 1, 8, 1 /* BI_RLE8 */, 0, &[0; 1024], &[0; 4])).is_err());
         assert!(dib_to_rgba(&dib(40, 100_000, 100_000, 32, BI_RGB, 0, &[], &[])).is_err());
         assert!(dib_to_rgba(&[0; 10]).is_err());
+    }
+
+    #[test]
+    fn png_header_checks() {
+        let ihdr = |w: u32, h: u32| {
+            let mut d = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+            d.extend_from_slice(&w.to_be_bytes());
+            d.extend_from_slice(&h.to_be_bytes());
+            d.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+            d
+        };
+        let real = rgba_to_png(&test_image(5, 3, true)).unwrap();
+        assert_eq!(png_dimensions(&real), Some((5, 3)));
+        assert_eq!(png_refusal(&real), None);
+        assert!(png_refusal(&ihdr(100_000, 100_000)).unwrap().contains("too large"));
+        assert!(png_refusal(&ihdr(u32::MAX, u32::MAX)).unwrap().contains("too large"));
+        assert_eq!(png_refusal(&ihdr(8192, 8192)), None);
+        assert!(png_refusal(&ihdr(8193, 8192)).is_some());
+        assert!(png_refusal(&ihdr(0, 7)).is_some());
+        assert!(png_refusal(b"GIF89a....................................").unwrap().contains("not a PNG"));
+        assert!(png_refusal(&rgba_to_dib(&test_image(2, 2, false))).is_some());
+        assert_eq!(png_dimensions(&real[..20]), None);
+        let mut idat_first = real.clone();
+        idat_first[12..16].copy_from_slice(b"IDAT");
+        assert_eq!(png_dimensions(&idat_first), None);
+        // prepare_incoming refuses a bomb before decoding; text alongside survives.
+        let bomb = ClipboardData { seq: 1, text: None, png: Some(ihdr(60_000, 60_000)) };
+        assert!(prepare_incoming(&bomb).unwrap_err().contains("too large"));
+        let with_text = ClipboardData { text: Some("t".into()), ..bomb };
+        let p = prepare_incoming(&with_text).unwrap();
+        assert!(p.png.is_none() && p.dib.is_none() && p.text_utf16.is_some());
+    }
+
+    #[test]
+    fn privacy_markers() {
+        assert_eq!(privacy_marker(&[]), None);
+        assert_eq!(
+            privacy_marker(&[("ExcludeClipboardContentFromMonitorProcessing", None)]),
+            Some("ExcludeClipboardContentFromMonitorProcessing")
+        );
+        assert_eq!(privacy_marker(&[("Clipboard Viewer Ignore", Some(5))]), Some("Clipboard Viewer Ignore"));
+        // Can* formats only mark content private with DWORD 0.
+        assert_eq!(privacy_marker(&[("CanIncludeInClipboardHistory", Some(1))]), None);
+        assert_eq!(privacy_marker(&[("CanIncludeInClipboardHistory", None)]), None);
+        assert_eq!(privacy_marker(&[("CanIncludeInClipboardHistory", Some(0))]), Some("CanIncludeInClipboardHistory"));
+        assert_eq!(
+            privacy_marker(&[("CanIncludeInClipboardHistory", Some(1)), ("CanUploadToCloudClipboard", Some(0))]),
+            Some("CanUploadToCloudClipboard")
+        );
+        assert_eq!(privacy_marker(&[("SomethingElse", Some(0))]), None);
     }
 
     #[test]

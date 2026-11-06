@@ -13,6 +13,14 @@ struct HostSettings {
     var bitrateKbps = 0
     var maxWidth = 3840
     var maxInFlightBytes = 6 * 1024 * 1024
+    /// host.json `clipboard.syncConcealed`: also sync password-manager (concealed) items.
+    var clipboardSyncConcealed = false
+}
+
+/// host.json `"clipboard": {"syncConcealed": false}` (PROTOCOL.md §5).
+struct ClipboardSettings: Codable {
+    /// Send pasteboard items marked org.nspasteboard.ConcealedType (passwords). Default false.
+    var syncConcealed: Bool?
 }
 
 /// Persistent host identity: password salt (and a generated password if none supplied).
@@ -23,6 +31,8 @@ struct HostConfig: Codable {
     var connect: String?
     /// Display-mode policy (DisplayModeController.swift).
     var display: DisplaySettings? = nil
+    /// Clipboard sync options (ClipboardSync.swift).
+    var clipboard: ClipboardSettings? = nil
 
     static var url: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Glide", isDirectory: true)
@@ -109,6 +119,7 @@ let salt = Data(hex: config.salt)!
 
 var settings = HostSettings(password: password, salt: salt, passwordKey: Handshake.passwordKey(password, salt: salt))
 if let v = takeValue("--port"), let n = UInt16(v) { settings.port = n }
+settings.clipboardSyncConcealed = config.clipboard?.syncConcealed ?? false
 if let v = takeValue("--fps"), let n = Int(v) { settings.fps = n }
 if let v = takeValue("--bitrate-kbps"), let n = Int(v) { settings.bitrateKbps = n }
 if let v = takeValue("--max-width"), let n = Int(v) { settings.maxWidth = n }

@@ -10,11 +10,11 @@
 //!
 //! Sync is active only while a connection is up and the host has sent ClipboardCaps.
 
-use crate::clipboard::{prepare_incoming, utf16_to_wire, EchoGuard, LocalClip, Prepared};
+use crate::clipboard::{prepare_incoming, privacy_marker, utf16_to_wire, EchoGuard, LocalClip, Prepared, PRIVACY_FORMATS};
 use crate::net::Sender;
 use crate::protocol::{ClientMsg, ClipboardData, CLIPBOARD_MAX_BYTES, CLIP_CAPS_PNG, CLIP_CAPS_TEXT};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Duration;
 use windows::core::w;
@@ -52,11 +52,21 @@ struct Clip {
     jobs: Mutex<mpsc::Sender<Job>>,
     hwnd: AtomicIsize,
     png_format: u32,
+    /// (name, registered id) of the clipboard privacy markers.
+    privacy_formats: Vec<(&'static str, u32)>,
     seq: AtomicU32,
     generation: AtomicU32,
 }
 
 static CLIP: OnceLock<Clip> = OnceLock::new();
+
+/// `--clipboard-sync-secrets` / GLIDE_CLIPBOARD_SYNC_SECRETS=1: also send content marked private
+/// by its source app (password managers). Default false. (Moves to config.json later.)
+static SYNC_SECRETS: AtomicBool = AtomicBool::new(false);
+
+pub fn set_sync_secrets(on: bool) {
+    SYNC_SECRETS.store(on, Ordering::Relaxed);
+}
 
 #[derive(Default)]
 struct UiClip {
@@ -79,6 +89,13 @@ pub fn init(hwnd: HWND) {
         jobs: Mutex::new(tx),
         hwnd: AtomicIsize::new(hwnd.0 as isize),
         png_format,
+        privacy_formats: PRIVACY_FORMATS
+            .iter()
+            .map(|&n| {
+                let wide: Vec<u16> = n.encode_utf16().chain(std::iter::once(0)).collect();
+                (n, unsafe { RegisterClipboardFormatW(windows::core::PCWSTR(wide.as_ptr())) })
+            })
+            .collect(),
         seq: AtomicU32::new(0),
         generation: AtomicU32::new(0),
     };
@@ -185,12 +202,16 @@ fn read_and_send(hwnd: HWND) {
         });
         return retry(hwnd, READ_TIMER, tries, "read");
     }
-    let clip = unsafe { read_open_clipboard(c.png_format, formats) };
+    let clip = unsafe { read_open_clipboard(c, formats, SYNC_SECRETS.load(Ordering::Relaxed)) };
     let marker = unsafe { GetClipboardSequenceNumber() } as u64;
     unsafe {
         let _ = CloseClipboard();
     }
-    let Some(clip) = clip else { return };
+    let clip = match clip {
+        Ok(Some(clip)) => clip,
+        Ok(None) => return,
+        Err(why) => return eprintln!("clipboard: {why}"),
+    };
     if !UI.with(|u| u.borrow_mut().guard.should_send(clip.hash(), marker)) {
         return; // same content as last sent/applied
     }
@@ -222,8 +243,29 @@ unsafe fn read_global(fmt: u32) -> Option<Vec<u8>> {
     Some(v)
 }
 
-/// Text (if non-empty) wins; else PNG, else DIB (§5 sender rules).
-unsafe fn read_open_clipboard(png_format: u32, formats: u32) -> Option<LocalClip> {
+/// Privacy marker on the open clipboard, if any (pure decision in `clipboard::privacy_marker`).
+unsafe fn open_clipboard_privacy_marker(c: &Clip) -> Option<&'static str> {
+    let present: Vec<(&str, Option<u32>)> = c
+        .privacy_formats
+        .iter()
+        .filter(|&&(_, id)| id != 0 && IsClipboardFormatAvailable(id).is_ok())
+        .map(|&(name, id)| (name, read_global(id).filter(|b| b.len() >= 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))))
+        .collect();
+    privacy_marker(&present)
+}
+
+/// Text (if non-empty) wins; else PNG, else DIB (§5 sender rules). Err = not sent, with the reason
+/// (never the content). Clipboard must be open.
+unsafe fn read_open_clipboard(c: &Clip, formats: u32, sync_secrets: bool) -> Result<Option<LocalClip>, String> {
+    if !sync_secrets {
+        if let Some(m) = open_clipboard_privacy_marker(c) {
+            return Err(format!("local content is marked private ({m}), not sent (--clipboard-sync-secrets to sync it)"));
+        }
+    }
+    Ok(read_content(c.png_format, formats))
+}
+
+unsafe fn read_content(png_format: u32, formats: u32) -> Option<LocalClip> {
     if formats & CLIP_CAPS_TEXT != 0 {
         if let Some(b) = read_global(CF_UNICODETEXT) {
             let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
@@ -413,7 +455,7 @@ unsafe fn external_write(hwnd: HWND, items: &[(u32, Vec<u8>)]) -> Result<(), Str
 unsafe fn read_back(hwnd: HWND, fmt: u32) -> Result<(Option<LocalClip>, Option<Vec<u8>>), String> {
     let c = CLIP.get().ok_or("not initialized")?;
     OpenClipboard(Some(hwnd)).map_err(|e| format!("OpenClipboard: {e}"))?;
-    let clip = read_open_clipboard(c.png_format, CLIP_CAPS_TEXT | CLIP_CAPS_PNG);
+    let clip = read_open_clipboard(c, CLIP_CAPS_TEXT | CLIP_CAPS_PNG, false).ok().flatten();
     let raw = read_global(fmt);
     let _ = CloseClipboard();
     Ok((clip, raw))
@@ -524,6 +566,34 @@ pub fn selftest() -> Result<(), String> {
         pump(50);
         let (clip, _) = read_back(hwnd, CF_UNICODETEXT)?;
         check(clip == Some(LocalClip::Text("cells".into())), "text preferred over image");
+
+        // 6. Privacy markers (password managers): not sent unless --clipboard-sync-secrets.
+        let fmt = |n: &str| {
+            let wide: Vec<u16> = n.encode_utf16().chain(std::iter::once(0)).collect();
+            RegisterClipboardFormatW(windows::core::PCWSTR(wide.as_ptr()))
+        };
+        let secret: Vec<u8> = "hunter2\0".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let cases: [(&str, Vec<u8>, bool); 5] = [
+            ("ExcludeClipboardContentFromMonitorProcessing", vec![], true),
+            ("Clipboard Viewer Ignore", vec![], true),
+            ("CanIncludeInClipboardHistory", 0u32.to_le_bytes().to_vec(), true),
+            ("CanUploadToCloudClipboard", 0u32.to_le_bytes().to_vec(), true),
+            ("CanIncludeInClipboardHistory", 1u32.to_le_bytes().to_vec(), false),
+        ];
+        for (name, value, private) in cases {
+            external_write(other, &[(CF_UNICODETEXT, secret.clone()), (fmt(name), value)])?;
+            OpenClipboard(Some(hwnd)).map_err(|e| format!("OpenClipboard: {e}"))?;
+            let respected = read_open_clipboard(c, CLIP_CAPS_TEXT, false);
+            let opted_in = read_open_clipboard(c, CLIP_CAPS_TEXT, true);
+            let _ = CloseClipboard();
+            let ok = if private {
+                respected.as_ref().is_err_and(|e| e.contains(name) && !e.contains("hunter2"))
+            } else {
+                respected == Ok(Some(LocalClip::Text("hunter2".into())))
+            };
+            check(ok, &format!("{name}{} -> {}", if private { "" } else { "=1" }, if private { "not sent" } else { "sent" }));
+            check(opted_in == Ok(Some(LocalClip::Text("hunter2".into()))), &format!("{name}: sent with --clipboard-sync-secrets"));
+        }
 
         shutdown(hwnd);
         let _ = DestroyWindow(other);

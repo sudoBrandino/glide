@@ -83,7 +83,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the details.
 | Signed `Glide Host.app` + LaunchAgent (stable TCC grants), `host.json` config | done |
 | Power management: no idle sleep while hosting, display kept awake during a session | done |
 | CI: Swift build + selftest, Rust tests, Windows cross-build artifact, vector check | done |
-| Clipboard sync | in progress |
+| Clipboard sync (text + images, both directions) | done |
 | Audio (SCK audio → Opus) | in progress |
 | Viewer UX | in progress |
 | Host UX: menu-bar item, automatic display mode, auth-gated session replacement | done |
@@ -162,6 +162,7 @@ only takes effect after the host restarts. The LaunchAgent restarts it on its ow
 | `salt` | Per-host password salt, generated on first run |
 | `password` | Session password. If no password is configured anywhere, a random one is generated, printed once and saved here |
 | `connect` | Default dial-out target (`HOST[:PORT]`). If it is set, the host dials the viewer instead of listening |
+| `clipboard` | `{"syncConcealed": false}`. `true` also syncs password-manager (concealed) pasteboard items to the viewer |
 
 ```sh
 H=~/Applications/Glide\ Host.app/Contents/MacOS/glide-host
