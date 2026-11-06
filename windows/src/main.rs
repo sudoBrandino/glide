@@ -30,7 +30,7 @@ pub struct Args {
     audio_selftest: Option<f64>,
 }
 
-const USAGE: &str = "usage: glide-client <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--bench SECONDS] [--probe]
+const USAGE: &str = "usage: glide-client <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--no-audio] [--bench SECONDS] [--probe]
        glide-client --listen [PORT] [options...]
 
   host[:port]        Glide host (default port 7420)
