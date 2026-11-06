@@ -6,8 +6,12 @@ pub mod console;
 pub mod cursor;
 pub mod d3d;
 pub mod decoder;
+pub mod dpapi;
+pub mod placement;
 pub mod probe;
+pub mod prompt;
 pub mod render;
+pub mod tray;
 
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;

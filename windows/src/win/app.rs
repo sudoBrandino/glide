@@ -3,18 +3,26 @@
 //! that (re)connects or (re)listens, runs one connection at a time (with its own receive
 //! thread from `net`) and survives disconnects. Frames go network → render thread over a
 //! channel and are presented as soon as they decode.
+//!
+//! UX layer: local hotkeys (`hotkeys`), a stats HUD and toasts drawn by the renderer, persisted
+//! preferences / per-monitor window placement (`config::Store`), password re-prompt on auth
+//! failure (`prompt`), and a tray icon (`tray`).
 
 use super::cursor::{create_cursor, destroy_cursor, scale_image, CursorImage};
 use super::d3d::Gpu;
 use super::decoder::Decoder;
 use super::render::Renderer;
+use super::{dpapi, placement, prompt, tray};
+use crate::config::{self, Store};
 use crate::hid;
+use crate::hotkeys::{self, Action};
+use crate::hud;
 use crate::net::{ClockSync, Connection, NetEvent, Sender};
 use crate::protocol::{self, ClientMsg, HostMsg, Mode, VideoConfig, FRAME_FLAG_KEYFRAME, FRAME_FLAG_SHARP};
 use crate::util::{letterbox, now_us, present_rect};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -30,6 +38,21 @@ pub struct Options {
     pub ctrl_as_cmd: bool,
     pub mode: Mode,
     pub host_label: String,
+    /// This PC decodes HEVC 4:4:4 (sharp/hybrid modes available).
+    pub has444: bool,
+    /// Persisted preferences (HUD, mode, window placement).
+    pub store: Store,
+    pub password_source: PasswordSource,
+}
+
+/// Where the session password came from. Only saved/prompted passwords are re-prompted for
+/// when the host rejects them (CLI/env passwords are the caller's business).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordSource {
+    Cli,
+    Env,
+    Saved,
+    Prompted,
 }
 
 /// How the viewer reaches the host. The session thread retries forever.
@@ -48,12 +71,20 @@ pub struct Connector {
 
 const WM_APP_CURSOR: u32 = WM_APP + 1;
 const WM_APP_CLOSED: u32 = WM_APP + 2;
-const WM_APP_TOGGLE_FS: u32 = WM_APP + 3;
 const WM_APP_CONNECTED: u32 = WM_APP + 4;
 const WM_APP_DISCONNECTED: u32 = WM_APP + 5;
+/// wParam = `hotkeys::Action as u8`.
+const WM_APP_HOTKEY: u32 = WM_APP + 6;
+const WM_APP_AUTH_FAILED: u32 = WM_APP + 7;
+/// Tray icon callback (see `tray`).
+pub(super) const WM_APP_TRAY: u32 = WM_APP + 8;
 const TITLE_TIMER: usize = 1;
 const EXIT_TIMER: usize = 2;
 const VIEW_TIMER: usize = 3;
+/// Debounced save of the window placement after moves/resizes.
+const PLACEMENT_TIMER: usize = 4;
+/// `GLIDE_TEST_ACTIONS` test hook: fires one queued action per tick.
+const TEST_ACTION_TIMER: usize = 5;
 
 enum RenderCmd {
     Frame { data: Vec<u8>, keyframe: bool, sharp: bool, rects: Option<Vec<protocol::Rect>> },
@@ -61,6 +92,10 @@ enum RenderCmd {
     SharpConfig(VideoConfig),
     /// Status overlay text (None = connected, no overlay). Some dims the canvas.
     Status(Option<String>),
+    /// Stats HUD lines (None = hidden).
+    Hud(Option<Vec<String>>),
+    /// Brief hotkey feedback, fades out by itself.
+    Toast(String),
     Resize(u32, u32),
     Redraw,
     Quit,
@@ -88,7 +123,16 @@ struct Stats {
 
 struct Shared {
     host_name: Mutex<String>,
-    mode: Mode,
+    /// Current stream mode (`Mode as u8`); changed by Ctrl+Alt+Shift+M, used for (re)connects.
+    mode: AtomicU8,
+    has444: bool,
+    password: Mutex<String>,
+    /// Ctrl+Alt+Shift+D: the current connection was dropped on purpose; reconnect immediately.
+    reconnect: AtomicBool,
+    /// Tray "Disconnect": stay disconnected (and stop listening) until "Connect".
+    paused: AtomicBool,
+    /// Interrupts a pending accept (quit or pause).
+    abort_accept: AtomicBool,
     /// Zero-sized until the first connection.
     config: Mutex<VideoConfig>,
     /// Current connection's writer; None while disconnected.
@@ -114,6 +158,8 @@ struct UiCtx {
     ctrl_as_cmd: bool,
     render_tx: Mutex<mpsc::Sender<RenderCmd>>,
     shared: Arc<Shared>,
+    store: Mutex<Store>,
+    password_source: Mutex<PasswordSource>,
 }
 
 static UI: OnceLock<UiCtx> = OnceLock::new();
@@ -128,9 +174,20 @@ struct UiState {
     buttons_down: u8,
     swallow_up: HashSet<u16>,
     cursor_cache: HashMap<(u32, u32), HCURSOR>,
-    title_last: Option<(Instant, u64, u64, u64, u64)>,
+    stats_last: Option<hud::Counters>,
     focused: bool,
     last_title: String,
+    /// Ctrl+Alt+Shift+K: keyboard released to Windows (no LL hook, nothing forwarded).
+    kb_released: bool,
+    hud_on: bool,
+    last_hud: Vec<String>,
+    /// Last normal (not maximized / fullscreen / minimized) outer window rect.
+    normal_rect: Option<RECT>,
+    /// Password dialog currently open / dismissed with Cancel (stop re-prompting).
+    prompt_open: bool,
+    prompt_declined: bool,
+    test_actions: Vec<Action>,
+    tray: Option<tray::Tray>,
 }
 
 thread_local! {
@@ -217,7 +274,13 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
     let mut cfg = *shared.config.lock().unwrap(); // zero-sized until the first VideoConfig
     let mut sharp_cfg: Option<VideoConfig> = None;
     let mut dim = 1.0f32;
-    let overlay_px = || unsafe { (GetDpiForWindow(hwnd).max(96) as i32 * 22) / 96 };
+    let dpi_px = |pt: i32| unsafe { (GetDpiForWindow(hwnd).max(96) as i32 * pt) / 96 };
+    let overlay_px = || dpi_px(22);
+    // Toast: fully visible for TOAST_HOLD, then fades out over TOAST_FADE.
+    const TOAST_HOLD: Duration = Duration::from_millis(1400);
+    const TOAST_FADE: Duration = Duration::from_millis(350);
+    let mut toast_since: Option<Instant> = None;
+    let mut hud_lines: Option<Vec<String>> = None;
     // Base layer decoder (continuous 4:2:0 stream) and sharp-layer decoder (standalone 4:4:4 IDRs).
     let mut sdec: Option<Decoder> = None;
     let mut need_key = true;
@@ -258,8 +321,21 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
             }
         }
     };
-    while let Ok(first) = rx.recv() {
-        let mut cmds = vec![first];
+    loop {
+        // While a toast is fading, wake up ~30x/s to animate it; otherwise block.
+        let first = if toast_since.is_some() {
+            match rx.recv_timeout(Duration::from_millis(33)) {
+                Ok(c) => Some(c),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(c) => Some(c),
+                Err(_) => break,
+            }
+        };
+        let mut cmds: Vec<RenderCmd> = first.into_iter().collect();
         while let Ok(c) = rx.try_recv() {
             cmds.push(c);
         }
@@ -283,6 +359,23 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
                         eprintln!("overlay failed: {e}");
                     }
                     dim = if text.is_some() { 0.35 } else { 1.0 };
+                    redraw = true;
+                }
+                RenderCmd::Hud(lines) => {
+                    // Re-rasterize only when the text changed (≤ 2x/s).
+                    if lines != hud_lines {
+                        if let Err(e) = renderer.set_hud(lines.as_deref(), dpi_px(15)) {
+                            eprintln!("hud failed: {e}");
+                        }
+                        hud_lines = lines;
+                        redraw = true;
+                    }
+                }
+                RenderCmd::Toast(text) => {
+                    if let Err(e) = renderer.set_toast(Some(&text), dpi_px(19)) {
+                        eprintln!("toast failed: {e}");
+                    }
+                    toast_since = Some(Instant::now());
                     redraw = true;
                 }
                 RenderCmd::SharpConfig(c) => {
@@ -369,6 +462,17 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
                 }
             }
         }
+        if let Some(t0) = toast_since {
+            let age = t0.elapsed();
+            if age >= TOAST_HOLD + TOAST_FADE {
+                let _ = renderer.set_toast(None, 0);
+                toast_since = None;
+                redraw = true;
+            } else if age > TOAST_HOLD {
+                renderer.set_toast_opacity(1.0 - (age - TOAST_HOLD).as_secs_f32() / TOAST_FADE.as_secs_f32());
+                redraw = true;
+            }
+        }
         if let Some((w, h)) = resize {
             if let Err(e) = renderer.resize(w, h) {
                 eprintln!("resize failed: {e}");
@@ -436,18 +540,17 @@ fn handle_key(hwnd: HWND, vk: u32, scan: u32, extended: bool, down: bool) -> boo
     };
     let Some(usage) = usage else { return true };
 
-    // Local hotkeys: F11, Alt+Enter → toggle fullscreen (not forwarded).
-    let alt_held = STATE.with(|s| {
-        let s = s.borrow();
-        s.keys_down.contains(&hid::HID_LALT) || s.keys_down.contains(&hid::HID_RALT)
-    });
-    let is_toggle = usage == 0x44 || (usage == 0x28 && alt_held);
-    if down && is_toggle {
-        STATE.with(|s| s.borrow_mut().swallow_up.insert(usage));
-        unsafe {
-            let _ = PostMessageW(Some(hwnd), WM_APP_TOGGLE_FS, WPARAM(0), LPARAM(0));
+    // Local hotkeys (F11, Alt+Enter, Ctrl+Alt+Shift+letter): handled here, never forwarded.
+    // Matched on physical keys; the action runs later on the UI thread (we may be in the LL hook).
+    let mods = STATE.with(|s| hotkeys::Mods::from_held(s.borrow().keys_down.iter().copied()));
+    if down {
+        if let Some(a) = hotkeys::match_hotkey(mods, usage) {
+            STATE.with(|s| s.borrow_mut().swallow_up.insert(usage));
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_APP_HOTKEY, WPARAM(a as usize), LPARAM(0));
+            }
+            return true;
         }
-        return true;
     }
     if !down && STATE.with(|s| s.borrow_mut().swallow_up.remove(&usage)) {
         return true;
@@ -462,8 +565,8 @@ fn handle_key(hwnd: HWND, vk: u32, scan: u32, extended: bool, down: bool) -> boo
             s.keys_down.remove(&usage);
         }
     });
-    // While disconnected, keys behave normally on this PC (no swallowing).
-    if !connected() {
+    // While disconnected or with the keyboard released, keys behave normally on this PC.
+    if !connected() || STATE.with(|s| s.borrow().kb_released) {
         return false;
     }
     let out = if ui().ctrl_as_cmd { hid::remap_ctrl_as_cmd(usage) } else { usage };
@@ -498,17 +601,30 @@ fn set_focus_state(hwnd: HWND, active: bool) {
     }
     STATE.with(|s| s.borrow_mut().focused = active);
     if active {
-        let hook = unsafe {
-            SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard), GetModuleHandleW(None).ok().map(|m| HINSTANCE(m.0)), 0).ok()
-        };
-        STATE.with(|s| s.borrow_mut().hook = hook);
-    } else {
-        if let Some(h) = STATE.with(|s| s.borrow_mut().hook.take()) {
-            unsafe {
-                let _ = UnhookWindowsHookEx(h);
-            }
+        if !STATE.with(|s| s.borrow().kb_released) {
+            install_hook();
         }
+    } else {
+        remove_hook();
         release_all(hwnd);
+    }
+}
+
+fn install_hook() {
+    if STATE.with(|s| s.borrow().hook.is_some()) {
+        return;
+    }
+    let hook = unsafe {
+        SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard), GetModuleHandleW(None).ok().map(|m| HINSTANCE(m.0)), 0).ok()
+    };
+    STATE.with(|s| s.borrow_mut().hook = hook);
+}
+
+fn remove_hook() {
+    if let Some(h) = STATE.with(|s| s.borrow_mut().hook.take()) {
+        unsafe {
+            let _ = UnhookWindowsHookEx(h);
+        }
     }
 }
 
@@ -633,9 +749,15 @@ fn toggle_fullscreen(hwnd: HWND) {
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
             let mut wp = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
             let _ = GetWindowPlacement(hwnd, &mut wp);
+            // Never restore into a hidden/minimized state (the window may not be shown yet).
+            if wp.showCmd != SW_SHOWMAXIMIZED.0 as u32 {
+                wp.showCmd = SW_SHOWNORMAL.0 as u32;
+            }
             let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
             let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
             if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                // Mark fullscreen first: the WM_SIZE below must not be taken as the normal rect.
+                STATE.with(|s| s.borrow_mut().fullscreen_saved = Some((style, wp)));
                 SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW.0 as isize));
                 let r = mi.rcMonitor;
                 let _ = SetWindowPos(
@@ -647,66 +769,278 @@ fn toggle_fullscreen(hwnd: HWND) {
                     r.bottom - r.top,
                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
                 );
-                STATE.with(|s| s.borrow_mut().fullscreen_saved = Some((style, wp)));
             }
         }
     }
 }
 
+fn is_fullscreen() -> bool {
+    STATE.with(|s| s.borrow().fullscreen_saved.is_some())
+}
+
+fn current_mode() -> Mode {
+    Mode::from_u8(ui().shared.mode.load(Ordering::Relaxed))
+}
+
+/// Sample the stats (every 500 ms) → window title + HUD.
 fn update_title(hwnd: HWND) {
     let ctx = ui();
     let sh = &ctx.shared;
-    let now = Instant::now();
-    let dec = sh.stats.decoded.load(Ordering::Relaxed);
-    let pres = sh.stats.presented.load(Ordering::Relaxed);
-    let bytes = sh.stats.bytes.load(Ordering::Relaxed);
-    let dus = sh.stats.decode_us_total.load(Ordering::Relaxed);
-    let prev = STATE.with(|s| s.borrow_mut().title_last.replace((now, dec, pres, bytes, dus)));
+    let now = hud::Counters {
+        t_us: now_us(),
+        decoded: sh.stats.decoded.load(Ordering::Relaxed),
+        presented: sh.stats.presented.load(Ordering::Relaxed),
+        bytes: sh.stats.bytes.load(Ordering::Relaxed),
+        decode_us: sh.stats.decode_us_total.load(Ordering::Relaxed),
+    };
+    let prev = STATE.with(|s| s.borrow_mut().stats_last.replace(now));
     let cfg = *sh.config.lock().unwrap();
-    let rtt = sh.clock.lock().unwrap().as_ref().and_then(|c| c.lock().unwrap().last_rtt_ms);
     let host_name = sh.host_name.lock().unwrap().clone();
-    let mut t = format!(
-        "Glide — {} — {}x{} {} {} {}",
-        host_name,
-        cfg.width,
-        cfg.height,
-        cfg.codec.name(),
-        cfg.chroma_name(),
-        sh.decoder_desc.lock().unwrap()
-    );
-    if let Some((t0, d0, p0, b0, u0)) = prev {
-        let dt = now.duration_since(t0).as_secs_f64().max(0.001);
-        let fps = (pres - p0) as f64 / dt;
-        let mbps = (bytes - b0) as f64 * 8.0 / dt / 1e6;
-        let dms = if dec > d0 { (dus - u0) as f64 / (dec - d0) as f64 / 1000.0 } else { 0.0 };
-        t.push_str(&format!(" — {fps:.0} fps — {mbps:.1} Mbps — dec {dms:.1} ms"));
-    }
-    if let Some(r) = rtt {
-        t.push_str(&format!(" — rtt {r:.1} ms"));
-    }
-    if sh.mode == Mode::Hybrid {
-        let layer = if sh.stats.showing_sharp.load(Ordering::Relaxed) == 1 { "4:4:4" } else { "4:2:0" };
-        t.push_str(&format!(
-            " — hybrid [{layer}] sharp {} rects {}",
-            sh.stats.sharp.load(Ordering::Relaxed),
-            sh.stats.rect_frames.load(Ordering::Relaxed)
-        ));
-    } else {
-        t.push_str(&format!(" — {}", sh.mode.name()));
-    }
-    let errs = sh.stats.decode_errors.load(Ordering::Relaxed);
-    if errs > 0 {
-        t.push_str(&format!(" — {errs} decode errors"));
-    }
+    let status = sh.status.lock().unwrap().clone();
     let (vw, vh, _) = *sh.view.lock().unwrap();
-    t.push_str(&format!(" — view {vw}x{vh}"));
-    if let Some(status) = sh.status.lock().unwrap().as_ref() {
-        t = format!("Glide — {status} — view {vw}x{vh}");
+    let kb_released = STATE.with(|s| s.borrow().kb_released);
+    let info = hud::HudInfo {
+        host_name: host_name.clone(),
+        status: status.clone(),
+        video: (cfg.width, cfg.height),
+        codec: cfg.codec.name().to_string(),
+        chroma: cfg.chroma_name().to_string(),
+        decoder: sh.decoder_desc.lock().unwrap().clone(),
+        rates: prev.map(|p| hud::rates(&p, &now)).unwrap_or_default(),
+        rtt_ms: sh.clock.lock().unwrap().as_ref().and_then(|c| c.lock().unwrap().last_rtt_ms),
+        mode: Some(current_mode()),
+        showing_sharp: sh.stats.showing_sharp.load(Ordering::Relaxed) == 1,
+        sharp_frames: sh.stats.sharp.load(Ordering::Relaxed),
+        rect_frames: sh.stats.rect_frames.load(Ordering::Relaxed),
+        decode_errors: sh.stats.decode_errors.load(Ordering::Relaxed),
+        view: (vw, vh),
+        keyboard_captured: !kb_released,
+    };
+    let lines = hud::lines(&info);
+    let hud_on = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        s.last_hud = lines.clone();
+        s.hud_on
+    });
+    render_cmd(RenderCmd::Hud(hud_on.then_some(lines)));
+
+    // Title: just who we're looking at (stats live in the HUD, Ctrl+Alt+Shift+H).
+    let mut t = match &status {
+        Some(st) => format!("Glide — {st}"),
+        None => format!("{host_name} — Glide"),
+    };
+    if kb_released && status.is_none() {
+        t.push_str(" — keyboard released (Ctrl+Alt+Shift+K)");
     }
-    let wide: Vec<u16> = t.encode_utf16().chain(std::iter::once(0)).collect();
-    STATE.with(|s| s.borrow_mut().last_title = t.clone());
+    let changed = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let c = s.last_title != t;
+        s.last_title = t.clone();
+        c
+    });
+    if changed {
+        let wide: Vec<u16> = t.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
+        }
+        if let Some(tr) = STATE.with(|s| s.borrow().tray.clone()) {
+            tr.set_tip(&t);
+        }
+    }
+}
+
+fn toast(text: impl Into<String>) {
+    render_cmd(RenderCmd::Toast(text.into()));
+}
+
+/// Run a hotkey / tray / test action on the UI thread.
+fn do_action(hwnd: HWND, a: Action) {
+    let sh = &ui().shared;
+    match a {
+        Action::ToggleHud => {
+            let on = STATE.with(|s| {
+                let mut s = s.borrow_mut();
+                s.hud_on = !s.hud_on;
+                s.hud_on
+            });
+            ui().store.lock().unwrap().update(|c| c.hud = on);
+            update_title(hwnd);
+            toast(if on { "Stats overlay on" } else { "Stats overlay off" });
+        }
+        Action::CycleMode => {
+            let cur = current_mode();
+            let next = hotkeys::next_mode(cur, sh.has444);
+            if next == cur {
+                toast("Only Fast mode — this PC can't decode HEVC 4:4:4");
+                return;
+            }
+            sh.mode.store(next as u8, Ordering::Relaxed);
+            sh.stats.showing_sharp.store(0, Ordering::Relaxed);
+            ui().store.lock().unwrap().update(|c| c.set_mode(next));
+            if connected() {
+                eprintln!("mode -> {} (SetMode)", next.name());
+                send(ClientMsg::SetMode { mode: next as u8, bitrate_kbps: 0, max_fps: 0 });
+                toast(format!("Mode: {}", hotkeys::mode_label(next)));
+            } else {
+                toast(format!("Mode: {} — applies when connected", hotkeys::mode_label(next)));
+            }
+            update_title(hwnd);
+        }
+        Action::ToggleFullscreen => {
+            toggle_fullscreen(hwnd);
+            schedule_view_check(hwnd);
+            remember_placement(hwnd);
+            toast(if is_fullscreen() { "Fullscreen — F11 or Ctrl+Alt+Shift+F to exit" } else { "Windowed" });
+        }
+        Action::ToggleKeyboardCapture => {
+            let released = STATE.with(|s| {
+                let mut s = s.borrow_mut();
+                s.kb_released = !s.kb_released;
+                s.kb_released
+            });
+            if released {
+                remove_hook();
+                // Modifiers of the hotkey itself (and anything else held) were forwarded as downs.
+                send(ClientMsg::ReleaseAll);
+                toast("Keyboard released — shortcuts go to Windows · Ctrl+Alt+Shift+K to recapture");
+            } else {
+                if STATE.with(|s| s.borrow().focused) {
+                    install_hook();
+                }
+                toast("Keyboard captured — shortcuts go to the Mac");
+            }
+            update_title(hwnd);
+        }
+        Action::RequestKeyframe => {
+            if connected() {
+                send(ClientMsg::RequestKeyframe);
+                toast("Keyframe requested");
+            } else {
+                toast("Not connected");
+            }
+        }
+        Action::Reconnect => {
+            STATE.with(|s| s.borrow_mut().prompt_declined = false);
+            sh.paused.store(false, Ordering::Relaxed);
+            let cur = sh.sender.lock().unwrap().clone();
+            match cur {
+                Some(s) => {
+                    sh.reconnect.store(true, Ordering::Relaxed);
+                    let _ = s.send(&ClientMsg::ReleaseAll);
+                    s.shutdown();
+                    toast("Reconnecting…");
+                }
+                None => toast("Not connected — retrying"),
+            }
+        }
+    }
+}
+
+/// Tray "Disconnect" / "Connect".
+fn set_paused(hwnd: HWND, paused: bool) {
+    let sh = &ui().shared;
+    sh.paused.store(paused, Ordering::Relaxed);
+    if paused {
+        sh.abort_accept.store(true, Ordering::Relaxed);
+        if let Some(s) = sh.sender.lock().unwrap().clone() {
+            let _ = s.send(&ClientMsg::ReleaseAll);
+            s.shutdown();
+        }
+        toast("Disconnected");
+    } else {
+        STATE.with(|s| s.borrow_mut().prompt_declined = false);
+        toast("Connecting…");
+    }
+    update_title(hwnd);
+}
+
+/// Save the window's normal rect, maximized and fullscreen state for its current monitor.
+fn remember_placement(hwnd: HWND) {
     unsafe {
-        let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
+        if IsIconic(hwnd).as_bool() {
+            return;
+        }
+        let Some(mon) = placement::monitor_desc(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)) else { return };
+        let (fs, saved_wp, normal) = STATE.with(|s| {
+            let s = s.borrow();
+            (s.fullscreen_saved.is_some(), s.fullscreen_saved.map(|f| f.1), s.normal_rect)
+        });
+        let maximized = match saved_wp {
+            Some(wp) => wp.showCmd == SW_SHOWMAXIMIZED.0 as u32,
+            None => IsZoomed(hwnd).as_bool(),
+        };
+        let normal = match normal {
+            Some(r) => r,
+            None => {
+                let mut r = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut r);
+                r
+            }
+        };
+        ui().store.lock().unwrap().update(|c| {
+            config::record_placement(c, &mon, placement::rect(normal), maximized, fs);
+        });
+    }
+}
+
+/// Track the normal (restored, windowed) rect as the window moves/resizes.
+fn track_normal_rect(hwnd: HWND) {
+    unsafe {
+        if is_fullscreen() || IsIconic(hwnd).as_bool() || IsZoomed(hwnd).as_bool() {
+            return;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_ok() {
+            STATE.with(|s| s.borrow_mut().normal_rect = Some(r));
+        }
+    }
+}
+
+/// The host rejected the password: ask again (only for saved/prompted passwords).
+fn on_auth_failed(hwnd: HWND) {
+    let src = *ui().password_source.lock().unwrap();
+    if !matches!(src, PasswordSource::Saved | PasswordSource::Prompted) {
+        return;
+    }
+    let skip = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let skip = s.prompt_open || s.prompt_declined;
+        if !skip {
+            s.prompt_open = true;
+        }
+        skip
+    });
+    if skip {
+        return;
+    }
+    let msg = if src == PasswordSource::Saved {
+        "The host rejected the saved password. Enter the current password:"
+    } else {
+        "The host rejected that password. Try again:"
+    };
+    let res = prompt::ask_password(Some(hwnd), msg, src == PasswordSource::Saved);
+    STATE.with(|s| s.borrow_mut().prompt_open = false);
+    match res {
+        Ok(Some(a)) => {
+            *ui().shared.password.lock().unwrap() = a.password.clone();
+            let dir = ui().store.lock().unwrap().dir.clone();
+            if let Some(dir) = dir {
+                if a.remember {
+                    match dpapi::store_password(&dir, &a.password) {
+                        Ok(()) => *ui().password_source.lock().unwrap() = PasswordSource::Saved,
+                        Err(e) => eprintln!("warning: cannot save password: {e}"),
+                    }
+                } else {
+                    dpapi::forget_password(&dir);
+                    *ui().password_source.lock().unwrap() = PasswordSource::Prompted;
+                }
+            }
+        }
+        Ok(None) => STATE.with(|s| s.borrow_mut().prompt_declined = true),
+        Err(e) => {
+            eprintln!("{e}");
+            STATE.with(|s| s.borrow_mut().prompt_declined = true);
+        }
     }
 }
 
@@ -725,15 +1059,76 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 render_cmd(RenderCmd::Resize(w, h));
             }
             schedule_view_check(hwnd);
+            track_normal_rect(hwnd);
+            SetTimer(Some(hwnd), PLACEMENT_TIMER, 1000, None);
             LRESULT(0)
         }
         WM_MOVE | WM_DISPLAYCHANGE | WM_EXITSIZEMOVE => {
             schedule_view_check(hwnd);
+            track_normal_rect(hwnd);
+            SetTimer(Some(hwnd), PLACEMENT_TIMER, 1000, None);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_TIMER if wparam.0 == VIEW_TIMER => {
             let _ = KillTimer(Some(hwnd), VIEW_TIMER);
             check_view(hwnd);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == PLACEMENT_TIMER => {
+            let _ = KillTimer(Some(hwnd), PLACEMENT_TIMER);
+            remember_placement(hwnd);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TEST_ACTION_TIMER => {
+            match STATE.with(|s| s.borrow_mut().test_actions.pop()) {
+                Some(a) => {
+                    eprintln!("test action: {a:?}");
+                    do_action(hwnd, a);
+                }
+                None => {
+                    let _ = KillTimer(Some(hwnd), TEST_ACTION_TIMER);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_APP_HOTKEY => {
+            if let Some(a) = Action::from_u8(wparam.0 as u8) {
+                do_action(hwnd, a);
+            }
+            LRESULT(0)
+        }
+        WM_APP_AUTH_FAILED => {
+            on_auth_failed(hwnd);
+            LRESULT(0)
+        }
+        WM_APP_TRAY => {
+            let paused = ui().shared.paused.load(Ordering::Relaxed);
+            tray::on_notify(hwnd, lparam, paused, STATE.with(|s| s.borrow().hud_on));
+            LRESULT(0)
+        }
+        WM_COMMAND if lparam.0 == 0 && tray::is_menu_id((wparam.0 & 0xFFFF) as u16) => {
+            match tray::MenuCmd::from_id((wparam.0 & 0xFFFF) as u16) {
+                Some(tray::MenuCmd::Connect) => set_paused(hwnd, false),
+                Some(tray::MenuCmd::Disconnect) => set_paused(hwnd, true),
+                Some(tray::MenuCmd::Reconnect) => do_action(hwnd, Action::Reconnect),
+                Some(tray::MenuCmd::ToggleHud) => do_action(hwnd, Action::ToggleHud),
+                Some(tray::MenuCmd::OpenConfig) => {
+                    let path = ui().store.lock().unwrap().path();
+                    match path {
+                        Some(p) => tray::open_in_editor(&p),
+                        None => toast("No config file (APPDATA not set)"),
+                    }
+                }
+                Some(tray::MenuCmd::ForgetPassword) => {
+                    let dir = ui().store.lock().unwrap().dir.clone();
+                    let had = dir.map(|d| dpapi::forget_password(&d)).unwrap_or(false);
+                    toast(if had { "Saved password removed" } else { "No saved password" });
+                }
+                Some(tray::MenuCmd::Quit) => {
+                    let _ = DestroyWindow(hwnd);
+                }
+                None => {}
+            }
             LRESULT(0)
         }
         WM_PAINT => {
@@ -873,22 +1268,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 s.keys_down.clear();
                 s.swallow_up.clear();
                 s.last_move = None;
-                s.title_last = None;
+                s.stats_last = None;
             });
             // The hello carried the view at connect time; re-check in case the window moved since.
             check_view(hwnd);
             apply_cursor_if_inside(hwnd);
             update_title(hwnd);
-            LRESULT(0)
-        }
-        WM_APP_TOGGLE_FS => {
-            toggle_fullscreen(hwnd);
-            schedule_view_check(hwnd);
+            let host = ui().shared.host_name.lock().unwrap().clone();
+            toast(format!("Connected to {host}"));
             LRESULT(0)
         }
         WM_DESTROY => {
             set_focus_state(hwnd, false);
+            remember_placement(hwnd);
+            if let Some(t) = STATE.with(|s| s.borrow_mut().tray.take()) {
+                t.remove();
+            }
             PostQuitMessage(0);
+            LRESULT(0)
+        }
+        m if m == tray::taskbar_created_msg() => {
+            // Explorer restarted: re-add the tray icon.
+            if let Some(t) = STATE.with(|s| s.borrow().tray.clone()) {
+                t.add();
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -956,6 +1359,17 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
         if shared.quit.load(Ordering::Relaxed) {
             return;
         }
+        if shared.paused.load(Ordering::Relaxed) {
+            // Tray "Disconnect": stop listening too, so the host can't reconnect until "Connect".
+            listener = None;
+            note = None;
+            set_status(&shared, &tx, hwnd_raw, Some("Disconnected — use the tray icon to connect".into()));
+            if sleep_or_quit(&shared, Duration::from_millis(200)) {
+                return;
+            }
+            continue;
+        }
+        shared.abort_accept.store(false, Ordering::Relaxed);
         let host = shared.host_name.lock().unwrap().clone();
         let waiting = match &connector.target {
             Target::Listen(port) => {
@@ -997,19 +1411,27 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
                     }
                 }
                 let hello = hello_for(&connector.hello, &shared);
-                match Connection::accept_on(listener.as_ref().unwrap(), &connector.password, &hello, &shared.quit) {
+                let pw = shared.password.lock().unwrap().clone();
+                match Connection::accept_on(listener.as_ref().unwrap(), &pw, &hello, &shared.abort_accept) {
                     Ok(Some(c)) => Ok(c),
-                    Ok(None) => return, // quitting
+                    Ok(None) if shared.quit.load(Ordering::Relaxed) => return,
+                    Ok(None) => continue, // paused
                     Err(e) => Err(e),
                 }
             }
-            Target::Connect(addr) => Connection::connect(addr, &connector.password, &hello_for(&connector.hello, &shared)),
+            Target::Connect(addr) => {
+                let pw = shared.password.lock().unwrap().clone();
+                Connection::connect(addr, &pw, &hello_for(&connector.hello, &shared))
+            }
         };
         let conn = match res {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("connection attempt failed: {e}");
                 note = Some(if e.is_auth_failure() { "Authentication failed".to_string() } else { short_error(&e.to_string()) });
+                if e.is_auth_failure() {
+                    post(hwnd_raw, WM_APP_AUTH_FAILED);
+                }
                 let retry = match connector.target {
                     Target::Listen(_) => Duration::from_millis(200),
                     Target::Connect(_) => Duration::from_secs(2),
@@ -1026,6 +1448,10 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
             None => return, // quitting
             Some(r) => {
                 eprintln!("connection closed: {r}");
+                if shared.reconnect.swap(false, Ordering::Relaxed) || shared.paused.load(Ordering::Relaxed) {
+                    note = None; // on purpose: reconnect right away (or pause)
+                    continue;
+                }
                 note = Some("Connection lost".into());
                 if let Target::Connect(_) = connector.target {
                     if sleep_or_quit(&shared, Duration::from_secs(2)) {
@@ -1040,7 +1466,7 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
 /// ClientHello with the current monitor's view size / refresh (the window may have moved).
 fn hello_for(template: &ClientMsg, shared: &Shared) -> ClientMsg {
     match template {
-        ClientMsg::ClientHello { version, codec_caps, mode, client_name, .. } => {
+        ClientMsg::ClientHello { version, codec_caps, client_name, .. } => {
             let (w, h, fps) = *shared.view.lock().unwrap();
             *shared.sent_view.lock().unwrap() = (w, h);
             ClientMsg::ClientHello {
@@ -1048,7 +1474,8 @@ fn hello_for(template: &ClientMsg, shared: &Shared) -> ClientMsg {
                 codec_caps: *codec_caps,
                 view_w: w,
                 view_h: h,
-                mode: *mode,
+                // The mode may have been changed with Ctrl+Alt+Shift+M since startup.
+                mode: shared.mode.load(Ordering::Relaxed),
                 max_fps: fps,
                 client_name: client_name.clone(),
             }
@@ -1173,7 +1600,12 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
     };
     let shared = Arc::new(Shared {
         host_name: Mutex::new(opts.host_label.clone()),
-        mode: opts.mode,
+        mode: AtomicU8::new(opts.mode as u8),
+        has444: opts.has444,
+        password: Mutex::new(connector.password.clone()),
+        reconnect: AtomicBool::new(false),
+        paused: AtomicBool::new(false),
+        abort_accept: AtomicBool::new(false),
         config: Mutex::new(VideoConfig { width: 0, height: 0, codec: protocol::Codec::Hevc, chroma: 0, color: 0, scale: 1.0 }),
         sender: Mutex::new(None),
         clock: Mutex::new(None),
@@ -1194,7 +1626,26 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         hwnd: AtomicIsize::new(0),
     });
     let (render_tx, render_rx) = mpsc::channel::<RenderCmd>();
-    let _ = UI.set(UiCtx { ctrl_as_cmd: opts.ctrl_as_cmd, render_tx: Mutex::new(render_tx.clone()), shared: shared.clone() });
+    let hud_on = opts.store.config.hud;
+    let restore = {
+        let ms = placement::monitors();
+        config::choose_placement(&opts.store.config, &ms, placement::cursor_monitor_index(&ms))
+    };
+    let _ = UI.set(UiCtx {
+        ctrl_as_cmd: opts.ctrl_as_cmd,
+        render_tx: Mutex::new(render_tx.clone()),
+        shared: shared.clone(),
+        store: Mutex::new(opts.store),
+        password_source: Mutex::new(opts.password_source),
+    });
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        s.hud_on = hud_on;
+        // GLIDE_TEST_ACTIONS=hud,mode,... (test hook): run these actions one per tick.
+        s.test_actions = std::env::var("GLIDE_TEST_ACTIONS")
+            .map(|v| v.split(',').filter_map(Action::from_name).rev().collect())
+            .unwrap_or_default();
+    });
 
     // --- window (shown immediately, before any connection)
     let hwnd = unsafe {
@@ -1208,7 +1659,10 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
             hCursor: HCURSOR::default(), // we set it per WM_SETCURSOR
             hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
             lpszClassName: class,
-            hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+            hIcon: prompt::app_icon(GetSystemMetrics(SM_CXICON))
+                .or_else(|| LoadIconW(None, IDI_APPLICATION).ok())
+                .unwrap_or_default(),
+            hIconSm: prompt::app_icon(GetSystemMetrics(SM_CXSMICON)).unwrap_or_default(),
             ..Default::default()
         };
         if RegisterClassExW(&wc) == 0 {
@@ -1230,15 +1684,25 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         let dpi = GetDpiForSystem();
         let _ = AdjustWindowRectExForDpi(&mut rc, style, false, WINDOW_EX_STYLE(0), dpi);
         let title: Vec<u16> = format!("Glide — {initial_status}").encode_utf16().chain(std::iter::once(0)).collect();
+        // Restore the remembered placement (last monitor) if any, else centered on the cursor monitor.
+        let (x, y, w, h) = match &restore {
+            Some(p) => (p.rect.l, p.rect.t, p.rect.w(), p.rect.h()),
+            None => (
+                mon.map_or(CW_USEDEFAULT, |m| m.work.left + ((m.work.right - m.work.left) - (rc.right - rc.left)) / 2),
+                mon.map_or(CW_USEDEFAULT, |m| m.work.top + ((m.work.bottom - m.work.top) - (rc.bottom - rc.top)) / 2),
+                rc.right - rc.left,
+                rc.bottom - rc.top,
+            ),
+        };
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
             PCWSTR(title.as_ptr()),
             style,
-            mon.map_or(CW_USEDEFAULT, |m| m.work.left + ((m.work.right - m.work.left) - (rc.right - rc.left)) / 2),
-            mon.map_or(CW_USEDEFAULT, |m| m.work.top + ((m.work.bottom - m.work.top) - (rc.bottom - rc.top)) / 2),
-            rc.right - rc.left,
-            rc.bottom - rc.top,
+            x,
+            y,
+            w,
+            h,
             None,
             None,
             Some(HINSTANCE(hinst.0)),
@@ -1248,6 +1712,26 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
     };
     let hwnd_raw = hwnd.0 as isize;
     shared.hwnd.store(hwnd_raw, Ordering::Relaxed);
+    track_normal_rect(hwnd);
+    let show = match &restore {
+        Some(p) if p.fullscreen => {
+            toggle_fullscreen(hwnd);
+            if p.maximized {
+                // Leaving fullscreen later returns to a maximized window.
+                STATE.with(|s| {
+                    if let Some(f) = s.borrow_mut().fullscreen_saved.as_mut() {
+                        f.1.showCmd = SW_SHOWMAXIMIZED.0 as u32;
+                    }
+                });
+            }
+            SW_SHOW
+        }
+        Some(p) if p.maximized => SW_SHOWMAXIMIZED,
+        _ => SW_SHOW,
+    };
+    if let Some(p) = &restore {
+        eprintln!("restored window on monitor {} (fullscreen={}, maximized={})", p.monitor, p.fullscreen, p.maximized);
+    }
     check_view(hwnd); // view = the monitor the window actually opened on (before the first hello)
 
     // --- render thread
@@ -1271,10 +1755,20 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
     }
 
     unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(hwnd, show);
         let _ = UpdateWindow(hwnd);
         SetTimer(Some(hwnd), TITLE_TIMER, 500, None);
+        if STATE.with(|s| !s.borrow().test_actions.is_empty()) {
+            let ms = std::env::var("GLIDE_TEST_ACTIONS_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
+            SetTimer(Some(hwnd), TEST_ACTION_TIMER, ms, None);
+        }
     }
+    if std::env::var("GLIDE_NO_TRAY").as_deref() != Ok("1") {
+        let t = tray::Tray::new(hwnd, WM_APP_TRAY);
+        t.add();
+        STATE.with(|s| s.borrow_mut().tray = Some(t));
+    }
+    update_title(hwnd);
     // Test hook: GLIDE_EXIT_AFTER=SECONDS closes the window automatically (smoke tests).
     let exit_after = std::env::var("GLIDE_EXIT_AFTER").ok().and_then(|v| v.parse::<f64>().ok());
     if let Some(secs) = exit_after {
@@ -1295,6 +1789,7 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
 
     // User closed the window: stop everything (the session thread notices `quit`).
     shared.quit.store(true, Ordering::Relaxed);
+    shared.abort_accept.store(true, Ordering::Relaxed);
     if let Some(s) = shared.sender.lock().unwrap().take() {
         let _ = s.send(&ClientMsg::ReleaseAll);
         s.shutdown();
@@ -1304,7 +1799,7 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
     if exit_after.is_some() {
         let st = &shared.stats;
         eprintln!(
-            "viewer exit: decoded={} sharp={} rect_frames={} presented={} bytes={} decode_errors={} decoder={:?} status={:?} last_title={:?}",
+            "viewer exit: decoded={} sharp={} rect_frames={} presented={} bytes={} decode_errors={} decoder={:?} status={:?} last_title={:?} mode={} hud={:?}",
             st.decoded.load(Ordering::Relaxed),
             st.sharp.load(Ordering::Relaxed),
             st.rect_frames.load(Ordering::Relaxed),
@@ -1313,7 +1808,9 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
             st.decode_errors.load(Ordering::Relaxed),
             shared.decoder_desc.lock().unwrap(),
             shared.status.lock().unwrap(),
-            STATE.with(|s| s.borrow().last_title.clone())
+            STATE.with(|s| s.borrow().last_title.clone()),
+            Mode::from_u8(shared.mode.load(Ordering::Relaxed)).name(),
+            STATE.with(|s| s.borrow().last_hud.clone())
         );
     }
     Ok(())

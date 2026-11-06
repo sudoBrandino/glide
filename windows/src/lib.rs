@@ -5,8 +5,11 @@
 
 pub mod annexb;
 pub mod bench;
+pub mod config;
 pub mod crypto;
 pub mod hid;
+pub mod hotkeys;
+pub mod hud;
 pub mod net;
 pub mod protocol;
 pub mod util;
