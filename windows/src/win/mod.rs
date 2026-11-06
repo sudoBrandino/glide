@@ -4,15 +4,18 @@ pub mod app;
 pub mod audio;
 pub mod bench_decoder;
 pub mod clipboard;
+pub mod connbar;
 pub mod console;
 pub mod cursor;
 pub mod d3d;
 pub mod decoder;
 pub mod dpapi;
+pub mod menu;
 pub mod placement;
 pub mod probe;
 pub mod prompt;
 pub mod render;
+pub mod scanout;
 pub mod tray;
 
 use windows::Win32::Graphics::Gdi::*;

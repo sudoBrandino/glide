@@ -26,6 +26,8 @@ pub const MSG_MOUSE_WHEEL: u8 = 0x12;
 pub const MSG_KEY: u8 = 0x13;
 pub const MSG_RELEASE_ALL: u8 = 0x14;
 pub const MSG_VIEW_SIZE: u8 = 0x15;
+/// Viewer → host: Mac display-mode preference for this session (v1.3).
+pub const MSG_SET_DISPLAY_PREFERENCE: u8 = 0x16;
 pub const MSG_REQUEST_KEYFRAME: u8 = 0x20;
 pub const MSG_SET_MODE: u8 = 0x21;
 pub const MSG_PING: u8 = 0x30;
@@ -33,6 +35,9 @@ pub const MSG_CLIPBOARD: u8 = 0x50;
 pub const MSG_AUDIO_ENABLE: u8 = 0x62;
 /// Pairing: the user confirmed (1) / rejected (0) the code (§2.4). 0x08–0x0F: auth phase.
 pub const MSG_PAIR_CONFIRM: u8 = 0x0A;
+/// Latency instrumentation (§3.4), client -> host.
+pub const MSG_LATENCY_ENABLE: u8 = 0x80;
+pub const MSG_LATENCY_REPORT: u8 = 0x82;
 
 // Host -> Client message types
 pub const MSG_SERVER_HELLO: u8 = 0x02;
@@ -50,12 +55,24 @@ pub const AUTH_PAIRING_CLOSED: u8 = 2;
 pub const AUTH_DECLINED: u8 = 3;
 pub const AUTH_TIMEOUT: u8 = 4;
 pub const AUTH_BUSY: u8 = 5;
+/// Host → viewer: current display preference + mode (v1.3).
+pub const MSG_DISPLAY_INFO: u8 = 0x05;
+
+/// Mac display-mode preferences (SetDisplayPreference / DisplayInfo `u8 preference`).
+pub const DISPLAY_PREF_AUTOMATIC: u8 = 0;
+pub const DISPLAY_PREF_CRISP: u8 = 1;
+pub const DISPLAY_PREF_SMOOTH: u8 = 2;
+pub const DISPLAY_PREF_RETINA: u8 = 3;
+/// Never change the display mode ("Don't change").
+pub const DISPLAY_PREF_MANUAL: u8 = 4;
 pub const MSG_PONG: u8 = 0x31;
 pub const MSG_VIDEO_FRAME: u8 = 0x40;
 pub const MSG_CURSOR_POS: u8 = 0x41;
 pub const MSG_CURSOR_SHAPE: u8 = 0x42;
 pub const MSG_CURSOR_SHAPE_REF: u8 = 0x43;
 pub const MSG_CLIPBOARD_CAPS: u8 = 0x51;
+/// Per-frame host pipeline timestamps (§3.4), host -> client.
+pub const MSG_FRAME_TIMING: u8 = 0x81;
 
 // Clipboard (§5)
 pub const CLIP_FORMAT_TEXT: u8 = 1;
@@ -230,6 +247,55 @@ pub struct AudioConfig {
     pub frame_samples: u16,
 }
 
+/// "Unknown" marker for `FrameTiming` / `LatencyReport` fields.
+pub const TIMING_UNKNOWN: u32 = u32::MAX;
+
+/// `FrameTiming` (0x81, §3.4): host-side timestamps of one `VideoFrame`, as µs offsets after
+/// `capture_us` (host monotonic clock); `TIMING_UNKNOWN` = not measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameTiming {
+    pub frame_id: u32,
+    /// Same as the frame's `capture_time_us` (ScreenCaptureKit PTS).
+    pub capture_us: u64,
+    /// The frame's `VideoFrame` flags.
+    pub flags: u8,
+    /// Capture callback ran on the host.
+    pub callback: u32,
+    /// Handed to the encoder.
+    pub submit: u32,
+    /// Encoder output callback.
+    pub encoded: u32,
+    /// Queued on the connection (record sealed, `send` called).
+    pub enqueued: u32,
+    /// The network stack accepted the whole record (send completion).
+    pub sent: u32,
+}
+
+impl FrameTiming {
+    /// Absolute host time of a stage offset, if known.
+    pub fn at(&self, d: u32) -> Option<u64> {
+        (d != TIMING_UNKNOWN).then(|| self.capture_us + d as u64)
+    }
+}
+
+/// `LatencyReport` (0x82, §3.4): the viewer's p50 breakdown over its last window, in µs
+/// (`TIMING_UNKNOWN` = not measured). Informational: the host logs it and shows the total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatencyReport {
+    pub samples: u16,
+    /// bit0: `total_us` ends at scan-out (else at the Present call); bit1: ground truth valid.
+    pub flags: u8,
+    pub host_us: u32,
+    pub network_us: u32,
+    pub queue_us: u32,
+    pub decode_us: u32,
+    pub render_us: u32,
+    pub scanout_us: u32,
+    pub total_us: u32,
+    /// Glass-to-glass ground truth from the test pattern (latency test mode).
+    pub ground_truth_us: u32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientMsg {
     ClientHello {
@@ -256,6 +322,11 @@ pub enum ClientMsg {
     AudioEnable { enabled: bool },
     /// Pairing: the user compared the codes (§2.4).
     PairConfirm { matched: bool },
+    /// Ask the host for `FrameTiming` messages (§3.4). `flags` bit0 = enabled.
+    LatencyEnable { flags: u8 },
+    LatencyReport(LatencyReport),
+    /// Mac display-mode preference for this session (`DISPLAY_PREF_*`).
+    SetDisplayPreference { mode: u8 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -280,6 +351,10 @@ pub enum HostMsg {
     AudioConfig(AudioConfig),
     /// `data`: interleaved s16le PCM (codec 1); `capture_time_us` is the first sample's host time.
     AudioFrame { seq: u32, capture_time_us: u64, data: Vec<u8> },
+    FrameTiming(FrameTiming),
+    /// Current Mac display preference (`DISPLAY_PREF_*`) and mode ("looks like" size in points,
+    /// `hidpi` = Retina backing). Sent after ServerHello and whenever either changes.
+    DisplayInfo { preference: u8, mode_w: u16, mode_h: u16, hidpi: bool },
     /// Unknown message type: ignored for forward compatibility.
     Unknown { msg_type: u8 },
 }
@@ -474,6 +549,20 @@ impl ClientMsg {
             }
             ClientMsg::AudioEnable { enabled } => Writer::new(MSG_AUDIO_ENABLE).u8(*enabled as u8).finish(),
             ClientMsg::PairConfirm { matched } => Writer::new(MSG_PAIR_CONFIRM).u8(*matched as u8).finish(),
+            ClientMsg::LatencyEnable { flags } => Writer::new(MSG_LATENCY_ENABLE).u8(*flags).finish(),
+            ClientMsg::LatencyReport(r) => Writer::new(MSG_LATENCY_REPORT)
+                .u16(r.samples)
+                .u8(r.flags)
+                .u32(r.host_us)
+                .u32(r.network_us)
+                .u32(r.queue_us)
+                .u32(r.decode_us)
+                .u32(r.render_us)
+                .u32(r.scanout_us)
+                .u32(r.total_us)
+                .u32(r.ground_truth_us)
+                .finish(),
+            ClientMsg::SetDisplayPreference { mode } => Writer::new(MSG_SET_DISPLAY_PREFERENCE).u8(*mode).finish(),
         }
     }
 
@@ -503,6 +592,20 @@ impl ClientMsg {
             MSG_CLIPBOARD => ClientMsg::Clipboard(ClipboardData::read(&mut r)?),
             MSG_AUDIO_ENABLE => ClientMsg::AudioEnable { enabled: r.u8()? != 0 },
             MSG_PAIR_CONFIRM => ClientMsg::PairConfirm { matched: r.u8()? != 0 },
+            MSG_LATENCY_ENABLE => ClientMsg::LatencyEnable { flags: r.u8()? },
+            MSG_LATENCY_REPORT => ClientMsg::LatencyReport(LatencyReport {
+                samples: r.u16()?,
+                flags: r.u8()?,
+                host_us: r.u32()?,
+                network_us: r.u32()?,
+                queue_us: r.u32()?,
+                decode_us: r.u32()?,
+                render_us: r.u32()?,
+                scanout_us: r.u32()?,
+                total_us: r.u32()?,
+                ground_truth_us: r.u32()?,
+            }),
+            MSG_SET_DISPLAY_PREFERENCE => ClientMsg::SetDisplayPreference { mode: r.u8()? },
             _ => return Err(DecodeError::BadLength(t)),
         })
     }
@@ -580,6 +683,19 @@ impl HostMsg {
                 buf.drain(..1 + r.pos());
                 return Ok(HostMsg::AudioFrame { seq, capture_time_us, data: buf });
             }
+            MSG_FRAME_TIMING => HostMsg::FrameTiming(FrameTiming {
+                frame_id: r.u32()?,
+                capture_us: r.u64()?,
+                flags: r.u8()?,
+                callback: r.u32()?,
+                submit: r.u32()?,
+                encoded: r.u32()?,
+                enqueued: r.u32()?,
+                sent: r.u32()?,
+            }),
+            MSG_DISPLAY_INFO => {
+                HostMsg::DisplayInfo { preference: r.u8()?, mode_w: r.u16()?, mode_h: r.u16()?, hidpi: r.u8()? != 0 }
+            }
             other => HostMsg::Unknown { msg_type: other },
         };
         Ok(msg)
@@ -643,6 +759,19 @@ impl HostMsg {
             }
             HostMsg::AudioFrame { seq, capture_time_us, data } => {
                 Writer::new(MSG_AUDIO_FRAME).u32(*seq).u64(*capture_time_us).bytes(data).finish()
+            }
+            HostMsg::FrameTiming(t) => Writer::new(MSG_FRAME_TIMING)
+                .u32(t.frame_id)
+                .u64(t.capture_us)
+                .u8(t.flags)
+                .u32(t.callback)
+                .u32(t.submit)
+                .u32(t.encoded)
+                .u32(t.enqueued)
+                .u32(t.sent)
+                .finish(),
+            HostMsg::DisplayInfo { preference, mode_w, mode_h, hidpi } => {
+                Writer::new(MSG_DISPLAY_INFO).u8(*preference).u16(*mode_w).u16(*mode_h).u8(*hidpi as u8).finish()
             }
             HostMsg::Unknown { msg_type } => vec![*msg_type],
         }
@@ -800,6 +929,46 @@ mod tests {
     }
 
     #[test]
+    fn latency_messages_match_reference_bytes() {
+        // docs/PROTOCOL.md §3.4 reference encodings (mac glide-selftest and mock_host check the same bytes).
+        let ft_hex = "810700000040420f000000000001dc0500004006000048260000ac26000074270000";
+        let ft = HostMsg::FrameTiming(FrameTiming {
+            frame_id: 7,
+            capture_us: 1_000_000,
+            flags: 1,
+            callback: 1500,
+            submit: 1600,
+            encoded: 9800,
+            enqueued: 9900,
+            sent: 10100,
+        });
+        assert_eq!(crate::util::hex(&ft.encode()), ft_hex);
+        assert_eq!(HostMsg::decode(crate::util::unhex(ft_hex)).unwrap(), ft);
+        assert!(HostMsg::decode(crate::util::unhex(&ft_hex[..ft_hex.len() - 2])).is_err());
+        if let HostMsg::FrameTiming(t) = ft {
+            assert_eq!(t.at(t.encoded), Some(1_009_800));
+            assert_eq!(t.at(TIMING_UNKNOWN), None);
+        }
+        assert_eq!(ClientMsg::LatencyEnable { flags: 1 }.encode(), vec![0x80, 0x01]);
+        let lr_hex = "82780001f82a0000b00400002c0100000807000090010000f41a000060540000ffffffff";
+        let lr = ClientMsg::LatencyReport(LatencyReport {
+            samples: 120,
+            flags: 1,
+            host_us: 11000,
+            network_us: 1200,
+            queue_us: 300,
+            decode_us: 1800,
+            render_us: 400,
+            scanout_us: 6900,
+            total_us: 21600,
+            ground_truth_us: TIMING_UNKNOWN,
+        });
+        assert_eq!(crate::util::hex(&lr.encode()), lr_hex);
+        assert_eq!(ClientMsg::decode(&crate::util::unhex(lr_hex)).unwrap(), lr);
+        assert_eq!(ClientMsg::decode(&[0x80, 0x01]).unwrap(), ClientMsg::LatencyEnable { flags: 1 });
+    }
+
+    #[test]
     fn audio_messages_match_reference_bytes() {
         // docs/PROTOCOL.md §3.2 reference encodings (mac glide-selftest checks the same bytes).
         let cfg = HostMsg::AudioConfig(AudioConfig { codec: AUDIO_CODEC_PCM_S16, sample_rate: 48000, channels: 2, frame_samples: 480 });
@@ -820,6 +989,23 @@ mod tests {
             HostMsg::AudioFrame { seq: 7, capture_time_us: 1_000_000, data: vec![] }
         );
         assert_eq!(CAP_AUDIO_PCM, 0x200);
+    }
+
+    #[test]
+    fn display_messages_match_reference_bytes() {
+        // docs/PROTOCOL.md §3.3 reference encodings (mac glide-selftest checks the same bytes).
+        let set = ClientMsg::SetDisplayPreference { mode: DISPLAY_PREF_RETINA };
+        assert_eq!(crate::util::hex(&set.encode()), "1603");
+        assert_eq!(ClientMsg::decode(&[0x16, 0x03]).unwrap(), set);
+        assert!(ClientMsg::decode(&[0x16]).is_err());
+        let info = HostMsg::DisplayInfo { preference: DISPLAY_PREF_AUTOMATIC, mode_w: 1920, mode_h: 1080, hidpi: true };
+        assert_eq!(crate::util::hex(&info.encode()), "05008007380401");
+        assert_eq!(HostMsg::decode(crate::util::unhex("05008007380401")).unwrap(), info);
+        assert_eq!(
+            HostMsg::decode(crate::util::unhex("0504000a400600")).unwrap(),
+            HostMsg::DisplayInfo { preference: DISPLAY_PREF_MANUAL, mode_w: 2560, mode_h: 1600, hidpi: false }
+        );
+        assert!(HostMsg::decode(crate::util::unhex("050080073804")).is_err());
     }
 
     #[test]

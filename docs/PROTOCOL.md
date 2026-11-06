@@ -94,11 +94,14 @@ Any decrypt failure is fatal: close the connection.
 | `0x13` | Key | `u16 hid_usage` (USB HID Keyboard page 0x07), `u8 down` (1/0). A down for an already-held key is an autorepeat |
 | `0x14` | ReleaseAll | (none) — host releases every held key/button |
 | `0x15` | ViewSize | `u16 view_w`, `u16 view_h` — physical pixels of the monitor/area the viewer will present on (the window's current monitor in fullscreen). Sent whenever it changes (window moved to another monitor, display mode change). The host re-captures so the encoded width ≤ `view_w` and follows with `VideoConfig` + keyframe |
+| `0x16` | SetDisplayPreference | `u8 mode` — Mac display-mode preference for this session, see §3.3 |
 | `0x20` | RequestKeyframe | (none) |
 | `0x21` | SetMode | `u8 mode` (0 fast, 1 sharp), `u32 bitrate_kbps` (0 = auto), `u8 max_fps` (0 = keep) |
 | `0x30` | Ping | `u64 client_time_us` |
 | `0x50` | Clipboard | clipboard snapshot, see §5 (only after the host sent `ClipboardCaps`) |
 | `0x62` | AudioEnable | `u8 enabled` — see §3.2 |
+| `0x80` | LatencyEnable | `u8 flags` — see §3.4 |
+| `0x82` | LatencyReport | viewer latency breakdown — see §3.4 |
 
 `codec_caps` bits (despite the name, a general capability mask): bits 0–7 are video codecs —
 `0` HEVC 4:2:0, `1` HEVC 4:4:4, `2` H.264 4:2:0; bits 8+ are non-video features — `8` clipboard
@@ -117,6 +120,7 @@ the host injects exactly the HID usages it receives.
 |----|----|----|
 | `0x02` | ServerHello | `u16 version`, `str host_name`, then a `VideoConfig` body (below) |
 | `0x04` | SharpLayerConfig | `VideoConfig` body for the refinement layer (hybrid mode only; sent right after `ServerHello`/`VideoConfig`). Same width/height as the base layer, HEVC 4:4:4 |
+| `0x05` | DisplayInfo | `u8 preference`, `u16 mode_w`, `u16 mode_h`, `u8 hidpi` — see §3.3 |
 | `0x03` | VideoConfig | `u16 width`, `u16 height` (encoded pixels), `u8 codec` (1 HEVC, 2 H.264), `u8 chroma` (0 4:2:0, 1 4:4:4), `u8 color` (0 BT.709 limited), `f32 scale` (host backing scale, e.g. 2.0) |
 | `0x31` | Pong | `u64 client_time_us` (echoed), `u64 host_time_us` |
 | `0x40` | VideoFrame | `u32 frame_id`, `u64 capture_time_us` (host monotonic), `u8 flags`, [rects], then Annex-B elementary stream bytes. Flags: bit0 keyframe; bit1 refresh (re-encode of unchanged content for quality — `capture_time_us` is the original capture, so exclude from latency stats); bit2 **sharp layer** (decode with the refinement-layer decoder, see §3.1); bit3 **has rects**: the payload starts with `u16 n` then `n` × (`u16 x, y, w, h`) in encoded pixels, before the Annex-B bytes |
@@ -127,6 +131,7 @@ the host injects exactly the HID usages it receives.
 | `0x51` | ClipboardCaps | `u32 formats`, `u32 max_bytes` — see §5 (only to clients with caps bit 8) |
 | `0x60` | AudioConfig | see §3.2 (only to clients with caps bit 9) |
 | `0x61` | AudioFrame | see §3.2 (only to clients with caps bit 9) |
+| `0x81` | FrameTiming | per-frame host timestamps, see §3.4 (only after `LatencyEnable`) |
 
 Rules:
 - Host sends `ServerHello` immediately after it successfully decrypts `ClientHello`.
@@ -210,6 +215,82 @@ AudioConfig {codec 1, 48000 Hz, 2 ch, 480}              60 01 80bb0000 02 e001
 AudioFrame  {seq 7, t 1000000 µs, L/R 1,-1, 32767,-32768} 61 07000000 40420f0000000000 0100 ffff ff7f 0080
 AudioEnable {0}                                         62 00
 ```
+
+## 3.3 Mac display preference (v1.3)
+
+The host may switch the Mac's display mode to suit the viewer (`automatic` policy, configurable on
+the Mac). The viewer can choose the preference **for the current session**:
+
+| dir | type | name | payload |
+|----|----|----|----|
+| C→H | `0x16` | SetDisplayPreference | `u8 mode` |
+| H→C | `0x05` | DisplayInfo | `u8 preference`, `u16 mode_w`, `u16 mode_h`, `u8 hidpi` |
+
+`mode` / `preference`: `0` automatic, `1` crisp (non-HiDPI, pixels 1:1 with the viewer), `2` smooth
+(HiDPI looking like ~2/3 of the viewer), `3` retina (HiDPI, backing pixels 1:1 with the viewer),
+`4` manual ("don't change").
+
+- `SetDisplayPreference` applies immediately (the host may switch modes, then re-captures:
+  `VideoConfig` + keyframe as usual). It lasts until the session ends; it is not persisted, and a
+  change of the policy on the Mac itself overrides it. Unknown values are ignored.
+- `DisplayInfo` reports the preference in force for this session and the current mode: `mode_w` ×
+  `mode_h` is the "looks like" size in points, `hidpi` = 1 if the mode has Retina backing (pixels =
+  2× points). `0×0` = unknown. The host sends it right after `ServerHello` (and the clipboard/audio
+  messages that follow it) and again whenever the preference or mode changes.
+- Older peers ignore these: viewers ignore unknown host message types; a host that doesn't know
+  `0x16` logs and drops it. A viewer that never got `DisplayInfo` should treat the feature as unavailable.
+
+Reference encodings (both implementations test these):
+
+```
+SetDisplayPreference {3 retina}                     16 03
+DisplayInfo {automatic, 1920x1080, hidpi}           05 00 8007 3804 01
+DisplayInfo {manual, 2560x1600, not hidpi}          05 04 000a 4006 00
+```
+
+## 3.4 Latency instrumentation (v1.4)
+
+Message types `0x80–0x8F` are reserved for latency measurement. Everything here is optional and
+informational: a peer that doesn't implement it loses nothing but numbers.
+
+| dir | type | name | payload |
+|----|----|----|----|
+| C→H | `0x80` | LatencyEnable | `u8 flags` — bit0: send `FrameTiming` for every `VideoFrame` (1 = on, 0 = off) |
+| H→C | `0x81` | FrameTiming | `u32 frame_id`, `u64 capture_us`, `u8 flags`, then five `u32` offsets in µs after `capture_us`: `callback`, `submit`, `encoded`, `enqueued`, `sent` |
+| C→H | `0x82` | LatencyReport | `u16 samples`, `u8 flags`, then eight `u32` µs: `host`, `network`, `queue`, `decode`, `render`, `scanout`, `total`, `ground_truth` |
+
+Rules:
+- A viewer that wants timing sends `LatencyEnable(1)` once after `ServerHello` (it is not
+  gated by a caps bit; a v1.2 host ignores the unknown message). The host then follows **every**
+  `VideoFrame` (base and sharp layer, refresh frames included) with a `FrameTiming` carrying
+  the same `frame_id`, sent once the network stack has accepted the whole `VideoFrame` record
+  (so it usually arrives right after the frame, possibly after later frames — match by id).
+- `FrameTiming` fields (host monotonic clock, the clock of `capture_time_us` and `Pong`):
+  `capture_us` = the frame's `capture_time_us` (ScreenCaptureKit presentation time);
+  `flags` = the frame's `VideoFrame` flags; `callback` = the capture callback ran;
+  `submit` = handed to the encoder; `encoded` = encoder output; `enqueued` = record queued on
+  the connection; `sent` = send completion (whole record accepted by the TCP stack — not wire
+  time). `0xFFFFFFFF` = not measured. For refresh frames, offsets are relative to the original
+  capture and are not latencies.
+- `LatencyReport` is the viewer's p50 breakdown over its last ~2 s (definitions in
+  `docs/LATENCY.md`); `0xFFFFFFFF` = not measured. `flags` bit0: `total` ends at scan-out
+  (else at the `Present()` call); bit1: `ground_truth` is valid (latency test mode). Viewers send
+  it at most every 2 s and only after receiving at least one `FrameTiming` (proof that the host
+  implements §3.4). The host only logs/displays it.
+
+Reference encodings (Rust, Swift `glide-selftest` and `mock_host.py --selftest` check these):
+
+```
+FrameTiming {id 7, capture 1000000, flags 1, callback 1500, submit 1600, encoded 9800, enqueued 9900, sent 10100}
+  81 07000000 40420f0000000000 01 dc050000 40060000 48260000 ac260000 74270000
+LatencyEnable {1}  80 01
+LatencyReport {120 samples, flags 1, host 11000, network 1200, queue 300, decode 1800, render 400,
+               scanout 6900, total 21600, ground_truth unknown}
+  82 7800 01 f82a0000 b0040000 2c010000 08070000 90010000 f41a0000 60540000 ffffffff
+```
+
+The glass-to-glass test pattern (a block code of the host clock drawn on the host screen and
+read back by the viewer) is not part of the wire protocol; its layout is in `docs/LATENCY.md`.
 
 ## 4. Test vectors
 

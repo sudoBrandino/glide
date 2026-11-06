@@ -13,14 +13,18 @@ use super::audio::Audio;
 use super::cursor::{create_cursor, destroy_cursor, scale_image, CursorImage};
 use super::d3d::Gpu;
 use super::decoder::Decoder;
-use super::render::Renderer;
 use super::prompt::PairText;
-use super::{placement, prompt, tray};
+use super::render::{Readback, Renderer};
+use super::scanout::ScanoutClock;
+use super::{connbar as cbar, menu, placement, prompt, tray};
+use crate::menu_model::{self, Cmd};
 use crate::config::{self, Store};
 use crate::hid;
 use crate::hotkeys::{self, Action};
+use crate::blockcode;
 use crate::hud;
 use crate::identity::Identity;
+use crate::latency::Tracker;
 use crate::net::{Auth, ClockSync, ConnectError, Connection, NetEvent, PairPrompt, PairingUi, Sender};
 use crate::peers;
 use crate::protocol::{self, ClientMsg, HostMsg, Mode, VideoConfig, FRAME_FLAG_KEYFRAME, FRAME_FLAG_SHARP};
@@ -51,6 +55,11 @@ pub struct Options {
     pub audio: bool,
     /// Start muted (config "audio_muted").
     pub audio_muted: bool,
+    /// Start in latency test mode (--latency-test / GLIDE_LATENCY_TEST=1; Ctrl+Alt+Shift+L).
+    pub latency_test: bool,
+    /// Clipboard sync switch at startup (config "clipboard" / --no-clipboard); toggled at runtime
+    /// from the menu. ClientHello advertises clipboard support only while it is on.
+    pub clipboard: bool,
 }
 
 /// How the viewer reaches the host. The session thread retries forever.
@@ -87,11 +96,9 @@ const VIEW_TIMER: usize = 3;
 const PLACEMENT_TIMER: usize = 4;
 /// `GLIDE_TEST_ACTIONS` test hook: fires one queued action per tick.
 const TEST_ACTION_TIMER: usize = 5;
-/// Window-menu command: mute/unmute audio (low 4 bits zero, below 0xF000, as WM_SYSCOMMAND requires).
-const IDM_MUTE: usize = 0x1F10;
 
 enum RenderCmd {
-    Frame { data: Vec<u8>, keyframe: bool, sharp: bool, rects: Option<Vec<protocol::Rect>> },
+    Frame { frame_id: u32, data: Vec<u8>, keyframe: bool, sharp: bool, rects: Option<Vec<protocol::Rect>> },
     Config(VideoConfig),
     SharpConfig(VideoConfig),
     /// Status overlay text (None = connected, no overlay). Some dims the canvas.
@@ -100,6 +107,8 @@ enum RenderCmd {
     Hud(Option<Vec<String>>),
     /// Brief hotkey feedback, fades out by itself.
     Toast(String),
+    /// Connection-bar tab text (None = hidden).
+    Bar(Option<String>),
     Resize(u32, u32),
     Redraw,
     Quit,
@@ -164,8 +173,19 @@ struct Shared {
     cursor: Mutex<CursorState>,
     stats: Stats,
     hwnd: AtomicIsize,
+    /// Mac display preference/mode from the host (DisplayInfo, §3.3); None until received.
+    display_info: Mutex<Option<menu_model::DisplayInfo>>,
     /// Audio output (None with --no-audio).
     audio: Option<Audio>,
+    /// Per-frame latency breakdown (docs/LATENCY.md). Written by the receive and render
+    /// threads, summarized by the UI thread.
+    latency: Mutex<Tracker>,
+    /// Latency test mode: read the host's block-code test pattern back from the canvas.
+    latency_test: AtomicBool,
+    /// Present path facts for latency reports (set by the render thread).
+    present_info: Mutex<String>,
+    /// Clock-sync facts for latency reports (kept after a disconnect).
+    clock_info: Mutex<String>,
 }
 
 /// Process-wide UI context (the low-level keyboard hook has no user pointer).
@@ -177,6 +197,27 @@ struct UiCtx {
 }
 
 static UI: OnceLock<UiCtx> = OnceLock::new();
+
+/// One `GLIDE_TEST_ACTIONS` step: a hotkey action, `menu:<cmd>`, or `bar` (reveal the bar).
+#[derive(Debug, Clone, Copy)]
+enum TestStep {
+    Action(Action),
+    Menu(Cmd),
+    Bar,
+}
+
+impl TestStep {
+    fn parse(s: &str) -> Option<TestStep> {
+        let s = s.trim();
+        if s == "bar" {
+            return Some(TestStep::Bar);
+        }
+        if let Some(c) = s.strip_prefix("menu:") {
+            return Cmd::from_name(c).map(TestStep::Menu);
+        }
+        Action::from_name(s).map(TestStep::Action)
+    }
+}
 
 /// UI-thread-only mutable state.
 #[derive(Default)]
@@ -197,8 +238,12 @@ struct UiState {
     last_hud: Vec<String>,
     /// Last normal (not maximized / fullscreen / minimized) outer window rect.
     normal_rect: Option<RECT>,
-    test_actions: Vec<Action>,
+    test_actions: Vec<TestStep>,
+    /// Mouse buttons whose down went to the connection bar (their ups aren't forwarded either).
+    bar_buttons: u8,
     tray: Option<tray::Tray>,
+    last_latency_report: Option<Instant>,
+    last_latency_log: Option<Instant>,
 }
 
 thread_local! {
@@ -322,6 +367,11 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
     if let Some(s) = shared.status.lock().unwrap().clone() {
         let _ = renderer.set_overlay(Some(&s), overlay_px());
     }
+    // Latency instrumentation: present -> scan-out from DXGI frame statistics, and (test mode)
+    // canvas readback of the host's block-code pattern.
+    let mut scan = ScanoutClock::new();
+    let mut lt = LatencyTest::default();
+    let mut last_info = Instant::now() - Duration::from_secs(10);
 
     let dump = std::env::var("GLIDE_DUMP_FRAME").ok();
     let finish = |renderer: &Renderer| {
@@ -333,9 +383,18 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
         }
     };
     loop {
-        // While a toast is fading, wake up ~30x/s to animate it; otherwise block.
-        let first = if toast_since.is_some() {
-            match rx.recv_timeout(Duration::from_millis(33)) {
+        // While presents await their scan-out time (or readbacks are in flight), poll every 2 ms;
+        // while a toast is fading, wake up ~30x/s to animate it; otherwise block.
+        let awaiting = !renderer.is_offscreen() && shared.latency.lock().unwrap().awaiting_scanout(now_us());
+        let wait = if awaiting || !lt.pending.is_empty() {
+            Some(Duration::from_millis(2))
+        } else if toast_since.is_some() {
+            Some(Duration::from_millis(33))
+        } else {
+            None
+        };
+        let first = if let Some(wait) = wait {
+            match rx.recv_timeout(wait) {
                 Ok(c) => Some(c),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -353,6 +412,8 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
         let mut redraw = false;
         let mut new_frame = false;
         let mut resize = None;
+        // Frames whose canvas updates the next present shows (latency tracking).
+        let mut shown: Vec<u32> = Vec::new();
         for c in cmds {
             match c {
                 RenderCmd::Quit => return finish(&renderer),
@@ -382,6 +443,14 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
                         redraw = true;
                     }
                 }
+                RenderCmd::Bar(text) => {
+                    match renderer.set_bar(text.as_deref(), dpi_px(13)) {
+                        Ok(Some((w, h))) => cbar::set_size(w, h),
+                        Ok(None) => {}
+                        Err(e) => eprintln!("connection bar failed: {e}"),
+                    }
+                    redraw = true;
+                }
                 RenderCmd::Toast(text) => {
                     if let Err(e) = renderer.set_toast(Some(&text), dpi_px(19)) {
                         eprintln!("toast failed: {e}");
@@ -396,7 +465,7 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
                 }
                 RenderCmd::Resize(w, h) => resize = Some((w, h)),
                 RenderCmd::Redraw => redraw = true,
-                RenderCmd::Frame { data, sharp: true, .. } => {
+                RenderCmd::Frame { frame_id, data, sharp: true, .. } => {
                     // Sharp layer: standalone IDR → whole frame into the canvas. Independent of
                     // the base decoder's reference chain.
                     if sdec.is_none() {
@@ -407,11 +476,17 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
                     let t0 = now_us();
                     match d.decode(&data, true) {
                         Ok(n) => {
-                            shared.stats.decode_us_total.fetch_add(now_us() - t0, Ordering::Relaxed);
+                            let t1 = now_us();
+                            shared.stats.decode_us_total.fetch_add(t1 - t0, Ordering::Relaxed);
                             if n > 0 {
                                 if let Some(f) = d.frame.as_ref() {
                                     renderer.apply(f, None);
                                 }
+                                let mut l = shared.latency.lock().unwrap();
+                                l.on_decode(frame_id, t0, t1);
+                                l.on_canvas(frame_id, now_us());
+                                drop(l);
+                                shown.push(frame_id);
                                 shared.stats.decoded.fetch_add(n as u64, Ordering::Relaxed);
                                 shared.stats.sharp.fetch_add(1, Ordering::Relaxed);
                                 shared.stats.showing_sharp.store(1, Ordering::Relaxed);
@@ -428,7 +503,7 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
                         }
                     }
                 }
-                RenderCmd::Frame { data, keyframe, sharp: false, rects } => {
+                RenderCmd::Frame { frame_id, data, keyframe, sharp: false, rects } => {
                     if need_key && !keyframe {
                         continue;
                     }
@@ -437,7 +512,8 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
                     let t0 = now_us();
                     match d.decode(&data, keyframe) {
                         Ok(n) => {
-                            shared.stats.decode_us_total.fetch_add(now_us() - t0, Ordering::Relaxed);
+                            let t1 = now_us();
+                            shared.stats.decode_us_total.fetch_add(t1 - t0, Ordering::Relaxed);
                             if n > 0 {
                                 if let Some(f) = d.frame.as_ref() {
                                     // Rects apply only to non-keyframes (§3.1).
@@ -457,6 +533,11 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
                                 }
                                 shared.stats.decoded.fetch_add(n as u64, Ordering::Relaxed);
                                 new_frame = true;
+                                let mut l = shared.latency.lock().unwrap();
+                                l.on_decode(frame_id, t0, t1);
+                                l.on_canvas(frame_id, now_us());
+                                drop(l);
+                                shown.push(frame_id);
                             }
                         }
                         Err(e) => {
@@ -504,10 +585,133 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
             let (vw, vh) = renderer.canvas_size().unwrap_or((cfg.width as u32, cfg.height as u32));
             // 1:1 when the video matches the window/monitor (no resample blur), else filtered fit.
             let rect = present_rect(bw, bh, vw, vh);
-            if let Err(e) = renderer.present(rect, dim) {
-                eprintln!("present failed: {e}");
-            } else if new_frame {
-                shared.stats.presented.fetch_add(1, Ordering::Relaxed);
+            match renderer.present(rect, dim) {
+                Err(e) => eprintln!("present failed: {e}"),
+                Ok(t_call) => {
+                    if new_frame {
+                        shared.stats.presented.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let present_id = renderer.last_present_count().map(|c| c as u64);
+                    if !shown.is_empty() {
+                        shared.latency.lock().unwrap().on_present(&shown, t_call, present_id);
+                        if shared.latency_test.load(Ordering::Relaxed) {
+                            lt.after_present(&renderer, t_call, present_id, shown.last().copied());
+                        }
+                    }
+                }
+            }
+        }
+        // Scan-out times of earlier presents.
+        if !renderer.is_offscreen() {
+            if let Some(st) = renderer.frame_stats() {
+                let hz = shared.view.lock().unwrap().2.max(1) as f64;
+                if let Some((pc, t)) = scan.poll(st, hz) {
+                    shared.latency.lock().unwrap().on_scanout(pc, t);
+                }
+            }
+        }
+        if !lt.pending.is_empty() {
+            lt.poll(&renderer, &shared);
+        }
+        if last_info.elapsed() > Duration::from_secs(2) {
+            last_info = Instant::now();
+            *shared.present_info.lock().unwrap() = format!(
+                "{{\"offscreen\":{},\"tearing\":{},\"refresh_hz_measured\":{},\"monitor_hz\":{}}}",
+                renderer.is_offscreen(),
+                renderer.tearing(),
+                crate::util::json_opt(scan.refresh_hz()),
+                shared.view.lock().unwrap().2
+            );
+        }
+    }
+}
+
+/// Latency test mode (render thread): copies the block-code region of the canvas after each
+/// present that showed new frames, maps it a few ms later without stalling, decodes the host
+/// clock in it and records the first present that showed each value (docs/LATENCY.md).
+#[derive(Default)]
+struct LatencyTest {
+    loc: Option<blockcode::Loc>,
+    misses: u32,
+    last_locate: Option<Instant>,
+    pending: std::collections::VecDeque<(Readback, RbMeta)>,
+    spare: Option<Readback>,
+    last_value: Option<u32>,
+}
+
+struct RbMeta {
+    full: bool,
+    present_t: u64,
+    present_id: Option<u64>,
+    last_frame: Option<u32>,
+}
+
+impl LatencyTest {
+    fn after_present(&mut self, r: &Renderer, present_t: u64, present_id: Option<u64>, last_frame: Option<u32>) {
+        if self.pending.len() >= 8 {
+            return;
+        }
+        let meta = |full| RbMeta { full, present_t, present_id, last_frame };
+        if let Some(loc) = self.loc {
+            let cell = loc.cell.max(1.0);
+            let x = (loc.x0 - 2.0 * cell).max(0.0) as u32;
+            let w = (60.0 * cell) as u32;
+            let y = loc.y.saturating_sub(1) as u32;
+            if let Some(rb) = r.read_canvas(x, y, w, 3, self.spare.take()) {
+                self.pending.push_back((rb, meta(false)));
+            }
+        } else if self.last_locate.is_none_or(|t| t.elapsed() > Duration::from_millis(500)) && !self.pending.iter().any(|p| p.1.full) {
+            // Full-canvas search (≤ 2x/s until found).
+            self.last_locate = Some(Instant::now());
+            if let Some((cw, ch)) = r.canvas_size() {
+                if let Some(rb) = r.read_canvas(0, 0, cw, ch, None) {
+                    self.pending.push_back((rb, meta(true)));
+                }
+            }
+        }
+    }
+
+    fn poll(&mut self, r: &Renderer, shared: &Shared) {
+        while let Some((rb, _)) = self.pending.front() {
+            let Some(luma) = r.try_read_luma(rb) else { return }; // GPU not done: keep order
+            let (rb, m) = self.pending.pop_front().unwrap();
+            let (w, h) = (rb.w as usize, rb.h as usize);
+            let code = if m.full {
+                let found = blockcode::locate(&luma, w, h, w);
+                if let Some((loc, _)) = found {
+                    eprintln!("latency test: pattern found at x={:.0} y={} cell {:.1}px", loc.x0, loc.y, loc.cell);
+                    self.loc = Some(loc);
+                    self.misses = 0;
+                }
+                found.map(|f| f.1)
+            } else {
+                let loc = self.loc;
+                let c = loc.and_then(|loc| [1usize, 0, 2].iter().filter(|&&y| y < h).find_map(|&y| blockcode::read_at(&luma[y * w..(y + 1) * w], &loc, rb.x as usize)));
+                self.spare = Some(rb);
+                c
+            };
+            match code {
+                Some(c) => {
+                    self.misses = 0;
+                    if self.last_value != Some(c.value) {
+                        self.last_value = Some(c.value);
+                        let clock = shared.clock.lock().unwrap().clone();
+                        let host_now = clock.and_then(|c| c.lock().unwrap().client_to_host_us(m.present_t));
+                        if let Some(hn) = host_now {
+                            let host_us = blockcode::unwrap32(c.value, hn.max(0) as u64);
+                            shared.latency.lock().unwrap().on_ground_truth(host_us, c.kind, m.present_t, m.present_id, m.last_frame);
+                        }
+                    }
+                }
+                None if !m.full => {
+                    self.misses += 1;
+                    if self.misses > 30 {
+                        eprintln!("latency test: pattern lost; searching again");
+                        self.loc = None;
+                        self.misses = 0;
+                    }
+                }
+                None => {}
             }
         }
     }
@@ -586,12 +790,16 @@ fn handle_key(hwnd: HWND, vk: u32, scan: u32, extended: bool, down: bool) -> boo
     true
 }
 
+/// A Glide menu (context or system menu) is open: the LL hook lets keys through to it.
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+
 unsafe extern "system" fn ll_keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         if let Some(ctx) = UI.get() {
             let ours = ctx.shared.hwnd.load(Ordering::Relaxed);
             let fg = GetForegroundWindow();
-            if fg.0 as isize == ours && ours != 0 {
+            // While a Glide menu is open, keys navigate the menu (not the Mac).
+            if fg.0 as isize == ours && ours != 0 && !MENU_OPEN.load(Ordering::Relaxed) {
                 let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
                 let msg = wparam.0 as u32;
                 let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
@@ -649,6 +857,19 @@ fn mouse_pos(hwnd: HWND, lparam: LPARAM) -> (f32, f32) {
     (((x + 0.5 - rx as f32) / rw as f32).clamp(0.0, 1.0), ((y + 0.5 - ry as f32) / rh as f32).clamp(0.0, 1.0))
 }
 
+fn lparam_xy(lparam: LPARAM) -> (i32, i32) {
+    ((lparam.0 & 0xFFFF) as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as i16 as i32)
+}
+
+/// WM_MOUSEMOVE: the connection bar sees it first; over the tab nothing goes to the Mac.
+fn mouse_move(hwnd: HWND, lparam: LPARAM) {
+    let (x, y) = lparam_xy(lparam);
+    let held = STATE.with(|s| s.borrow().buttons_down != 0);
+    if !cbar::on_mouse_move(hwnd, x, y, held) {
+        send_move(hwnd, lparam);
+    }
+}
+
 fn send_move(hwnd: HWND, lparam: LPARAM) {
     let p = mouse_pos(hwnd, lparam);
     let changed = STATE.with(|s| {
@@ -663,6 +884,20 @@ fn send_move(hwnd: HWND, lparam: LPARAM) {
 }
 
 fn button(hwnd: HWND, lparam: LPARAM, b: u8, down: bool) {
+    // Connection bar: a press on the tab is ours (left opens the menu); so is its release.
+    let (x, y) = lparam_xy(lparam);
+    let nothing_held = STATE.with(|s| s.borrow().buttons_down == 0);
+    if down && nothing_held && cbar::hit(hwnd, x, y) {
+        STATE.with(|s| s.borrow_mut().bar_buttons |= 1 << b);
+        if b == protocol::MOUSE_LEFT {
+            STATE.with(|s| s.borrow_mut().bar_buttons &= !(1 << b)); // the menu loop eats the up
+            open_menu(hwnd, menu::Anchor::Below(cbar::menu_anchor(hwnd)));
+        }
+        return;
+    }
+    if !down && STATE.with(|s| std::mem::take(&mut s.borrow_mut().bar_buttons) & (1 << b) != 0) {
+        return;
+    }
     send_move(hwnd, lparam);
     // Update state first; never hold the RefCell borrow across Win32 calls that may re-enter wndproc.
     let any_down = STATE.with(|s| {
@@ -810,6 +1045,9 @@ fn update_title(hwnd: HWND) {
     let status = sh.status.lock().unwrap().clone();
     let (vw, vh, _) = *sh.view.lock().unwrap();
     let kb_released = STATE.with(|s| s.borrow().kb_released);
+    // Outside the literal below: its `sh.clock` guard temporary lives until the end of the
+    // statement, and latency_tick() locks `sh.clock` too.
+    let latency = latency_tick();
     let info = hud::HudInfo {
         host_name: host_name.clone(),
         status: status.clone(),
@@ -827,6 +1065,14 @@ fn update_title(hwnd: HWND) {
         view: (vw, vh),
         keyboard_captured: !kb_released,
         audio: audio_hud(),
+        latency,
+        latency_test: sh.latency_test.load(Ordering::Relaxed),
+        mac_display: sh
+            .display_info
+            .lock()
+            .unwrap()
+            .filter(|_| status.is_none())
+            .map(|d| format!("{} ({})", d.describe(), menu_model::display_pref_name(d.preference))),
     };
     let lines = hud::lines(&info);
     let hud_on = STATE.with(|s| {
@@ -861,6 +1107,100 @@ fn update_title(hwnd: HWND) {
     }
 }
 
+/// Finalize latency records, send the viewer's breakdown to the host every 2 s (§3.4), and in
+/// test mode log it every 10 s. Returns the HUD summary once the host sends FrameTiming.
+fn latency_tick() -> Option<crate::latency::Summary> {
+    let sh = &ui().shared;
+    let clock = sh.clock.lock().unwrap().clone();
+    let mut l = sh.latency.lock().unwrap();
+    match &clock {
+        Some(c) => {
+            let c = c.lock().unwrap();
+            l.tick(now_us(), c.offset_us.is_some().then_some(&*c));
+            *sh.clock_info.lock().unwrap() = format!(
+                "{{\"min_rtt_ms\":{},\"drift_ppm\":{:.2},\"window_samples\":{}}}",
+                crate::util::json_opt(c.min_rtt_us().map(|u| u as f64 / 1000.0)),
+                c.drift_ppm(),
+                c.window_samples()
+            );
+        }
+        None => l.tick(now_us(), None),
+    }
+    if !l.host_timing_seen {
+        return None;
+    }
+    let summary = l.summary();
+    let report = l.report();
+    drop(l);
+    let (send_report, log) = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let due = |t: &mut Option<Instant>, every: u64| {
+            let d = t.is_none_or(|t| t.elapsed() >= Duration::from_secs(every));
+            if d {
+                *t = Some(Instant::now());
+            }
+            d
+        };
+        (due(&mut s.last_latency_report, 2), due(&mut s.last_latency_log, 10))
+    });
+    if send_report && summary.n > 0 {
+        send(ClientMsg::LatencyReport(report));
+    }
+    if log && sh.latency_test.load(Ordering::Relaxed) {
+        eprintln!("latency: {}", hud::latency_lines(&summary, true).join(" | "));
+    }
+    Some(summary)
+}
+
+/// Write the latency test report (all samples since the test started) and return its path.
+fn write_latency_report() -> Option<String> {
+    let sh = &ui().shared;
+    let clock = sh.clock.lock().unwrap().clone();
+    let clock_json = sh.clock_info.lock().unwrap().clone();
+    let cfg = *sh.config.lock().unwrap();
+    let mut l = sh.latency.lock().unwrap();
+    if let Some(c) = &clock {
+        let c = c.lock().unwrap();
+        l.tick(now_us() + crate::latency::SCANOUT_WAIT_US, c.offset_us.is_some().then_some(&*c));
+    }
+    let json = format!(
+        "{{\"host\":{},\"video\":\"{}x{} {} {}\",\"mode\":\"{}\",\"present\":{},\"clock\":{},\"latency\":{}}}",
+        crate::util::json_str(&sh.host_name.lock().unwrap()),
+        cfg.width,
+        cfg.height,
+        cfg.codec.name(),
+        cfg.chroma_name(),
+        current_mode().name(),
+        sh.present_info.lock().unwrap(),
+        clock_json,
+        l.report_json()
+    );
+    drop(l);
+    eprintln!("latency report: {json}");
+    let path = std::env::var("GLIDE_LATENCY_OUT").unwrap_or_else(|_| {
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        std::env::temp_dir().join(format!("glide-latency-{secs}.json")).to_string_lossy().into_owned()
+    });
+    match std::fs::write(&path, json + "\n") {
+        Ok(()) => Some(path),
+        Err(e) => {
+            eprintln!("latency report: cannot write {path}: {e}");
+            None
+        }
+    }
+}
+
+fn set_latency_test(on: bool) {
+    let sh = &ui().shared;
+    sh.latency_test.store(on, Ordering::Relaxed);
+    let mut l = sh.latency.lock().unwrap();
+    l.keep_all = on;
+    if on {
+        l.all.clear();
+        l.all_gt.clear();
+    }
+}
+
 fn toast(text: impl Into<String>) {
     render_cmd(RenderCmd::Toast(text.into()));
 }
@@ -886,18 +1226,9 @@ fn do_action(hwnd: HWND, a: Action) {
                 toast("Only Fast mode — this PC can't decode HEVC 4:4:4");
                 return;
             }
-            sh.mode.store(next as u8, Ordering::Relaxed);
-            sh.stats.showing_sharp.store(0, Ordering::Relaxed);
-            ui().store.lock().unwrap().update(|c| c.set_mode(next));
-            if connected() {
-                eprintln!("mode -> {} (SetMode)", next.name());
-                send(ClientMsg::SetMode { mode: next as u8, bitrate_kbps: 0, max_fps: 0 });
-                toast(format!("Mode: {}", hotkeys::mode_label(next)));
-            } else {
-                toast(format!("Mode: {} — applies when connected", hotkeys::mode_label(next)));
-            }
-            update_title(hwnd);
+            set_mode(hwnd, next);
         }
+        Action::OpenMenu => open_menu(hwnd, menu::Anchor::Cursor),
         Action::ToggleFullscreen => {
             toggle_fullscreen(hwnd);
             schedule_view_check(hwnd);
@@ -932,6 +1263,24 @@ fn do_action(hwnd: HWND, a: Action) {
             }
         }
         Action::ToggleMute => toggle_mute(hwnd),
+        Action::LatencyTest => {
+            if sh.latency_test.load(Ordering::Relaxed) {
+                let path = write_latency_report();
+                set_latency_test(false);
+                toast(match path {
+                    Some(p) => format!("Latency test off — report: {p}"),
+                    None => "Latency test off".to_string(),
+                });
+            } else {
+                set_latency_test(true);
+                // The breakdown is in the HUD: make sure it's visible.
+                if !STATE.with(|s| s.borrow().hud_on) {
+                    do_action(hwnd, Action::ToggleHud);
+                }
+                toast("Latency test on — run glide-probe --pattern-only on the Mac · Ctrl+Alt+Shift+L to stop");
+            }
+            update_title(hwnd);
+        }
         Action::Reconnect => {
             sh.paused.store(false, Ordering::Relaxed);
             let cur = sh.sender.lock().unwrap().clone();
@@ -945,6 +1294,136 @@ fn do_action(hwnd: HWND, a: Action) {
                 None => toast("Not connected — retrying"),
             }
         }
+    }
+}
+
+/// Switch the stream mode (SetMode), remembered in the config and used for reconnects.
+fn set_mode(hwnd: HWND, next: Mode) {
+    let sh = &ui().shared;
+    if next != Mode::Fast && !sh.has444 {
+        toast("Only Fast mode — this PC can't decode HEVC 4:4:4");
+        return;
+    }
+    sh.mode.store(next as u8, Ordering::Relaxed);
+    sh.stats.showing_sharp.store(0, Ordering::Relaxed);
+    ui().store.lock().unwrap().update(|c| c.set_mode(next));
+    if connected() {
+        eprintln!("mode -> {} (SetMode)", next.name());
+        send(ClientMsg::SetMode { mode: next as u8, bitrate_kbps: 0, max_fps: 0 });
+        toast(format!("Mode: {}", hotkeys::mode_label(next)));
+    } else {
+        toast(format!("Mode: {} — applies when connected", hotkeys::mode_label(next)));
+    }
+    update_title(hwnd);
+}
+
+// ------------------------------------------------------------------ context menu
+
+fn menu_state() -> menu_model::MenuState {
+    let sh = &ui().shared;
+    STATE.with(|s| {
+        let s = s.borrow();
+        menu_model::MenuState {
+            host_name: sh.host_name.lock().unwrap().clone(),
+            connected: connected(),
+            paused: sh.paused.load(Ordering::Relaxed),
+            mode: Some(current_mode()),
+            has444: sh.has444,
+            display: *sh.display_info.lock().unwrap(),
+            audio_muted: sh.audio.as_ref().map(|a| a.muted()),
+            clipboard_on: clipboard::is_active(),
+            hud: s.hud_on,
+            fullscreen: s.fullscreen_saved.is_some(),
+            keyboard_released: s.kb_released,
+            bar_pinned: cbar::pinned(),
+            // TODO(file-transfer): true once the host negotiated file transfer (caps bit 11).
+            file_transfer: false,
+            latency_test: sh.latency_test.load(Ordering::Relaxed),
+        }
+    })
+}
+
+/// Show the Glide menu (connection bar click, Ctrl+Alt+Shift+Space) and run the choice.
+fn open_menu(hwnd: HWND, anchor: menu::Anchor) {
+    // Held modifiers (e.g. from Ctrl+Alt+Shift+Space) were forwarded: release them on the Mac.
+    if connected() {
+        send(ClientMsg::ReleaseAll);
+    }
+    cbar::hold(hwnd);
+    let items = menu_model::build(&menu_state());
+    MENU_OPEN.store(true, Ordering::Relaxed);
+    let choice = menu::track(hwnd, &items, anchor);
+    MENU_OPEN.store(false, Ordering::Relaxed);
+    cbar::release(hwnd);
+    if let Some(c) = choice {
+        run_menu_cmd(hwnd, c);
+    }
+}
+
+/// A command from the context menu, the system menu or the test hook.
+fn run_menu_cmd(hwnd: HWND, c: Cmd) {
+    eprintln!("menu: {}", c.name());
+    if let Some(m) = c.mode() {
+        if m != current_mode() {
+            set_mode(hwnd, m);
+        }
+        return;
+    }
+    if let Some(p) = c.display_pref() {
+        if connected() {
+            send(ClientMsg::SetDisplayPreference { mode: p });
+            toast(format!("Mac display: {}", menu_model::display_pref_name(p)));
+        }
+        return;
+    }
+    if let Some(keys) = menu_model::mac_shortcut(c) {
+        if connected() {
+            send(ClientMsg::ReleaseAll);
+            for (usage, down) in keys {
+                send(ClientMsg::Key { hid_usage: usage, down });
+            }
+        }
+        return;
+    }
+    match c {
+        Cmd::ToggleMute => toggle_mute(hwnd),
+        Cmd::ToggleClipboard => toggle_clipboard(hwnd),
+        Cmd::ToggleHud => do_action(hwnd, Action::ToggleHud),
+        Cmd::LatencyTest => do_action(hwnd, Action::LatencyTest),
+        Cmd::ToggleFullscreen => do_action(hwnd, Action::ToggleFullscreen),
+        Cmd::ToggleKeyboard => do_action(hwnd, Action::ToggleKeyboardCapture),
+        Cmd::RefreshPicture => do_action(hwnd, Action::RequestKeyframe),
+        Cmd::Reconnect => do_action(hwnd, Action::Reconnect),
+        Cmd::Disconnect => set_paused(hwnd, true),
+        Cmd::Connect => set_paused(hwnd, false),
+        Cmd::PinBar => {
+            let pinned = !cbar::pinned();
+            cbar::set_pinned(hwnd, pinned);
+            ui().store.lock().unwrap().update(|c| c.bar_pinned = pinned);
+            toast(if pinned { "Connection bar pinned" } else { "Connection bar unpinned" });
+        }
+        Cmd::Settings => match ui().store.lock().unwrap().path() {
+            Some(p) => tray::open_in_editor(&p),
+            None => toast("No config file (APPDATA not set)"),
+        },
+        Cmd::OpenMenu => open_menu(hwnd, menu::Anchor::Cursor),
+        // TODO(file-transfer): open a file picker and start the transfer (feat/file-transfer).
+        Cmd::SendFiles => toast("Sending files isn't available yet"),
+        _ => {}
+    }
+}
+
+/// Menu → Clipboard sync: on/off at runtime, persisted. Turning it on mid-session reconnects if
+/// this connection didn't negotiate clipboard sync (ClientHello only advertises it while on).
+fn toggle_clipboard(hwnd: HWND) {
+    let on = !clipboard::is_active();
+    clipboard::set_active(hwnd, on);
+    ui().store.lock().unwrap().update(|c| c.clipboard = on);
+    if on && connected() && !clipboard::negotiated() {
+        toast("Clipboard sync on — reconnecting to enable it");
+        do_action(hwnd, Action::Reconnect);
+    } else {
+        toast(if on { "Clipboard sync on" } else { "Clipboard sync off" });
     }
 }
 
@@ -1129,17 +1608,9 @@ fn toggle_mute(hwnd: HWND) {
     let muted = a.set_muted(!a.muted());
     eprintln!("audio: {}", if muted { "muted" } else { "unmuted" });
     send(ClientMsg::AudioEnable { enabled: !muted });
-    sync_mute_menu(hwnd, muted);
     ui().store.lock().unwrap().update(|c| c.audio_muted = muted);
     toast(if muted { "Audio muted" } else { "Audio on" });
     update_title(hwnd);
-}
-
-fn sync_mute_menu(hwnd: HWND, muted: bool) {
-    unsafe {
-        let menu = GetSystemMenu(hwnd, false);
-        let _ = CheckMenuItem(menu, IDM_MUTE as u32, (MF_BYCOMMAND | if muted { MF_CHECKED } else { MF_UNCHECKED }).0);
-    }
 }
 
 fn audio_hud() -> Option<hud::AudioHud> {
@@ -1194,9 +1665,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_TIMER if wparam.0 == TEST_ACTION_TIMER => {
             match STATE.with(|s| s.borrow_mut().test_actions.pop()) {
-                Some(a) => {
-                    eprintln!("test action: {a:?}");
-                    do_action(hwnd, a);
+                Some(step) => {
+                    eprintln!("test action: {step:?}");
+                    match step {
+                        TestStep::Action(a) => do_action(hwnd, a),
+                        TestStep::Menu(c) => run_menu_cmd(hwnd, c),
+                        TestStep::Bar => cbar::reveal(hwnd),
+                    }
                 }
                 None => {
                     let _ = KillTimer(Some(hwnd), TEST_ACTION_TIMER);
@@ -1258,7 +1733,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_MOUSEMOVE => {
-            send_move(hwnd, lparam);
+            mouse_move(hwnd, lparam);
             LRESULT(0)
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
@@ -1291,6 +1766,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             button(hwnd, lparam, b, msg != WM_XBUTTONUP);
             LRESULT(1)
         }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL if cbar::cursor_hit(hwnd) => LRESULT(0),
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
             let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as f32 / 120.0;
             if msg == WM_MOUSEWHEEL {
@@ -1309,7 +1785,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = ScreenToClient(hwnd, &mut pt);
                 let (x, y, w, h) = video_rect(hwnd);
                 let inside = pt.x >= x && pt.x < x + w && pt.y >= y && pt.y < y + h;
-                if inside {
+                if inside && !cbar::hit(hwnd, pt.x, pt.y) {
                     SetCursor(current_cursor(hwnd));
                 } else {
                     SetCursor(LoadCursorW(None, IDC_ARROW).ok());
@@ -1342,9 +1818,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
         WM_SYSCHAR | WM_CHAR => LRESULT(0),
-        WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_KEYMENU => LRESULT(0),
-        WM_SYSCOMMAND if wparam.0 & 0xFFF0 == IDM_MUTE => {
-            toggle_mute(hwnd);
+        // Alt alone must not enter menu mode (it's Option on the Mac); Alt+Space (keyboard
+        // released) opens the system menu as usual.
+        WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_KEYMENU && lparam.0 != 0x20 => LRESULT(0),
+        WM_ENTERMENULOOP => {
+            MENU_OPEN.store(true, Ordering::Relaxed);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_EXITMENULOOP => {
+            MENU_OPEN.store(false, Ordering::Relaxed);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_SYSCOMMAND if Cmd::from_id((wparam.0 & 0xFFF0) as u32).is_some() => {
+            run_menu_cmd(hwnd, Cmd::from_id((wparam.0 & 0xFFF0) as u32).unwrap());
+            LRESULT(0)
+        }
+        WM_INITMENU => {
+            // The system menu is about to open: refresh the Glide items' check marks.
+            menu::refresh_system_menu(hwnd, &menu_model::system_items(&menu_state()));
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == cbar::BAR_TIMER => {
+            cbar::on_timer(hwnd);
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == TITLE_TIMER => {
@@ -1364,6 +1859,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == EXIT_TIMER => {
+            if std::env::var("GLIDE_DUMP_MENU").as_deref() == Ok("1") {
+                // Test hook: the menu as text (session 0 can't show real menus).
+                let st = menu_state();
+                eprintln!("context menu:\n{}", menu_model::to_text(&menu_model::build(&st)));
+                eprintln!("system menu additions:\n{}", menu_model::to_text(&menu_model::system_items(&st)));
+            }
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
@@ -1384,6 +1885,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_DISCONNECTED => {
             // No stuck keys/buttons: drop all local held state (the host side is gone anyway).
             release_all(hwnd);
+            let host = ui().shared.host_name.lock().unwrap().clone();
+            cbar::set_label(hwnd, &format!("{host} — disconnected"));
             {
                 let mut c = ui().shared.cursor.lock().unwrap();
                 c.visible = true;
@@ -1409,6 +1912,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             apply_cursor_if_inside(hwnd);
             update_title(hwnd);
             let host = ui().shared.host_name.lock().unwrap().clone();
+            cbar::set_label(hwnd, &host);
             let paired = ui().shared.just_paired.lock().unwrap().take();
             match (paired, ui().shared.just_pinned.lock().unwrap().take()) {
                 (Some(fp), _) => toast(format!("Paired with {host} (key {fp}) — connected")),
@@ -1673,9 +2177,11 @@ fn hello_for(template: &ClientMsg, shared: &Shared) -> ClientMsg {
         ClientMsg::ClientHello { version, codec_caps, client_name, .. } => {
             let (w, h, fps) = *shared.view.lock().unwrap();
             *shared.sent_view.lock().unwrap() = (w, h);
+            // Clipboard sync is advertised only while the user switch is on (menu → Clipboard sync).
+            let codec_caps = if clipboard::is_active() { *codec_caps } else { *codec_caps & !protocol::CAP_CLIPBOARD };
             ClientMsg::ClientHello {
                 version: *version,
-                codec_caps: *codec_caps,
+                codec_caps,
                 view_w: w,
                 view_h: h,
                 // The mode may have been changed with Ctrl+Alt+Shift+M since startup.
@@ -1707,6 +2213,7 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
     );
     *shared.host_name.lock().unwrap() = conn.host_name.clone();
     *shared.config.lock().unwrap() = cfg;
+    *shared.display_info.lock().unwrap() = None; // until this host sends DisplayInfo
     *shared.clock.lock().unwrap() = Some(conn.clock.clone());
     {
         // Fresh cursor state for the new host session.
@@ -1717,6 +2224,7 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
     }
     // New configuration: resets the base decoder and canvas (sharp layer follows via SharpLayerConfig).
     let _ = tx.send(RenderCmd::Config(cfg));
+    shared.latency.lock().unwrap().reset();
 
     let (ended_tx, ended_rx) = mpsc::channel::<String>();
     {
@@ -1724,9 +2232,11 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
         let tx = tx.clone();
         let sender = conn.sender.clone();
         conn.spawn_receiver(move |ev| match ev {
-            NetEvent::Msg(HostMsg::VideoFrame { flags, rects, data, .. }) => {
+            NetEvent::Msg(HostMsg::VideoFrame { frame_id, flags, rects, data, .. }) => {
+                shared.latency.lock().unwrap().on_recv(frame_id, flags, now_us());
                 shared.stats.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
                 let _ = tx.send(RenderCmd::Frame {
+                    frame_id,
                     data,
                     keyframe: flags & FRAME_FLAG_KEYFRAME != 0,
                     sharp: flags & FRAME_FLAG_SHARP != 0,
@@ -1736,6 +2246,7 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
             NetEvent::Msg(HostMsg::SharpLayerConfig(c)) => {
                 let _ = tx.send(RenderCmd::SharpConfig(c));
             }
+            NetEvent::Msg(HostMsg::FrameTiming(ft)) => shared.latency.lock().unwrap().on_timing(ft, now_us()),
             NetEvent::Msg(HostMsg::VideoConfig(c)) | NetEvent::Msg(HostMsg::ServerHello { config: c, .. }) => {
                 *shared.config.lock().unwrap() = c;
                 let _ = tx.send(RenderCmd::Config(c));
@@ -1777,6 +2288,11 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
                 }
             }
             NetEvent::Msg(HostMsg::ClipboardCaps { formats, max_bytes }) => clipboard::enable(sender.clone(), formats, max_bytes),
+            NetEvent::Msg(HostMsg::DisplayInfo { preference, mode_w, mode_h, hidpi }) => {
+                let d = menu_model::DisplayInfo { preference, mode_w, mode_h, hidpi };
+                eprintln!("mac display: {} ({})", d.describe(), menu_model::display_pref_name(preference));
+                *shared.display_info.lock().unwrap() = Some(d);
+            }
             NetEvent::Msg(HostMsg::Clipboard(c)) => clipboard::incoming(c),
             NetEvent::Msg(_) => {}
             NetEvent::Closed(reason) => {
@@ -1784,7 +2300,9 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
             }
         });
     }
-    let _pinger = conn.spawn_pinger(Duration::from_secs(1));
+    let _pinger = conn.spawn_pinger(crate::net::PING_INTERVAL);
+    // Per-frame host timestamps for the latency breakdown (§3.4); older hosts ignore this.
+    let _ = conn.sender.send(&ClientMsg::LatencyEnable { flags: 1 });
     if let Some(a) = &shared.audio {
         a.on_connected(conn.clock.clone());
         if a.muted() {
@@ -1857,10 +2375,19 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         stats: Stats::default(),
         hwnd: AtomicIsize::new(0),
         audio: opts.audio.then(Audio::start),
+        latency: Mutex::new(Tracker::new(true)),
+        latency_test: AtomicBool::new(false),
+        present_info: Mutex::new("null".into()),
+        clock_info: Mutex::new("null".into()),
+        display_info: Mutex::new(None),
     });
     let (render_tx, render_rx) = mpsc::channel::<RenderCmd>();
-    let hud_on = opts.store.config.hud;
+    let latency_test = opts.latency_test || std::env::var("GLIDE_LATENCY_TEST").is_ok_and(|v| v == "1");
+    // The latency test lives in the HUD.
+    let hud_on = opts.store.config.hud || latency_test;
     let opts_audio_muted = opts.audio_muted;
+    let opts_bar_pinned = opts.store.config.bar_pinned;
+    let opts_clipboard = opts.clipboard;
     let restore = {
         let ms = placement::monitors();
         config::choose_placement(&opts.store.config, &ms, placement::cursor_monitor_index(&ms))
@@ -1871,12 +2398,15 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         shared: shared.clone(),
         store: Mutex::new(opts.store),
     });
+    if latency_test {
+        set_latency_test(true);
+    }
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         s.hud_on = hud_on;
         // GLIDE_TEST_ACTIONS=hud,mode,... (test hook): run these actions one per tick.
         s.test_actions = std::env::var("GLIDE_TEST_ACTIONS")
-            .map(|v| v.split(',').filter_map(Action::from_name).rev().collect())
+            .map(|v| v.split(',').filter_map(TestStep::parse).rev().collect())
             .unwrap_or_default();
     });
 
@@ -1965,20 +2495,21 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
     if let Some(p) = &restore {
         eprintln!("restored window on monitor {} (fullscreen={}, maximized={})", p.monitor, p.fullscreen, p.maximized);
     }
-    if shared.audio.is_some() {
-        unsafe {
-            let menu = GetSystemMenu(hwnd, false);
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            let _ = AppendMenuW(menu, MF_STRING, IDM_MUTE, w!("Mute audio\tCtrl+Alt+Shift+A"));
-        }
-        if opts_audio_muted {
-            if let Some(a) = &shared.audio {
-                a.set_muted(true); // run_connection tells the host (AudioEnable false) on connect
-            }
-            sync_mute_menu(hwnd, true);
+    if opts_audio_muted {
+        if let Some(a) = &shared.audio {
+            a.set_muted(true); // run_connection tells the host (AudioEnable false) on connect
         }
     }
+    menu::init_dark_mode();
+    menu::refresh_system_menu(hwnd, &menu_model::system_items(&menu_state()));
+    {
+        let tx = render_tx.clone();
+        cbar::init(hwnd, opts_bar_pinned, "Glide — not connected", Box::new(move |t| {
+            let _ = tx.send(RenderCmd::Bar(t));
+        }));
+    }
     check_view(hwnd); // view = the monitor the window actually opened on (before the first hello)
+    clipboard::set_active(hwnd, opts_clipboard);
     clipboard::init(hwnd);
 
     // --- render thread
@@ -2046,6 +2577,11 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         a.shutdown();
     }
     let _ = rt.join();
+    if shared.latency_test.load(Ordering::Relaxed) {
+        if let Some(p) = write_latency_report() {
+            eprintln!("latency report written to {p}");
+        }
+    }
     if exit_after.is_some() {
         let st = &shared.stats;
         eprintln!(

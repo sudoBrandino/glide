@@ -53,6 +53,7 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   "mode": null,             // "fast" | "hybrid" | "sharp"; null = auto (hybrid if 4:4:4 decodes)
   "ctrl_as_cmd": true,
   "hud": false,             // stats overlay, toggled with Ctrl+Alt+Shift+H
+  "bar_pinned": false,      // connection bar always visible (menu → Pin connection bar)
   "audio": true,            // play the Mac's sound (false = --no-audio)
   "audio_muted": false,     // Ctrl+Alt+Shift+A
   "clipboard": true,        // clipboard sync with the host (false = --no-clipboard)
@@ -146,15 +147,30 @@ To replace a `.cmd` launcher that sets `GLIDE_PASSWORD`, run `glide-client.exe` 
   | Ctrl+Alt+Shift+R | request a keyframe |
   | Ctrl+Alt+Shift+D | disconnect and reconnect immediately (in listen mode, the host redials within about 2 s) |
   | Ctrl+Alt+Shift+A | mute / unmute audio (saved in the config) |
+  | Ctrl+Alt+Shift+L | latency test on/off: read the host's test pattern (`glide-probe --pattern-only`) back from the picture; switching it off writes a JSON report to `%TEMP%` ([`docs/LATENCY.md`](../docs/LATENCY.md)) |
+  | Ctrl+Alt+Shift+Space | open the Glide menu at the mouse pointer |
 
   While the window has focus and the keyboard is captured, a low-level keyboard hook sends Win, Alt+Tab, Alt+Space and similar keys to the host.
   To leave the window, click outside it, press Ctrl+Alt+Shift+K, or press Ctrl+Alt+Del, which cannot be intercepted.
+- **Connection bar and Glide menu.** A slim tab at the top center of the window shows the host name, like the Microsoft Remote Desktop or Jump connection bar.
+  - **Showing it:** move the mouse to the top edge (about 4 px) of the middle third of the window. This works windowed and fullscreen. The corners are excluded, so reaching for the Mac's menu bar there doesn't trigger it.
+  - **Hiding it:** it hides 1.5 s after the mouse leaves. *Pin connection bar* keeps it visible, and the pin is saved as `bar_pinned`.
+  - While the mouse is over the tab, mouse input is not sent to the Mac. While a mouse button is held (a drag on the Mac), the bar neither appears nor captures input.
+  - **Opening the menu:** click the tab and the native Glide menu opens below it. Ctrl+Alt+Shift+Space opens the same menu at the pointer. Menus use dark mode when Windows apps are in dark mode.
+  - **Menu items:**
+    - Stream mode ▸ Fast / Hybrid / Sharp.
+    - Mac display ▸ Automatic / Crisp / Retina / Smooth / Don't change, plus a "Now: 1920×1080 Retina" line. This uses `SetDisplayPreference` / `DisplayInfo` (PROTOCOL.md §3.3), applies for the current session, and is disabled for hosts that don't send `DisplayInfo`.
+    - Send to Mac ▸ Spotlight (Cmd+Space), Mission Control (Ctrl+Up), App switcher (Cmd+Tab), Force Quit (Cmd+Opt+Esc), Lock screen (Ctrl+Cmd+Q), Screenshot (Cmd+Shift+5).
+    - Toggles: Mute audio, Clipboard sync, Stats overlay, Fullscreen, Release keyboard, Pin connection bar.
+    - Actions: Refresh picture, Reconnect, Disconnect/Connect, Send files… (disabled until file transfer lands), Settings… (opens `config.json`).
+  - **Clipboard sync** can be switched at runtime and is saved as `"clipboard"`. Off means the clipboard listener is removed and nothing is sent or applied; the next ClientHello also stops advertising clipboard support. Turning it on during a session that started with it off reconnects once, to negotiate it.
+  - **System menu:** the main items are also in the window's system menu (title-bar right-click, or Alt+Space while the keyboard is released): Glide menu…, Stream mode ▸, Mute audio, Stats overlay, Fullscreen, Refresh picture, Reconnect, Settings….
 - **Stats HUD** (off by default): a small translucent panel in the top-left corner. It shows:
   - host name;
   - fps, decode ms and RTT;
   - Mbps and the video size and codec;
   - the mode and the current layer (4:2:0/4:4:4), with sharp and rect frame counts;
-  - the view size and the decoder;
+  - the view size, the decoder, and the Mac's display mode and preference;
   - audio latency and underruns, or "muted".
 
   The text is rasterized with GDI into a texture only when it changes (at most twice a second) and blended 1:1, so it stays crisp.
@@ -220,6 +236,9 @@ Then start the host on the Mac: `mac/.build/release/glide-host --password-file .
   - `rtt_ms`;
   - `e2e_capture_to_decoded_ms`, estimated from the ping/pong clock offset and counting base-layer frames only (refresh and sharp frames are excluded);
   - `audio`: format, frames, lost frames, and `capture_to_arrival_ms` for audio frames (null if the host sent no audio);
+  - `latency`: `host_timing` (the host sends `FrameTiming`, PROTOCOL.md §3.4), `breakdown` (distributions of every
+    stage: capture → callback, encode, network, queue, decode, capture → decoded; see `docs/LATENCY.md`) and `clock`
+    (min RTT, drift ppm);
   - errors.
 - `--clipboard-selftest` exercises the real Win32 clipboard path (apply, read back, CRLF, PNG/DIB,
   echo suppression, external changes) on hidden windows and prints one line per check. Session 0
@@ -229,6 +248,9 @@ Then start the host on the Mac: `mac/.build/release/glide-host --password-file .
   - `GLIDE_DUMP_FRAME=path.bmp` writes the last rendered frame.
   - `GLIDE_OFFSCREEN=1` forces offscreen rendering. This is automatic in session 0, where no swap chain can be created.
   - `GLIDE_TEARING=1` presents with `ALLOW_TEARING`.
+  - `--latency-test` / `GLIDE_LATENCY_TEST=1` starts in latency test mode (Ctrl+Alt+Shift+L); `GLIDE_LATENCY_OUT=path`
+    sets where the report goes (default `%TEMP%\glide-latency-<time>.json`). Offscreen (session 0) it measures up to
+    `Present()`; scan-out times need a real swap chain.
   - `GLIDE_CONFIG_DIR=dir` uses another config folder. Use it for tests, so the real `%APPDATA%\Glide` is never touched.
   - `GLIDE_TEST_ACTIONS=mode,keyframe,hud,fullscreen,keyboard,reconnect` fires those hotkey actions one at a time, every `GLIDE_TEST_ACTIONS_MS` (default 1500 ms).
   - `GLIDE_PROMPT_AUTOFILL=pw` fills in the password dialog and presses Connect. `GLIDE_PROMPT_AUTOFILL_RETRY` is used for later prompts, `GLIDE_PROMPT_REMEMBER=1` ticks the box, and `GLIDE_PROMPT_DUMP=x.bmp` captures the dialog.
@@ -254,6 +276,10 @@ The mock host:
   `--selftest` checks the codec against the §5 reference bytes;
 - in hybrid mode, sends SharpLayerConfig, then each `--hybrid-period` frames (default 60) a 4:4:4 sharp IDR,
   followed by base frames limited to small rects;
+- latency (§3.4): after the viewer's `LatencyEnable` it follows every frame with a `FrameTiming` and logs the
+  viewer's `LatencyReport`s; `--latency-pattern` (needs ffmpeg with libx265) streams a live-encoded block-code clock
+  pattern (`--pattern-size 1280x720`, `--pattern-cell 8`) instead of the files, for checking `--latency-test`
+  against ground truth offline (`docs/LATENCY.md`);
 - if the viewer advertises audio, streams a continuous 440 Hz sine at -12 dBFS (`--audio-freq`, `--audio-db`,
   `--no-audio`). A pure tone makes every glitch audible. `--audio-burst 1024` mimics ScreenCaptureKit's buffer
   size, `--audio-drift-ppm` a fast/slow host clock, `--audio-jitter-ms` random send delays, `--audio-pattern 2000:1000`

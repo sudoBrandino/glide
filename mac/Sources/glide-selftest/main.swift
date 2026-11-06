@@ -385,6 +385,23 @@ func audioTests() throws {
     check(ms < 500, String(format: "packetize 10 s of audio in %.1f ms (%.3f ms per 21 ms buffer)", ms, ms / 469))
 }
 
+func displayWireTests() throws {
+    // docs/PROTOCOL.md §3.3 reference bytes; windows/src/protocol.rs checks the same.
+    check(ClientMessage.setDisplayPreference(mode: DisplayModePreference.retina.wireValue).encoded.hex == "1603", "SetDisplayPreference encoding")
+    if case let .setDisplayPreference(m) = try ClientMessage.decode(Data(hex: "1603")!) {
+        check(DisplayModePreference(wire: m) == .retina, "SetDisplayPreference decode")
+    } else { check(false, "SetDisplayPreference decode") }
+    let retina1080 = DisplayModeInfo(width: 1920, height: 1080, pixelWidth: 3840, pixelHeight: 2160)
+    let info = HostMessage.displayInfo(preference: .automatic, mode: retina1080)
+    check(info.encoded.hex == "05008007380401", "DisplayInfo encoding")
+    if case let .displayInfo(p, w, h, hi) = try HostMessage.decode(Data(hex: "0504000a400600")!) {
+        check(p == 4 && w == 2560 && h == 1600 && !hi, "DisplayInfo decode")
+    } else { check(false, "DisplayInfo decode") }
+    check(DisplayModePreference.allCases.map(\.wireValue) == [0, 1, 2, 3, 4], "display preference wire values")
+    check(DisplayModePreference.allCases.allSatisfy { DisplayModePreference(wire: $0.wireValue) == $0 } && DisplayModePreference(wire: 5) == nil, "display preference wire roundtrip")
+    check(HostMessage.displayInfo(preference: .manual, mode: nil).encoded.hex == "05040000000000", "DisplayInfo unknown mode")
+}
+
 func trackerChecks() {
     let crisp = DisplayModeInfo(width: 2560, height: 1440, pixelWidth: 2560, pixelHeight: 1440)
     let retina = DisplayModeInfo(width: 1920, height: 1080, pixelWidth: 3840, pixelHeight: 2160)
@@ -422,7 +439,36 @@ func trackerChecks() {
     check(t6.observe(current: other, now: 1) == .manual, "tracker: change with no switch is manual")
 }
 
+/// PROTOCOL.md §3.4 reference bytes and the docs/LATENCY.md block code (the Rust viewer and
+/// tools/mock_host.py --selftest check the same vectors).
+func latencyTests() throws {
+    let ftHex = "810700000040420f000000000001dc0500004006000048260000ac26000074270000"
+    let ft = FrameTiming(frameId: 7, captureUs: 1_000_000, flags: 1, callback: 1500, submit: 1600, encoded: 9800, enqueued: 9900, sent: 10100)
+    check(HostMessage.frameTiming(ft).encoded.hex == ftHex, "FrameTiming reference bytes")
+    if case let .frameTiming(d) = try HostMessage.decode(Data(hex: ftHex)!) { check(d == ft, "FrameTiming decode") } else { check(false, "FrameTiming decode") }
+    check(FrameTiming.delta(1_009_800, from: 1_000_000) == 9800 && FrameTiming.delta(nil, from: 5) == timingUnknown && FrameTiming.delta(3, from: 5) == 0, "FrameTiming deltas")
+    check(ClientMessage.latencyEnable(flags: 1).encoded.hex == "8001", "LatencyEnable bytes")
+    let lrHex = "82780001f82a0000b00400002c0100000807000090010000f41a000060540000ffffffff"
+    if case let .latencyReport(r) = try ClientMessage.decode(Data(hex: lrHex)!) {
+        check(r.samples == 120 && r.totalUs == 21600 && r.groundTruthUs == timingUnknown, "LatencyReport decode")
+        check(ClientMessage.latencyReport(r).encoded.hex == lrHex, "LatencyReport re-encode")
+        check(r.summary.hasSuffix("total(glass) 21.6"), "LatencyReport summary: \(r.summary)")
+    } else { check(false, "LatencyReport decode") }
+    check(BlockCode.crc8(Array("123456789".utf8)) == 0xF4, "CRC-8/SMBUS check value")
+    let bits = BlockCode.bits(value: 0x1234_5678, kind: 1, counter: 5).map { $0 ? "1" : "0" }.joined()
+    check(bits == "10110010000100100011010001010110011110000001010100111111", "block code reference bits")
+    // Rendered pattern: sample the cell centers back.
+    let cell = 4, w = BlockCode.widthCells * cell, h = BlockCode.heightCells * cell
+    let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)!
+    BlockCode.draw(in: ctx, origin: .zero, cell: CGFloat(cell), value: 0x1234_5678, kind: 1, counter: 5)
+    let px = ctx.data!.assumingMemoryBound(to: UInt8.self)
+    let row = h / 2  // middle of the strip (rows are top-down in memory)
+    let read = (0..<BlockCode.cells).map { px[row * w + (BlockCode.quiet + $0) * cell + cell / 2] > 128 ? "1" : "0" }.joined()
+    check(read == bits && px[0] == 0 && px[row * w + 1] == 0, "block code pattern rendering")
+}
+
 do { try run() } catch { failures += 1; print("  FAIL threw \(error)") }
+do { try latencyTests() } catch { failures += 1; print("  FAIL latency threw \(error)") }
 policyChecks()
 registryChecks()
 trackerChecks()
@@ -430,5 +476,6 @@ trackerChecks()
 do { try clipboardTests() } catch { failures += 1; print("  FAIL clipboard threw \(error)") }
 pasteboardTests()
 do { try audioTests() } catch { failures += 1; print("  FAIL audio threw \(error)") }
+do { try displayWireTests() } catch { failures += 1; print("  FAIL display wire threw \(error)") }
 print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)

@@ -10,27 +10,25 @@ use crate::protocol::Mode;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Action {
+    // Named variants only (no hand-numbered discriminants): the u8 value is just a WPARAM round
+    // trip inside one binary, and `from_u8` is derived from `TABLE`. New actions add a line here
+    // and a `TABLE` row.
     ToggleHud = 1,
-    CycleMode = 2,
-    ToggleFullscreen = 3,
-    ToggleKeyboardCapture = 4,
-    RequestKeyframe = 5,
-    Reconnect = 6,
-    ToggleMute = 7,
+    CycleMode,
+    ToggleFullscreen,
+    ToggleKeyboardCapture,
+    RequestKeyframe,
+    Reconnect,
+    ToggleMute,
+    OpenMenu,
+    /// Latency test mode: read the host's test pattern back (docs/LATENCY.md).
+    LatencyTest,
 }
 
 impl Action {
+    /// Inverse of `action as u8` (every action has a `TABLE` row).
     pub fn from_u8(v: u8) -> Option<Action> {
-        Some(match v {
-            1 => Action::ToggleHud,
-            2 => Action::CycleMode,
-            3 => Action::ToggleFullscreen,
-            4 => Action::ToggleKeyboardCapture,
-            5 => Action::RequestKeyframe,
-            6 => Action::Reconnect,
-            7 => Action::ToggleMute,
-            _ => return None,
-        })
+        TABLE.iter().map(|t| t.1).find(|a| *a as u8 == v)
     }
     /// Name used by the `GLIDE_TEST_ACTIONS` test hook.
     pub fn from_name(s: &str) -> Option<Action> {
@@ -42,6 +40,8 @@ impl Action {
             "keyframe" | "r" => Action::RequestKeyframe,
             "reconnect" | "d" => Action::Reconnect,
             "mute" | "a" => Action::ToggleMute,
+            "menu" | "space" => Action::OpenMenu,
+            "latency" | "l" => Action::LatencyTest,
             _ => return None,
         })
     }
@@ -53,8 +53,10 @@ pub const KEY_D: u16 = 0x07;
 pub const KEY_F: u16 = 0x09;
 pub const KEY_H: u16 = 0x0B;
 pub const KEY_K: u16 = 0x0E;
+pub const KEY_L: u16 = 0x0F;
 pub const KEY_M: u16 = 0x10;
 pub const KEY_R: u16 = 0x15;
+pub const KEY_SPACE: u16 = 0x2C;
 pub const KEY_ENTER: u16 = 0x28;
 pub const KEY_F11: u16 = 0x44;
 
@@ -67,6 +69,8 @@ pub const TABLE: &[(u16, Action, &str)] = &[
     (KEY_R, Action::RequestKeyframe, "Ctrl+Alt+Shift+R  request a keyframe (fix a smeared picture)"),
     (KEY_D, Action::Reconnect, "Ctrl+Alt+Shift+D  disconnect and reconnect"),
     (KEY_A, Action::ToggleMute, "Ctrl+Alt+Shift+A  mute / unmute audio"),
+    (KEY_SPACE, Action::OpenMenu, "Ctrl+Alt+Shift+Space  open the Glide menu at the mouse pointer"),
+    (KEY_L, Action::LatencyTest, "Ctrl+Alt+Shift+L  latency test: read the host's test pattern (glide-probe --pattern-only)"),
 ];
 
 pub fn help() -> String {
@@ -148,6 +152,8 @@ mod tests {
         assert_eq!(match_hotkey(CAS, KEY_R), Some(Action::RequestKeyframe));
         assert_eq!(match_hotkey(CAS, KEY_D), Some(Action::Reconnect));
         assert_eq!(match_hotkey(CAS, KEY_A), Some(Action::ToggleMute));
+        assert_eq!(match_hotkey(CAS, KEY_SPACE), Some(Action::OpenMenu));
+        assert_eq!(match_hotkey(Mods { ctrl: true, ..Default::default() }, KEY_SPACE), None, "Cmd+Space goes to the Mac");
         assert_eq!(match_hotkey(CAS, 0x05 /* B */), None);
         // missing any modifier → forwarded to the host as usual (e.g. Cmd+Shift+H, Cmd+Opt+H)
         for m in [

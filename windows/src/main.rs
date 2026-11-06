@@ -19,6 +19,8 @@ pub struct Args {
     /// None = config (default on).
     ctrl_as_cmd: Option<bool>,
     bench: Option<f64>,
+    /// Start in latency test mode (docs/LATENCY.md).
+    latency_test: bool,
     probe: bool,
     /// Reverse-connect: listen on this port and let the host dial in.
     listen: Option<u16>,
@@ -62,6 +64,9 @@ const USAGE: &str = "usage: glide-client [host[:port] | --listen [PORT]] [option
                      \"clipboard_sync_secrets\": true
   --bench SECONDS    headless: connect, decode for N seconds, print one JSON line
   --probe            print decoder capabilities as JSON (no connection)
+  --latency-test     start in latency test mode: read the host's block-code test pattern
+                     (glide-probe --pattern-only on the Mac) back from the decoded picture and
+                     report true glass-to-glass latency (Ctrl+Alt+Shift+L toggles; docs/LATENCY.md)
   --clipboard-selftest  exercise the Win32 clipboard path headlessly (no connection; run over SSH)
 
 Config: %APPDATA%\\Glide\\config.json (GLIDE_CONFIG_DIR overrides the folder). Pairing: the
@@ -101,6 +106,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Strin
                 a.bench = Some(v.parse::<f64>().map_err(|_| format!("bad --bench value {v}"))?);
             }
             "--probe" => a.probe = true,
+            "--latency-test" => a.latency_test = true,
             "--no-audio" => a.audio = Some(false),
             "--audio-selftest" => {
                 let secs = match it.peek() {
@@ -279,7 +285,8 @@ fn main() -> ExitCode {
             caps |= protocol::CAP_HEVC_444;
         }
         // Clipboard sync (§5) needs the viewer window; the headless bench never advertises it.
-        if args.clipboard.unwrap_or(store.config.clipboard) && args.bench.is_none() {
+        // The GUI viewer drops the bit from each ClientHello while sync is switched off (menu).
+        if args.bench.is_none() {
             caps |= protocol::CAP_CLIPBOARD;
         }
     }
@@ -333,6 +340,8 @@ fn main() -> ExitCode {
                 has444,
                 audio: audio_on,
                 audio_muted: store.config.audio_muted,
+                latency_test: args.latency_test,
+                clipboard: args.clipboard.unwrap_or(store.config.clipboard),
                 store,
             };
             return match glide::win::app::run(Connector { target, identity, pin_target, hello }, opts) {

@@ -17,7 +17,13 @@
   Clipboard it receives (--clip-save DIR keeps received PNGs). --clip-text/--clip-png push a
   clipboard to the client (--clip-every N repeats it); --clip-bounce sends each received
   clipboard straight back once, to check that the viewer does not echo it again (no ping-pong).
-- --selftest checks the clipboard codec against the PROTOCOL.md §5 reference bytes and exits.
+- --selftest checks the clipboard codec against the PROTOCOL.md §5 reference bytes (and the §3.4
+  latency messages + the docs/LATENCY.md block code) and exits.
+- Latency (§3.4): after the client's LatencyEnable (0x80) every VideoFrame is followed by a
+  FrameTiming (0x81) with the mock's send stamps; LatencyReports (0x82) are logged.
+  --latency-pattern streams a live-encoded (ffmpeg, x265 zerolatency) test pattern instead of the
+  files: each frame carries the mock's clock as a block code (docs/LATENCY.md), so a viewer in
+  --latency-test mode can check its instrumentation against ground truth.
 - Hybrid (mode 2, needs HEVC 4:4:4 cap): ServerHello + SharpLayerConfig, base 4:2:0 stream, a
   sharp-layer 4:4:4 IDR (flags bit2) each --hybrid-period frames, and rect-only base frames (bit3).
 - Audio (§3.2, client caps bit 9): AudioConfig + a continuous sine (default 440 Hz, -12 dBFS,
@@ -34,10 +40,11 @@ Usage:
       [--clip-text TEXT | --clip-png FILE] [--clip-every SECONDS] [--clip-bounce] [--clip-save DIR]
       [--no-audio] [--audio-freq HZ] [--audio-right-freq HZ] [--audio-db DBFS] [--audio-burst FRAMES]
       [--audio-drift-ppm PPM] [--audio-jitter-ms MS] [--audio-pattern ON_MS:OFF_MS]
+      [--latency-pattern [--pattern-size 1280x720] [--pattern-cell 8]]
   python3 tools/mock_host.py --selftest
 Generate streams first with tools/make_streams.sh.
 """
-import argparse, array, datetime, hashlib, json, math, os, random, socket, struct, sys, threading, time
+import argparse, array, collections, datetime, hashlib, json, math, os, random, select, socket, struct, subprocess, sys, threading, time
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
@@ -225,6 +232,152 @@ def clip_caps(formats=3, max_bytes=CLIPBOARD_MAX):
     return bytes([0x51]) + struct.pack("<II", formats, max_bytes)
 
 
+# ---------------------------------------------------------------- latency (§3.4, docs/LATENCY.md)
+
+TIMING_UNKNOWN = 0xFFFFFFFF
+BLOCK_SYNC, BLOCK_CELLS, BLOCK_QUIET = 0b10110010, 56, 2
+BLOCK_REF = "10110010000100100011010001010110011110000001010100111111"  # value 0x12345678, kind 1, counter 5
+
+
+def crc8(data):
+    c = 0
+    for b in data:
+        c ^= b
+        for _ in range(8):
+            c = ((c << 1) ^ 0x07) & 0xFF if c & 0x80 else (c << 1) & 0xFF
+    return c
+
+
+def block_bits(value, kind, counter):
+    p = struct.pack(">I", value & 0xFFFFFFFF) + bytes([(kind & 15) << 4 | (counter & 15)])
+    b = bytes([BLOCK_SYNC]) + p + bytes([crc8(p)])
+    return [(b[i // 8] >> (7 - i % 8)) & 1 for i in range(BLOCK_CELLS)]
+
+
+def frame_timing(frame_id, cap_us, flags, callback, submit, encoded, enqueued, sent):
+    def d(t):
+        return TIMING_UNKNOWN if t is None else max(0, min(TIMING_UNKNOWN - 1, t - cap_us))
+    return bytes([0x81]) + struct.pack("<IQBIIIII", frame_id, cap_us, flags, d(callback), d(submit), d(encoded), d(enqueued), d(sent))
+
+
+def latency_report_str(m):
+    names = ("host", "net", "queue", "decode", "render", "scanout", "total", "ground_truth")
+    n, flags = struct.unpack("<HB", m[1:4])
+    vals = struct.unpack("<8I", m[4:36])
+    parts = [f"{k} {'–' if v == TIMING_UNKNOWN else f'{v / 1000:.1f}'}" for k, v in zip(names, vals)]
+    return f"n={n} flags={flags:#x} p50 ms: " + "  ".join(parts)
+
+
+class PatternEncoder:
+    """Live test-pattern stream: draws the mock clock as a block code into raw YUV frames and
+    encodes them with ffmpeg/x265 (zerolatency, AUD-delimited). Yields (au, keyframe, gen_us,
+    submit_us, encoded_us) per frame."""
+
+    def __init__(self, w, h, fps, cell):
+        self.w, self.h, self.fps, self.cell = w, h, fps, cell
+        self.out = collections.deque()
+        self.cv = threading.Condition()
+        self.pending = collections.deque()  # (gen_us, submit_us) in encode order
+        self.alive = True
+        x265 = "keyint=60:min-keyint=60:bframes=0:repeat-headers=1:aud=1:frame-threads=1:log-level=error"
+        self.proc = subprocess.Popen(
+            [os.environ.get("FFMPEG", "ffmpeg"), "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{w}x{h}",
+             "-r", str(fps), "-i", "-", "-c:v", "libx265", "-preset", "ultrafast", "-tune", "zerolatency",
+             "-b:v", "20M", "-x265-params", x265, "-f", "hevc", "-"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+        y = bytearray([40]) * (w * h)
+        for row in range(0, h, 32):  # faint grid so the background is not flat
+            y[row * w:(row + 1) * w] = bytes([56]) * w
+        self.bg_y = bytes(y)
+        self.chroma = bytes([128]) * (w // 2 * h // 2 * 2)
+        threading.Thread(target=self._gen, daemon=True).start()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def frame(self, value, counter, t):
+        w, cell = self.w, self.cell
+        y = bytearray(self.bg_y)
+        ox, oy = 64, 64
+        pw, ph = (BLOCK_CELLS + 2 * BLOCK_QUIET) * cell, 4 * cell
+        for r in range(ph):
+            y[(oy + r) * w + ox:(oy + r) * w + ox + pw] = bytes(pw)
+        row = bytearray(pw)
+        for i, bit in enumerate(block_bits(value, 2, counter)):  # kind 2 = KIND_FRAME
+            if bit:
+                x = (BLOCK_QUIET + i) * cell
+                row[x:x + cell] = b"\xeb" * cell
+        for r in range(cell, 3 * cell):
+            y[(oy + r) * w + ox:(oy + r) * w + ox + pw] = row
+        # A moving box, so there is motion elsewhere too.
+        bx = int((t * 400) % (w - 200)) + 100
+        for r in range(oy + ph + 40, min(self.h, oy + ph + 140)):
+            y[r * w + bx:r * w + bx + 96] = b"\xc0" * 96
+        return bytes(y) + self.chroma
+
+    def _gen(self):
+        period, nxt, counter = 1.0 / self.fps, time.monotonic(), 0
+        try:
+            while self.alive:
+                gen = mono_us()
+                data = self.frame(gen & 0xFFFFFFFF, counter, time.monotonic())
+                counter += 1
+                with self.cv:
+                    self.pending.append((gen, mono_us()))
+                self.proc.stdin.write(data)
+                nxt += period
+                d = nxt - time.monotonic()
+                if d > 0:
+                    time.sleep(d)
+                else:
+                    nxt = time.monotonic()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def _read(self):
+        fd, buf, aud = self.proc.stdout.fileno(), b"", b"\x00\x00\x00\x01\x46\x01"
+        while self.alive:
+            r, _, _ = select.select([fd], [], [], 0.003)
+            if r:
+                chunk = os.read(fd, 1 << 20)
+                if not chunk:
+                    return
+                buf += chunk
+                # Complete AUs: everything before the last AUD that is not at offset 0.
+                while True:
+                    i = buf.find(aud, 1)
+                    if i < 0:
+                        break
+                    self._emit(buf[:i])
+                    buf = buf[i:]
+            elif buf:
+                # No more bytes for 3 ms: the encoder finished this AU.
+                self._emit(buf)
+                buf = b""
+
+    def _emit(self, au):
+        done = mono_us()
+        key = any(16 <= ((n[0] >> 1) & 0x3F) <= 23 for n in split_nals(au) if n)
+        with self.cv:
+            if not self.pending:
+                return
+            gen, sub = self.pending.popleft()
+            self.out.append((au, key, gen, sub, done))
+            self.cv.notify()
+
+    def next(self, timeout=1.0):
+        with self.cv:
+            if not self.out:
+                self.cv.wait(timeout)
+            return self.out.popleft() if self.out else None
+
+    def close(self):
+        self.alive = False
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        self.proc.kill()
+
+
 def selftest():
     ok = True
 
@@ -243,6 +396,12 @@ def selftest():
     check(clip_decode(raw) == (2, "ok", None), "unknown format skipped, duplicate ignored")
     trunc = all(_raises(lambda n=n: clip_decode(both[:n])) for n in range(1, len(both)))
     check(trunc, "truncation rejected")
+    check(crc8(b"123456789") == 0xF4, "CRC-8/SMBUS check value")
+    check("".join(map(str, block_bits(0x12345678, 1, 5))) == BLOCK_REF, "block code reference bits (docs/LATENCY.md)")
+    ft = frame_timing(7, 1_000_000, 1, 1_001_500, 1_001_600, 1_009_800, 1_009_900, 1_010_100)
+    check(ft.hex() == "810700000040420f000000000001dc0500004006000048260000ac26000074270000", "FrameTiming reference bytes")
+    lr = bytes.fromhex("82780001f82a0000b00400002c0100000807000090010000f41a000060540000ffffffff")
+    check(latency_report_str(lr).endswith("total 21.6  ground_truth –"), "LatencyReport decode")
     print("ALL TESTS PASSED" if ok else "FAILURES")
     return ok
 
@@ -316,6 +475,7 @@ class Session:
         self.clipboard = False
         self.audio_enabled = True
         self.audio_need_config = True
+        self.timing = False
 
     def recv_exact(self, n):
         buf = bytearray()
@@ -465,7 +625,12 @@ class Session:
             name = hello[15:15 + nl].decode()
             log(f"{self.addr}: ClientHello v{ver} caps={caps:#05b} view={vw}x{vh} mode={mode} max_fps={maxfps} name={name!r}")
             self.hybrid = mode == 2 and bool(caps & 2) and "hevc444" in self.streams and "hevc" in self.streams
-            st = self.streams["hevc"] if self.hybrid else self.pick_stream(caps, mode)
+            if self.args.latency_pattern:
+                self.hybrid = False
+                pw, ph = (int(v) for v in self.args.pattern_size.split("x"))
+                st = argparse.Namespace(w=pw, h=ph, codec=1, chroma=0, path="latency-pattern (live)")
+            else:
+                st = self.streams["hevc"] if self.hybrid else self.pick_stream(caps, mode)
             self.caps = caps
             host = self.args.name.encode()
             self.send_msg(bytes([0x02]) + struct.pack("<H", 2) + struct.pack("<H", len(host)) + host + self.config_body(st))
@@ -481,8 +646,14 @@ class Session:
                 log(f"{self.addr}: clipboard sync negotiated (sent ClipboardCaps)")
                 if self.args.clip_text is not None or self.args.clip_png:
                     threading.Thread(target=self.clip_push_loop, daemon=True).start()
+            # DisplayInfo (§3.3): pretend the Mac runs 1920x1080 Retina under "automatic".
+            self.display_pref = 0
+            self.send_display_info()
             self.send_cursor()
-            t = threading.Thread(target=self.video_loop, args=(st,), daemon=True)
+            if self.args.latency_pattern:
+                t = threading.Thread(target=self.pattern_loop, daemon=True)
+            else:
+                t = threading.Thread(target=self.video_loop, args=(st,), daemon=True)
             t.start()
             if caps & (1 << 9) and not self.args.no_audio:
                 threading.Thread(target=self.audio_loop, daemon=True).start()
@@ -537,7 +708,8 @@ class Session:
                     c = frame_id % P
                     if c == (2 * P) // 3:
                         sd = self.sharp_idrs[(frame_id // P) % len(self.sharp_idrs)]
-                        self.send_msg(bytes([0x40]) + struct.pack("<IQB", frame_id, mono_us(), 1 | 4) + sd)
+                        cap = mono_us()
+                        self.send_frame(frame_id, cap, 1 | 4, sd, cap, cap, cap)
                         self.stats["frames"] += 1
                         self.stats["sharp"] = self.stats.get("sharp", 0) + 1
                         self.stats["bytes"] += len(sd)
@@ -551,7 +723,8 @@ class Session:
                         flags |= 8
                         rects = struct.pack("<H", len(rs)) + b"".join(struct.pack("<HHHH", *r) for r in rs)
                         self.stats["rect_frames"] = self.stats.get("rect_frames", 0) + 1
-                self.send_msg(bytes([0x40]) + struct.pack("<IQB", frame_id, mono_us(), flags) + rects + data)
+                cap = mono_us()
+                self.send_frame(frame_id, cap, flags, rects + data, cap, cap, cap)
                 self.stats["frames"] += 1
                 self.stats["bytes"] += len(data)
                 frame_id += 1
@@ -564,6 +737,33 @@ class Session:
                     nxt = time.monotonic()
         except (OSError, EOFError):
             self.alive = False
+
+    def send_frame(self, frame_id, cap, flags, payload, callback, submit, encoded):
+        enq = mono_us()
+        self.send_msg(bytes([0x40]) + struct.pack("<IQB", frame_id, cap, flags) + payload)
+        if self.timing:
+            self.send_msg(frame_timing(frame_id, cap, flags, callback, submit, encoded, enq, mono_us()))
+
+    def pattern_loop(self):
+        a = self.args
+        pw, ph = (int(v) for v in a.pattern_size.split("x"))
+        enc = PatternEncoder(pw, ph, a.fps, a.pattern_cell)
+        log(f"{self.addr}: latency pattern: live x265 {pw}x{ph} @ {a.fps:g} fps, cell {a.pattern_cell}px at (64,64)")
+        frame_id = 0
+        try:
+            while self.alive:
+                f = enc.next()
+                if f is None:
+                    continue
+                au, key, gen, sub, done = f
+                self.send_frame(frame_id, gen, 1 if key else 0, au, gen, sub, done)
+                self.stats["frames"] += 1
+                self.stats["bytes"] += len(au)
+                frame_id += 1
+        except (OSError, EOFError):
+            self.alive = False
+        finally:
+            enc.close()
 
     def send_clip(self, text=None, png=None):
         self.clip_seq += 1
@@ -664,6 +864,12 @@ class Session:
         except (OSError, EOFError):
             self.alive = False
 
+    DISPLAY_MODES = {0: (1920, 1080, 1), 1: (3840, 2160, 0), 2: (2560, 1440, 1), 3: (1920, 1080, 1), 4: (1920, 1080, 1)}
+
+    def send_display_info(self):
+        w, h, hi = self.DISPLAY_MODES.get(self.display_pref, (1920, 1080, 1))
+        self.send_msg(bytes([0x05, self.display_pref]) + struct.pack("<HHB", w, h, hi))
+
     def input_loop(self):
         names = {0x10: "MouseMove", 0x11: "MouseButton", 0x12: "MouseWheel", 0x13: "Key", 0x14: "ReleaseAll",
                  0x20: "RequestKeyframe", 0x21: "SetMode", 0x50: "Clipboard"}
@@ -693,11 +899,22 @@ class Session:
             elif t == 0x15:
                 vw, vh = struct.unpack("<HH", m[1:5])
                 log(f"{self.addr}: ViewSize {vw}x{vh}")
+            elif t == 0x16:
+                names16 = ["automatic", "crisp", "smooth", "retina", "manual"]
+                log(f"{self.addr}: SetDisplayPreference {names16[m[1]] if m[1] < 5 else m[1]}")
+                if m[1] < 5:
+                    self.display_pref = m[1]
+                    self.send_display_info()
             elif t == 0x20:
                 log(f"{self.addr}: RequestKeyframe -> restarting stream at first keyframe")
                 self.restart.set()
             elif t == 0x50:
                 self.on_clipboard(m)
+            elif t == 0x80:
+                self.timing = bool(m[1] & 1)
+                log(f"{self.addr}: LatencyEnable {m[1]:#x} -> FrameTiming {'on' if self.timing else 'off'}")
+            elif t == 0x82:
+                log(f"{self.addr}: LatencyReport {latency_report_str(m)}")
             elif t == 0x62:
                 on = bool(m[1])
                 log(f"{self.addr}: AudioEnable {'on' if on else 'off (muted)'}")
@@ -752,6 +969,10 @@ def main():
     ap.add_argument("--clip-bounce", action="store_true", help="send every received clipboard back once (echo test)")
     ap.add_argument("--clip-save", metavar="DIR", help="save received clipboard PNGs here")
     ap.add_argument("--selftest", action="store_true", help="check the clipboard codec against PROTOCOL.md §5 and exit")
+    ap.add_argument("--latency-pattern", action="store_true",
+                    help="stream a live-encoded block-code clock pattern (docs/LATENCY.md) instead of the files")
+    ap.add_argument("--pattern-size", default="1280x720", help="--latency-pattern frame size (default 1280x720)")
+    ap.add_argument("--pattern-cell", type=int, default=8, help="--latency-pattern cell size in px (default 8)")
     args = ap.parse_args()
     if args.selftest:
         sys.exit(0 if selftest() else 1)
@@ -762,7 +983,7 @@ def main():
     for key, path, codec, chroma in (("hevc", args.hevc, 1, 0), ("hevc444", args.hevc444, 1, 1), ("h264", args.h264, 2, 0)):
         if path and os.path.exists(path):
             streams[key] = Stream(path, codec, chroma)
-    if not streams:
+    if not streams and not args.latency_pattern:
         sys.exit("no streams found; run tools/make_streams.sh")
 
     if args.connect:

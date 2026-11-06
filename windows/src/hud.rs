@@ -85,6 +85,45 @@ pub struct HudInfo {
     pub view: (u16, u16),
     pub keyboard_captured: bool,
     pub audio: Option<AudioHud>,
+    /// Latency breakdown (p50 over the last 2 s); None until the host sends FrameTiming.
+    pub latency: Option<crate::latency::Summary>,
+    /// Latency test mode (Ctrl+Alt+Shift+L): reading the host's test pattern.
+    pub latency_test: bool,
+    /// Mac display mode + preference (DisplayInfo), e.g. "1920×1080 Retina (automatic)".
+    pub mac_display: Option<String>,
+}
+
+fn ms(v: Option<f64>) -> String {
+    v.map_or("–".to_string(), |x| format!("{x:.1}"))
+}
+
+/// The latency breakdown line(s): p50s of capture→encoded (host), network, decode,
+/// present→scan-out and the glass-to-glass estimate.
+pub fn latency_lines(l: &crate::latency::Summary, test: bool) -> Vec<String> {
+    let mut v = Vec::with_capacity(2);
+    if l.n == 0 {
+        v.push("latency: waiting for frames".into());
+    } else {
+        let total = if l.total_has_scanout { "glass" } else { "→present" };
+        v.push(format!(
+            "lat p50  enc {}  net {}  dec {}  scan {}  {total} {} ms",
+            ms(l.host),
+            ms(l.network),
+            ms(l.decode),
+            ms(l.scanout),
+            ms(l.total)
+        ));
+    }
+    if test {
+        v.push(match (l.gt_n, l.gt_to_scanout.or(l.gt_to_present)) {
+            (0, _) | (_, None) => "latency test: looking for the pattern…".into(),
+            (n, Some(g)) => format!(
+                "test pattern → {} p50 {g:.1} ms  (n {n})",
+                if l.gt_to_scanout.is_some() { "screen" } else { "present" }
+            ),
+        });
+    }
+    v
 }
 
 /// The HUD text, one entry per line.
@@ -114,12 +153,18 @@ pub fn lines(i: &HudInfo) -> Vec<String> {
     let mode = i.mode.map_or("?", |m| m.name());
     v.push(format!("mode {mode} [{layer}]   sharp {}   rects {}", i.sharp_frames, i.rect_frames));
     let mut last = format!("view {}x{}   {}", i.view.0, i.view.1, i.decoder);
+    if let Some(m) = &i.mac_display {
+        last.push_str(&format!("   mac {m}"));
+    }
     if i.decode_errors > 0 {
         last.push_str(&format!("   {} decode errors", i.decode_errors));
     }
     v.push(last);
     if let Some(a) = &i.audio {
         v.push(audio_line(a));
+    }
+    if let Some(l) = &i.latency {
+        v.extend(latency_lines(l, i.latency_test));
     }
     if !i.keyboard_captured {
         v.push("keyboard released (Ctrl+Alt+Shift+K)".into());
@@ -187,6 +232,9 @@ mod tests {
         assert_eq!(l[2], "12.3 Mbps   3072x1728 HEVC 4:2:0");
         assert_eq!(l[3], "mode hybrid [4:4:4]   sharp 12   rects 340");
         assert_eq!(l[4], "view 3072x1728   hw NV12 + AYUV");
+        i.mac_display = Some("1920×1080 Retina (automatic)".into());
+        assert_eq!(lines(&i)[4], "view 3072x1728   hw NV12 + AYUV   mac 1920×1080 Retina (automatic)");
+        i.mac_display = None;
         assert_eq!(l.len(), 5);
         i.showing_sharp = false;
         i.decode_errors = 2;
@@ -201,6 +249,28 @@ mod tests {
         i.keyboard_captured = true;
         i.audio = Some(AudioHud { streaming: true, e2e_ms: Some(41.6), underruns: 3, ..Default::default() });
         assert_eq!(lines(&i).last().unwrap(), "audio 42 ms   underruns 3");
+        i.audio = None;
+        i.latency = Some(crate::latency::Summary {
+            n: 100,
+            host: Some(11.84),
+            network: Some(1.21),
+            decode: Some(1.9),
+            scanout: Some(6.3),
+            total: Some(24.04),
+            total_has_scanout: true,
+            ..Default::default()
+        });
+        assert_eq!(lines(&i).last().unwrap(), "lat p50  enc 11.8  net 1.2  dec 1.9  scan 6.3  glass 24.0 ms");
+        i.latency_test = true;
+        assert_eq!(lines(&i).last().unwrap(), "latency test: looking for the pattern…");
+        i.latency.as_mut().unwrap().gt_n = 40;
+        i.latency.as_mut().unwrap().gt_to_present = Some(31.26);
+        assert_eq!(lines(&i).last().unwrap(), "test pattern → present p50 31.3 ms  (n 40)");
+        let mut l = i.latency.unwrap();
+        l.total_has_scanout = false;
+        l.scanout = None;
+        assert!(latency_lines(&l, false)[0].ends_with("scan –  →present 24.0 ms"));
+        assert_eq!(latency_lines(&crate::latency::Summary::default(), false), vec!["latency: waiting for frames"]);
         i.status = Some("Waiting for host on port 7420…".into());
         assert_eq!(lines(&i), vec!["Glide · Example-Mac", "Waiting for host on port 7420…", "view 3072x1728"]);
     }

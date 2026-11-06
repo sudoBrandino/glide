@@ -21,6 +21,20 @@ final class Session: @unchecked Sendable {
     private var displayAssertion: IOPMAssertionID?
     private var statsTimer: DispatchSourceTimer?
     private var clientName = "?"
+    /// The viewer asked for FrameTiming messages (PROTOCOL.md §3.4).
+    private let timingLock = NSLock()
+    private var timingEnabledValue = false
+    private var timingEnabled: Bool {
+        get { timingLock.lock(); defer { timingLock.unlock() }; return timingEnabledValue }
+        set { timingLock.lock(); timingEnabledValue = newValue; timingLock.unlock() }
+    }
+    /// Latest LatencyReport from the viewer (logged with the stats; written on the session queue,
+    /// read on the pipeline queue).
+    private var viewerLatencyValue: LatencyReport?
+    private var viewerLatency: LatencyReport? {
+        get { timingLock.lock(); defer { timingLock.unlock() }; return viewerLatencyValue }
+        set { timingLock.lock(); viewerLatencyValue = newValue; timingLock.unlock() }
+    }
     /// Created at auth if the viewer advertised clipboard support; started after ServerHello.
     private var clipboard: ClipboardSync?
     var onEnd: ((Session) -> Void)?
@@ -233,6 +247,7 @@ final class Session: @unchecked Sendable {
         statsTimer?.cancel()
         Power.release(displayAssertion); displayAssertion = nil
         if let o = displayObserver { NotificationCenter.default.removeObserver(o) }
+        if let o = preferenceObserver { NotificationCenter.default.removeObserver(o) }
         displayRestart?.cancel()
         cursor.stop()
         clipboard?.stop(); clipboard = nil
@@ -334,6 +349,15 @@ final class Session: @unchecked Sendable {
             audio?.setEnabled(on)
             if audio != nil { HostStatus.shared.audio(id: id, on ? "on" : "muted") }
         case let .clipboard(c): clipboard?.apply(c)
+        case let .latencyEnable(f):
+            timingEnabled = f & 1 != 0
+            log("session \(id): viewer \(timingEnabled ? "enabled" : "disabled") per-frame latency timing")
+        case let .latencyReport(r):
+            viewerLatency = r
+            HostStatus.shared.viewerLatency(id: id, r)
+        case let .setDisplayPreference(m):
+            guard let p = DisplayModePreference(wire: m) else { log("session \(id): unknown display preference \(m)"); return }
+            DisplayModeController.shared.setSessionPreference(id: id, p) { [weak self] _ in self?.sendDisplayInfo() }
         case .hello, .pairConfirm: break
         }
     }
@@ -364,6 +388,8 @@ final class Session: @unchecked Sendable {
                 }
                 if self.audioOff { self.send(.audioConfig(.off)) }
                 self.audio?.arm()
+                self.helloSent = true
+                self.sendDisplayInfo()
             } else {
                 self.send(.videoConfig(cfg))
                 if let sharpCfg { self.send(.sharpLayerConfig(sharpCfg)) }
@@ -377,7 +403,20 @@ final class Session: @unchecked Sendable {
         p.onFrame = { [weak self] f in
             guard let self else { return }
             self.frameId &+= 1
-            self.send(.videoFrame(frameId: self.frameId, captureTimeUs: f.captureUs, keyframe: f.keyframe, refresh: f.refresh, sharp: f.sharp, rects: f.rects, data: f.data))
+            let msg = HostMessage.videoFrame(frameId: self.frameId, captureTimeUs: f.captureUs, keyframe: f.keyframe, refresh: f.refresh, sharp: f.sharp, rects: f.rects, data: f.data)
+            guard self.timingEnabled else { self.send(msg); return }
+            // §3.4: once the network stack has taken the whole record, tell the viewer when each
+            // stage of this frame happened on the host.
+            let id = self.frameId
+            let flags: UInt8 = (f.keyframe ? 1 : 0) | (f.refresh ? 2 : 0) | (f.sharp ? 4 : 0) | (f.rects != nil ? 8 : 0)
+            let enqueued = hostTimeMicros()
+            self.channel.send(msg.encoded) { [weak self] err in
+                guard err == nil, let self else { return }
+                let sent = hostTimeMicros(), c = f.captureUs
+                self.send(.frameTiming(FrameTiming(frameId: id, captureUs: c, flags: flags, callback: FrameTiming.delta(f.callbackUs, from: c),
+                                                   submit: FrameTiming.delta(f.submitUs, from: c), encoded: FrameTiming.delta(f.encodedUs, from: c),
+                                                   enqueued: FrameTiming.delta(enqueued, from: c), sent: FrameTiming.delta(sent, from: c))))
+            }
         }
         cursor.onShape = { [weak self] shape, isNew in
             if isNew {
@@ -443,9 +482,14 @@ final class Session: @unchecked Sendable {
     /// Re-capture when the Mac's display mode changes (resolution / HiDPI switch), so the new
     /// pixel size and backing scale take effect without restarting the host.
     private var displayObserver: NSObjectProtocol?
+    private var preferenceObserver: NSObjectProtocol?
     private var displayRestart: DispatchWorkItem?
     private func watchDisplayChanges() {
+        preferenceObserver = NotificationCenter.default.addObserver(forName: DisplayModeController.preferenceChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.sendDisplayInfo()
+        }
         displayObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.sendDisplayInfo()
             guard let self, let p = self.pipeline, !self.ended else { return }
             self.displayRestart?.cancel()
             let work = DispatchWorkItem { [weak self] in
@@ -455,6 +499,24 @@ final class Session: @unchecked Sendable {
             }
             self.displayRestart = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)  // debounce mode-switch churn
+        }
+    }
+
+    /// DisplayInfo (§3.3): current preference + mode, sent after ServerHello and whenever it changes.
+    private var helloSent = false
+    private var lastDisplayInfo: Data?
+    private func sendDisplayInfo() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let dm = DisplayModeController.shared
+            let msg = HostMessage.displayInfo(preference: dm.effectivePreference, mode: dm.currentMode())
+            self.channel.queue.async {
+                guard self.helloSent, !self.ended else { return }
+                let enc = msg.encoded
+                guard enc != self.lastDisplayInfo else { return }
+                self.lastDisplayInfo = enc
+                self.channel.send(enc)
+            }
         }
     }
 
@@ -472,7 +534,13 @@ final class Session: @unchecked Sendable {
                 s.sharpMs.sort(); s.diffUs.sort()
                 let diffMed = s.diffUs.isEmpty ? 0 : s.diffUs[s.diffUs.count / 2] / 1000
                 let sharpMed = s.sharpMs.isEmpty ? 0 : s.sharpMs[s.sharpMs.count / 2]
-                HostStatus.shared.stats(id: self.id, fps: Double(s.encoded) / 5, mbps: Double(s.bytes) * 8 / 5 / 1e6, encodeMs: med)
+                func pct(_ a: [Double], _ p: Int) -> Double? { let v = a.sorted(); return v.isEmpty ? nil : v[min(v.count - 1, v.count * p / 100)] }
+                let capMed = pct(s.captureMs, 50), capP95 = pct(s.captureMs, 95), waitMed = pct(s.waitMs, 50)
+                HostStatus.shared.stats(id: self.id, fps: Double(s.encoded) / 5, mbps: Double(s.bytes) * 8 / 5 / 1e6, encodeMs: med, captureMs: capMed)
+                if let capMed, let capP95 {
+                    log(String(format: "latency: capture->callback p50 %.1fms p95 %.1fms, callback->encode p50 %.1fms, encode p50 %.1fms p95 %.1fms", capMed, capP95, waitMed ?? 0, med, p95)
+                        + (self.viewerLatency.map { "; viewer " + $0.summary } ?? ""))
+                }
                 log(String(format: "stats: sent %.1f fps, %.1f Mbps, encode p50 %.1fms p95 %.1fms, captured %d, keyframes %d, rect frames %d (avg %.1f rects), sharp %d sent/%d dropped (p50 %.1fms), diff p50 %.2fms, identical %d, skipped busy %d / net %d, in-flight %d KB",
                            Double(s.encoded) / 5, Double(s.bytes) * 8 / 5 / 1e6, med, p95, s.captured, s.keyframes, s.rectFrames, s.rectFrames > 0 ? Double(s.rectCount) / Double(s.rectFrames) : 0, s.sharpSent, s.sharpDropped, sharpMed, diffMed, s.identical, s.skippedBusy, s.skippedNet, self.channel.bytesInFlight / 1024))
             }

@@ -126,6 +126,8 @@ pub struct Renderer {
     hud: Option<Panel>,
     /// Hotkey toast, bottom-center, with its current opacity.
     toast: Option<(Panel, f32)>,
+    /// Connection bar tab, top-center, drawn `bar.1` px above the top edge (hides the top corners).
+    bar: Option<(Panel, i32)>,
     flags: DXGI_SWAP_CHAIN_FLAG,
     tearing: bool,
     pub size: (u32, u32),
@@ -261,6 +263,7 @@ impl Renderer {
                 overlay: None,
                 hud: None,
                 toast: None,
+                bar: None,
                 flags,
                 tearing,
                 size: (w.max(1), h.max(1)),
@@ -436,6 +439,19 @@ impl Renderer {
         Ok(())
     }
 
+    /// Set (or clear) the connection-bar tab. Returns the visible size (w, h) in pixels.
+    pub fn set_bar(&mut self, text: Option<&str>, px: i32) -> Result<Option<(u32, u32)>> {
+        self.bar = None;
+        let Some(text) = text else { return Ok(None) };
+        let p = self.make_panel(&[text], px, &PanelStyle::BAR)?;
+        // Push the rounded top corners (and the extra top padding) above the window edge: only
+        // the bottom corners show.
+        let off = (px.max(8) as f32 * PanelStyle::BAR.pad_top) as i32;
+        let size = (p.w, p.h - off as u32);
+        self.bar = Some((p, off));
+        Ok(Some(size))
+    }
+
     pub fn set_toast_opacity(&mut self, a: f32) {
         if let Some(t) = self.toast.as_mut() {
             t.1 = a.clamp(0.0, 1.0);
@@ -479,7 +495,8 @@ impl Renderer {
             }
             let (padx, pady) = ((px as f32 * st.pad.0) as i32, (px as f32 * st.pad.1) as i32);
             let text_h = line_h * (wides.len() as i32 - 1) + tm.tmHeight;
-            let (w, h) = ((text_w + 2 * padx).max(1) as u32, (text_h + 2 * pady).max(1) as u32);
+            let extra = (px as f32 * st.pad_top) as i32;
+            let (w, h) = ((text_w + 2 * padx).max(1) as u32, (text_h + 2 * pady + extra).max(1) as u32);
             let bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -502,7 +519,7 @@ impl Renderer {
                     SetBkMode(hdc, TRANSPARENT);
                     SetTextColor(hdc, windows::Win32::Foundation::COLORREF(0x00FF_FFFF));
                     for (i, wl) in wides.iter().enumerate() {
-                        let _ = TextOutW(hdc, padx, pady + i as i32 * line_h, wl);
+                        let _ = TextOutW(hdc, padx, extra + pady + i as i32 * line_h, wl);
                     }
                     let _ = GdiFlush();
                     let data = compose_panel(cov, w, h, (px as f32 * st.radius).min(h as f32 / 2.0), st);
@@ -568,10 +585,11 @@ impl Renderer {
     }
 
     /// Draw the canvas letterboxed into `rect` (x, y, w, h in back-buffer pixels), multiplied
-    /// by `dim`, then the HUD, toast and status panels if set, and present.
-    pub fn present(&mut self, rect: (i32, i32, i32, i32), dim: f32) -> Result<()> {
+    /// by `dim`, then the HUD, toast and status panels if set, and present. Returns the
+    /// `util::now_us()` time right before the `Present` call (latency instrumentation).
+    pub fn present(&mut self, rect: (i32, i32, i32, i32), dim: f32) -> Result<u64> {
         unsafe {
-            let Some(rtv) = self.rtv.clone() else { return Ok(()) };
+            let Some(rtv) = self.rtv.clone() else { return Ok(crate::util::now_us()) };
             let bg = if self.canvas.is_some() { 0.0 } else { 0.06 };
             self.context.ClearRenderTargetView(&rtv, &[bg, bg, bg * 1.1, 1.0]);
             let mode = self.cb_state.0;
@@ -614,25 +632,122 @@ impl Renderer {
             if let Some(p) = self.overlay.clone() {
                 self.draw_panel(&rtv, &p, (bw - p.w as i32) / 2, (bh - p.h as i32) / 2, 1.0);
             }
+            if let Some((p, off)) = self.bar.clone() {
+                self.draw_panel(&rtv, &p, (bw - p.w as i32) / 2, -off, 1.0);
+            }
             self.set_cb(mode, dim);
             let ctx = &self.context;
+            let t = crate::util::now_us();
             match &self.swap {
                 Some(s) => {
                     let flags = if self.tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) };
-                    s.Present(0, flags).ok()
+                    s.Present(0, flags).ok().map(|_| t)
                 }
                 None => {
                     ctx.Flush();
-                    Ok(())
+                    Ok(t)
                 }
             }
         }
     }
 }
 
+/// `DXGI_FRAME_STATISTICS` of the swap chain: the most recent present that reached the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameStats {
+    /// Present count (as `GetLastPresentCount`) of the last present that was displayed.
+    pub present_count: u32,
+    /// Vblank count at which it was first displayed.
+    pub present_refresh_count: u32,
+    /// Vblank count / QPC time at which the OS last sampled the vblank clock.
+    pub sync_refresh_count: u32,
+    pub sync_qpc: i64,
+}
+
+/// A canvas region copied to a CPU-readable texture (latency test mode). Mapped later, without
+/// stalling the render thread (`try_read_luma`).
+pub struct Readback {
+    tex: ID3D11Texture2D,
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
 impl Renderer {
     pub fn is_offscreen(&self) -> bool {
         self.swap.is_none()
+    }
+
+    pub fn tearing(&self) -> bool {
+        self.tearing
+    }
+
+    /// `IDXGISwapChain::GetLastPresentCount` (None offscreen).
+    pub fn last_present_count(&self) -> Option<u32> {
+        let s = self.swap.as_ref()?;
+        unsafe { s.GetLastPresentCount().ok() }
+    }
+
+    /// `IDXGISwapChain::GetFrameStatistics` (None offscreen, or while the OS has no data yet,
+    /// e.g. DXGI_ERROR_FRAME_STATISTICS_DISJOINT after a mode change).
+    pub fn frame_stats(&self) -> Option<FrameStats> {
+        let s = self.swap.as_ref()?;
+        let mut st = DXGI_FRAME_STATISTICS::default();
+        unsafe { s.GetFrameStatistics(&mut st).ok()? };
+        (st.PresentCount != 0).then_some(FrameStats {
+            present_count: st.PresentCount,
+            present_refresh_count: st.PresentRefreshCount,
+            sync_refresh_count: st.SyncRefreshCount,
+            sync_qpc: st.SyncQPCTime,
+        })
+    }
+
+    /// Queue a copy of a canvas region (clamped) into a staging texture. Copies run in GPU
+    /// order, so the result is exactly what the last present showed.
+    pub fn read_canvas(&self, x: u32, y: u32, w: u32, h: u32, reuse: Option<Readback>) -> Option<Readback> {
+        let (canvas, _, _, cw, ch) = self.canvas.as_ref()?;
+        let (x, y) = (x.min(cw.saturating_sub(1)), y.min(ch.saturating_sub(1)));
+        let (w, h) = (w.min(cw - x).max(1), h.min(ch - y).max(1));
+        let tex = match reuse {
+            Some(r) if (r.w, r.h) == (w, h) => r.tex,
+            _ => unsafe {
+                let d = D3D11_TEXTURE2D_DESC {
+                    Width: w,
+                    Height: h,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_R10G10B10A2_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Usage: D3D11_USAGE_STAGING,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    ..Default::default()
+                };
+                let mut t = None;
+                self.device.CreateTexture2D(&d, None, Some(&mut t)).ok()?;
+                t?
+            },
+        };
+        let b = D3D11_BOX { left: x, top: y, front: 0, right: x + w, bottom: y + h, back: 1 };
+        unsafe {
+            self.context.CopySubresourceRegion(&tex, 0, 0, 0, 0, canvas, 0, Some(&b));
+        }
+        Some(Readback { tex, x, y, w, h })
+    }
+
+    /// Map a readback if the GPU has finished it: 8-bit luma rows (`w` × `h`), else None.
+    pub fn try_read_luma(&self, r: &Readback) -> Option<Vec<u8>> {
+        unsafe {
+            let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context.Map(&r.tex, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32, Some(&mut m)).ok()?;
+            let mut out = Vec::with_capacity((r.w * r.h) as usize);
+            for y in 0..r.h as usize {
+                let row = std::slice::from_raw_parts((m.pData as *const u8).add(y * m.RowPitch as usize) as *const u32, r.w as usize);
+                out.extend(row.iter().map(|&p| crate::blockcode::luma_rgb10a2(p)));
+            }
+            self.context.Unmap(&r.tex, 0);
+            Some(out)
+        }
     }
 
     /// Write the current back buffer / offscreen target to a 32-bit BMP (diagnostics).
@@ -710,6 +825,8 @@ pub struct PanelStyle {
     radius: f32,
     pad: (f32, f32),
     line_gap: f32,
+    /// Extra space above the text (the bar draws this part above the window edge).
+    pad_top: f32,
 }
 
 impl PanelStyle {
@@ -722,6 +839,7 @@ impl PanelStyle {
         radius: 0.5,
         pad: (1.0, 0.5),
         line_gap: 0.2,
+        pad_top: 0.0,
     };
     const HUD: PanelStyle = PanelStyle {
         face: windows::core::w!("Consolas"),
@@ -732,6 +850,18 @@ impl PanelStyle {
         radius: 0.45,
         pad: (0.75, 0.5),
         line_gap: 0.18,
+        pad_top: 0.0,
+    };
+    pub(crate) const BAR: PanelStyle = PanelStyle {
+        face: windows::core::w!("Segoe UI"),
+        weight: 600,
+        fg: [0.96, 0.97, 1.0],
+        bg: [0.09, 0.10, 0.13],
+        bg_alpha: 0.88,
+        radius: 0.6,
+        pad: (1.0, 0.4),
+        line_gap: 0.2,
+        pad_top: 0.6,
     };
     const TOAST: PanelStyle = PanelStyle {
         face: windows::core::w!("Segoe UI"),
@@ -742,6 +872,7 @@ impl PanelStyle {
         radius: 0.9,
         pad: (1.1, 0.55),
         line_gap: 0.2,
+        pad_top: 0.0,
     };
 }
 

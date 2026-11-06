@@ -27,6 +27,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private let streamItem = NSMenuItem()
     private let resolutionItem = NSMenuItem()
     private let statsItem = NSMenuItem()
+    private let latencyItem = NSMenuItem()
     private let detailItem = NSMenuItem()
     private let warningItem = NSMenuItem()
     /// Last security event (rejected viewer, paired, v1 viewer).
@@ -68,7 +69,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private func buildMenu() {
         menu.autoenablesItems = false
         menu.delegate = self
-        for i in [headerItem, viewerItem, streamItem, resolutionItem, statsItem, detailItem, warningItem, noteItem] {
+        for i in [headerItem, viewerItem, streamItem, resolutionItem, statsItem, latencyItem, detailItem, warningItem, noteItem] {
             i.isEnabled = false
             menu.addItem(i)
         }
@@ -127,6 +128,17 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
     }
 
+    /// "Latency: capture→callback 4.1 · encode 10.8 · glass ~27 ms" (p50s; glass from the viewer).
+    static func latencyTitle(_ v: HostStatus.Viewer) -> String {
+        var parts: [String] = []
+        if let c = v.captureMs { parts.append(String(format: "capture→callback %.1f", c)) }
+        if let e = v.encodeMs { parts.append(String(format: "encode %.1f", e)) }
+        if let r = v.latency, r.totalUs != timingUnknown {
+            parts.append(String(format: "%@ ~%.0f", r.flags & 1 != 0 ? "glass" : "to present", Double(r.totalUs) / 1000))
+        }
+        return parts.isEmpty ? "" : "Latency: " + parts.joined(separator: " · ") + " ms"
+    }
+
     private func add(_ title: String, _ sel: Selector) {
         let i = NSMenuItem(title: title, action: sel, keyEquivalent: "")
         i.target = self
@@ -158,8 +170,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             } else {
                 statsItem.title = "Stats: waiting…"
             }
+            latencyItem.title = Self.latencyTitle(v)
         }
         for i in [viewerItem, streamItem, resolutionItem, statsItem] { i.isHidden = s.viewer == nil }
+        latencyItem.isHidden = s.viewer == nil || latencyItem.title.isEmpty
 
         var detail: String?
         if let e = s.viewer?.captureError { detail = "Capture: \(e)" }

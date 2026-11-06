@@ -30,7 +30,10 @@ func runSelfTestUI(outDir: String?) -> Never {
 
     let viewer = HostStatus.Viewer(sessionId: 7, name: "DESKTOP-TEST", address: "192.168.10.212", viewW: 2560, viewH: 1440,
                                    video: VideoConfig(width: 2560, height: 1440, codec: .hevc, chroma: .yuv420, scale: 1),
-                                   hybrid: true, captureError: nil, fps: 58.4, mbps: 12.3, encodeMs: 7.9, statsAt: Date())
+                                   hybrid: true, captureError: nil, fps: 58.4, mbps: 12.3, encodeMs: 7.9, captureMs: 4.2,
+                                   latency: LatencyReport(samples: 100, flags: 1, hostUs: 12_000, networkUs: 1_000, queueUs: 100, decodeUs: 1_500,
+                                                          renderUs: 300, scanoutUs: 6_900, totalUs: 27_400, groundTruthUs: timingUnknown),
+                                   statsAt: Date())
     let paired = [PairedViewer(name: "DESKTOP-TEST", key: Data(repeating: 0xab, count: 32), paired: Date(timeIntervalSince1970: 1_793_970_309))]
     let states: [(String, (inout HostStatus.Snapshot) -> Void, HostStatus.Phase)] = [
         ("idle", { $0 = .init(); $0.listenPort = 7420 }, .idle),
@@ -73,6 +76,7 @@ func runSelfTestUI(outDir: String?) -> Never {
             check(titles.contains("Viewer: DESKTOP-TEST (192.168.10.212)"), "connected: viewer row")
             check(titles.contains { $0.contains("58 fps") && $0.contains("12.3 Mbps") && $0.contains("encode 7.9 ms") }, "connected: stats row")
             check(menu.menu.items.first { $0.title == "Disconnect Viewer" }?.isEnabled == true, "connected: disconnect enabled")
+            check(titles.contains("Latency: capture→callback 4.2 · encode 7.9 · glass ~27 ms"), "connected: latency row")
         }
         if name == "paused" { check(titles.contains("Resume Dialing"), "paused: resume item") }
     }
