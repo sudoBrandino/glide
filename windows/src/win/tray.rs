@@ -1,6 +1,7 @@
 //! Notification-area (tray) icon: tooltip = window title; left click brings the viewer to
-//! the front; right click opens Connect / Disconnect / Reconnect / Stats / Open config /
-//! Forget password / Quit. Commands arrive at the viewer window as WM_COMMAND.
+//! the front; right click opens Connect / Disconnect / Reconnect / Stats / Change password /
+//! Open config / Forget password / Forget pinned host / Quit. Commands arrive at the viewer
+//! window as WM_COMMAND.
 
 use std::sync::OnceLock;
 use windows::core::{w, PCWSTR};
@@ -14,19 +15,31 @@ pub enum MenuCmd {
     Disconnect,
     Reconnect,
     ToggleHud,
+    ChangePassword,
     OpenConfig,
     ForgetPassword,
+    ForgetPinned,
     Quit,
 }
 
+/// What the menu shows (enabled/checked state).
+pub struct MenuState {
+    pub paused: bool,
+    pub hud_on: bool,
+    /// Listen mode with a pinned/allowed host list.
+    pub has_pinned: bool,
+}
+
 const BASE: u16 = 0x4100;
-const CMDS: [MenuCmd; 7] = [
+const CMDS: [MenuCmd; 9] = [
     MenuCmd::Connect,
     MenuCmd::Disconnect,
     MenuCmd::Reconnect,
     MenuCmd::ToggleHud,
+    MenuCmd::ChangePassword,
     MenuCmd::OpenConfig,
     MenuCmd::ForgetPassword,
+    MenuCmd::ForgetPinned,
     MenuCmd::Quit,
 ];
 
@@ -129,17 +142,18 @@ fn bring_to_front(hwnd: HWND) {
 }
 
 /// Tray callback (NOTIFYICON_VERSION_4: LOWORD(lParam) = event).
-pub fn on_notify(hwnd: HWND, lparam: LPARAM, paused: bool, hud_on: bool) {
+pub fn on_notify(hwnd: HWND, lparam: LPARAM, st: &MenuState) {
     const NIN_KEYSELECT: u32 = NIN_SELECT | 1; // NIN_SELECT | NINF_KEY
     let ev = (lparam.0 & 0xFFFF) as u32;
     match ev {
-        WM_CONTEXTMENU | WM_RBUTTONUP => show_menu(hwnd, paused, hud_on),
+        WM_CONTEXTMENU | WM_RBUTTONUP => show_menu(hwnd, st),
         NIN_SELECT | NIN_KEYSELECT | WM_LBUTTONDBLCLK => bring_to_front(hwnd),
         _ => {}
     }
 }
 
-fn show_menu(hwnd: HWND, paused: bool, hud_on: bool) {
+fn show_menu(hwnd: HWND, st: &MenuState) {
+    let (paused, hud_on) = (st.paused, st.hud_on);
     unsafe {
         let Ok(m) = CreatePopupMenu() else { return };
         let item = |cmd: MenuCmd, text: &str, flags: MENU_ITEM_FLAGS| {
@@ -152,8 +166,10 @@ fn show_menu(hwnd: HWND, paused: bool, hud_on: bool) {
         item(MenuCmd::Reconnect, "&Reconnect\tCtrl+Alt+Shift+D", gray(paused));
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         item(MenuCmd::ToggleHud, "&Stats overlay\tCtrl+Alt+Shift+H", if hud_on { MF_CHECKED } else { MF_UNCHECKED });
+        item(MenuCmd::ChangePassword, "Change &password…", MF_ENABLED);
         item(MenuCmd::OpenConfig, "Open &config file", MF_ENABLED);
         item(MenuCmd::ForgetPassword, "&Forget saved password", MF_ENABLED);
+        item(MenuCmd::ForgetPinned, "Forget pinned &host", gray(!st.has_pinned));
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         item(MenuCmd::Quit, "&Quit Glide", MF_ENABLED);
         let mut pt = POINT::default();

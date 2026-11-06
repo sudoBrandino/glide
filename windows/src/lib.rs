@@ -12,6 +12,7 @@ pub mod hid;
 pub mod hotkeys;
 pub mod hud;
 pub mod net;
+pub mod peers;
 pub mod protocol;
 pub mod util;
 

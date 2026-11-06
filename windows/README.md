@@ -53,7 +53,8 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   "ctrl_as_cmd": true,
   "hud": false,             // stats overlay, toggled with Ctrl+Alt+Shift+H
   "clipboard": true,        // clipboard sync with the host (false = --no-clipboard)
-  "clipboard_sync_secrets": false,  // also send clipboard items password managers mark private (= --clipboard-sync-secrets)
+  "clipboard_sync_secrets": false,
+  "allowed_peers": [],      // listen mode: IPs/CIDRs allowed to connect; [] = pin the first host that authenticates  // also send clipboard items password managers mark private (= --clipboard-sync-secrets)
   "last_monitor": "\\.\DISPLAY1",
   "windows": { "\\.\DISPLAY1": { "x": 0, "y": 0, "w": 2400, "h": 1400, "maximized": false, "fullscreen": true, "mon_w": 3840, "mon_h": 2160 } }
 }
@@ -69,14 +70,24 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
 - **Password:** `--password`, then `GLIDE_PASSWORD`, then the saved password, then a password dialog.
   - The dialog has a *Remember on this PC* box, on by default.
   - The saved password is `password.dpapi` next to `config.json`. It is encrypted with DPAPI (`CryptProtectData`, current user), so only this Windows account on this PC can read it.
-  - If the host rejects a saved or typed password, the dialog appears again. Passwords from `--password` or `GLIDE_PASSWORD` are not re-prompted, and they are never saved.
+  - The saved password is never deleted automatically, only by *Forget saved password* or `--forget-password`.
+  - **Connect mode** (the viewer dials the configured host): after two authentication failures in a row, the dialog asks for the password again. This only happens for saved or typed passwords; `--password` and `GLIDE_PASSWORD` are never re-prompted or saved.
+  - **Listen mode** never prompts. Anyone who can reach the port can cause a failed handshake, so the window shows a neutral status ("A connection attempt failed authentication — still waiting for …") and keeps listening. Use tray → *Change password…* to enter a new one.
   - Cancel on the first dialog exits. `--forget-password`, or the tray menu, deletes the saved password.
   - Migration: a plaintext `"password"` key in `config.json` is moved into `password.dpapi` and removed from the file on the next start. Older key names (`port`, `listen`, `connect`, `no_ctrl_as_cmd`) are also migrated.
 - **Window:** the window placement is remembered per monitor: the position, the size, and whether it is maximized or fullscreen.
   - At startup the window reopens on the last monitor it was on, in the same state.
   - If that monitor is gone, it uses the saved state of the monitor under the cursor, or opens centered.
   - A saved rect that no longer fits (for example after a resolution change) is clamped into the monitor's work area.
-- **Tray icon:** Connect / Disconnect / Reconnect, Stats overlay, Open config file, Forget saved password, Quit.
+- **Listen-mode admission control** (defense in depth; see `src/peers.rs`):
+  - **Allowlist:** if `allowed_peers` is non-empty, connections from any other IP are closed right after `accept()`, before a single handshake byte is sent or read. Entries are IPs or CIDRs, for example `"192.168.50.4"` or `"192.168.50.0/24"`.
+  - **Trust on first use:** if `allowed_peers` is empty, the IP of the first peer that completes an authenticated session is pinned there (logged, and shown in the "Connected" toast). Tray → *Forget pinned host* clears the list.
+  - **Backoff:** a failed handshake from an IP blocks that IP for 1 s, doubling on each further failure up to 60 s. Connections from a blocked IP are dropped without a handshake. A successful session resets it.
+  - **Pre-auth timeout:** a peer that hasn't completed the handshake after 5 s is disconnected.
+
+  These are mitigations only. In protocol v1 an attacker who can see or relay a handshake can still run an offline
+  dictionary attack on the password. The real fix is the planned PAKE handshake (SPAKE2 plus pinned host keys, security v2 in `docs/ROADMAP.md`).
+- **Tray icon:** Connect / Disconnect / Reconnect, Stats overlay, Change password…, Open config file, Forget saved password, Forget pinned host, Quit.
   - *Disconnect* also stops listening, so the host can't reconnect until you choose *Connect*.
   - Left-click brings the window to the front.
 

@@ -78,6 +78,9 @@ impl ClockSync {
     }
 }
 
+/// Per-read timeout during the handshake (an idle pre-auth peer is dropped after this).
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub enum NetEvent {
     Msg(HostMsg),
     Closed(String),
@@ -188,7 +191,7 @@ impl Connection {
     /// Run the client handshake on an already-connected stream.
     pub fn from_stream(mut stream: TcpStream, password: &str, hello: &ClientMsg) -> Result<Connection, ConnectError> {
         stream.set_nodelay(true).map_err(ConnectError::Io)?;
-        stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(ConnectError::Io)?;
+        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).map_err(ConnectError::Io)?;
         let sess = crypto::client_handshake(&mut stream, password).map_err(ConnectError::Crypto)?;
         let mut sealer = sess.sealer;
         let mut opener = sess.opener;
