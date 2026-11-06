@@ -43,24 +43,27 @@ layer, so text is pixel-exact at rest and motion stays fast.
 ```mermaid
 flowchart LR
   subgraph Mac["Mac host"]
-    SCK[ScreenCaptureKit] --> D[TileDiff<br/>dirty rects]
-    D --> E420[VideoToolbox<br/>HEVC 4:2:0 LL]
+    SCK[ScreenCaptureKit] --> E420[VideoToolbox<br/>HEVC 4:2:0 LL]
+    SCK --> D[TileDiff<br/>patch rects]
     SCK --> E444[VideoToolbox<br/>HEVC 4:4:4 sharp]
     CUR[Cursor monitor]
     INJ[CGEvent injector]
   end
-  subgraph Net["TCP :7420 · ChaCha20-Poly1305"]
-  end
+  NET(["TCP :7420<br/>ChaCha20-Poly1305"])
   subgraph PC["Windows viewer"]
     DB[MF decoder base] --> C[RGB canvas]
     DS[MF decoder sharp] --> C
     C --> SW[D3D11 swap chain]
     IN[Raw input + remap]
   end
-  E420 --> Net --> DB
-  E444 --> Net --> DS
-  CUR --> Net
-  IN --> Net --> INJ
+  E420 --> NET
+  D --> NET
+  E444 --> NET
+  CUR --> NET
+  NET --> DB
+  NET --> DS
+  IN --> NET
+  NET --> INJ
 ```
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the details.
