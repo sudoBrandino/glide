@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Reference crypto vectors: the Python generator must reproduce the committed file exactly.
+  vectors:
+    name: Test vectors (Python reference)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cryptography
+      - name: Regenerate and compare
+        run: |
+          python3 tools/gen_vectors.py "$RUNNER_TEMP/v.json"
+          cmp "$RUNNER_TEMP/v.json" docs/test-vectors.json
+
+  # Swift host: release build + protocol self-test against docs/test-vectors.json.
+  mac:
+    name: Mac host (Swift build + selftest)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcode-select -p
+          swift --version
+      - name: Cache SwiftPM build
+        uses: actions/cache@v4
+        with:
+          path: mac/.build
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mac/Package.swift', 'mac/Sources/**') }}
+          restore-keys: swiftpm-${{ runner.os }}-${{ runner.arch }}-
+      - name: Build (release)
+        working-directory: mac
+        # The default build backend is used when it works; fall back to the native backend
+        # (needed with Command Line Tools-only setups, see README).
+        run: |
+          if ! swift build -c release; then
+            echo "::warning::default build system failed; retrying with --build-system native"
+            swift build -c release --build-system native
+          fi
+      - name: Self-test
+        working-directory: mac
+        run: |
+          BIN="$(swift build -c release --show-bin-path 2>/dev/null || echo .build/release)"
+          [ -x "$BIN/glide-selftest" ] || BIN=.build/release
+          "$BIN/glide-selftest" ../docs/test-vectors.json
+
+  # Rust viewer: platform-independent unit tests on Linux, plus the MinGW cross-build of the exe.
+  rust:
+    name: Viewer (cargo test + Windows cross-build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: windows
+      - name: cargo test
+        run: cargo test --locked
+      - name: Cross-build glide-client.exe (x86_64-pc-windows-gnu)
+        run: cargo build --locked --release --target x86_64-pc-windows-gnu
+      - name: Check exe
+        run: |
+          EXE=target/x86_64-pc-windows-gnu/release/glide-client.exe
+          ls -l "$EXE"
+          file "$EXE"
+          # Must not depend on MinGW runtime DLLs (+crt-static in .cargo/config.toml).
+          if x86_64-w64-mingw32-objdump -p "$EXE" | grep -iE 'DLL Name: (libgcc|libwinpthread|libstdc)'; then
+            echo "::error::exe links MinGW runtime DLLs"; exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glide-client-windows-x64
+          path: windows/target/x86_64-pc-windows-gnu/release/glide-client.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  # Native Windows build (MSVC) + tests, and a smoke run of --probe (no GPU decoder on the runner,
+  # so only check that it runs and exits cleanly; the decode verdict is informational).
+  windows:
+    name: Viewer (native Windows build + probe smoke)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: windows
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: windows
+      - name: cargo test
+        run: cargo test --locked
+      - name: Build (release, MSVC)
+        run: cargo build --locked --release
+      - name: Probe smoke test
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath target\release\glide-client.exe -ArgumentList '--probe' `
+                -NoNewWindow -PassThru -RedirectStandardOutput probe.json -RedirectStandardError probe.err
+          $null = $p.Handle  # keep the handle so ExitCode is available after exit
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); Write-Error "--probe hung"; exit 1 }
+          Get-Content probe.json; Get-Content probe.err
+          "exit code: $($p.ExitCode)"
+          # 101 = Rust panic; negative = NTSTATUS crash (0xC0000005 access violation etc.)
+          if ($p.ExitCode -eq 101 -or $p.ExitCode -lt 0) { Write-Error "--probe crashed"; exit 1 }
+          Get-Content probe.json -Raw | ConvertFrom-Json | Out-Null
