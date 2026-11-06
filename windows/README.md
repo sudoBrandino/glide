@@ -11,8 +11,9 @@ The wire protocol is defined in `../docs/PROTOCOL.md`.
 | `src/protocol.rs`, `src/crypto.rs` | Message codec, handshake, KDF, ChaCha20-Poly1305 record layer. Works on any OS and is unit-tested against `../docs/test-vectors.json`. |
 | `src/net.rs` | TCP (NODELAY), shared encrypted writer, receive thread, 1 Hz ping, RTT and clock offset. Includes `--listen` reverse mode. |
 | `src/hid.rs` | Set-1 scancode → USB HID usage table, plus the Ctrl↔Cmd / Win↔Control remap. Unit-tested. |
+| `src/clipboard.rs` | Clipboard sync logic without Win32: CRLF↔LF, echo guard, DIB↔PNG (`png` crate). Unit-tested. |
 | `src/annexb.rs`, `src/bench.rs` | Annex-B access-unit splitting, and the headless benchmark driver. |
-| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain), `app` (window, input, cursor, fullscreen), `cursor`, `probe`, `bench_decoder`. |
+| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain), `app` (window, input, cursor, fullscreen), `clipboard` (clipboard listener/apply), `cursor`, `probe`, `bench_decoder`. |
 | `assets/` | Small clips embedded in the exe for `--probe`. Regenerate them with `../tools/make_streams.sh --clips-only`. |
 
 ## Build (on macOS, cross-compiling)
@@ -30,7 +31,7 @@ Shaders are compiled at runtime with `D3DCompile` from `d3dcompiler_47.dll`, whi
 ## Run
 
 ```
-glide-client.exe <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--bench SECONDS] [--probe]
+glide-client.exe <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--bench SECONDS] [--probe]
 glide-client.exe --listen [PORT] [same options]
 ```
 
@@ -72,6 +73,15 @@ glide-client.exe --listen [PORT] [same options]
   To leave the window, click outside it, or press Ctrl+Alt+Del, which cannot be intercepted.
 - Modifier remap (on by default; turn it off with `--no-ctrl-as-cmd`): Ctrl → Command, Win → Control, Alt → Option.
 - When a key is held, its typematic repeats are sent as repeated `Key down=1` messages.
+- **Clipboard sync** (PROTOCOL.md §5; off with `--no-clipboard`): text and images, both directions,
+  while connected to a host that answers caps bit 8 with `ClipboardCaps`.
+  - Only changes made while connected are sent; connecting doesn't push either clipboard.
+  - PC → Mac: CF_UNICODETEXT (CRLF → LF) if there is text, else the registered "PNG" format, else
+    CF_DIB converted to PNG on a worker thread. Mac → PC: CF_UNICODETEXT (LF → CRLF), or
+    "PNG" + CF_DIB (translucent pixels composited over white in the DIB).
+  - Max 16 MiB per clipboard; bigger content is not sent (logged, never truncated).
+  - Echo suppression: our own writes are recognized by `GetClipboardSequenceNumber()` / clipboard
+    owner, plus a content hash, so nothing ping-pongs.
 
 The GUI command for the real host (run it in the interactive desktop session):
 
@@ -97,6 +107,9 @@ Then start the host on the Mac: `mac/.build/release/glide-host --password-file .
   - `rtt_ms`;
   - `e2e_capture_to_decoded_ms`, estimated from the ping/pong clock offset and counting base-layer frames only (refresh and sharp frames are excluded);
   - errors.
+- `--clipboard-selftest` exercises the real Win32 clipboard path (apply, read back, CRLF, PNG/DIB,
+  echo suppression, external changes) on hidden windows and prints one line per check. Session 0
+  has its own clipboard, so running it over SSH doesn't touch the desktop user's clipboard.
 - Test hooks for the viewer:
   - `GLIDE_EXIT_AFTER=SECONDS` closes the window automatically and prints stats.
   - `GLIDE_DUMP_FRAME=path.bmp` writes the last rendered frame.
@@ -117,5 +130,9 @@ The mock host:
 - logs input messages;
 - handles RequestKeyframe and SetMode;
 - with `--switch-every N`, sends periodic VideoConfig switches to exercise decoder reset;
+- clipboard (§5): logs every Clipboard the viewer sends; `--clip-text TEXT` / `--clip-png FILE` push a
+  clipboard ~2 s after connect (`--clip-every N` repeats), `--clip-bounce` sends each received
+  clipboard back once (the viewer must keep it as is and not echo it), `--clip-save DIR` keeps PNGs;
+  `--selftest` checks the codec against the §5 reference bytes;
 - in hybrid mode, sends SharpLayerConfig, then each `--hybrid-period` frames (default 60) a 4:4:4 sharp IDR,
   followed by base frames limited to small rects.

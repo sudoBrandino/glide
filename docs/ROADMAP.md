@@ -14,7 +14,9 @@
 - [ ] Virtual display that matches the viewer (CGVirtualDisplay): e.g. 4K monitor →
       1920×1080 HiDPI at 120 Hz; drop BetterDisplay dependency
 - [ ] UDP video transport with NACK/FEC (TCP head-of-line blocking on loss)
-- [ ] Clipboard sync (text, then images/files), audio (SCK audio → Opus)
+- [x] Clipboard sync: text + images (PNG) both directions, PROTOCOL.md §5
+- [ ] Clipboard: files (with file transfer); chunked transfer so big images don't stall video
+- [ ] Audio (SCK audio → Opus)
 - [ ] Multi-monitor, display picker
 - [ ] Signed `.app` bundle + LaunchAgent so TCC permissions stick to the host, menu-bar UI
 - [ ] Windows viewer UI: connection list, settings, HUD

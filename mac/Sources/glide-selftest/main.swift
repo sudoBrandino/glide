@@ -1,3 +1,4 @@
+import AppKit
 import CryptoKit
 import Foundation
 import GlideCore
@@ -74,6 +75,149 @@ func run() throws {
     check(missing.isEmpty, "keymap coverage \(missing)")
 }
 
+/// Clipboard sync (PROTOCOL.md §5): wire format, line endings, echo suppression.
+func clipboardTests() throws {
+    print("clipboard:")
+    // Reference bytes from PROTOCOL.md §5 (also checked by the Rust tests and mock_host.py --selftest).
+    let textMsg = ClientMessage.clipboard(ClipboardData(seq: 1, text: "hi\n"))
+    check(textMsg.encoded.hex == "5001000000010103000000" + "68690a", "Clipboard text reference bytes")
+    check(HostMessage.clipboard(ClipboardData(seq: 1, text: "hi\n")).encoded == textMsg.encoded, "Clipboard same layout both directions")
+    let caps = HostMessage.clipboardCaps(formats: ClipboardData.capsText | ClipboardData.capsPNG, maxBytes: UInt32(ClipboardData.maxBytes))
+    check(caps.encoded.hex == "510300000000000001", "ClipboardCaps reference bytes")
+    if case let .clipboardCaps(f, m) = try HostMessage.decode(caps.encoded) {
+        check(f == 3 && m == 16 << 20, "ClipboardCaps decode")
+    } else { check(false, "ClipboardCaps decode") }
+
+    // Round trips.
+    let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3])
+    for c in [ClipboardData(seq: 7, text: "héllo — 世界 🎉\nline2"), ClipboardData(seq: 8, png: png),
+              ClipboardData(seq: UInt32.max, text: "", png: png), ClipboardData(seq: 9)] {
+        if case let .clipboard(d) = try ClientMessage.decode(ClientMessage.clipboard(c).encoded) {
+            check(d == c, "Clipboard c2s roundtrip seq \(c.seq)")
+        } else { check(false, "Clipboard c2s decode seq \(c.seq)") }
+        if case let .clipboard(d) = try HostMessage.decode(HostMessage.clipboard(c).encoded) {
+            check(d == c, "Clipboard s2c roundtrip seq \(c.seq)")
+        } else { check(false, "Clipboard s2c decode seq \(c.seq)") }
+    }
+    // A text bigger than the old u16 `str` limit survives.
+    let big = String(repeating: "x", count: 100_000)
+    if case let .clipboard(d) = try HostMessage.decode(HostMessage.clipboard(ClipboardData(seq: 1, text: big)).encoded) {
+        check(d.text == big, "Clipboard text > 64 KiB")
+    } else { check(false, "Clipboard big decode") }
+
+    // Unknown formats skipped, duplicate formats: first wins, invalid UTF-8 replaced.
+    var w = Data([0x50, 2, 0, 0, 0, 4])
+    w += Data([9, 2, 0, 0, 0, 0xAA, 0xBB])        // unknown format 9
+    w += Data([1, 2, 0, 0, 0, 0x6F, 0x6B])        // text "ok"
+    w += Data([1, 1, 0, 0, 0, 0x78])              // duplicate text: ignored
+    w += Data([2, 2, 0, 0, 0, 0xFF, 0xC0])        // png
+    if case let .clipboard(d) = try ClientMessage.decode(w) {
+        check(d.seq == 2 && d.text == "ok" && d.png == Data([0xFF, 0xC0]), "Clipboard unknown/duplicate formats")
+    } else { check(false, "Clipboard unknown/duplicate decode") }
+    if case let .clipboard(d) = try ClientMessage.decode(Data([0x50, 1, 0, 0, 0, 1, 1, 2, 0, 0, 0, 0xFF, 0x41])) {
+        check(d.text == "\u{FFFD}A", "Clipboard invalid UTF-8 replaced")
+    } else { check(false, "Clipboard invalid UTF-8 decode") }
+    let enc = textMsg.encoded
+    var truncatedRejected = true
+    for n in 1..<enc.count where (try? ClientMessage.decode(enc.prefix(n))) != nil { truncatedRejected = false }
+    check(truncatedRejected, "Clipboard truncation rejected")
+
+    // Line endings.
+    check(ClipboardText.toWire("a\r\nb\rc\nd") == "a\nb\nc\nd", "CRLF/CR -> LF")
+    check(ClipboardText.toWire("plain\n") == "plain\n", "LF unchanged")
+    check(ClipboardText.toWire("x\r\ny\r\n") == "x\ny\n", "CRLF-only text converted")
+
+    // FNV-1a 64 known values.
+    check(fnv1a64(Data()) == 0xcbf2_9ce4_8422_2325 && fnv1a64(Data("a".utf8)) == 0xaf63_dc4c_8601_ec8c, "FNV-1a 64")
+
+    // Echo suppression.
+    var g = ClipboardEchoGuard()
+    let h1 = ClipboardEchoGuard.hash(format: 1, Data("one".utf8)), h2 = ClipboardEchoGuard.hash(ClipboardData(text: "two"))!
+    check(h1 != ClipboardEchoGuard.hash(format: 2, Data("one".utf8)), "hash distinguishes text from image bytes")
+    g.baseline(marker: 5)
+    check(!g.changed(marker: 5), "guard: baseline content not sent")
+    check(g.changed(marker: 6) && g.shouldSend(hash: h1, marker: 6), "guard: local change sent")
+    check(!g.changed(marker: 6), "guard: same marker not re-sent")
+    check(!g.shouldApply(hash: h1, marker: 6), "guard: echo of what we sent not re-applied while unchanged")
+    check(g.shouldApply(hash: h2, marker: 6), "guard: different content applied")
+    check(g.changed(marker: 7) && !g.shouldSend(hash: h1, marker: 7), "guard: identical content not re-sent")
+    check(g.shouldApply(hash: h1, marker: 7), "guard: same content applied after a local change")
+    g.didApply(hash: h2, marker: 9)              // remote "two" written locally -> marker 9
+    check(!g.changed(marker: 9), "guard: own write not echoed")
+    check(g.changed(marker: 10) && !g.shouldSend(hash: h2, marker: 10), "guard: re-write of received content not echoed")
+    check(g.changed(marker: 11) && g.shouldSend(hash: h1, marker: 11), "guard: new local content after apply sent")
+    g.didApply(hash: h1, marker: 12)             // peer sends back what we sent: applied, never re-sent
+    check(!g.changed(marker: 12) && !g.shouldSend(hash: h1, marker: 12), "guard: ping-pong stops")
+}
+
+/// NSPasteboard read/write rules on a private named pasteboard (never the user's general one).
+func pasteboardTests() {
+    print("pasteboard (private):")
+    let pb = NSPasteboard(name: NSPasteboard.Name("io.github.sudobrandino.glide.selftest.\(getpid())"))
+    defer { pb.releaseGlobally() }
+    var g = ClipboardEchoGuard()
+    g.baseline(marker: pb.changeCount)
+
+    // Received text: written, our own write is not echoed, read back identical (hash match).
+    let remote = ClipboardData(seq: 1, text: "a\nb ✓")
+    guard case let .success((prepared, tiff0)) = ClipboardPasteboard.prepare(remote) else { return check(false, "prepare text") }
+    check(prepared == remote && tiff0 == nil, "prepare text")
+    let m1 = ClipboardPasteboard.write(prepared, tiff: nil, to: pb)
+    g.didApply(hash: ClipboardEchoGuard.hash(prepared), marker: m1)
+    check(!g.changed(marker: pb.changeCount), "own pasteboard write not echoed")
+    let back = ClipboardPasteboard.read(pb)
+    check(back == .text("a\nb ✓") && back?.hash == ClipboardEchoGuard.hash(remote), "text read back, same hash")
+    check(!g.shouldApply(hash: ClipboardEchoGuard.hash(remote), marker: pb.changeCount), "re-received same text not re-applied")
+
+    // Another app copies CRLF text: detected and normalized.
+    pb.clearContents(); pb.setString("x\r\ny", forType: .string)
+    check(g.changed(marker: pb.changeCount), "external change detected")
+    let ext = ClipboardPasteboard.read(pb)
+    check(ext == .text("x\ny"), "CRLF -> LF on read")
+    check(g.shouldSend(hash: ext!.hash!, marker: pb.changeCount), "external text would be sent")
+    if case let .success(c) = ext!.message(seq: 2, maxBytes: ClipboardData.maxBytes) { check(c.text == "x\ny" && c.seq == 2, "text message") }
+    else { check(false, "text message") }
+    check((try? ext!.message(seq: 3, maxBytes: 2).get()) == nil, "oversized text refused (no truncation)")
+
+    // Received image: PNG kept byte-for-byte + TIFF rendered; reading prefers the PNG.
+    let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 4, pixelsHigh: 3, bitsPerSample: 8, samplesPerPixel: 4,
+                               hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 16, bitsPerPixel: 32)!
+    for y in 0..<3 { for x in 0..<4 { rep.setColor(NSColor(deviceRed: CGFloat(x) / 3, green: CGFloat(y) / 2, blue: 0.5, alpha: 1), atX: x, y: y) } }
+    let png = rep.representation(using: .png, properties: [:])!
+    guard case let .success((img, tiff)) = ClipboardPasteboard.prepare(ClipboardData(seq: 4, png: png)) else { return check(false, "prepare png") }
+    check(tiff != nil, "TIFF rendered for received PNG")
+    ClipboardPasteboard.write(img, tiff: tiff, to: pb)
+    check(ClipboardPasteboard.read(pb) == .png(png), "image read back as the exact PNG")
+    check(pb.data(forType: .tiff) != nil, "TIFF representation present")
+
+    // TIFF-only image (e.g. older apps): converted to PNG with the same pixels.
+    pb.clearContents(); pb.setData(rep.tiffRepresentation!, forType: .tiff)
+    let t = ClipboardPasteboard.read(pb)
+    check(t?.needsConversion == true, "TIFF-only content needs conversion")
+    if case let .success(c)? = t?.message(seq: 5, maxBytes: ClipboardData.maxBytes), let p = c.png, let r = NSBitmapImageRep(data: p) {
+        check(r.pixelsWide == 4 && r.pixelsHigh == 3 && p.starts(with: [0x89, 0x50, 0x4E, 0x47]), "TIFF -> PNG")
+    } else { check(false, "TIFF -> PNG") }
+
+    // Text wins over an image; empty text falls through to the image; transient is skipped.
+    pb.clearContents(); pb.setString("cells", forType: .string); pb.setData(png, forType: .png)
+    check(ClipboardPasteboard.read(pb) == .text("cells"), "text preferred over image")
+    pb.clearContents(); pb.setString("", forType: .string); pb.setData(png, forType: .png)
+    check(ClipboardPasteboard.read(pb) == .png(png), "empty text falls through to image")
+    pb.clearContents(); pb.setString("otp", forType: .string); pb.setData(Data(), forType: ClipboardPasteboard.transientType)
+    if case .skipped? = ClipboardPasteboard.read(pb) { check(true, "transient content skipped") } else { check(false, "transient content skipped") }
+    pb.clearContents()
+    check(ClipboardPasteboard.read(pb) == nil, "empty pasteboard -> nothing")
+
+    // Invalid received PNG: refused alone, text kept when present.
+    check((try? ClipboardPasteboard.prepare(ClipboardData(seq: 6, png: Data([1, 2, 3]))).get()) == nil, "invalid PNG refused")
+    if case let .success((c, tf)) = ClipboardPasteboard.prepare(ClipboardData(seq: 7, text: "t", png: Data([1, 2, 3]))) {
+        check(c.text == "t" && c.png == nil && tf == nil, "invalid PNG dropped, text kept")
+    } else { check(false, "invalid PNG dropped, text kept") }
+    check((try? ClipboardPasteboard.prepare(ClipboardData(seq: 8)).get()) == nil, "empty message ignored")
+}
+
 do { try run() } catch { failures += 1; print("  FAIL threw \(error)") }
+do { try clipboardTests() } catch { failures += 1; print("  FAIL clipboard threw \(error)") }
+pasteboardTests()
 print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)

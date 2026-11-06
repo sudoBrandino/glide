@@ -8,6 +8,11 @@
   else HEVC 4:2:0, else H.264. SetMode switches stream (sends VideoConfig + keyframe).
 - Answers Ping with Pong, sends a synthetic cursor shape, logs input messages.
 - RequestKeyframe restarts the file at its first keyframe.
+- Clipboard (PROTOCOL.md §5): if the client sets caps bit 8, sends ClipboardCaps and logs every
+  Clipboard it receives (--clip-save DIR keeps received PNGs). --clip-text/--clip-png push a
+  clipboard to the client (--clip-every N repeats it); --clip-bounce sends each received
+  clipboard straight back once, to check that the viewer does not echo it again (no ping-pong).
+- --selftest checks the clipboard codec against the PROTOCOL.md §5 reference bytes and exits.
 - Hybrid (mode 2, needs HEVC 4:4:4 cap): ServerHello + SharpLayerConfig, base 4:2:0 stream, a
   sharp-layer 4:4:4 IDR (flags bit2) each --hybrid-period frames, and rect-only base frames (bit3).
 
@@ -15,6 +20,8 @@ Usage:
   GLIDE_PASSWORD=... python3 tools/mock_host.py [--port 7421 | --connect HOST:PORT [--once]] [--fps 60]
       [--hevc streams/hevc420_1440p.h265] [--hevc444 streams/hevc444_1440p.h265]
       [--h264 streams/h264_1440p.h264] [--switch-every SECONDS] [--quiet-input]
+      [--clip-text TEXT | --clip-png FILE] [--clip-every SECONDS] [--clip-bounce] [--clip-save DIR]
+  python3 tools/mock_host.py --selftest
 Generate streams first with tools/make_streams.sh.
 """
 import argparse, hashlib, os, socket, struct, sys, threading, time
@@ -160,6 +167,81 @@ class Stream:
             f"avg {len(data) * 8 / max(1, len(self.aus)) / 1000:.0f} kbit/frame")
 
 
+# ---------------------------------------------------------------- clipboard (§5)
+
+CAP_CLIPBOARD = 1 << 8
+CLIP_TEXT, CLIP_PNG = 1, 2
+CLIPBOARD_MAX = 16 << 20
+
+
+def clip_encode(seq, text=None, png=None):
+    items = []
+    if text is not None:
+        items.append((CLIP_TEXT, text.encode()))
+    if png is not None:
+        items.append((CLIP_PNG, png))
+    out = bytes([0x50]) + struct.pack("<IB", seq, len(items))
+    for fmt, b in items:
+        out += struct.pack("<BI", fmt, len(b)) + b
+    return out
+
+
+def clip_decode(m):
+    """Clipboard message (type byte included) -> (seq, text|None, png|None). Raises on truncation."""
+    if m[0] != 0x50 or len(m) < 6:
+        raise ValueError("not a Clipboard message")
+    seq, n = struct.unpack("<IB", m[1:6])
+    p, text, png = 6, None, None
+    for _ in range(n):
+        if p + 5 > len(m):
+            raise ValueError("truncated item header")
+        fmt, ln = struct.unpack("<BI", m[p:p + 5])
+        p += 5
+        if p + ln > len(m):
+            raise ValueError("truncated item")
+        b = m[p:p + ln]
+        p += ln
+        if fmt == CLIP_TEXT and text is None:
+            text = b.decode("utf-8", "replace")
+        elif fmt == CLIP_PNG and png is None:
+            png = b
+    return seq, text, png
+
+
+def clip_caps(formats=3, max_bytes=CLIPBOARD_MAX):
+    return bytes([0x51]) + struct.pack("<II", formats, max_bytes)
+
+
+def selftest():
+    ok = True
+
+    def check(c, what):
+        nonlocal ok
+        print(("  ok   " if c else "  FAIL ") + what)
+        ok &= c
+
+    ref = clip_encode(1, text="hi\n")
+    check(ref.hex() == "500100000001010300000068690a", "Clipboard reference bytes")
+    check(clip_caps().hex() == "510300000000000001", "ClipboardCaps reference bytes")
+    check(clip_decode(ref) == (1, "hi\n", None), "Clipboard decode")
+    both = clip_encode(9, text="é\nx", png=b"\x89PNG")
+    check(clip_decode(both) == (9, "é\nx", b"\x89PNG"), "text + png roundtrip")
+    raw = bytes([0x50, 2, 0, 0, 0, 3]) + bytes([9, 1, 0, 0, 0, 7]) + bytes([1, 2, 0, 0, 0]) + b"ok" + bytes([1, 1, 0, 0, 0]) + b"x"
+    check(clip_decode(raw) == (2, "ok", None), "unknown format skipped, duplicate ignored")
+    trunc = all(_raises(lambda n=n: clip_decode(both[:n])) for n in range(1, len(both)))
+    check(trunc, "truncation rejected")
+    print("ALL TESTS PASSED" if ok else "FAILURES")
+    return ok
+
+
+def _raises(f):
+    try:
+        f()
+    except (ValueError, struct.error):
+        return True
+    return False
+
+
 # ---------------------------------------------------------------- session
 
 class Session:
@@ -173,6 +255,8 @@ class Session:
         self.restart = threading.Event()
         self.switch_to = None
         self.stats = {"frames": 0, "bytes": 0}
+        self.clip_seq = 0
+        self.clipboard = False
 
     def recv_exact(self, n):
         buf = bytearray()
@@ -269,6 +353,12 @@ class Session:
                 self.send_msg(bytes([0x04]) + self.config_body(sharp))  # SharpLayerConfig
                 log(f"{self.addr}: hybrid mode: base {os.path.basename(st.path)} + sharp IDRs from "
                     f"{os.path.basename(sharp.path)} ({len(self.sharp_idrs)} IDRs), period {self.args.hybrid_period} frames")
+            if caps & CAP_CLIPBOARD:
+                self.clipboard = True
+                self.send_msg(clip_caps())
+                log(f"{self.addr}: clipboard sync negotiated (sent ClipboardCaps)")
+                if self.args.clip_text is not None or self.args.clip_png:
+                    threading.Thread(target=self.clip_push_loop, daemon=True).start()
             self.send_cursor()
             t = threading.Thread(target=self.video_loop, args=(st,), daemon=True)
             t.start()
@@ -349,6 +439,52 @@ class Session:
         except (OSError, EOFError):
             self.alive = False
 
+    def send_clip(self, text=None, png=None):
+        self.clip_seq += 1
+        self.send_msg(clip_encode(self.clip_seq, text=text, png=png))
+        what = (f"text {len(text.encode())} bytes {text[:60]!r}" if text is not None else "") + \
+               (f" png {len(png)} bytes" if png is not None else "")
+        log(f"{self.addr}: Clipboard -> client seq {self.clip_seq}: {what.strip()}")
+
+    def clip_push_loop(self):
+        png = open(self.args.clip_png, "rb").read() if self.args.clip_png else None
+        time.sleep(2)
+        n = 0
+        while self.alive:
+            n += 1
+            text = self.args.clip_text
+            if text is not None and self.args.clip_every:
+                text = f"{text} #{n}"  # distinct content each time (identical content is not re-sent)
+            try:
+                self.send_clip(text=text, png=png)
+            except OSError:
+                return
+            if not self.args.clip_every:
+                return
+            time.sleep(self.args.clip_every)
+
+    def on_clipboard(self, m):
+        try:
+            seq, text, png = clip_decode(m)
+        except ValueError as e:
+            log(f"{self.addr}: bad Clipboard message: {e}")
+            return
+        if not self.clipboard:
+            log(f"{self.addr}: WARNING client sent Clipboard without negotiating caps bit 8")
+        parts = []
+        if text is not None:
+            parts.append(f"text {len(text.encode())} bytes {text[:60]!r}" + (" (CR present!)" if "\r" in text else ""))
+        if png is not None:
+            parts.append(f"png {len(png)} bytes" + ("" if png.startswith(b"\x89PNG\r\n\x1a\n") else " (NOT a PNG!)"))
+            if self.args.clip_save:
+                os.makedirs(self.args.clip_save, exist_ok=True)
+                path = os.path.join(self.args.clip_save, f"clip-{seq}.png")
+                open(path, "wb").write(png)
+                parts.append(f"saved {path}")
+        log(f"{self.addr}: Clipboard <- client seq {seq}: {', '.join(parts) or 'empty'}")
+        if self.args.clip_bounce:
+            self.send_clip(text=text, png=png)
+
     def input_loop(self):
         names = {0x10: "MouseMove", 0x11: "MouseButton", 0x12: "MouseWheel", 0x13: "Key", 0x14: "ReleaseAll",
                  0x20: "RequestKeyframe", 0x21: "SetMode", 0x50: "Clipboard"}
@@ -381,6 +517,8 @@ class Session:
             elif t == 0x20:
                 log(f"{self.addr}: RequestKeyframe -> restarting stream at first keyframe")
                 self.restart.set()
+            elif t == 0x50:
+                self.on_clipboard(m)
             elif t == 0x21:
                 mode, kbps, fps = struct.unpack("<BIB", m[1:7])
                 log(f"{self.addr}: SetMode mode={mode} bitrate={kbps} max_fps={fps}")
@@ -409,7 +547,15 @@ def main():
                     help="reverse mode: dial out to a client running `glide-client --listen` (retries; re-dials after each session)")
     ap.add_argument("--once", action="store_true", help="with --connect: exit after one session")
     ap.add_argument("--password-file", default=os.path.join(HERE, "../.dev/password"))
+    ap.add_argument("--clip-text", help="clipboard text to push to the client ~2 s after connect")
+    ap.add_argument("--clip-png", help="PNG file to push to the client ~2 s after connect")
+    ap.add_argument("--clip-every", type=float, default=0, help="repeat the clipboard push every N s (text gets a counter)")
+    ap.add_argument("--clip-bounce", action="store_true", help="send every received clipboard back once (echo test)")
+    ap.add_argument("--clip-save", metavar="DIR", help="save received clipboard PNGs here")
+    ap.add_argument("--selftest", action="store_true", help="check the clipboard codec against PROTOCOL.md §5 and exit")
     args = ap.parse_args()
+    if args.selftest:
+        sys.exit(0 if selftest() else 1)
 
     password = os.environ.get("GLIDE_PASSWORD")
     if not password and os.path.exists(args.password_file):

@@ -5,6 +5,7 @@
 
 pub mod annexb;
 pub mod bench;
+pub mod clipboard;
 pub mod crypto;
 pub mod hid;
 pub mod net;
