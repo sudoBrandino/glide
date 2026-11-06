@@ -53,6 +53,7 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   "mode": null,             // "fast" | "hybrid" | "sharp"; null = auto (hybrid if 4:4:4 decodes)
   "ctrl_as_cmd": true,
   "hud": false,             // stats overlay, toggled with Ctrl+Alt+Shift+H
+  "bar_pinned": false,      // connection bar always visible (menu → Pin connection bar)
   "audio": true,            // play the Mac's sound (false = --no-audio)
   "audio_muted": false,     // Ctrl+Alt+Shift+A
   "clipboard": true,        // clipboard sync with the host (false = --no-clipboard)
@@ -146,15 +147,29 @@ To replace a `.cmd` launcher that sets `GLIDE_PASSWORD`, run `glide-client.exe` 
   | Ctrl+Alt+Shift+R | request a keyframe |
   | Ctrl+Alt+Shift+D | disconnect and reconnect immediately (in listen mode, the host redials within about 2 s) |
   | Ctrl+Alt+Shift+A | mute / unmute audio (saved in the config) |
+  | Ctrl+Alt+Shift+Space | open the Glide menu at the mouse pointer |
 
   While the window has focus and the keyboard is captured, a low-level keyboard hook sends Win, Alt+Tab, Alt+Space and similar keys to the host.
   To leave the window, click outside it, press Ctrl+Alt+Shift+K, or press Ctrl+Alt+Del, which cannot be intercepted.
+- **Connection bar and Glide menu.** A slim tab at the top center of the window shows the host name, like the Microsoft Remote Desktop or Jump connection bar.
+  - **Showing it:** move the mouse to the top edge (about 4 px) of the middle third of the window. This works windowed and fullscreen. The corners are excluded, so reaching for the Mac's menu bar there doesn't trigger it.
+  - **Hiding it:** it hides 1.5 s after the mouse leaves. *Pin connection bar* keeps it visible, and the pin is saved as `bar_pinned`.
+  - While the mouse is over the tab, mouse input is not sent to the Mac. While a mouse button is held (a drag on the Mac), the bar neither appears nor captures input.
+  - **Opening the menu:** click the tab and the native Glide menu opens below it. Ctrl+Alt+Shift+Space opens the same menu at the pointer. Menus use dark mode when Windows apps are in dark mode.
+  - **Menu items:**
+    - Stream mode ▸ Fast / Hybrid / Sharp.
+    - Mac display ▸ Automatic / Crisp / Retina / Smooth / Don't change, plus a "Now: 1920×1080 Retina" line. This uses `SetDisplayPreference` / `DisplayInfo` (PROTOCOL.md §3.3), applies for the current session, and is disabled for hosts that don't send `DisplayInfo`.
+    - Send to Mac ▸ Spotlight (Cmd+Space), Mission Control (Ctrl+Up), App switcher (Cmd+Tab), Force Quit (Cmd+Opt+Esc), Lock screen (Ctrl+Cmd+Q), Screenshot (Cmd+Shift+5).
+    - Toggles: Mute audio, Clipboard sync, Stats overlay, Fullscreen, Release keyboard, Pin connection bar.
+    - Actions: Refresh picture, Reconnect, Disconnect/Connect, Send files… (disabled until file transfer lands), Settings… (opens `config.json`).
+  - **Clipboard sync** can be switched at runtime and is saved as `"clipboard"`. Off means the clipboard listener is removed and nothing is sent or applied; the next ClientHello also stops advertising clipboard support. Turning it on during a session that started with it off reconnects once, to negotiate it.
+  - **System menu:** the main items are also in the window's system menu (title-bar right-click, or Alt+Space while the keyboard is released): Glide menu…, Stream mode ▸, Mute audio, Stats overlay, Fullscreen, Refresh picture, Reconnect, Settings….
 - **Stats HUD** (off by default): a small translucent panel in the top-left corner. It shows:
   - host name;
   - fps, decode ms and RTT;
   - Mbps and the video size and codec;
   - the mode and the current layer (4:2:0/4:4:4), with sharp and rect frame counts;
-  - the view size and the decoder;
+  - the view size, the decoder, and the Mac's display mode and preference;
   - audio latency and underruns, or "muted".
 
   The text is rasterized with GDI into a texture only when it changes (at most twice a second) and blended 1:1, so it stays crisp.

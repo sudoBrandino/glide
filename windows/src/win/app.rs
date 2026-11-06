@@ -14,7 +14,8 @@ use super::cursor::{create_cursor, destroy_cursor, scale_image, CursorImage};
 use super::d3d::Gpu;
 use super::decoder::Decoder;
 use super::render::Renderer;
-use super::{dpapi, placement, prompt, tray};
+use super::{connbar as cbar, dpapi, menu, placement, prompt, tray};
+use crate::menu_model::{self, Cmd};
 use crate::config::{self, Store};
 use crate::hid;
 use crate::hotkeys::{self, Action};
@@ -50,6 +51,9 @@ pub struct Options {
     pub audio: bool,
     /// Start muted (config "audio_muted").
     pub audio_muted: bool,
+    /// Clipboard sync switch at startup (config "clipboard" / --no-clipboard); toggled at runtime
+    /// from the menu. ClientHello advertises clipboard support only while it is on.
+    pub clipboard: bool,
 }
 
 /// Where the session password came from. Only saved/prompted passwords are re-prompted for
@@ -92,8 +96,6 @@ const VIEW_TIMER: usize = 3;
 const PLACEMENT_TIMER: usize = 4;
 /// `GLIDE_TEST_ACTIONS` test hook: fires one queued action per tick.
 const TEST_ACTION_TIMER: usize = 5;
-/// Window-menu command: mute/unmute audio (low 4 bits zero, below 0xF000, as WM_SYSCOMMAND requires).
-const IDM_MUTE: usize = 0x1F10;
 
 enum RenderCmd {
     Frame { data: Vec<u8>, keyframe: bool, sharp: bool, rects: Option<Vec<protocol::Rect>> },
@@ -105,6 +107,8 @@ enum RenderCmd {
     Hud(Option<Vec<String>>),
     /// Brief hotkey feedback, fades out by itself.
     Toast(String),
+    /// Connection-bar tab text (None = hidden).
+    Bar(Option<String>),
     Resize(u32, u32),
     Redraw,
     Quit,
@@ -164,6 +168,8 @@ struct Shared {
     cursor: Mutex<CursorState>,
     stats: Stats,
     hwnd: AtomicIsize,
+    /// Mac display preference/mode from the host (DisplayInfo, §3.3); None until received.
+    display_info: Mutex<Option<menu_model::DisplayInfo>>,
     /// Audio output (None with --no-audio).
     audio: Option<Audio>,
 }
@@ -178,6 +184,27 @@ struct UiCtx {
 }
 
 static UI: OnceLock<UiCtx> = OnceLock::new();
+
+/// One `GLIDE_TEST_ACTIONS` step: a hotkey action, `menu:<cmd>`, or `bar` (reveal the bar).
+#[derive(Debug, Clone, Copy)]
+enum TestStep {
+    Action(Action),
+    Menu(Cmd),
+    Bar,
+}
+
+impl TestStep {
+    fn parse(s: &str) -> Option<TestStep> {
+        let s = s.trim();
+        if s == "bar" {
+            return Some(TestStep::Bar);
+        }
+        if let Some(c) = s.strip_prefix("menu:") {
+            return Cmd::from_name(c).map(TestStep::Menu);
+        }
+        Action::from_name(s).map(TestStep::Action)
+    }
+}
 
 /// UI-thread-only mutable state.
 #[derive(Default)]
@@ -201,7 +228,9 @@ struct UiState {
     /// Password dialog currently open / dismissed with Cancel (stop re-prompting).
     prompt_open: bool,
     prompt_declined: bool,
-    test_actions: Vec<Action>,
+    test_actions: Vec<TestStep>,
+    /// Mouse buttons whose down went to the connection bar (their ups aren't forwarded either).
+    bar_buttons: u8,
     tray: Option<tray::Tray>,
 }
 
@@ -385,6 +414,14 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
                         hud_lines = lines;
                         redraw = true;
                     }
+                }
+                RenderCmd::Bar(text) => {
+                    match renderer.set_bar(text.as_deref(), dpi_px(13)) {
+                        Ok(Some((w, h))) => cbar::set_size(w, h),
+                        Ok(None) => {}
+                        Err(e) => eprintln!("connection bar failed: {e}"),
+                    }
+                    redraw = true;
                 }
                 RenderCmd::Toast(text) => {
                     if let Err(e) = renderer.set_toast(Some(&text), dpi_px(19)) {
@@ -590,12 +627,16 @@ fn handle_key(hwnd: HWND, vk: u32, scan: u32, extended: bool, down: bool) -> boo
     true
 }
 
+/// A Glide menu (context or system menu) is open: the LL hook lets keys through to it.
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+
 unsafe extern "system" fn ll_keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         if let Some(ctx) = UI.get() {
             let ours = ctx.shared.hwnd.load(Ordering::Relaxed);
             let fg = GetForegroundWindow();
-            if fg.0 as isize == ours && ours != 0 {
+            // While a Glide menu is open, keys navigate the menu (not the Mac).
+            if fg.0 as isize == ours && ours != 0 && !MENU_OPEN.load(Ordering::Relaxed) {
                 let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
                 let msg = wparam.0 as u32;
                 let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
@@ -653,6 +694,19 @@ fn mouse_pos(hwnd: HWND, lparam: LPARAM) -> (f32, f32) {
     (((x + 0.5 - rx as f32) / rw as f32).clamp(0.0, 1.0), ((y + 0.5 - ry as f32) / rh as f32).clamp(0.0, 1.0))
 }
 
+fn lparam_xy(lparam: LPARAM) -> (i32, i32) {
+    ((lparam.0 & 0xFFFF) as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as i16 as i32)
+}
+
+/// WM_MOUSEMOVE: the connection bar sees it first; over the tab nothing goes to the Mac.
+fn mouse_move(hwnd: HWND, lparam: LPARAM) {
+    let (x, y) = lparam_xy(lparam);
+    let held = STATE.with(|s| s.borrow().buttons_down != 0);
+    if !cbar::on_mouse_move(hwnd, x, y, held) {
+        send_move(hwnd, lparam);
+    }
+}
+
 fn send_move(hwnd: HWND, lparam: LPARAM) {
     let p = mouse_pos(hwnd, lparam);
     let changed = STATE.with(|s| {
@@ -667,6 +721,20 @@ fn send_move(hwnd: HWND, lparam: LPARAM) {
 }
 
 fn button(hwnd: HWND, lparam: LPARAM, b: u8, down: bool) {
+    // Connection bar: a press on the tab is ours (left opens the menu); so is its release.
+    let (x, y) = lparam_xy(lparam);
+    let nothing_held = STATE.with(|s| s.borrow().buttons_down == 0);
+    if down && nothing_held && cbar::hit(hwnd, x, y) {
+        STATE.with(|s| s.borrow_mut().bar_buttons |= 1 << b);
+        if b == protocol::MOUSE_LEFT {
+            STATE.with(|s| s.borrow_mut().bar_buttons &= !(1 << b)); // the menu loop eats the up
+            open_menu(hwnd, menu::Anchor::Below(cbar::menu_anchor(hwnd)));
+        }
+        return;
+    }
+    if !down && STATE.with(|s| std::mem::take(&mut s.borrow_mut().bar_buttons) & (1 << b) != 0) {
+        return;
+    }
     send_move(hwnd, lparam);
     // Update state first; never hold the RefCell borrow across Win32 calls that may re-enter wndproc.
     let any_down = STATE.with(|s| {
@@ -831,6 +899,12 @@ fn update_title(hwnd: HWND) {
         view: (vw, vh),
         keyboard_captured: !kb_released,
         audio: audio_hud(),
+        mac_display: sh
+            .display_info
+            .lock()
+            .unwrap()
+            .filter(|_| status.is_none())
+            .map(|d| format!("{} ({})", d.describe(), menu_model::display_pref_name(d.preference))),
     };
     let lines = hud::lines(&info);
     let hud_on = STATE.with(|s| {
@@ -890,18 +964,9 @@ fn do_action(hwnd: HWND, a: Action) {
                 toast("Only Fast mode — this PC can't decode HEVC 4:4:4");
                 return;
             }
-            sh.mode.store(next as u8, Ordering::Relaxed);
-            sh.stats.showing_sharp.store(0, Ordering::Relaxed);
-            ui().store.lock().unwrap().update(|c| c.set_mode(next));
-            if connected() {
-                eprintln!("mode -> {} (SetMode)", next.name());
-                send(ClientMsg::SetMode { mode: next as u8, bitrate_kbps: 0, max_fps: 0 });
-                toast(format!("Mode: {}", hotkeys::mode_label(next)));
-            } else {
-                toast(format!("Mode: {} — applies when connected", hotkeys::mode_label(next)));
-            }
-            update_title(hwnd);
+            set_mode(hwnd, next);
         }
+        Action::OpenMenu => open_menu(hwnd, menu::Anchor::Cursor),
         Action::ToggleFullscreen => {
             toggle_fullscreen(hwnd);
             schedule_view_check(hwnd);
@@ -950,6 +1015,134 @@ fn do_action(hwnd: HWND, a: Action) {
                 None => toast("Not connected — retrying"),
             }
         }
+    }
+}
+
+/// Switch the stream mode (SetMode), remembered in the config and used for reconnects.
+fn set_mode(hwnd: HWND, next: Mode) {
+    let sh = &ui().shared;
+    if next != Mode::Fast && !sh.has444 {
+        toast("Only Fast mode — this PC can't decode HEVC 4:4:4");
+        return;
+    }
+    sh.mode.store(next as u8, Ordering::Relaxed);
+    sh.stats.showing_sharp.store(0, Ordering::Relaxed);
+    ui().store.lock().unwrap().update(|c| c.set_mode(next));
+    if connected() {
+        eprintln!("mode -> {} (SetMode)", next.name());
+        send(ClientMsg::SetMode { mode: next as u8, bitrate_kbps: 0, max_fps: 0 });
+        toast(format!("Mode: {}", hotkeys::mode_label(next)));
+    } else {
+        toast(format!("Mode: {} — applies when connected", hotkeys::mode_label(next)));
+    }
+    update_title(hwnd);
+}
+
+// ------------------------------------------------------------------ context menu
+
+fn menu_state() -> menu_model::MenuState {
+    let sh = &ui().shared;
+    STATE.with(|s| {
+        let s = s.borrow();
+        menu_model::MenuState {
+            host_name: sh.host_name.lock().unwrap().clone(),
+            connected: connected(),
+            paused: sh.paused.load(Ordering::Relaxed),
+            mode: Some(current_mode()),
+            has444: sh.has444,
+            display: *sh.display_info.lock().unwrap(),
+            audio_muted: sh.audio.as_ref().map(|a| a.muted()),
+            clipboard_on: clipboard::is_active(),
+            hud: s.hud_on,
+            fullscreen: s.fullscreen_saved.is_some(),
+            keyboard_released: s.kb_released,
+            bar_pinned: cbar::pinned(),
+            // TODO(file-transfer): true once the host negotiated file transfer (caps bit 11).
+            file_transfer: false,
+        }
+    })
+}
+
+/// Show the Glide menu (connection bar click, Ctrl+Alt+Shift+Space) and run the choice.
+fn open_menu(hwnd: HWND, anchor: menu::Anchor) {
+    // Held modifiers (e.g. from Ctrl+Alt+Shift+Space) were forwarded: release them on the Mac.
+    if connected() {
+        send(ClientMsg::ReleaseAll);
+    }
+    cbar::hold(hwnd);
+    let items = menu_model::build(&menu_state());
+    MENU_OPEN.store(true, Ordering::Relaxed);
+    let choice = menu::track(hwnd, &items, anchor);
+    MENU_OPEN.store(false, Ordering::Relaxed);
+    cbar::release(hwnd);
+    if let Some(c) = choice {
+        run_menu_cmd(hwnd, c);
+    }
+}
+
+/// A command from the context menu, the system menu or the test hook.
+fn run_menu_cmd(hwnd: HWND, c: Cmd) {
+    eprintln!("menu: {}", c.name());
+    if let Some(m) = c.mode() {
+        if m != current_mode() {
+            set_mode(hwnd, m);
+        }
+        return;
+    }
+    if let Some(p) = c.display_pref() {
+        if connected() {
+            send(ClientMsg::SetDisplayPreference { mode: p });
+            toast(format!("Mac display: {}", menu_model::display_pref_name(p)));
+        }
+        return;
+    }
+    if let Some(keys) = menu_model::mac_shortcut(c) {
+        if connected() {
+            send(ClientMsg::ReleaseAll);
+            for (usage, down) in keys {
+                send(ClientMsg::Key { hid_usage: usage, down });
+            }
+        }
+        return;
+    }
+    match c {
+        Cmd::ToggleMute => toggle_mute(hwnd),
+        Cmd::ToggleClipboard => toggle_clipboard(hwnd),
+        Cmd::ToggleHud => do_action(hwnd, Action::ToggleHud),
+        Cmd::ToggleFullscreen => do_action(hwnd, Action::ToggleFullscreen),
+        Cmd::ToggleKeyboard => do_action(hwnd, Action::ToggleKeyboardCapture),
+        Cmd::RefreshPicture => do_action(hwnd, Action::RequestKeyframe),
+        Cmd::Reconnect => do_action(hwnd, Action::Reconnect),
+        Cmd::Disconnect => set_paused(hwnd, true),
+        Cmd::Connect => set_paused(hwnd, false),
+        Cmd::PinBar => {
+            let pinned = !cbar::pinned();
+            cbar::set_pinned(hwnd, pinned);
+            ui().store.lock().unwrap().update(|c| c.bar_pinned = pinned);
+            toast(if pinned { "Connection bar pinned" } else { "Connection bar unpinned" });
+        }
+        Cmd::Settings => match ui().store.lock().unwrap().path() {
+            Some(p) => tray::open_in_editor(&p),
+            None => toast("No config file (APPDATA not set)"),
+        },
+        Cmd::OpenMenu => open_menu(hwnd, menu::Anchor::Cursor),
+        // TODO(file-transfer): open a file picker and start the transfer (feat/file-transfer).
+        Cmd::SendFiles => toast("Sending files isn't available yet"),
+        _ => {}
+    }
+}
+
+/// Menu → Clipboard sync: on/off at runtime, persisted. Turning it on mid-session reconnects if
+/// this connection didn't negotiate clipboard sync (ClientHello only advertises it while on).
+fn toggle_clipboard(hwnd: HWND) {
+    let on = !clipboard::is_active();
+    clipboard::set_active(hwnd, on);
+    ui().store.lock().unwrap().update(|c| c.clipboard = on);
+    if on && connected() && !clipboard::negotiated() {
+        toast("Clipboard sync on — reconnecting to enable it");
+        do_action(hwnd, Action::Reconnect);
+    } else {
+        toast(if on { "Clipboard sync on" } else { "Clipboard sync off" });
     }
 }
 
@@ -1080,17 +1273,9 @@ fn toggle_mute(hwnd: HWND) {
     let muted = a.set_muted(!a.muted());
     eprintln!("audio: {}", if muted { "muted" } else { "unmuted" });
     send(ClientMsg::AudioEnable { enabled: !muted });
-    sync_mute_menu(hwnd, muted);
     ui().store.lock().unwrap().update(|c| c.audio_muted = muted);
     toast(if muted { "Audio muted" } else { "Audio on" });
     update_title(hwnd);
-}
-
-fn sync_mute_menu(hwnd: HWND, muted: bool) {
-    unsafe {
-        let menu = GetSystemMenu(hwnd, false);
-        let _ = CheckMenuItem(menu, IDM_MUTE as u32, (MF_BYCOMMAND | if muted { MF_CHECKED } else { MF_UNCHECKED }).0);
-    }
 }
 
 fn audio_hud() -> Option<hud::AudioHud> {
@@ -1145,9 +1330,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_TIMER if wparam.0 == TEST_ACTION_TIMER => {
             match STATE.with(|s| s.borrow_mut().test_actions.pop()) {
-                Some(a) => {
-                    eprintln!("test action: {a:?}");
-                    do_action(hwnd, a);
+                Some(step) => {
+                    eprintln!("test action: {step:?}");
+                    match step {
+                        TestStep::Action(a) => do_action(hwnd, a),
+                        TestStep::Menu(c) => run_menu_cmd(hwnd, c),
+                        TestStep::Bar => cbar::reveal(hwnd),
+                    }
                 }
                 None => {
                     let _ = KillTimer(Some(hwnd), TEST_ACTION_TIMER);
@@ -1217,7 +1406,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_MOUSEMOVE => {
-            send_move(hwnd, lparam);
+            mouse_move(hwnd, lparam);
             LRESULT(0)
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
@@ -1250,6 +1439,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             button(hwnd, lparam, b, msg != WM_XBUTTONUP);
             LRESULT(1)
         }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL if cbar::cursor_hit(hwnd) => LRESULT(0),
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
             let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as f32 / 120.0;
             if msg == WM_MOUSEWHEEL {
@@ -1268,7 +1458,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = ScreenToClient(hwnd, &mut pt);
                 let (x, y, w, h) = video_rect(hwnd);
                 let inside = pt.x >= x && pt.x < x + w && pt.y >= y && pt.y < y + h;
-                if inside {
+                if inside && !cbar::hit(hwnd, pt.x, pt.y) {
                     SetCursor(current_cursor(hwnd));
                 } else {
                     SetCursor(LoadCursorW(None, IDC_ARROW).ok());
@@ -1301,9 +1491,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
         WM_SYSCHAR | WM_CHAR => LRESULT(0),
-        WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_KEYMENU => LRESULT(0),
-        WM_SYSCOMMAND if wparam.0 & 0xFFF0 == IDM_MUTE => {
-            toggle_mute(hwnd);
+        // Alt alone must not enter menu mode (it's Option on the Mac); Alt+Space (keyboard
+        // released) opens the system menu as usual.
+        WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_KEYMENU && lparam.0 != 0x20 => LRESULT(0),
+        WM_ENTERMENULOOP => {
+            MENU_OPEN.store(true, Ordering::Relaxed);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_EXITMENULOOP => {
+            MENU_OPEN.store(false, Ordering::Relaxed);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_SYSCOMMAND if Cmd::from_id((wparam.0 & 0xFFF0) as u32).is_some() => {
+            run_menu_cmd(hwnd, Cmd::from_id((wparam.0 & 0xFFF0) as u32).unwrap());
+            LRESULT(0)
+        }
+        WM_INITMENU => {
+            // The system menu is about to open: refresh the Glide items' check marks.
+            menu::refresh_system_menu(hwnd, &menu_model::system_items(&menu_state()));
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == cbar::BAR_TIMER => {
+            cbar::on_timer(hwnd);
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == TITLE_TIMER => {
@@ -1323,6 +1532,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == EXIT_TIMER => {
+            if std::env::var("GLIDE_DUMP_MENU").as_deref() == Ok("1") {
+                // Test hook: the menu as text (session 0 can't show real menus).
+                let st = menu_state();
+                eprintln!("context menu:\n{}", menu_model::to_text(&menu_model::build(&st)));
+                eprintln!("system menu additions:\n{}", menu_model::to_text(&menu_model::system_items(&st)));
+            }
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
@@ -1343,6 +1558,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_DISCONNECTED => {
             // No stuck keys/buttons: drop all local held state (the host side is gone anyway).
             release_all(hwnd);
+            let host = ui().shared.host_name.lock().unwrap().clone();
+            cbar::set_label(hwnd, &format!("{host} — disconnected"));
             {
                 let mut c = ui().shared.cursor.lock().unwrap();
                 c.visible = true;
@@ -1368,6 +1585,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             apply_cursor_if_inside(hwnd);
             update_title(hwnd);
             let host = ui().shared.host_name.lock().unwrap().clone();
+            cbar::set_label(hwnd, &host);
             match ui().shared.just_pinned.lock().unwrap().take() {
                 Some(ip) => toast(format!("Connected to {host} · pinned host {ip}")),
                 None => toast(format!("Connected to {host}")),
@@ -1615,9 +1833,11 @@ fn hello_for(template: &ClientMsg, shared: &Shared) -> ClientMsg {
         ClientMsg::ClientHello { version, codec_caps, client_name, .. } => {
             let (w, h, fps) = *shared.view.lock().unwrap();
             *shared.sent_view.lock().unwrap() = (w, h);
+            // Clipboard sync is advertised only while the user switch is on (menu → Clipboard sync).
+            let codec_caps = if clipboard::is_active() { *codec_caps } else { *codec_caps & !protocol::CAP_CLIPBOARD };
             ClientMsg::ClientHello {
                 version: *version,
-                codec_caps: *codec_caps,
+                codec_caps,
                 view_w: w,
                 view_h: h,
                 // The mode may have been changed with Ctrl+Alt+Shift+M since startup.
@@ -1649,6 +1869,7 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
     );
     *shared.host_name.lock().unwrap() = conn.host_name.clone();
     *shared.config.lock().unwrap() = cfg;
+    *shared.display_info.lock().unwrap() = None; // until this host sends DisplayInfo
     *shared.clock.lock().unwrap() = Some(conn.clock.clone());
     {
         // Fresh cursor state for the new host session.
@@ -1719,6 +1940,11 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
                 }
             }
             NetEvent::Msg(HostMsg::ClipboardCaps { formats, max_bytes }) => clipboard::enable(sender.clone(), formats, max_bytes),
+            NetEvent::Msg(HostMsg::DisplayInfo { preference, mode_w, mode_h, hidpi }) => {
+                let d = menu_model::DisplayInfo { preference, mode_w, mode_h, hidpi };
+                eprintln!("mac display: {} ({})", d.describe(), menu_model::display_pref_name(preference));
+                *shared.display_info.lock().unwrap() = Some(d);
+            }
             NetEvent::Msg(HostMsg::Clipboard(c)) => clipboard::incoming(c),
             NetEvent::Msg(_) => {}
             NetEvent::Closed(reason) => {
@@ -1797,10 +2023,13 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         stats: Stats::default(),
         hwnd: AtomicIsize::new(0),
         audio: opts.audio.then(Audio::start),
+        display_info: Mutex::new(None),
     });
     let (render_tx, render_rx) = mpsc::channel::<RenderCmd>();
     let hud_on = opts.store.config.hud;
     let opts_audio_muted = opts.audio_muted;
+    let opts_bar_pinned = opts.store.config.bar_pinned;
+    let opts_clipboard = opts.clipboard;
     let restore = {
         let ms = placement::monitors();
         config::choose_placement(&opts.store.config, &ms, placement::cursor_monitor_index(&ms))
@@ -1817,7 +2046,7 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         s.hud_on = hud_on;
         // GLIDE_TEST_ACTIONS=hud,mode,... (test hook): run these actions one per tick.
         s.test_actions = std::env::var("GLIDE_TEST_ACTIONS")
-            .map(|v| v.split(',').filter_map(Action::from_name).rev().collect())
+            .map(|v| v.split(',').filter_map(TestStep::parse).rev().collect())
             .unwrap_or_default();
     });
 
@@ -1906,20 +2135,21 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
     if let Some(p) = &restore {
         eprintln!("restored window on monitor {} (fullscreen={}, maximized={})", p.monitor, p.fullscreen, p.maximized);
     }
-    if shared.audio.is_some() {
-        unsafe {
-            let menu = GetSystemMenu(hwnd, false);
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            let _ = AppendMenuW(menu, MF_STRING, IDM_MUTE, w!("Mute audio\tCtrl+Alt+Shift+A"));
-        }
-        if opts_audio_muted {
-            if let Some(a) = &shared.audio {
-                a.set_muted(true); // run_connection tells the host (AudioEnable false) on connect
-            }
-            sync_mute_menu(hwnd, true);
+    if opts_audio_muted {
+        if let Some(a) = &shared.audio {
+            a.set_muted(true); // run_connection tells the host (AudioEnable false) on connect
         }
     }
+    menu::init_dark_mode();
+    menu::refresh_system_menu(hwnd, &menu_model::system_items(&menu_state()));
+    {
+        let tx = render_tx.clone();
+        cbar::init(hwnd, opts_bar_pinned, "Glide — not connected", Box::new(move |t| {
+            let _ = tx.send(RenderCmd::Bar(t));
+        }));
+    }
     check_view(hwnd); // view = the monitor the window actually opened on (before the first hello)
+    clipboard::set_active(hwnd, opts_clipboard);
     clipboard::init(hwnd);
 
     // --- render thread

@@ -84,6 +84,7 @@ final class Session: @unchecked Sendable {
         statsTimer?.cancel()
         Power.release(displayAssertion); displayAssertion = nil
         if let o = displayObserver { NotificationCenter.default.removeObserver(o) }
+        if let o = preferenceObserver { NotificationCenter.default.removeObserver(o) }
         displayRestart?.cancel()
         cursor.stop()
         clipboard?.stop(); clipboard = nil
@@ -158,6 +159,9 @@ final class Session: @unchecked Sendable {
             audio?.setEnabled(on)
             if audio != nil { HostStatus.shared.audio(id: id, on ? "on" : "muted") }
         case let .clipboard(c): clipboard?.apply(c)
+        case let .setDisplayPreference(m):
+            guard let p = DisplayModePreference(wire: m) else { log("session \(id): unknown display preference \(m)"); return }
+            DisplayModeController.shared.setSessionPreference(id: id, p) { [weak self] _ in self?.sendDisplayInfo() }
         case .hello: break
         }
     }
@@ -188,6 +192,8 @@ final class Session: @unchecked Sendable {
                 }
                 if self.audioOff { self.send(.audioConfig(.off)) }
                 self.audio?.arm()
+                self.helloSent = true
+                self.sendDisplayInfo()
             } else {
                 self.send(.videoConfig(cfg))
                 if let sharpCfg { self.send(.sharpLayerConfig(sharpCfg)) }
@@ -267,9 +273,14 @@ final class Session: @unchecked Sendable {
     /// Re-capture when the Mac's display mode changes (resolution / HiDPI switch), so the new
     /// pixel size and backing scale take effect without restarting the host.
     private var displayObserver: NSObjectProtocol?
+    private var preferenceObserver: NSObjectProtocol?
     private var displayRestart: DispatchWorkItem?
     private func watchDisplayChanges() {
+        preferenceObserver = NotificationCenter.default.addObserver(forName: DisplayModeController.preferenceChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.sendDisplayInfo()
+        }
         displayObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.sendDisplayInfo()
             guard let self, let p = self.pipeline, !self.ended else { return }
             self.displayRestart?.cancel()
             let work = DispatchWorkItem { [weak self] in
@@ -279,6 +290,24 @@ final class Session: @unchecked Sendable {
             }
             self.displayRestart = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)  // debounce mode-switch churn
+        }
+    }
+
+    /// DisplayInfo (§3.3): current preference + mode, sent after ServerHello and whenever it changes.
+    private var helloSent = false
+    private var lastDisplayInfo: Data?
+    private func sendDisplayInfo() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let dm = DisplayModeController.shared
+            let msg = HostMessage.displayInfo(preference: dm.effectivePreference, mode: dm.currentMode())
+            self.channel.queue.async {
+                guard self.helloSent, !self.ended else { return }
+                let enc = msg.encoded
+                guard enc != self.lastDisplayInfo else { return }
+                self.lastDisplayInfo = enc
+                self.channel.send(enc)
+            }
         }
     }
 
