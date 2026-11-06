@@ -1,0 +1,31 @@
+{
+  "password": "correct horse battery staple",
+  "client_private": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "host_private": "65666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f8081828384",
+  "client_handshake": "474c4431010007a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7ca0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+  "host_handshake": "474c443101005714769d116bf76436ae74bc793d2c30ad1903c59ac5273805c7e2698b410c36c0c1c2c3c4c5c6c7c8c9cacbcccdcecf505152535455565758595a5b5c5d5e5f",
+  "pw_key": "fb9a596cdd4edbb53c6026263ffcfd9b30f1df459c22b272fbf918efc3ccf413",
+  "shared": "c9ea6a3f79a000b60b076d4afc990b272f3f0b5aaa3f0b8713c209273e363863",
+  "c2s_key": "41f01466f512e601d09892afb7d4f872b758aade480f7411af321a36e5698747",
+  "s2c_key": "2cd14b805db20dd33cee0a9561326ce7f01cb272ea048017d0a661d938c6cef7",
+  "records": [
+    {
+      "dir": "c2s",
+      "counter": 0,
+      "plaintext": "01010007000000000f7008003c0b00746573742d636c69656e74",
+      "record": "2a000000acaad780b1ddcfa298c74f5671a8dbe0b7fda8f6398836b0516301a2721fd0d0ede1412def37a9fb6241"
+    },
+    {
+      "dir": "c2s",
+      "counter": 1,
+      "plaintext": "100000803e0000403f",
+      "record": "19000000d337725c77479328bf5883eed0e5c216ecab5e69de1b4b4a4e"
+    },
+    {
+      "dir": "s2c",
+      "counter": 0,
+      "plaintext": "0201000900746573742d686f7374000aa00501000000000040",
+      "record": "29000000d29e63480b3a74cca252ff8535fbd6495f3335a9ebe4c4b1897c960847f36fd899d5909232f2ab6c54"
+    }
+  ]
+}
