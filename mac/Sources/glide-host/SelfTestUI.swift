@@ -34,7 +34,9 @@ func runSelfTestUI(outDir: String?) -> Never {
     let states: [(String, (inout HostStatus.Snapshot) -> Void, HostStatus.Phase)] = [
         ("idle", { $0 = .init(); $0.listenPort = 7420 }, .idle),
         ("dialing", { $0 = .init(); $0.dialTarget = "192.168.10.212:7420"; $0.dialDetail = "connection refused" }, .dialing),
-        ("connected", { $0 = .init(); $0.dialTarget = "192.168.10.212:7420"; $0.viewer = viewer }, .connected),
+        ("connected", { $0 = .init(); $0.dialTarget = "192.168.10.212:7420"; var v = viewer; v.files = true; $0.viewer = v
+            $0.transfers = [.init(incoming: true, files: 3, bytes: 12_300_000, items: [URL(fileURLWithPath: "/tmp")], ok: true, text: nil, date: Date()),
+                            .init(incoming: false, files: 0, bytes: 0, items: [], ok: false, text: "Files not sent: the viewer declined (too large)", date: Date())] }, .connected),
         ("error", { $0 = .init(); $0.dialTarget = "192.168.10.212:7420"; var v = viewer; v.captureError = "Screen Recording not granted"; v.video = nil; v.fps = nil; $0.viewer = v }, .error),
         ("paused", { $0 = .init(); $0.dialTarget = "192.168.10.212:7420"; $0.paused = true }, .paused),
     ]
@@ -56,8 +58,12 @@ func runSelfTestUI(outDir: String?) -> Never {
             check(titles.contains("Viewer: DESKTOP-TEST (192.168.10.212)"), "connected: viewer row")
             check(titles.contains { $0.contains("58 fps") && $0.contains("12.3 Mbps") && $0.contains("encode 7.9 ms") }, "connected: stats row")
             check(menu.menu.items.first { $0.title == "Disconnect Viewer" }?.isEnabled == true, "connected: disconnect enabled")
+            check(menu.menu.items.first { $0.title == "Send Files to Viewer…" }?.isEnabled == true, "connected: send files enabled")
+            let recent = menu.menu.items.first { $0.title == "Recent Transfers" }?.submenu?.items.map(\.title) ?? []
+            check(recent.first?.hasPrefix("Received 3 files · 12 MB") == true && recent.contains("Open Received Files Folder"), "connected: recent transfers \(recent)")
         }
         if name == "paused" { check(titles.contains("Resume Dialing"), "paused: resume item") }
+        if name == "idle" { check(menu.menu.items.first { $0.title == "Send Files to Viewer…" }?.isEnabled == false, "idle: send files disabled") }
     }
     print("log file: \(StatusMenu.logURL().path)")
     print(failures == 0 ? "UI SELFTEST PASSED" : "\(failures) UI FAILURE(S)")

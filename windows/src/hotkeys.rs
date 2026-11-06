@@ -17,6 +17,8 @@ pub enum Action {
     RequestKeyframe = 5,
     Reconnect = 6,
     ToggleMute = 7,
+    PullFiles = 8,
+    CancelFiles = 9,
 }
 
 impl Action {
@@ -29,6 +31,8 @@ impl Action {
             5 => Action::RequestKeyframe,
             6 => Action::Reconnect,
             7 => Action::ToggleMute,
+            8 => Action::PullFiles,
+            9 => Action::CancelFiles,
             _ => return None,
         })
     }
@@ -42,6 +46,8 @@ impl Action {
             "keyframe" | "r" => Action::RequestKeyframe,
             "reconnect" | "d" => Action::Reconnect,
             "mute" | "a" => Action::ToggleMute,
+            "pullfiles" | "v" => Action::PullFiles,
+            "cancelfiles" | "x" => Action::CancelFiles,
             _ => return None,
         })
     }
@@ -55,6 +61,8 @@ pub const KEY_H: u16 = 0x0B;
 pub const KEY_K: u16 = 0x0E;
 pub const KEY_M: u16 = 0x10;
 pub const KEY_R: u16 = 0x15;
+pub const KEY_V: u16 = 0x19;
+pub const KEY_X: u16 = 0x1B;
 pub const KEY_ENTER: u16 = 0x28;
 pub const KEY_F11: u16 = 0x44;
 
@@ -67,6 +75,8 @@ pub const TABLE: &[(u16, Action, &str)] = &[
     (KEY_R, Action::RequestKeyframe, "Ctrl+Alt+Shift+R  request a keyframe (fix a smeared picture)"),
     (KEY_D, Action::Reconnect, "Ctrl+Alt+Shift+D  disconnect and reconnect"),
     (KEY_A, Action::ToggleMute, "Ctrl+Alt+Shift+A  mute / unmute audio"),
+    (KEY_V, Action::PullFiles, "Ctrl+Alt+Shift+V  paste files copied in Finder (saved to Downloads\\Glide)"),
+    (KEY_X, Action::CancelFiles, "Ctrl+Alt+Shift+X  cancel the file transfer"),
 ];
 
 pub fn help() -> String {
@@ -148,6 +158,9 @@ mod tests {
         assert_eq!(match_hotkey(CAS, KEY_R), Some(Action::RequestKeyframe));
         assert_eq!(match_hotkey(CAS, KEY_D), Some(Action::Reconnect));
         assert_eq!(match_hotkey(CAS, KEY_A), Some(Action::ToggleMute));
+        assert_eq!(match_hotkey(CAS, KEY_V), Some(Action::PullFiles));
+        assert_eq!(match_hotkey(CAS, KEY_X), Some(Action::CancelFiles));
+        assert_eq!(match_hotkey(Mods { ctrl: true, ..Default::default() }, KEY_V), None, "Ctrl+V (Cmd+V) still pastes on the Mac");
         assert_eq!(match_hotkey(CAS, 0x05 /* B */), None);
         // missing any modifier → forwarded to the host as usual (e.g. Cmd+Shift+H, Cmd+Opt+H)
         for m in [
@@ -194,7 +207,9 @@ mod tests {
         }
         assert_eq!(Action::from_u8(0), None);
         assert_eq!(Action::from_name("Mode"), Some(Action::CycleMode));
-        assert_eq!(Action::from_name("x"), None);
+        assert_eq!(Action::from_name("x"), Some(Action::CancelFiles));
+        assert_eq!(Action::from_name("pullfiles"), Some(Action::PullFiles));
+        assert_eq!(Action::from_name("nope"), None);
         assert!(help().lines().count() == TABLE.len());
     }
 }

@@ -21,8 +21,11 @@ capture ─► diff ─► encode ─► record layer ─► TCP ─► record l
 | Host | `glide-host/Encoder.swift` | VideoToolbox compression sessions (HEVC 4:2:0 or 4:4:4, H.264). |
 | Host | `glide-host/CursorMonitor.swift`, `InputInjector.swift` | Cursor shape and position out, CGEvent injection in. |
 | Host | `glide-host/Power.swift` | Sleep and display-sleep assertions, display wake on input. |
+| Host | `GlideCore/FileNames.swift`, `FileTransfer.swift` | File transfer (PROTOCOL.md §6): name sanitizer, receiver, sender, `FileTransferEngine`. |
+| Host | `glide-host/HostFiles.swift` | Per-session file transfer wiring (chunk pacing on `bytesInFlight`, Finder pasteboard pull), notifications. |
 | Viewer | `windows/src/{protocol,crypto,net}.rs` | Codec, crypto and TCP transport. These are platform independent and unit-tested on Linux, macOS and Windows. |
 | Viewer | `windows/src/{hid,annexb,bench}.rs` | Scancode → HID table, Annex-B splitter, the headless benchmark. |
+| Viewer | `windows/src/files.rs`, `win/files.rs` | File transfer: platform-independent service + Win32 drag & drop / notifications. |
 | Viewer | `windows/src/win/*` | Windows only: D3D11 device, Media Foundation decoders, renderer, window and input, cursor, `--probe`. |
 
 ## Host video pipeline
@@ -230,6 +233,25 @@ PAKE. An active impersonator of either side obtains a value they can check passw
 against offline. Security v2 replaces this with a PAKE (CPace or SPAKE2 over X25519) plus a pinned
 host identity. See [ROADMAP.md](ROADMAP.md).
 
+## File transfer
+
+File transfer (PROTOCOL.md §6) shares the session's connection with video and input, so it is
+built to only use spare capacity:
+
+- **Host → viewer.** `FileTransferEngine` runs on its own utility queue. It sends a chunk only
+  while the connection's `bytesInFlight` (video backlog) is below 256 KiB and at most 512 KiB is
+  unacknowledged; it re-checks when a chunk leaves the send queue and every 3 ms while blocked. So
+  a keyframe never queues behind more than ~512 KiB of file data.
+- **Viewer → host.** The viewer's `net::Sender` is shared by input, control and chunks.
+  `send()` (input/control) registers itself before taking the lock; `send_bulk()` (chunks) only
+  starts a record while no normal send is waiting. An input event therefore waits for at most
+  the one chunk already being written (≤ 256 KiB); the ack window bounds what sits in socket
+  buffers. A unit test (`net::tests::input_never_waits_behind_more_than_one_chunk`) checks this.
+- **Receivers** write on their own thread/queue (never the receive path), ack each chunk after
+  writing it, verify SHA-256 before renaming, and refuse peers that ignore the window.
+- The viewer's `files::Service` and the host's `FileTransferEngine` are the same state machine
+  (one outgoing + one incoming transfer, offer → answer → chunks/ends → done, cancel either way).
+
 ## Testing
 
 - **Reference vectors:** `tools/gen_vectors.py` is an independent Python reference for the
@@ -240,6 +262,11 @@ host identity. See [ROADMAP.md](ROADMAP.md).
 - **End-to-end on the Mac:** `glide-probe` is a Mac-side client that uses VideoToolbox decode. It
   measures exact capture → decoded latency on loopback, can animate a test window, and dumps PNGs.
   `tools/compare.swift` builds per-tile error heatmaps from a Mac screenshot and a viewer frame dump.
+- **File transfer:** `docs/file-transfer-vectors.json` (messages + adversarial names) is checked by
+  all three implementations; `glide-selftest` runs the receiver/sender and an engine loopback;
+  `cargo test` runs a two-service loopback; `glide-selftest --file-host PORT` is a capture-free
+  host (real `SecureChannel` + `FileTransferEngine`) for end-to-end tests with the real viewer;
+  `mock_host.py --file-*` covers the viewer, including adversarial offers.
 - **Viewer without a Mac:** `tools/mock_host.py` plus `tools/make_streams.sh` exercise the viewer:
   - mode switches and decoder resets;
   - hybrid sharp IDRs followed by rect-limited base frames.

@@ -15,6 +15,8 @@ struct HostSettings {
     var maxInFlightBytes = 6 * 1024 * 1024
     /// host.json `clipboard.syncConcealed`: also sync password-manager (concealed) items.
     var clipboardSyncConcealed = false
+    /// host.json `files` (PROTOCOL.md §6).
+    var files = HostFileConfig()
 }
 
 /// host.json `"clipboard": {"syncConcealed": false}` (PROTOCOL.md §5).
@@ -33,6 +35,8 @@ struct HostConfig: Codable {
     var display: DisplaySettings? = nil
     /// Clipboard sync options (ClipboardSync.swift).
     var clipboard: ClipboardSettings? = nil
+    /// File transfer options (HostFiles.swift).
+    var files: FileSettings? = nil
 
     static var url: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Glide", isDirectory: true)
@@ -120,6 +124,7 @@ let salt = Data(hex: config.salt)!
 var settings = HostSettings(password: password, salt: salt, passwordKey: Handshake.passwordKey(password, salt: salt))
 if let v = takeValue("--port"), let n = UInt16(v) { settings.port = n }
 settings.clipboardSyncConcealed = config.clipboard?.syncConcealed ?? false
+settings.files = HostFileConfig(config.files)
 if let v = takeValue("--fps"), let n = Int(v) { settings.fps = n }
 if let v = takeValue("--bitrate-kbps"), let n = Int(v) { settings.bitrateKbps = n }
 if let v = takeValue("--max-width"), let n = Int(v) { settings.maxWidth = n }
@@ -261,8 +266,13 @@ log(sleepAssertion != nil ? "power: preventing idle system sleep while the host 
 app.setActivationPolicy(.accessory)  // LSUIElement: menu-bar status item only
 let server = try Server(settings: settings)
 DisplayModeController.shared.start(displayID: settings.displayID)
-let statusMenu = StatusMenu(actions: .init(disconnect: { server.disconnect() }, setPaused: { server.setPaused($0) }),
+HostNotifier.shared.setUp()
+let statusMenu = StatusMenu(actions: .init(disconnect: { server.disconnect() }, setPaused: { server.setPaused($0) },
+                                           sendFiles: { server.current?.sendFiles($0) ?? false },
+                                           cancelFiles: { server.current?.cancelFiles() }),
                             password: password, displayID: settings.displayID)
+statusMenu.downloadDir = settings.files.downloadDir
+log("files: transfer \(settings.files.enabled ? "on" : "off"), receiving \(settings.files.receive ? "on" : "off") into \(settings.files.downloadDir.path)")
 if let target = connectTarget {
     let parts = target.split(separator: ":")
     server.dial(host: String(parts[0]), port: parts.count > 1 ? UInt16(parts[1]) ?? 7420 : 7420)

@@ -9,6 +9,7 @@ pub mod bench;
 pub mod clipboard;
 pub mod config;
 pub mod crypto;
+pub mod files;
 pub mod hid;
 pub mod hotkeys;
 pub mod hud;

@@ -14,8 +14,9 @@ The wire protocol is defined in `../docs/PROTOCOL.md`.
 | `src/hid.rs` | Set-1 scancode → USB HID usage table, plus the Ctrl↔Cmd / Win↔Control remap. Unit-tested. |
 | `src/config.rs`, `src/hotkeys.rs`, `src/hud.rs` | Config file (load/save/migration, CLI-vs-config precedence, per-monitor window placement), hotkey table, stats-HUD text. Pure Rust, unit-tested. |
 | `src/clipboard.rs` | Clipboard sync logic without Win32: CRLF↔LF, echo guard, DIB↔PNG (`png` crate). Unit-tested. |
+| `src/files.rs` | File transfer (PROTOCOL.md §6) without Win32: name sanitizer, receiver (temp → SHA-256 → no-overwrite rename), sender (folder walk, chunking), `Service` (transfers + ack window). Unit-tested, incl. a two-service loopback. |
 | `src/annexb.rs`, `src/bench.rs` | Annex-B access-unit splitting, and the headless benchmark driver. |
-| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain, text panels), `app` (window, input, cursor, fullscreen, hotkeys), `clipboard` (clipboard listener/apply), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`, `dpapi` (saved password), `prompt` (password dialog), `placement` (monitors), `tray`. |
+| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain, text panels), `app` (window, input, cursor, fullscreen, hotkeys), `clipboard` (clipboard listener/apply), `files` (drag & drop, notifications, open folder), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`, `dpapi` (saved password), `prompt` (password dialog), `placement` (monitors), `tray`. |
 | `res/`, `build.rs` | Icon, manifest (themed controls, PerMonitorV2), password dialog and version info, linked into the exe: MinGW `windres` for the GNU target, `rc.exe` (via `embed-resource`) for MSVC. Regenerate the icon with `../tools/make_icon.py`. |
 | `assets/` | Small clips embedded in the exe for `--probe`. Regenerate them with `../tools/make_streams.sh --clips-only`. |
 
@@ -57,6 +58,11 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   "audio_muted": false,     // Ctrl+Alt+Shift+A
   "clipboard": true,        // clipboard sync with the host (false = --no-clipboard)
   "clipboard_sync_secrets": false,
+  "file_transfer": true,    // drag & drop to the Mac, Ctrl+Alt+Shift+V, receiving (caps bit 11)
+  "file_receive": true,     // accept files the Mac sends
+  "download_dir": null,     // null = <Downloads>\Glide; "%USERPROFILE%\..." variables are expanded
+  "file_max_total_bytes": 8589934592,
+  "file_max_files": 10000,
   "allowed_peers": [],      // listen mode: IPs/CIDRs allowed to connect; [] = pin the first host that authenticates  // also send clipboard items password managers mark private (= --clipboard-sync-secrets)
   "last_monitor": "\\.\DISPLAY1",
   "windows": { "\\.\DISPLAY1": { "x": 0, "y": 0, "w": 2400, "h": 1400, "maximized": false, "fullscreen": true, "mon_w": 3840, "mon_h": 2160 } }
@@ -146,6 +152,8 @@ To replace a `.cmd` launcher that sets `GLIDE_PASSWORD`, run `glide-client.exe` 
   | Ctrl+Alt+Shift+R | request a keyframe |
   | Ctrl+Alt+Shift+D | disconnect and reconnect immediately (in listen mode, the host redials within about 2 s) |
   | Ctrl+Alt+Shift+A | mute / unmute audio (saved in the config) |
+  | Ctrl+Alt+Shift+V | paste files copied in Finder: asks the Mac (`FilePull`) and saves them to `download_dir` |
+  | Ctrl+Alt+Shift+X | cancel the running file transfer(s) |
 
   While the window has focus and the keyboard is captured, a low-level keyboard hook sends Win, Alt+Tab, Alt+Space and similar keys to the host.
   To leave the window, click outside it, press Ctrl+Alt+Shift+K, or press Ctrl+Alt+Del, which cannot be intercepted.
@@ -190,6 +198,21 @@ To replace a `.cmd` launcher that sets `GLIDE_PASSWORD`, run `glide-client.exe` 
   - Echo suppression: our own writes are recognized by `GetClipboardSequenceNumber()` / clipboard
     owner, plus a content hash, so nothing ping-pongs.
 
+- **File transfer** (PROTOCOL.md §6; off with config `"file_transfer": false`), while connected to
+  a host that sent `FileCaps`:
+  - Drop files/folders from Explorer on the window (`DragAcceptFiles`/WM_DROPFILES) → sent to the
+    Mac's `~/Downloads/Glide`. Folders are sent recursively; symlinks/junctions are skipped (a
+    toast says so).
+  - Ctrl+Alt+Shift+V pulls what was copied in Finder; the Mac's *Send Files to Viewer…* pushes.
+    Files go to `download_dir` (default `<Downloads>\Glide`, the real Downloads known folder),
+    with sanitized names, never overwriting (`a (2).txt`), verified by SHA-256 before the rename,
+    and marked with Mark-of-the-Web (`Zone.Identifier`, ZoneId=3). Nothing is opened.
+  - A toast line shows progress; Ctrl+Alt+Shift+X or the tray's *Cancel file transfer* cancels.
+    When files arrive, a tray notification appears: clicking it selects them in Explorer (tray →
+    *Open received files folder* does the same later).
+  - Chunks go through `Sender::send_bulk`: they yield to every pending input/control message, so
+    keys and mouse never wait behind more than one 256 KiB chunk.
+
 The GUI command for the real host (run it in the interactive desktop session, e.g. from a shortcut):
 
 ```
@@ -230,7 +253,8 @@ Then start the host on the Mac: `mac/.build/release/glide-host --password-file .
   - `GLIDE_OFFSCREEN=1` forces offscreen rendering. This is automatic in session 0, where no swap chain can be created.
   - `GLIDE_TEARING=1` presents with `ALLOW_TEARING`.
   - `GLIDE_CONFIG_DIR=dir` uses another config folder. Use it for tests, so the real `%APPDATA%\Glide` is never touched.
-  - `GLIDE_TEST_ACTIONS=mode,keyframe,hud,fullscreen,keyboard,reconnect` fires those hotkey actions one at a time, every `GLIDE_TEST_ACTIONS_MS` (default 1500 ms).
+  - `GLIDE_TEST_ACTIONS=mode,keyframe,hud,fullscreen,keyboard,reconnect,pullfiles,cancelfiles` fires those hotkey actions one at a time, every `GLIDE_TEST_ACTIONS_MS` (default 1500 ms).
+  - `GLIDE_TEST_SEND_FILES=C:\a.bin;C:\folder` sends these to the host once it sent `FileCaps` (drag & drop can't be scripted over SSH). Point `download_dir` into a test folder (config in `GLIDE_CONFIG_DIR`).
   - `GLIDE_PROMPT_AUTOFILL=pw` fills in the password dialog and presses Connect. `GLIDE_PROMPT_AUTOFILL_RETRY` is used for later prompts, `GLIDE_PROMPT_REMEMBER=1` ticks the box, and `GLIDE_PROMPT_DUMP=x.bmp` captures the dialog.
   - `GLIDE_NO_TRAY=1` skips the tray icon.
 
@@ -252,6 +276,12 @@ The mock host:
   clipboard ~2 s after connect (`--clip-every N` repeats), `--clip-bounce` sends each received
   clipboard back once (the viewer must keep it as is and not echo it), `--clip-save DIR` keeps PNGs;
   `--selftest` checks the codec against the §5 reference bytes;
+- file transfer (§6, viewer caps bit 11): sends FileCaps and saves files from the viewer into `--file-recv DIR`
+  (verifying SHA-256, never overwriting); `--file-send PATH…` offers files ~2 s after connect, `--file-pull PATH…`
+  answers Ctrl+Alt+Shift+V, `--file-evil` sends adversarial offers (traversal, absolute paths, device names, `:`
+  streams, bidi tricks, bad SHA-256, 1 PiB, file/folder clash) and logs what the viewer did, `--log-pings` logs how
+  long each Ping queued (input priority during uploads), `--file-vectors OUT` regenerates
+  `docs/file-transfer-vectors.json`;
 - in hybrid mode, sends SharpLayerConfig, then each `--hybrid-period` frames (default 60) a 4:4:4 sharp IDR,
   followed by base frames limited to small rects;
 - if the viewer advertises audio, streams a continuous 440 Hz sine at -12 dBFS (`--audio-freq`, `--audio-db`,

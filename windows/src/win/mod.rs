@@ -9,6 +9,7 @@ pub mod cursor;
 pub mod d3d;
 pub mod decoder;
 pub mod dpapi;
+pub mod files;
 pub mod placement;
 pub mod probe;
 pub mod prompt;
