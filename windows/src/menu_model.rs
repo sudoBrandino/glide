@@ -41,9 +41,11 @@ pub enum Cmd {
     ReceiveFiles,
     CancelFiles,
     OpenReceived,
+    /// Latency test mode (docs/LATENCY.md).
+    LatencyTest,
 }
 
-const ALL: [Cmd; 31] = [
+const ALL: [Cmd; 32] = [
     Cmd::ModeFast,
     Cmd::ModeHybrid,
     Cmd::ModeSharp,
@@ -75,6 +77,7 @@ const ALL: [Cmd; 31] = [
     Cmd::ReceiveFiles,
     Cmd::CancelFiles,
     Cmd::OpenReceived,
+    Cmd::LatencyTest,
 ];
 
 /// Menu ids: 0x2000 + 16·index. Low nibble zero and below 0xF000, so the same ids work as
@@ -198,6 +201,8 @@ pub struct MenuState {
     pub file_pull: bool,
     /// A file transfer is running (or queued).
     pub files_busy: bool,
+    /// Latency test mode is on (Ctrl+Alt+Shift+L).
+    pub latency_test: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -264,6 +269,7 @@ pub fn build(s: &MenuState) -> Vec<Item> {
         cmd(Cmd::ToggleMute, "M&ute audio\tCtrl+Alt+Shift+A", s.audio_muted == Some(true), s.audio_muted.is_some()),
         cmd(Cmd::ToggleClipboard, "&Clipboard sync", s.clipboard_on, true),
         cmd(Cmd::ToggleHud, "S&tats overlay\tCtrl+Alt+Shift+H", s.hud, true),
+        cmd(Cmd::LatencyTest, "&Latency test\tCtrl+Alt+Shift+L", s.latency_test, true),
         cmd(Cmd::ToggleFullscreen, "F&ullscreen\tCtrl+Alt+Shift+F", s.fullscreen, true),
         cmd(Cmd::ToggleKeyboard, "Release &keyboard\tCtrl+Alt+Shift+K", s.keyboard_released, true),
         cmd(Cmd::PinBar, "&Pin connection bar", s.bar_pinned, true),
@@ -398,6 +404,9 @@ mod tests {
         assert_eq!(state(&m, Cmd::ToggleMute), (false, true));
         assert_eq!(state(&m, Cmd::ToggleClipboard), (true, true));
         assert_eq!(state(&m, Cmd::ToggleHud), (true, true));
+        assert_eq!(state(&m, Cmd::LatencyTest), (false, true));
+        assert!(to_text(&m).contains("Latency test    Ctrl+Alt+Shift+L"));
+        assert_eq!(state(&build(&MenuState { latency_test: true, ..s.clone() }), Cmd::LatencyTest), (true, true));
         assert_eq!(state(&m, Cmd::SendSpotlight), (false, true));
         assert!(find(&m, Cmd::SendFiles).is_none(), "file transfer off in this viewer → no file items");
         assert!(find(&m, Cmd::Disconnect).is_some() && find(&m, Cmd::Connect).is_none());

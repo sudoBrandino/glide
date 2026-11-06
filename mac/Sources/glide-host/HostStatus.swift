@@ -17,6 +17,10 @@ final class HostStatus: @unchecked Sendable {
         var hybrid = false
         var captureError: String?
         var fps: Double?, mbps: Double?, encodeMs: Double?
+        /// SCK frame PTS -> capture callback, p50 ms.
+        var captureMs: Double?
+        /// The viewer's latest latency report (PROTOCOL.md §3.4).
+        var latency: LatencyReport?
         var statsAt: Date?
         /// "on", "muted" or "off"; nil when the viewer doesn't take audio (PROTOCOL.md §3.2).
         var audio: String?
@@ -101,7 +105,8 @@ final class HostStatus: @unchecked Sendable {
     func captureError(id: Int, _ e: String?) { updateViewer(id) { $0.captureError = e } }
     func files(id: Int, _ on: Bool) { updateViewer(id) { $0.files = on } }
     func addTransfer(_ t: Transfer) { update { s in s.transfers.insert(t, at: 0); if s.transfers.count > 8 { s.transfers.removeLast() } } }
-    func stats(id: Int, fps: Double, mbps: Double, encodeMs: Double) {
-        updateViewer(id) { $0.fps = fps; $0.mbps = mbps; $0.encodeMs = encodeMs; $0.statsAt = Date() }
+    func stats(id: Int, fps: Double, mbps: Double, encodeMs: Double, captureMs: Double? = nil) {
+        updateViewer(id) { $0.fps = fps; $0.mbps = mbps; $0.encodeMs = encodeMs; $0.captureMs = captureMs; $0.statsAt = Date() }
     }
+    func viewerLatency(id: Int, _ r: LatencyReport) { updateViewer(id) { $0.latency = r } }
 }

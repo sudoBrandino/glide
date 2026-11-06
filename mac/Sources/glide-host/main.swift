@@ -65,6 +65,10 @@ func usage() -> Never {
            glide-host --set-connect HOST[:PORT] (save the default dial-out target in host.json)
            glide-host --set-password-file PATH  (save the password in host.json)
            glide-host --selftest-ui [--out DIR] (print the status menu per state + display-mode picks; no capture)
+           glide-host --encode-bench [SECONDS]  (offline VideoToolbox encode timing, normal vs low-latency RC,
+                                                synthetic 2560x1440 desktop content; no capture, no network)
+      Latency tuning (env, see docs/LATENCY.md): GLIDE_FPS=N (like --fps), GLIDE_LL=1 (low-latency RC),
+      GLIDE_SCK_QUEUE_DEPTH=N (default 5), GLIDE_SCK_INTERVAL=native|fps (minimumFrameInterval)
       --connect: dial out to a client running `glide-client --listen` (reconnects automatically)
                  instead of listening. Use when the network only allows Mac -> viewer connections.
       Password resolution: --password, --password-file, $GLIDE_PASSWORD, saved password in
@@ -83,6 +87,10 @@ func takeValue(_ flag: String) -> String? {
 }
 if args.contains("-h") || args.contains("--help") { usage() }
 if args.contains("--selftest-ui") { runSelfTestUI(outDir: takeValue("--out")) }  // offscreen; never captures
+if let i = args.firstIndex(of: "--encode-bench") {  // offline; never captures or listens
+    let secs = i + 1 < args.count ? Double(args[i + 1]) ?? 3 : 3
+    runEncodeBench(seconds: secs)
+}
 
 if args.contains("--request-permissions") {
     // Run from the app bundle so macOS attributes the grants to Glide Host itself.
@@ -125,6 +133,7 @@ var settings = HostSettings(password: password, salt: salt, passwordKey: Handsha
 if let v = takeValue("--port"), let n = UInt16(v) { settings.port = n }
 settings.clipboardSyncConcealed = config.clipboard?.syncConcealed ?? false
 settings.files = HostFileConfig(config.files)
+if let v = ProcessInfo.processInfo.environment["GLIDE_FPS"], let n = Int(v), n > 0 { settings.fps = n }  // LaunchAgent-friendly
 if let v = takeValue("--fps"), let n = Int(v) { settings.fps = n }
 if let v = takeValue("--bitrate-kbps"), let n = Int(v) { settings.bitrateKbps = n }
 if let v = takeValue("--max-width"), let n = Int(v) { settings.maxWidth = n }

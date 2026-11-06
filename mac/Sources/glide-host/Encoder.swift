@@ -68,6 +68,13 @@ final class VideoEncoder {
     }
 
     func requestKeyframe() { forceKey = true }
+
+    /// Sets a compression session property after creation (experiments / tuning).
+    func setProperty(_ key: CFString, _ value: CFTypeRef) {
+        guard let session else { return }
+        let r = VTSessionSetProperty(session, key: key, value: value)
+        if r != noErr { log("encoder: property \(key) rejected (\(r))") }
+    }
     var keyframePending: Bool { forceKey }
 
     func encode(_ pb: CVPixelBuffer, pts: CMTime, output: @escaping Output) {

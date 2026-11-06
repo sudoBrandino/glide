@@ -471,7 +471,36 @@ func trackerChecks() {
 }
 
 if CommandLine.arguments.dropFirst().first == "--file-host" { runFileHost(Array(CommandLine.arguments.dropFirst(2))) }
+/// PROTOCOL.md §3.4 reference bytes and the docs/LATENCY.md block code (the Rust viewer and
+/// tools/mock_host.py --selftest check the same vectors).
+func latencyTests() throws {
+    let ftHex = "810700000040420f000000000001dc0500004006000048260000ac26000074270000"
+    let ft = FrameTiming(frameId: 7, captureUs: 1_000_000, flags: 1, callback: 1500, submit: 1600, encoded: 9800, enqueued: 9900, sent: 10100)
+    check(HostMessage.frameTiming(ft).encoded.hex == ftHex, "FrameTiming reference bytes")
+    if case let .frameTiming(d) = try HostMessage.decode(Data(hex: ftHex)!) { check(d == ft, "FrameTiming decode") } else { check(false, "FrameTiming decode") }
+    check(FrameTiming.delta(1_009_800, from: 1_000_000) == 9800 && FrameTiming.delta(nil, from: 5) == timingUnknown && FrameTiming.delta(3, from: 5) == 0, "FrameTiming deltas")
+    check(ClientMessage.latencyEnable(flags: 1).encoded.hex == "8001", "LatencyEnable bytes")
+    let lrHex = "82780001f82a0000b00400002c0100000807000090010000f41a000060540000ffffffff"
+    if case let .latencyReport(r) = try ClientMessage.decode(Data(hex: lrHex)!) {
+        check(r.samples == 120 && r.totalUs == 21600 && r.groundTruthUs == timingUnknown, "LatencyReport decode")
+        check(ClientMessage.latencyReport(r).encoded.hex == lrHex, "LatencyReport re-encode")
+        check(r.summary.hasSuffix("total(glass) 21.6"), "LatencyReport summary: \(r.summary)")
+    } else { check(false, "LatencyReport decode") }
+    check(BlockCode.crc8(Array("123456789".utf8)) == 0xF4, "CRC-8/SMBUS check value")
+    let bits = BlockCode.bits(value: 0x1234_5678, kind: 1, counter: 5).map { $0 ? "1" : "0" }.joined()
+    check(bits == "10110010000100100011010001010110011110000001010100111111", "block code reference bits")
+    // Rendered pattern: sample the cell centers back.
+    let cell = 4, w = BlockCode.widthCells * cell, h = BlockCode.heightCells * cell
+    let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)!
+    BlockCode.draw(in: ctx, origin: .zero, cell: CGFloat(cell), value: 0x1234_5678, kind: 1, counter: 5)
+    let px = ctx.data!.assumingMemoryBound(to: UInt8.self)
+    let row = h / 2  // middle of the strip (rows are top-down in memory)
+    let read = (0..<BlockCode.cells).map { px[row * w + (BlockCode.quiet + $0) * cell + cell / 2] > 128 ? "1" : "0" }.joined()
+    check(read == bits && px[0] == 0 && px[row * w + 1] == 0, "block code pattern rendering")
+}
+
 do { try run() } catch { failures += 1; print("  FAIL threw \(error)") }
+do { try latencyTests() } catch { failures += 1; print("  FAIL latency threw \(error)") }
 policyChecks()
 registryChecks()
 trackerChecks()

@@ -36,8 +36,13 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
     let _rx_thread = conn.spawn_receiver(move |ev| {
         let _ = tx.send((ev, now_us()));
     });
-    let _ping = conn.spawn_pinger(Duration::from_secs(1));
+    let _ping = conn.spawn_pinger(crate::net::PING_INTERVAL);
     let sender = conn.sender.clone();
+    // Ask for per-frame host timestamps (§3.4); hosts without it ignore this.
+    let _ = sender.send(&ClientMsg::LatencyEnable { flags: 1 });
+    let mut lat = crate::latency::Tracker::new(false);
+    lat.keep_all = true;
+    let mut last_tick = Instant::now();
     let mut cfg = conn.config;
     let mut sharp_cfg: Option<VideoConfig> = None;
     let mut errors: Vec<String> = Vec::new();
@@ -83,6 +88,11 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
 
     while Instant::now() < deadline {
         let left = deadline.saturating_duration_since(Instant::now());
+        if last_tick.elapsed() > Duration::from_millis(200) {
+            last_tick = Instant::now();
+            let clock = conn.clock.lock().unwrap();
+            lat.tick(now_us(), clock.offset_us.is_some().then_some(&*clock));
+        }
         let (ev, rx_us) = match rx.recv_timeout(left.min(Duration::from_millis(200))) {
             Ok(x) => x,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -108,7 +118,9 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
                     errors.push(format!("sharp configure: {e}"));
                 }
             }
-            NetEvent::Msg(HostMsg::VideoFrame { capture_time_us, flags, rects, data, .. }) if flags & FRAME_FLAG_SHARP != 0 => {
+            NetEvent::Msg(HostMsg::FrameTiming(ft)) => lat.on_timing(ft, rx_us),
+            NetEvent::Msg(HostMsg::VideoFrame { frame_id, capture_time_us, flags, rects, data }) if flags & FRAME_FLAG_SHARP != 0 => {
+                lat.on_recv(frame_id, flags, rx_us);
                 frames_rx += 1;
                 sharp_rx += 1;
                 bytes += data.len() as u64;
@@ -127,7 +139,11 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
                 let t0 = now_us();
                 match sharp.decode(&data, true) {
                     Ok(n) => {
-                        sharp_decode_ms.push((now_us() - t0) as f64 / 1000.0);
+                        let t1 = now_us();
+                        sharp_decode_ms.push((t1 - t0) as f64 / 1000.0);
+                        if n > 0 {
+                            lat.on_decode(frame_id, t0, t1);
+                        }
                         sharp_frames += n as u64;
                         frames_out += n as u64;
                     }
@@ -140,7 +156,8 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
                 }
                 let _ = capture_time_us;
             }
-            NetEvent::Msg(HostMsg::VideoFrame { capture_time_us, flags, rects, data, .. }) => {
+            NetEvent::Msg(HostMsg::VideoFrame { frame_id, capture_time_us, flags, rects, data }) => {
+                lat.on_recv(frame_id, flags, rx_us);
                 frames_rx += 1;
                 bytes += data.len() as u64;
                 let key = flags & FRAME_FLAG_KEYFRAME != 0;
@@ -175,6 +192,7 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
                         frames_out += n as u64;
                         base_frames += n as u64;
                         if n > 0 {
+                            lat.on_decode(frame_id, t0, t1);
                             let now = Instant::now();
                             first_frame_at.get_or_insert(now);
                             last_frame_at = Some(now);
@@ -231,15 +249,24 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
     errors.dedup();
 
     let clock = conn.clock.lock().unwrap();
+    lat.tick(now_us(), clock.offset_us.is_some().then_some(&*clock));
+    let latency = format!(
+        "{{\"host_timing\":{},\"breakdown\":{},\"clock\":{{\"min_rtt_ms\":{},\"drift_ppm\":{:.2},\"window_samples\":{}}}}}",
+        lat.host_timing_seen,
+        lat.report_json(),
+        json_opt(clock.min_rtt_us().map(|u| u as f64 / 1000.0)),
+        clock.drift_ppm(),
+        clock.window_samples()
+    );
     let fps_window = match (first_frame_at, last_frame_at) {
         (Some(a), Some(b)) if base_frames > 1 && b > a => Some((base_frames - 1) as f64 / (b - a).as_secs_f64()),
         _ => None,
     };
     let notes = format!(
         "e2e = host capture_time -> base-layer frame decoded on client (GPU-complete), excluding refresh and sharp-layer frames, \
-         using a Ping/Pong clock-offset estimate (error bound ~ +/- min_rtt/2 = {:.2} ms); excludes display scan-out. \
-         Add ~1 refresh (<=4.2 ms @239Hz) for present.",
-        clock.rtts_ms.iter().cloned().fold(f64::INFINITY, f64::min) / 2.0
+         using a sliding-window min-RTT Ping/Pong clock-offset estimate (error bound ~ +/- min_rtt/2 = {:.2} ms); excludes display scan-out. \
+         latency.breakdown: per-stage distributions (docs/LATENCY.md) when the host sends FrameTiming (latency.host_timing).",
+        clock.min_rtt_us().map_or(f64::NAN, |u| u as f64 / 2000.0)
     );
     let errs: Vec<String> = errors.iter().map(|e| json_str(e)).collect();
     let audio = match audio_cfg {
@@ -284,7 +311,7 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
             "\"keyframes\":{},\"configs\":{},\"cursor_shapes\":{},\"bytes\":{},\"mbps\":{:.3},\"layers\":{},",
             "\"decode_ms\":{{\"p50\":{},\"p95\":{},\"max\":{}}},\"recv_to_decode_start_ms_p50\":{},",
             "\"rtt_ms\":{{\"p50\":{},\"min\":{},\"samples\":{}}},\"e2e_capture_to_decoded_ms\":{{\"p50\":{},\"p95\":{},\"samples\":{}}},",
-            "\"audio\":{},\"est_latency_notes\":{},\"errors\":[{}]}}"
+            "\"audio\":{},\"latency\":{},\"est_latency_notes\":{},\"errors\":[{}]}}"
         ),
         json_str(&conn.host_name),
         elapsed,
@@ -316,6 +343,7 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
         json_opt(percentile(&e2e_ms, 95.0)),
         e2e_ms.len(),
         audio,
+        latency,
         json_str(&notes),
         errs.join(",")
     )

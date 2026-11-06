@@ -10,33 +10,27 @@ use crate::protocol::Mode;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Action {
+    // Named variants only (no hand-numbered discriminants): the u8 value is just a WPARAM round
+    // trip inside one binary, and `from_u8` is derived from `TABLE`. New actions add a line here
+    // and a `TABLE` row.
     ToggleHud = 1,
-    CycleMode = 2,
-    ToggleFullscreen = 3,
-    ToggleKeyboardCapture = 4,
-    RequestKeyframe = 5,
-    Reconnect = 6,
-    ToggleMute = 7,
-    OpenMenu = 8,
-    PullFiles = 9,
-    CancelFiles = 10,
+    CycleMode,
+    ToggleFullscreen,
+    ToggleKeyboardCapture,
+    RequestKeyframe,
+    Reconnect,
+    ToggleMute,
+    OpenMenu,
+    /// Latency test mode: read the host's test pattern back (docs/LATENCY.md).
+    LatencyTest,
+    PullFiles,
+    CancelFiles,
 }
 
 impl Action {
+    /// Inverse of `action as u8` (every action has a `TABLE` row).
     pub fn from_u8(v: u8) -> Option<Action> {
-        Some(match v {
-            1 => Action::ToggleHud,
-            2 => Action::CycleMode,
-            3 => Action::ToggleFullscreen,
-            4 => Action::ToggleKeyboardCapture,
-            5 => Action::RequestKeyframe,
-            6 => Action::Reconnect,
-            7 => Action::ToggleMute,
-            8 => Action::OpenMenu,
-            9 => Action::PullFiles,
-            10 => Action::CancelFiles,
-            _ => return None,
-        })
+        TABLE.iter().map(|t| t.1).find(|a| *a as u8 == v)
     }
     /// Name used by the `GLIDE_TEST_ACTIONS` test hook.
     pub fn from_name(s: &str) -> Option<Action> {
@@ -51,6 +45,7 @@ impl Action {
             "menu" | "space" => Action::OpenMenu,
             "pullfiles" | "v" => Action::PullFiles,
             "cancelfiles" | "x" => Action::CancelFiles,
+            "latency" | "l" => Action::LatencyTest,
             _ => return None,
         })
     }
@@ -62,6 +57,7 @@ pub const KEY_D: u16 = 0x07;
 pub const KEY_F: u16 = 0x09;
 pub const KEY_H: u16 = 0x0B;
 pub const KEY_K: u16 = 0x0E;
+pub const KEY_L: u16 = 0x0F;
 pub const KEY_M: u16 = 0x10;
 pub const KEY_R: u16 = 0x15;
 pub const KEY_SPACE: u16 = 0x2C;
@@ -82,6 +78,7 @@ pub const TABLE: &[(u16, Action, &str)] = &[
     (KEY_SPACE, Action::OpenMenu, "Ctrl+Alt+Shift+Space  open the Glide menu at the mouse pointer"),
     (KEY_V, Action::PullFiles, "Ctrl+Alt+Shift+V  paste files copied in Finder (saved to Downloads\\Glide)"),
     (KEY_X, Action::CancelFiles, "Ctrl+Alt+Shift+X  cancel the file transfer"),
+    (KEY_L, Action::LatencyTest, "Ctrl+Alt+Shift+L  latency test: read the host's test pattern (glide-probe --pattern-only)"),
 ];
 
 pub fn help() -> String {

@@ -109,36 +109,152 @@ impl Sender {
     }
 }
 
+/// One Ping/Pong exchange.
+#[derive(Debug, Clone, Copy)]
+struct PongSample {
+    /// Client time halfway between Ping send and Pong receipt.
+    t_mid: u64,
+    rtt: u64,
+    /// host_time_us - t_mid.
+    offset: i64,
+}
+
 /// RTT + host clock offset estimation from Ping/Pong.
-#[derive(Default)]
+///
+/// The offset (host_time_us - client_time_us) is estimated from the **lowest-RTT samples in a
+/// sliding window** (default 30 s): queueing only ever adds delay, so the fastest exchanges carry
+/// the least asymmetry (error ≤ rtt_min / 2). The window is split into buckets; when the minima
+/// of at least four buckets span ≥ 20 s, a least-squares line through them also tracks the drift
+/// between the two crystals (tens of ppm = several ms per minute), so the estimate never goes
+/// stale the way a single all-time-best sample does.
 pub struct ClockSync {
     pub rtts_ms: Vec<f64>,
     pub last_rtt_ms: Option<f64>,
-    /// host_time_us - client_time_us, estimated from the lowest-RTT sample.
+    /// host_time_us - client_time_us at the most recent sample time (see `offset_at`).
     pub offset_us: Option<i64>,
-    best_rtt_us: Option<u64>,
+    window: std::collections::VecDeque<PongSample>,
+    /// (t0, offset at t0, drift in µs per µs). Drift is 0 until there is enough data.
+    fit: Option<(u64, f64, f64)>,
+    pub window_us: u64,
+    pub bucket_us: u64,
+}
+
+impl Default for ClockSync {
+    fn default() -> Self {
+        ClockSync {
+            rtts_ms: Vec::new(),
+            last_rtt_ms: None,
+            offset_us: None,
+            window: std::collections::VecDeque::new(),
+            fit: None,
+            window_us: 30_000_000,
+            bucket_us: 5_000_000,
+        }
+    }
 }
 
 impl ClockSync {
     pub fn on_pong(&mut self, client_time_us: u64, host_time_us: u64, now: u64) {
-        let rtt = now.saturating_sub(client_time_us);
+        if now < client_time_us {
+            return;
+        }
+        let rtt = now - client_time_us;
         self.last_rtt_ms = Some(rtt as f64 / 1000.0);
         self.rtts_ms.push(rtt as f64 / 1000.0);
         if self.rtts_ms.len() > 10_000 {
             self.rtts_ms.drain(..5_000);
         }
-        if self.best_rtt_us.map_or(true, |b| rtt <= b) {
-            self.best_rtt_us = Some(rtt);
-            let mid = client_time_us + rtt / 2;
-            self.offset_us = Some(host_time_us as i64 - mid as i64);
+        let t_mid = client_time_us + rtt / 2;
+        self.window.push_back(PongSample { t_mid, rtt, offset: host_time_us as i64 - t_mid as i64 });
+        while self.window.front().is_some_and(|s| t_mid.saturating_sub(s.t_mid) > self.window_us) {
+            self.window.pop_front();
         }
+        self.refit();
+        self.offset_us = self.offset_at(t_mid);
+    }
+
+    fn refit(&mut self) {
+        let Some(best) = self.window.iter().min_by_key(|s| s.rtt).copied() else {
+            self.fit = None;
+            return;
+        };
+        // Minimum-RTT sample of each bucket.
+        let mut mins: Vec<PongSample> = Vec::new();
+        for s in &self.window {
+            let b = s.t_mid / self.bucket_us;
+            match mins.last_mut() {
+                Some(m) if m.t_mid / self.bucket_us == b => {
+                    if s.rtt < m.rtt {
+                        *m = *s;
+                    }
+                }
+                _ => mins.push(*s),
+            }
+        }
+        // A bucket whose best exchange was still slow (e.g. a partial, newest bucket) would pull
+        // the line by its asymmetry: only fit near-minimal exchanges.
+        let limit = best.rtt + (best.rtt / 2).max(100);
+        mins.retain(|m| m.rtt <= limit);
+        let span = mins.last().unwrap().t_mid - mins[0].t_mid;
+        if mins.len() >= 4 && span >= 20_000_000 {
+            let n = mins.len() as f64;
+            let t0 = mins[0].t_mid;
+            let xs: Vec<f64> = mins.iter().map(|m| (m.t_mid - t0) as f64).collect();
+            let ys: Vec<f64> = mins.iter().map(|m| m.offset as f64).collect();
+            let mx = xs.iter().sum::<f64>() / n;
+            let my = ys.iter().sum::<f64>() / n;
+            let sxx: f64 = xs.iter().map(|x| (x - mx) * (x - mx)).sum();
+            let sxy: f64 = xs.iter().zip(&ys).map(|(x, y)| (x - mx) * (y - my)).sum();
+            let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+            // Two crystals differ by tens of ppm at most; a steeper line is noise (or a clock step).
+            if slope.abs() <= 100e-6 {
+                self.fit = Some((t0, my - slope * mx, slope));
+                return;
+            }
+        }
+        // Not enough spread for a fit right now: anchor on the best recent exchange and keep the
+        // last fitted drift (it changes slowly), so the estimate doesn't jump back to drift-free.
+        let slope = self.fit.map_or(0.0, |f| f.2);
+        self.fit = Some((best.t_mid, best.offset as f64, slope));
+    }
+
+    /// host - client offset at client time `t`.
+    pub fn offset_at(&self, t: u64) -> Option<i64> {
+        self.fit.map(|(t0, a, b)| (a + b * (t as f64 - t0 as f64)).round() as i64)
+    }
+
+    /// Estimated drift of the host clock relative to the client's, in ppm (0 until fitted).
+    pub fn drift_ppm(&self) -> f64 {
+        self.fit.map_or(0.0, |f| f.2 * 1e6)
+    }
+
+    /// Lowest RTT in the current window (the offset's error bound is half of it).
+    pub fn min_rtt_us(&self) -> Option<u64> {
+        self.window.iter().map(|s| s.rtt).min()
+    }
+
+    pub fn window_samples(&self) -> usize {
+        self.window.len()
     }
 
     /// Convert a host monotonic timestamp into client `now_us()` time, if synced.
     pub fn host_to_client_us(&self, host_us: u64) -> Option<i64> {
-        self.offset_us.map(|o| host_us as i64 - o)
+        let o = self.offset_us?;
+        // Evaluate the (slowly varying) offset at the event's own time.
+        let approx = (host_us as i64 - o).max(0) as u64;
+        self.offset_at(approx).map(|o| host_us as i64 - o)
+    }
+
+    /// Convert a client `now_us()` timestamp into host time, if synced.
+    pub fn client_to_host_us(&self, client_us: u64) -> Option<i64> {
+        self.offset_at(client_us).map(|o| client_us as i64 + o)
     }
 }
+
+/// Pings sent 50 ms apart right after connecting (fast initial clock sync).
+pub const PING_BURST: u32 = 8;
+/// Default ping interval after the burst: 2 Hz keeps several samples per clock-sync bucket.
+pub const PING_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Per-read timeout during the handshake (an idle pre-auth peer is dropped after this).
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -348,22 +464,27 @@ impl Connection {
             .expect("spawn receiver")
     }
 
-    /// Send a Ping every `interval` until the connection closes or `stop()` is called.
+    /// Send a Ping every `interval` until the connection closes or `stop()` is called. The first
+    /// `PING_BURST` pings go out 50 ms apart so the clock offset is usable within a second.
     pub fn spawn_pinger(&self, interval: Duration) -> JoinHandle<()> {
         let sender = self.sender.clone();
         let stop = self.stop.clone();
         thread::Builder::new()
             .name("glide-ping".into())
             .spawn(move || {
+                let mut n = 0u32;
                 while !stop.load(Ordering::Relaxed) {
                     if sender.send(&ClientMsg::Ping { client_time_us: now_us() }).is_err() {
                         return;
                     }
+                    n += 1;
+                    let wait = if n < PING_BURST { Duration::from_millis(50) } else { interval };
                     // Sleep in small steps so stop() is responsive.
                     let mut slept = Duration::ZERO;
-                    while slept < interval && !stop.load(Ordering::Relaxed) {
-                        thread::sleep(Duration::from_millis(50));
-                        slept += Duration::from_millis(50);
+                    while slept < wait && !stop.load(Ordering::Relaxed) {
+                        let step = Duration::from_millis(50).min(wait - slept);
+                        thread::sleep(step);
+                        slept += step;
                     }
                 }
             })
@@ -486,5 +607,56 @@ mod tests {
         assert_eq!(c.offset_us, Some(500000));
         assert_eq!(c.host_to_client_us(600_000), Some(100_000));
         assert_eq!(c.rtts_ms.len(), 2);
+        assert_eq!(c.client_to_host_us(100_000), Some(600_000));
+    }
+
+    /// Simulated host clock: offset 7 s, drifting +40 ppm, random asymmetric queueing on both
+    /// legs. The windowed min-RTT fit must track it to well under 100 µs; the old all-time-best
+    /// estimator would be off by 40 ppm × elapsed (2.4 ms after a minute).
+    #[test]
+    fn clock_sync_tracks_drift_with_sliding_window() {
+        for seed in [0x1234_5678u64, 0xDEAD_BEEF, 0x0BAD_F00D, 42] {
+            drift_case(seed, 40.0);
+            drift_case(seed, -25.0);
+        }
+    }
+
+    fn drift_case(seed: u64, ppm: f64) {
+        let mut c = ClockSync::default();
+        let mut rng = seed;
+        let mut rand = move |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let host = |t: u64| -> u64 { (7_000_000.0 + t as f64 * (1.0 + ppm * 1e-6)) as u64 };
+        let mut t = 1_000_000u64;
+        let mut worst_late = 0i64;
+        for i in 0..240 {
+            // 2 Hz pings for 2 minutes; base one-way 300 µs, plus 0..2 ms queueing per leg
+            // (only occasionally small on both legs).
+            let up = 300 + if i % 7 == 0 { rand(40) } else { rand(2000) };
+            let down = 300 + if i % 7 == 0 { rand(40) } else { rand(2000) };
+            let ht = host(t + up);
+            c.on_pong(t, ht, t + up + down);
+            if t > 40_000_000 {
+                let est = c.host_to_client_us(host(t)).unwrap();
+                worst_late = worst_late.max((est - t as i64).abs());
+            }
+            t += 500_000;
+        }
+        assert!(worst_late < 100, "seed {seed:#x} {ppm} ppm: offset error {worst_late} µs");
+        assert!((c.drift_ppm() - ppm).abs() < 5.0, "seed {seed:#x}: drift {} ppm vs {ppm}", c.drift_ppm());
+        assert!(c.window_samples() <= 61);
+        assert!(c.min_rtt_us().unwrap() < 700);
+    }
+
+    #[test]
+    fn clock_sync_ignores_bogus_samples() {
+        let mut c = ClockSync::default();
+        c.on_pong(5000, 1, 4000); // reply "before" the ping: ignored
+        assert_eq!(c.offset_us, None);
+        assert_eq!(c.host_to_client_us(1), None);
     }
 }
