@@ -23,8 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install cryptography
@@ -39,14 +39,14 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Toolchain
         run: |
           sw_vers
           xcode-select -p
           swift --version
       - name: Cache SwiftPM build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: mac/.build
           key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mac/Package.swift', 'mac/Sources/**') }}
@@ -66,6 +66,12 @@ jobs:
           BIN="$(swift build -c release --show-bin-path 2>/dev/null || echo .build/release)"
           [ -x "$BIN/glide-selftest" ] || BIN=.build/release
           "$BIN/glide-selftest" ../docs/test-vectors.json
+      - name: Tools compile / syntax check
+        run: |
+          swiftc -O tools/display-mode.swift -o "$RUNNER_TEMP/glide-display-mode"
+          swiftc -O tools/compare.swift -o "$RUNNER_TEMP/glide-compare"
+          for f in tools/*.sh; do bash -n "$f"; done
+          python3 -m py_compile tools/mock_host.py tools/gen_vectors.py
 
   # Rust viewer: platform-independent unit tests on Linux, plus the MinGW cross-build of the exe.
   rust:
@@ -76,7 +82,7 @@ jobs:
       run:
         working-directory: windows
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install MinGW-w64
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64
       - uses: dtolnay/rust-toolchain@stable
@@ -98,7 +104,7 @@ jobs:
           if x86_64-w64-mingw32-objdump -p "$EXE" | grep -iE 'DLL Name: (libgcc|libwinpthread|libstdc)'; then
             echo "::error::exe links MinGW runtime DLLs"; exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: glide-client-windows-x64
           path: windows/target/x86_64-pc-windows-gnu/release/glide-client.exe
@@ -116,7 +122,7 @@ jobs:
         working-directory: windows
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
