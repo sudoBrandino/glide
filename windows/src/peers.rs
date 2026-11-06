@@ -207,7 +207,7 @@ pub fn accept_admitted(
         stream.set_nonblocking(false).map_err(ConnectError::Io)?;
         eprintln!("host connected from {peer}");
         let timer = PreAuthDeadline::arm(&stream, deadline);
-        let res = Connection::from_stream(stream, password, hello);
+        let res = Connection::from_stream_timeout(stream, password, hello, deadline);
         let timed_out = timer.disarm();
         match res {
             Ok(c) if !timed_out => {
