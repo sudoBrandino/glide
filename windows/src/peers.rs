@@ -1,14 +1,15 @@
-//! Listen-mode admission control (defense in depth until the protocol gets a PAKE, security v2).
+//! Listen-mode admission control (defense in depth on top of the v2 key pinning).
 //!
 //! In `--listen` mode anyone who can reach the port can start a handshake. Before a single
 //! handshake byte is exchanged the viewer:
 //! - drops peers not in `allowed_peers` (IPs or CIDRs) when that list is non-empty;
 //! - drops peers that are in a failed-handshake backoff window (1 s doubling to 60 s per IP).
 //!
-//! With an empty list the first peer that completes an authenticated session is pinned
-//! (trust on first use). Pure Rust; unit-tested.
+//! With an empty list the IP of the first host that completes an authenticated session is
+//! pinned (trust on first use). The host's *key* is what authenticates it (config
+//! `pinned_hosts`); the IP list only limits who may start a handshake. Pure Rust; unit-tested.
 
-use crate::net::{ConnectError, Connection};
+use crate::net::{Auth, ConnectError, Connection};
 use crate::protocol::ClientMsg;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -167,7 +168,7 @@ impl Backoff {
 /// Ok(None) = interrupted by quit/pause.
 pub fn accept_admitted(
     listener: &std::net::TcpListener,
-    password: &str,
+    auth: &Auth,
     hello: &ClientMsg,
     abort: &AtomicBool,
     allowed_peers: &dyn Fn() -> Vec<String>,
@@ -207,7 +208,10 @@ pub fn accept_admitted(
         stream.set_nonblocking(false).map_err(ConnectError::Io)?;
         eprintln!("host connected from {peer}");
         let timer = PreAuthDeadline::arm(&stream, deadline);
-        let res = Connection::from_stream_timeout(stream, password, hello, deadline);
+        // Pairing (authenticated, waits for the user) lifts the pre-auth deadline.
+        let res = Connection::from_stream_timeout(stream, auth, hello, deadline, &|| {
+            timer.disarm();
+        });
         let timed_out = timer.disarm();
         match res {
             Ok(c) if !timed_out => {
@@ -259,7 +263,7 @@ impl PreAuthDeadline {
     }
 
     /// Stop the timer; returns true if it already fired (the socket was shut down).
-    fn disarm(self) -> bool {
+    fn disarm(&self) -> bool {
         let mut g = self.state.lock().unwrap();
         g.0 = true;
         g.1
@@ -378,12 +382,11 @@ mod tests {
 #[cfg(test)]
 mod accept_tests {
     use super::*;
+    use crate::identity::Identity;
+    use crate::net::tests::{auth, hello, TestUi};
+    use crate::testhost::{serve, HostCfg, Outcome};
     use std::io::Read;
     use std::net::{TcpListener, TcpStream};
-
-    fn hello() -> ClientMsg {
-        ClientMsg::ClientHello { version: 1, codec_caps: 1, view_w: 1, view_h: 1, mode: 0, max_fps: 60, client_name: "t".into() }
-    }
 
     /// Run accept_admitted on a loopback listener in a thread; return (bytes the peer received
     /// before the viewer closed, backoff after).
@@ -394,7 +397,8 @@ mod accept_tests {
         let ab = abort.clone();
         let t = std::thread::spawn(move || {
             let allowed_fn = move || allowed.clone();
-            let r = accept_admitted(&l, "pw", &hello(), &ab, &allowed_fn, &mut backoff, deadline);
+            let a = auth(&Identity::generate(), None, TestUi::new(true));
+            let r = accept_admitted(&l, &a, &hello(), &ab, &allowed_fn, &mut backoff, deadline);
             let what = match r {
                 Ok(Some(_)) => "connected".to_string(),
                 Ok(None) => "aborted".to_string(),
@@ -411,6 +415,9 @@ mod accept_tests {
         let (b, what) = t.join().unwrap();
         (got.len(), b, what)
     }
+
+    /// The viewer's first flight: ClientPreamble + framed msg1.
+    const FIRST_FLIGHT: usize = crate::handshake::CLIENT_PREAMBLE_LEN + 2 + 32;
 
     #[test]
     fn not_allowlisted_is_dropped_before_handshake() {
@@ -433,45 +440,15 @@ mod accept_tests {
     fn idle_preauth_peer_is_cut_off_and_backed_off() {
         let t0 = Instant::now();
         let (n, b, what) = probe(vec!["127.0.0.0/8".into()], Backoff::default(), Duration::from_millis(300));
-        assert_eq!(n, crate::crypto::CLIENT_HS_LEN, "allowed peer gets the ClientHandshake, then is cut off");
+        assert_eq!(n, FIRST_FLIGHT, "allowed peer gets the first flight, then is cut off");
         assert!(what.starts_with("err"), "{what}");
         assert!(t0.elapsed() < Duration::from_secs(3), "deadline, not the 5 s read timeout");
         assert!(b.blocked("127.0.0.1".parse().unwrap(), Instant::now()).is_some());
     }
 
-    /// Minimal host side of the v1 handshake (docs/PROTOCOL.md §1–2). Returns true if the
-    /// viewer's ClientHello decrypted (i.e. the passwords matched) and ServerHello was sent.
-    fn fake_host(addr: std::net::SocketAddr, password: &str) -> bool {
-        use crate::crypto::{derive_keys, pw_key, Opener, Sealer, CLIENT_HS_LEN, HOST_HS_LEN, MAGIC};
-        use crate::protocol::{Codec, HostMsg, VideoConfig};
-        use std::io::Write;
-        use x25519_dalek::{PublicKey, StaticSecret};
-        let mut s = TcpStream::connect(addr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let mut chs = [0u8; CLIENT_HS_LEN];
-        if s.read_exact(&mut chs).is_err() {
-            return false;
-        }
-        let secret = StaticSecret::random_from_rng(rand_core::OsRng);
-        let mut hhs = Vec::with_capacity(HOST_HS_LEN);
-        hhs.extend_from_slice(MAGIC);
-        hhs.extend_from_slice(&1u16.to_le_bytes());
-        hhs.extend_from_slice(PublicKey::from(&secret).as_bytes());
-        hhs.extend_from_slice(&[7u8; 16]); // nonce
-        let salt = [9u8; 16];
-        hhs.extend_from_slice(&salt);
-        s.write_all(&hhs).unwrap();
-        let peer: [u8; 32] = chs[6..38].try_into().unwrap();
-        let shared = secret.diffie_hellman(&PublicKey::from(peer));
-        let keys = derive_keys(shared.as_bytes(), &pw_key(password, &salt), &chs, &hhs);
-        let mut buf = Vec::new();
-        if Opener::new(&keys.c2s).read_record(&mut s, &mut buf).is_err() {
-            return false; // wrong password: a real host just closes
-        }
-        let cfg = VideoConfig { width: 64, height: 64, codec: Codec::Hevc, chroma: 0, color: 0, scale: 1.0 };
-        let hello = HostMsg::ServerHello { version: 1, host_name: "fake".into(), config: cfg }.encode();
-        s.write_all(&Sealer::new(&keys.s2c).seal(&hello)).unwrap();
-        true
+    /// The fake host dials the listening viewer (like `glide-host --connect`).
+    fn dial(addr: std::net::SocketAddr, cfg: HostCfg) -> std::thread::JoinHandle<Outcome> {
+        std::thread::spawn(move || serve(TcpStream::connect(addr).unwrap(), &cfg))
     }
 
     #[test]
@@ -481,26 +458,50 @@ mod accept_tests {
         let addr = l.local_addr().unwrap();
         let abort = AtomicBool::new(false);
         let none = || Vec::<String>::new();
+        let (host, viewer) = (Identity::generate(), Identity::generate());
+        let a = auth(&viewer, Some(host.public()), TestUi::new(true));
         let mut b = Backoff::default();
-        // wrong password → auth failure, IP backed off
-        let h = std::thread::spawn(move || fake_host(addr, "not-pw"));
-        let r = accept_admitted(&l, "pw", &hello(), &abort, &none, &mut b, Duration::from_secs(5));
-        assert!(matches!(r, Err(ref e) if e.is_auth_failure()), "{:?}", r.as_ref().err());
-        assert!(!h.join().unwrap());
+        // impostor host (different key) → key mismatch, IP backed off
+        let h = dial(addr, HostCfg::new(Identity::generate()));
+        let r = accept_admitted(&l, &a, &hello(), &abort, &none, &mut b, Duration::from_secs(5));
+        assert!(matches!(r, Err(ConnectError::HostKeyChanged { .. })), "{:?}", r.as_ref().err());
+        assert!(matches!(h.join().unwrap(), Outcome::Closed(_)));
         assert!(b.blocked(lo, Instant::now()).is_some());
-        // after the window expires, the right password connects and clears the record
+        // after the window expires, the real host connects and clears the record
         let mut b = Backoff::default();
         b.failed(lo, Instant::now() - Duration::from_secs(2));
-        let h = std::thread::spawn(move || fake_host(addr, "pw"));
-        let r = accept_admitted(&l, "pw", &hello(), &abort, &none, &mut b, Duration::from_secs(5));
+        let mut cfg = HostCfg::new(host.clone());
+        cfg.paired = vec![viewer.public()];
+        let h = dial(addr, cfg);
+        let r = accept_admitted(&l, &a, &hello(), &abort, &none, &mut b, Duration::from_secs(5));
         let (conn, ip) = r.unwrap().unwrap();
-        assert!(h.join().unwrap());
+        assert!(matches!(h.join().unwrap(), Outcome::Streaming { .. }));
         assert_eq!((conn.host_name.as_str(), ip), ("fake", lo));
         assert_eq!(b.failed(lo, Instant::now()), BACKOFF_START, "success reset the doubling");
-        // TOFU pin of the authenticated peer
+        // TOFU pin of the authenticated peer's IP
         let mut allowed = Vec::new();
         assert!(pin_first(&mut allowed, ip));
         assert_eq!(allowed, vec!["127.0.0.1"]);
+    }
+
+    #[test]
+    fn pairing_outlives_the_preauth_deadline() {
+        // Listen mode, unpaired: the user takes longer than the 300 ms pre-auth deadline to compare
+        // codes; the pairing phase must not be cut off.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let abort = AtomicBool::new(false);
+        let none = || Vec::<String>::new();
+        let host = Identity::generate();
+        let ui = Arc::new(TestUi { delay: Duration::from_millis(800), ..Arc::try_unwrap(TestUi::new(true)).ok().unwrap() });
+        let a = auth(&Identity::generate(), None, ui);
+        let mut cfg = HostCfg::new(host.clone());
+        cfg.pairing_open = true;
+        let h = dial(addr, cfg);
+        let mut b = Backoff::default();
+        let (conn, _) = accept_admitted(&l, &a, &hello(), &abort, &none, &mut b, Duration::from_millis(300)).unwrap().unwrap();
+        assert!(conn.paired && conn.host_key == host.public());
+        assert!(matches!(h.join().unwrap(), Outcome::Streaming { paired_now: true, .. }));
     }
 
     #[test]
@@ -516,6 +517,6 @@ mod accept_tests {
         assert_eq!((n, what.as_str()), (0, "aborted"));
         // pinned + allowlisted: still gets the handshake
         let (n, _, _) = probe(vec!["127.0.0.1".into()], b, Duration::from_millis(300));
-        assert_eq!(n, crate::crypto::CLIENT_HS_LEN);
+        assert_eq!(n, FIRST_FLIGHT);
     }
 }

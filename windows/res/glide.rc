@@ -13,35 +13,36 @@
 #define WS_EX_APPWINDOW   0x00040000L
 #define SS_ICON           0x3
 #define SS_CENTERIMAGE    0x200
-#define ES_PASSWORD       0x20
-#define ES_AUTOHSCROLL    0x80
+#define SS_CENTER         0x1
 #define IDOK              1
 #define IDCANCEL          2
 #define VOS_NT_WINDOWS32  0x40004L
 #define VFT_APP           0x1L
 
 #define IDI_GLIDE        1
-#define IDD_PASSWORD     101
-#define IDC_PW_ICON      1000
-#define IDC_PW_TEXT      1001
-#define IDC_PW_EDIT      1002
-#define IDC_PW_REMEMBER  1003
+#define IDD_PAIR         102
+#define IDC_PAIR_ICON    1100
+#define IDC_PAIR_TEXT    1101
+#define IDC_PAIR_CODE    1102
+#define IDC_PAIR_DETAIL  1103
 
 IDI_GLIDE ICON "glide.ico"
 1 24 "glide.manifest"
 
-IDD_PASSWORD DIALOGEX 0, 0, 262, 98
+// Pairing (security v2): both screens show the same 6-digit code; the user confirms on both.
+// Texts are set at runtime (win/prompt.rs); keep this file ASCII for rc.exe.
+IDD_PAIR DIALOGEX 0, 0, 262, 150
 STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | DS_SETFOREGROUND | WS_POPUP | WS_CAPTION | WS_SYSMENU
 EXSTYLE WS_EX_APPWINDOW
-CAPTION "Glide"
+CAPTION "Glide: Pair with Mac"
 FONT 9, "Segoe UI", 400, 0, 1
 BEGIN
-    CONTROL         "", IDC_PW_ICON, "Static", SS_ICON | SS_CENTERIMAGE, 10, 10, 24, 24
-    LTEXT           "Enter the password for the Glide host.", IDC_PW_TEXT, 44, 10, 208, 18
-    EDITTEXT        IDC_PW_EDIT, 44, 31, 208, 14, ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP
-    AUTOCHECKBOX    "&Remember on this PC (encrypted for your Windows account)", IDC_PW_REMEMBER, 44, 52, 208, 10, WS_TABSTOP
-    DEFPUSHBUTTON   "Connect", IDOK, 148, 74, 50, 14, WS_TABSTOP
-    PUSHBUTTON      "Cancel", IDCANCEL, 202, 74, 50, 14, WS_TABSTOP
+    CONTROL         "", IDC_PAIR_ICON, "Static", SS_ICON | SS_CENTERIMAGE, 10, 10, 24, 24
+    LTEXT           "Pair this PC with the Mac?", IDC_PAIR_TEXT, 44, 10, 208, 26
+    CTEXT           "000 000", IDC_PAIR_CODE, 10, 40, 242, 32
+    LTEXT           "", IDC_PAIR_DETAIL, 10, 78, 242, 44
+    DEFPUSHBUTTON   "Codes Match, Pair", IDOK, 118, 128, 80, 14, WS_TABSTOP
+    PUSHBUTTON      "Cancel", IDCANCEL, 202, 128, 50, 14, WS_TABSTOP
 END
 
 VS_VERSION_INFO VERSIONINFO

@@ -111,6 +111,8 @@ public enum ClientMessage {
     case ping(clientTimeUs: UInt64)
     case clipboard(ClipboardData)
     case audioEnable(Bool)
+    /// Pairing (§2.4): the user compared the codes (true = they match).
+    case pairConfirm(Bool)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -128,6 +130,7 @@ public enum ClientMessage {
         case let .ping(t): w.u8(0x30); w.u64(t)
         case let .clipboard(c): w = ByteWriter(capacity: c.payloadBytes + 32); w.u8(0x50); c.write(&w)
         case let .audioEnable(on): w.u8(0x62); w.u8(on ? 1 : 0)
+        case let .pairConfirm(ok): w.u8(0x07); w.u8(ok ? 1 : 0)
         }
         return w.data
     }
@@ -151,6 +154,7 @@ public enum ClientMessage {
         case 0x30: return .ping(clientTimeUs: try r.u64())
         case 0x50: return .clipboard(try ClipboardData.read(&r))
         case 0x62: return .audioEnable(try r.u8() != 0)
+        case 0x07: return .pairConfirm(try r.u8() != 0)
         default: throw WireError.unknownMessage(t)
         }
     }
@@ -158,6 +162,10 @@ public enum ClientMessage {
 
 /// Host -> Client messages.
 public enum HostMessage {
+    /// Auth phase result (§2.4); nonzero closes the connection.
+    case authResult(AuthCode)
+    /// Pairing: the host's nonce n_h, opening the msg2 commitment (§2.4).
+    case pairReveal(nonce: Data)
     case serverHello(version: UInt16, hostName: String, config: VideoConfig)
     case videoConfig(VideoConfig)
     case sharpLayerConfig(VideoConfig)
@@ -176,6 +184,8 @@ public enum HostMessage {
     public var encoded: Data {
         var w = ByteWriter()
         switch self {
+        case let .authResult(c): w.u8(0x05); w.u8(c.rawValue)
+        case let .pairReveal(n): w.u8(0x06); w.bytes(n)
         case let .serverHello(v, name, cfg): w.u8(0x02); w.u16(v); w.str(name); cfg.write(&w)
         case let .videoConfig(cfg): w.u8(0x03); cfg.write(&w)
         case let .sharpLayerConfig(cfg): w.u8(0x04); cfg.write(&w)
@@ -208,6 +218,8 @@ public enum HostMessage {
         var r = ByteReader(d)
         let t = try r.u8()
         switch t {
+        case 0x05: return .authResult(AuthCode(rawValue: try r.u8()) ?? .unknownViewer)
+        case 0x06: return .pairReveal(nonce: try r.bytes(32))
         case 0x02:
             let v = try r.u16(), name = try r.str()
             return .serverHello(version: v, hostName: name, config: try VideoConfig.read(&r))

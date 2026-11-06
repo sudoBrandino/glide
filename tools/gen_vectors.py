@@ -1,53 +1,159 @@
 #!/usr/bin/env python3
-"""Reference implementation of the Glide v1 handshake + record layer.
-Generates docs/test-vectors.json. Independent of the Swift and Rust code."""
-import hashlib, json, struct, sys
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes, serialization
+"""Reference transcripts for the Glide v2 handshake, pairing and record layer (docs/PROTOCOL.md §1–2).
 
-raw = lambda k: k.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-client_priv_b = bytes(range(1, 33))
-host_priv_b = bytes(range(101, 133))
-client_nonce = bytes([0xA0 + i for i in range(16)])
-host_nonce = bytes([0xC0 + i for i in range(16)])
-salt = bytes([0x50 + i for i in range(16)])
-password = "correct horse battery staple"
+  python3 tools/gen_vectors.py [OUT]          write docs/test-vectors.json (fixed inputs below)
+  python3 tools/gen_vectors.py --check FILE   recompute FILE (e.g. the Rust-generated
+                                              docs/test-vectors-rust.json) from its inputs and
+                                              compare every derived field byte for byte
 
-cpriv = X25519PrivateKey.from_private_bytes(client_priv_b)
-hpriv = X25519PrivateKey.from_private_bytes(host_priv_b)
-client_hs = b"GLD1" + struct.pack("<H", 1) + raw(cpriv) + client_nonce
-host_hs = b"GLD1" + struct.pack("<H", 1) + raw(hpriv) + host_nonce + salt
-assert len(client_hs) == 54 and len(host_hs) == 70
+Uses tools/glide_noise.py, which is written from the Noise spec independently of the Swift and
+Rust code and is first checked against the official vectors in docs/noise-vectors.json.
+"""
+import json, os, struct, sys
 
-pw_key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100000, 32)
-shared = cpriv.exchange(hpriv.public_key())
-assert shared == hpriv.exchange(cpriv.public_key())
-okm = HKDF(algorithm=hashes.SHA256(), length=64, salt=hashlib.sha256(client_hs + host_hs).digest(),
-           info=b"glide v1 session keys").derive(shared + pw_key)
-c2s, s2c = okm[:32], okm[32:]
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import glide_noise as gn  # noqa: E402
 
-def record(key, counter, plaintext):
-    nonce = b"\0\0\0\0" + struct.pack("<Q", counter)
-    ct = ChaCha20Poly1305(key).encrypt(nonce, plaintext, b"")
-    return struct.pack("<I", len(ct)) + ct
 
-def s(b): return struct.pack("<H", len(b.encode())) + b.encode()
-client_hello = bytes([0x01]) + struct.pack("<HIHHBB", 1, 0b111, 3840, 2160, 0, 60) + s("test-client")
-server_hello = bytes([0x02]) + struct.pack("<H", 1) + s("test-host") + struct.pack("<HHBBBf", 2560, 1440, 1, 0, 0, 2.0)
-mouse = bytes([0x10]) + struct.pack("<ff", 0.25, 0.75)
+def s(text):
+    b = text.encode()
+    return struct.pack("<H", len(b)) + b
 
-out = {
-  "password": password,
-  "client_private": client_priv_b.hex(), "host_private": host_priv_b.hex(),
-  "client_handshake": client_hs.hex(), "host_handshake": host_hs.hex(),
-  "pw_key": pw_key.hex(), "shared": shared.hex(), "c2s_key": c2s.hex(), "s2c_key": s2c.hex(),
-  "records": [
-    {"dir": "c2s", "counter": 0, "plaintext": client_hello.hex(), "record": record(c2s, 0, client_hello).hex()},
-    {"dir": "c2s", "counter": 1, "plaintext": mouse.hex(), "record": record(c2s, 1, mouse).hex()},
-    {"dir": "s2c", "counter": 0, "plaintext": server_hello.hex(), "record": record(s2c, 0, server_hello).hex()},
-  ],
-}
-json.dump(out, open(sys.argv[1] if len(sys.argv) > 1 else "docs/test-vectors.json", "w"), indent=2)
-print("ok")
+
+def client_hello(name):
+    return bytes([0x01]) + struct.pack("<HIHHBB", 2, 0b111, 3840, 2160, 0, 60) + s(name)
+
+
+def server_hello(name):
+    return bytes([0x02]) + struct.pack("<H", 2) + s(name) + struct.pack("<HHBBBf", 2560, 1440, 1, 0, 0, 2.0)
+
+
+MOUSE = bytes([0x10]) + struct.pack("<ff", 0.25, 0.75)
+
+
+def session(inp, viewer_s, host_s):
+    """One connection from fixed inputs. Returns the transcript dict (inputs + derived values)."""
+    pairing = inp["kind"] == "pairing"
+    ve, he = gn.priv_from(bytes.fromhex(inp["viewer_ephemeral"])), gn.priv_from(bytes.fromhex(inp["host_ephemeral"]))
+    n_v, n_h = bytes.fromhex(inp["viewer_nonce"]), bytes.fromhex(inp["host_nonce"])
+    cp = gn.client_preamble()
+    hp = gn.host_preamble()
+    ini = gn.HandshakeXX(True, viewer_s, cp, ve)
+    res = gn.HandshakeXX(False, host_s, cp, he)
+
+    msg1 = ini.write_message(b"")
+    assert res.read_message(msg1) == b""
+    p2 = gn.msg2_payload(inp["host_flags"], n_h)
+    msg2 = res.write_message(p2)
+    assert ini.read_message(msg2) == p2 and ini.rs == gn.raw_pub(host_s)
+    p3 = gn.msg3_payload(inp["viewer_flags"], n_v, inp["viewer_name"])
+    msg3 = ini.write_message(p3)
+    assert res.read_message(msg3) == p3 and res.rs == gn.raw_pub(viewer_s)
+    h = ini.handshake_hash()
+    assert h == res.handshake_hash()
+    c2s, s2c = ini.split()
+    hs2c, hc2s = res.split()
+    assert (c2s.k, s2c.k) == (hc2s.k, hs2c.k)
+
+    recs = []
+
+    def rec(direction, pt):
+        r = gn.record(c2s if direction == "c2s" else s2c, pt)
+        recs.append({"dir": direction, "plaintext": pt.hex(), "record": r.hex()})
+        return r
+
+    flights = [("viewer", cp + gn.frame(msg1)), ("host", hp + gn.frame(msg2))]
+    if pairing:
+        flights.append(("viewer", gn.frame(msg3)))
+        flights.append(("host", rec("s2c", bytes([gn.MSG_PAIR_REVEAL]) + n_h)))
+        flights.append(("viewer", rec("c2s", bytes([gn.MSG_PAIR_CONFIRM, 1]))))
+        flights.append(("host", rec("s2c", bytes([gn.MSG_AUTH_RESULT, gn.AUTH_OK]))))
+        flights.append(("viewer", rec("c2s", client_hello(inp["viewer_name"]))))
+        flights.append(("host", rec("s2c", server_hello(inp["host_name"]))))
+    else:
+        flights.append(("viewer", gn.frame(msg3) + rec("c2s", client_hello(inp["viewer_name"]))))
+        flights.append(("host", rec("s2c", server_hello(inp["host_name"]))))
+        flights.append(("viewer", rec("c2s", MOUSE)))
+
+    out = dict(inp)
+    out.update({
+        "client_preamble": cp.hex(), "msg1": msg1.hex(),
+        "host_preamble": hp.hex(), "msg2_payload": p2.hex(), "msg2": msg2.hex(),
+        "msg3_payload": p3.hex(), "msg3": msg3.hex(),
+        "handshake_hash": h.hex(), "c2s_key": c2s.k.hex(), "s2c_key": s2c.k.hex(),
+        "commitment": gn.commitment(n_h).hex(),
+        "sas": gn.sas_text(gn.sas_code(h, n_v, n_h)),
+        "records": recs,
+        "flights": [{"from": f, "bytes": b.hex()} for f, b in flights],
+    })
+    return out
+
+
+INPUT_KEYS = ["kind", "viewer_name", "host_name", "viewer_flags", "host_flags",
+              "viewer_ephemeral", "host_ephemeral", "viewer_nonce", "host_nonce"]
+
+
+def transcript(viewer_static, host_static, sessions, generator):
+    vs, hs = gn.priv_from(bytes.fromhex(viewer_static)), gn.priv_from(bytes.fromhex(host_static))
+    return {
+        "_comment": "Glide v2 handshake transcripts (docs/PROTOCOL.md §1-2). Inputs: the static and "
+                    "ephemeral private keys, nonces, names and flags; everything else is derived. "
+                    "'flights' are the exact bytes each side writes, in order. Generated by " + generator + ".",
+        "protocol": "Noise_XX_25519_ChaChaPoly_SHA256",
+        "viewer_static": viewer_static, "viewer_static_pub": gn.raw_pub(vs).hex(),
+        "host_static": host_static, "host_static_pub": gn.raw_pub(hs).hex(),
+        "viewer_fingerprint": gn.fingerprint(gn.raw_pub(vs)),
+        "host_fingerprint": gn.fingerprint(gn.raw_pub(hs)),
+        "sessions": [session(si, vs, hs) for si in sessions],
+    }
+
+
+def default_inputs():
+    seq = lambda start: bytes((start + i) & 0xFF for i in range(32)).hex()  # noqa: E731
+    return dict(
+        viewer_static=seq(1), host_static=seq(101),
+        sessions=[
+            {"kind": "pairing", "viewer_name": "test-viewer", "host_name": "test-host",
+             "viewer_flags": gn.VIEWER_FLAG_PAIR_REQUEST, "host_flags": gn.HOST_FLAG_PAIRING_OPEN,
+             "viewer_ephemeral": seq(0x21), "host_ephemeral": seq(0x41),
+             "viewer_nonce": seq(0xA0), "host_nonce": seq(0xC0)},
+            {"kind": "pinned", "viewer_name": "test-viewer", "host_name": "test-host",
+             "viewer_flags": 0, "host_flags": 0,
+             "viewer_ephemeral": seq(0x61), "host_ephemeral": seq(0x81),
+             "viewer_nonce": seq(0xE0), "host_nonce": seq(0x10)},
+        ])
+
+
+def main():
+    n = gn.check_noise_vectors(os.path.join(HERE, "..", "docs", "noise-vectors.json"))
+    assert n >= 1
+    if len(sys.argv) > 2 and sys.argv[1] == "--check":
+        doc = json.load(open(sys.argv[2]))
+        again = transcript(doc["viewer_static"], doc["host_static"],
+                           [{k: si[k] for k in INPUT_KEYS} for si in doc["sessions"]], "check")
+        bad = []
+        for k in ("viewer_static_pub", "host_static_pub", "viewer_fingerprint", "host_fingerprint"):
+            if doc[k] != again[k]:
+                bad.append(k)
+        for i, (a, b) in enumerate(zip(doc["sessions"], again["sessions"])):
+            for k, v in b.items():
+                if a.get(k) != v:
+                    bad.append(f"sessions[{i}].{k}")
+        if len(doc["sessions"]) != len(again["sessions"]):
+            bad.append("session count")
+        if bad:
+            sys.exit(f"MISMATCH in {sys.argv[2]}: {', '.join(bad)}")
+        print(f"ok: {sys.argv[2]} matches the Python reference ({len(doc['sessions'])} sessions)")
+        return
+    inp = default_inputs()
+    doc = transcript(inp["viewer_static"], inp["host_static"], inp["sessions"], "tools/gen_vectors.py (Python reference)")
+    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "..", "docs", "test-vectors.json")
+    with open(path, "w") as f:
+        json.dump(doc, f, indent=2)
+        f.write("\n")
+    print("ok")
+
+
+if __name__ == "__main__":
+    main()

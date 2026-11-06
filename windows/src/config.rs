@@ -2,9 +2,11 @@
 //! `GLIDE_CONFIG_DIR`). Platform independent so load/save/migration and the "what does a
 //! no-argument launch do" logic are unit-tested on macOS.
 //!
-//! The password is NOT stored here: it lives DPAPI-encrypted next to it (`password.dpapi`,
-//! see `win::dpapi`). A plaintext `"password"` key from an older/hand-written config is
-//! migrated out on load (the caller encrypts it and rewrites the file without it).
+//! Security v2 (docs/PROTOCOL.md §1–2): `pinned_hosts` holds the host public key pinned for each
+//! target after pairing. The viewer's own private key is NOT stored here: it lives
+//! DPAPI-encrypted next to it (`identity.dpapi`, see `identity`). Passwords are gone: a v1
+//! `password.dpapi` file is left alone (so the v1 viewer still works after a rollback) but no
+//! longer read, and a plaintext `"password"` key is dropped from the file.
 
 use crate::protocol::{Mode, DEFAULT_PORT};
 use serde::{Deserialize, Serialize};
@@ -13,7 +15,30 @@ use std::path::{Path, PathBuf};
 
 pub const CONFIG_VERSION: u32 = 1;
 pub const CONFIG_FILE: &str = "config.json";
-pub const PASSWORD_FILE: &str = "password.dpapi";
+/// v1 saved password (DPAPI). No longer read; only mentioned once in the log if present.
+pub const LEGACY_PASSWORD_FILE: &str = "password.dpapi";
+
+/// A host public key pinned by pairing (docs/PROTOCOL.md §2.3).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct PinnedHost {
+    /// X25519 static public key, 64 hex chars.
+    pub key: String,
+    /// Host name from ServerHello at pairing time (display only).
+    pub name: String,
+    /// When it was paired (RFC 3339 UTC).
+    pub paired: String,
+}
+
+impl PinnedHost {
+    pub fn key_bytes(&self) -> Option<[u8; 32]> {
+        let k = self.key.trim();
+        if k.len() != 64 || !k.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        crate::util::unhex(k).try_into().ok()
+    }
+}
 
 /// Remembered window state on one monitor. Position is relative to that monitor's top-left
 /// (so it survives monitor re-arrangement); `mon_w`/`mon_h` record the monitor size at save time.
@@ -56,6 +81,9 @@ pub struct Config {
     /// Listen mode: only these IPs / CIDRs may connect (checked before any handshake byte).
     /// Empty = trust on first use: the first host that authenticates is pinned here.
     pub allowed_peers: Vec<String>,
+    /// Host keys pinned by pairing, keyed by target (`pin_target`): "host:port" when dialing,
+    /// "listen:PORT" in listen mode.
+    pub pinned_hosts: BTreeMap<String, PinnedHost>,
     /// Monitor (device name, e.g. `\\.\DISPLAY1`) the window was last on.
     pub last_monitor: Option<String>,
     /// Per-monitor window state, keyed by monitor device name.
@@ -76,6 +104,7 @@ impl Default for Config {
             clipboard: true,
             clipboard_sync_secrets: false,
             allowed_peers: Vec::new(),
+            pinned_hosts: BTreeMap::new(),
             last_monitor: None,
             windows: BTreeMap::new(),
         }
@@ -98,14 +127,44 @@ impl Config {
     pub fn set_mode(&mut self, m: Mode) {
         self.mode = Some(m.name().to_string());
     }
+    /// The host key pinned for `target` (`pin_target`), if any and valid.
+    pub fn pinned_key(&self, target: &str) -> Option<[u8; 32]> {
+        self.pinned_hosts.get(target).and_then(PinnedHost::key_bytes)
+    }
+}
+
+/// Pin-store key for a connection target: "host:port" (normalized, lowercase) when dialing,
+/// "listen:PORT" in listen mode (whoever dials in must present that key).
+pub fn pin_target(t: &TargetSpec) -> String {
+    match t {
+        TargetSpec::Connect(h) => crate::net::parse_addr(h.trim()).to_ascii_lowercase(),
+        TargetSpec::Listen(p) => format!("listen:{p}"),
+    }
+}
+
+/// RFC 3339 UTC timestamp ("2026-11-06T13:05:09Z") for `pinned_hosts[..].paired`.
+pub fn rfc3339_utc(t: std::time::SystemTime) -> String {
+    let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 /// Result of loading a config file.
 #[derive(Debug, Default)]
 pub struct Loaded {
     pub config: Config,
-    /// A plaintext password found in the file (legacy); the caller should encrypt it and save.
-    pub legacy_password: Option<String>,
+    /// The file had a plaintext v1 `"password"` key (dropped; passwords are no longer used).
+    pub legacy_password: bool,
     /// The on-disk file should be rewritten (migrated, or missing fields filled in).
     pub needs_save: bool,
     /// Non-fatal problem (e.g. unparsable file, which was moved aside).
@@ -147,11 +206,9 @@ pub fn parse(text: &str) -> Loaded {
         }
         out.needs_save = true;
     }
-    // A plaintext password never stays in the file (any version).
-    if let Some(p) = obj.remove("password") {
-        if let Some(s) = p.as_str().filter(|s| !s.is_empty()) {
-            out.legacy_password = Some(s.to_string());
-        }
+    // A plaintext password never stays in the file (any version); v2 doesn't use passwords.
+    if obj.remove("password").is_some() {
+        out.legacy_password = true;
         out.needs_save = true;
     }
     obj.insert("version".into(), CONFIG_VERSION.into());
@@ -183,6 +240,7 @@ pub fn parse(text: &str) -> Loaded {
     field!(clipboard);
     field!(clipboard_sync_secrets);
     field!(allowed_peers);
+    field!(pinned_hosts);
     field!(last_monitor);
     field!(windows);
     if c.listen_port == 0 {
@@ -192,6 +250,11 @@ pub fn parse(text: &str) -> Loaded {
     if c.mode.as_deref().is_some_and(|m| mode_from_str(m).is_none()) {
         c.mode = None;
         bad.push("mode");
+    }
+    let before = c.pinned_hosts.len();
+    c.pinned_hosts.retain(|_, p| p.key_bytes().is_some());
+    if c.pinned_hosts.len() != before {
+        bad.push("pinned_hosts");
     }
     if c.host.as_deref().is_some_and(|h| h.trim().is_empty()) {
         c.host = None;
@@ -263,21 +326,23 @@ pub struct Store {
 }
 
 impl Store {
-    /// Load from `dir` (or defaults if None), applying migrations. Returns the store, any legacy
-    /// plaintext password found, and warnings to print.
-    pub fn open(dir: Option<PathBuf>) -> (Store, Option<String>, Vec<String>) {
+    /// Load from `dir` (or defaults if None), applying migrations. Returns the store and
+    /// warnings/notices to print.
+    pub fn open(dir: Option<PathBuf>) -> (Store, Vec<String>) {
         let mut warnings = Vec::new();
-        let Some(d) = dir else { return (Store::default(), None, warnings) };
+        let Some(d) = dir else { return (Store::default(), warnings) };
         let l = load(&d.join(CONFIG_FILE));
         warnings.extend(l.warning);
+        if l.legacy_password {
+            warnings.push("removed the plaintext v1 \"password\" from config.json (passwords are no longer used; Glide v2 pairs keys)".into());
+        }
         let st = Store { dir: Some(d), config: l.config };
-        // Don't write while a legacy password is pending: the caller saves after encrypting it.
-        if l.needs_save && l.legacy_password.is_none() {
+        if l.needs_save {
             if let Err(e) = st.save() {
                 warnings.push(format!("cannot write config: {e}"));
             }
         }
-        (st, l.legacy_password, warnings)
+        (st, warnings)
     }
 
     pub fn path(&self) -> Option<PathBuf> {
@@ -289,6 +354,22 @@ impl Store {
             Some(p) => save(&p, &self.config),
             None => Ok(()),
         }
+    }
+
+    /// After a successful pairing: pin the host key for `target` (replaces an older pin).
+    pub fn pin_host(&mut self, target: &str, key: &[u8; 32], host_name: &str) {
+        let pin = PinnedHost { key: crate::util::hex(key), name: host_name.to_string(), paired: rfc3339_utc(std::time::SystemTime::now()) };
+        self.update(|c| {
+            c.pinned_hosts.insert(target.to_string(), pin);
+        });
+        eprintln!("pinned host key {} for {target} (config pinned_hosts)", crate::handshake::fingerprint(key));
+    }
+
+    /// Unpair: forget the host key pinned for `target`. Returns the removed pin.
+    pub fn forget_host(&mut self, target: &str) -> Option<PinnedHost> {
+        let mut had = None;
+        self.update(|c| had = c.pinned_hosts.remove(target));
+        had
     }
 
     /// Apply `f`; save if the config changed. Errors are reported, not fatal.
@@ -466,7 +547,7 @@ mod tests {
         let back = parse(&to_json(&c));
         assert_eq!(back.config, c);
         assert!(!back.needs_save);
-        assert!(back.legacy_password.is_none());
+        assert!(!back.legacy_password);
         assert_eq!(back.config.mode(), Some(Mode::Sharp));
         assert_eq!(back.config.windows[r"\\.\DISPLAY2"].x, 160);
         // new keys default sensibly when missing from an older file
@@ -478,7 +559,7 @@ mod tests {
     #[test]
     fn migrates_legacy_v0() {
         let l = parse(r#"{"port": 7500, "password": "hunter2", "no_ctrl_as_cmd": true, "connect": "192.168.50.4"}"#);
-        assert_eq!(l.legacy_password.as_deref(), Some("hunter2"));
+        assert!(l.legacy_password);
         assert!(l.needs_save);
         assert_eq!(l.config.listen_port, 7500);
         assert_eq!(l.config.host.as_deref(), Some("192.168.50.4"));
@@ -489,7 +570,7 @@ mod tests {
         assert!(!j.contains("hunter2") && !j.contains("password"));
         // and it reloads cleanly
         let again = parse(&j);
-        assert!(!again.needs_save && again.legacy_password.is_none());
+        assert!(!again.needs_save && !again.legacy_password);
         assert_eq!(again.config, l.config);
     }
 
@@ -498,7 +579,7 @@ mod tests {
         let mut c = serde_json::to_value(Config::default()).unwrap();
         c["password"] = "x".into();
         let l = parse(&c.to_string());
-        assert_eq!(l.legacy_password.as_deref(), Some("x"));
+        assert!(l.legacy_password);
         assert!(l.needs_save);
     }
 
@@ -550,21 +631,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("glide-store-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // first run: defaults are written out
-        let (mut st, pw, warn) = Store::open(Some(dir.clone()));
-        assert!(pw.is_none() && warn.is_empty());
+        let (mut st, warn) = Store::open(Some(dir.clone()));
+        assert!(warn.is_empty());
         assert!(dir.join(CONFIG_FILE).exists());
         st.update(|c| c.hud = true);
         assert!(load(&dir.join(CONFIG_FILE)).config.hud);
-        // legacy plaintext password: reported, file left for the caller to rewrite
+        // legacy plaintext password: dropped from the file with a notice
         std::fs::write(dir.join(CONFIG_FILE), r#"{"port": 7444, "password": "pw"}"#).unwrap();
-        let (st, pw, _) = Store::open(Some(dir.clone()));
-        assert_eq!(pw.as_deref(), Some("pw"));
+        let (st, warn) = Store::open(Some(dir.clone()));
+        assert!(warn.iter().any(|w| w.contains("password")));
         assert_eq!(st.config.listen_port, 7444);
-        st.save().unwrap();
         let text = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
         assert!(!text.contains("pw\"") && text.contains("7444"));
         // no dir: in-memory only
-        let (mut st, _, _) = Store::open(None);
+        let (mut st, _) = Store::open(None);
         st.update(|c| c.hud = true);
         assert!(st.config.hud && st.path().is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -579,6 +659,31 @@ mod tests {
         } else {
             assert_eq!(config_dir_from(env(&[("HOME", "/h")])), Some(PathBuf::from("/h/.config/glide")));
         }
+    }
+
+    #[test]
+    fn pinned_hosts_roundtrip_and_validation() {
+        let mut c = Config::default();
+        let key = "ab".repeat(32);
+        c.pinned_hosts.insert("192.168.50.4:7420".into(), PinnedHost { key: key.clone(), name: "Mac".into(), paired: "2026-11-06T13:00:00Z".into() });
+        let back = parse(&to_json(&c));
+        assert_eq!(back.config, c);
+        assert_eq!(back.config.pinned_key("192.168.50.4:7420"), Some([0xab; 32]));
+        assert_eq!(back.config.pinned_key("listen:7420"), None);
+        // a malformed key is dropped (fail closed: treated as not paired), others survive
+        let l = parse(r#"{"version":1,"hud":true,"pinned_hosts":{"a:1":{"key":"zz","name":"x"},"b:2":{"key":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}}}"#);
+        assert!(l.warning.as_deref().unwrap().contains("pinned_hosts"));
+        assert_eq!(l.config.pinned_hosts.len(), 1);
+        assert_eq!(l.config.pinned_key("b:2"), Some([0xcd; 32]));
+        assert!(l.config.hud);
+        // targets
+        assert_eq!(pin_target(&TargetSpec::Connect("Mac.Local".into())), "mac.local:7420");
+        assert_eq!(pin_target(&TargetSpec::Connect("192.168.50.4:7421".into())), "192.168.50.4:7421");
+        assert_eq!(pin_target(&TargetSpec::Listen(7420)), "listen:7420");
+        // timestamps
+        assert_eq!(rfc3339_utc(std::time::UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_970_309)), "2026-11-06T13:05:09Z");
+        assert_eq!(rfc3339_utc(std::time::UNIX_EPOCH + std::time::Duration::from_secs(951_782_400)), "2000-02-29T00:00:00Z");
     }
 
     #[test]

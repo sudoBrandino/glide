@@ -55,49 +55,145 @@ public final class SecureChannel: @unchecked Sendable {
         })
     }
 
-    // MARK: Handshake
+    // MARK: Handshake (docs/PROTOCOL.md §1)
 
-    /// Host side. `salt` is the host's persistent password salt.
-    public func acceptHandshake(password: String, salt: Data, passwordKey: Data? = nil, completion: @escaping (Error?) -> Void) {
-        readExactly(Handshake.clientSize) { [self] res in
-            switch res {
-            case .failure(let e): completion(e)
-            case .success(let raw):
-                do {
-                    let ch = try Handshake.ClientHello.decode(raw)
-                    let priv = Curve25519.KeyAgreement.PrivateKey()
-                    let hh = Handshake.HostHello(publicKey: priv.publicKey.rawRepresentation, nonce: Handshake.randomBytes(16), salt: salt)
-                    let hhRaw = hh.encoded
-                    let shared = try Handshake.sharedSecret(privateKey: priv, peerPublic: ch.publicKey)
-                    let pwk = passwordKey ?? Handshake.passwordKey(password, salt: salt)
-                    let keys = Handshake.deriveKeys(shared: shared, passwordKey: pwk, clientHandshake: raw, hostHandshake: hhRaw)
-                    sendCipher = RecordCipher(key: keys.s2c)
-                    recvCipher = RecordCipher(key: keys.c2s)
-                    writeRaw(hhRaw) { err in completion(err) }
-                } catch { completion(error) }
+    /// Why a host-side handshake didn't complete.
+    public enum HandshakeFailure: Error, CustomStringConvertible {
+        /// A Glide v1 (password) viewer; it was sent the v1-style "unsupported version 2" reply.
+        case v1Viewer
+        /// Answered with HostPreamble status != 0 (rate limited, paused, version).
+        case refused(UInt16)
+        public var description: String {
+            switch self {
+            case .v1Viewer: return "Glide v1 viewer (password protocol) — it was told to update"
+            case .refused(let s): return "refused with status \(s)"
             }
         }
     }
 
-    /// Client side.
-    public func performHandshake(password: String, completion: @escaping (Error?) -> Void) {
-        let priv = Curve25519.KeyAgreement.PrivateKey()
-        let ch = Handshake.ClientHello(publicKey: priv.publicKey.rawRepresentation, nonce: Handshake.randomBytes(16))
-        let chRaw = ch.encoded
-        writeRaw(chRaw)
-        readExactly(Handshake.hostSize) { [self] res in
+    /// Result of the host side of the handshake: who the viewer is (authenticated by Noise XX).
+    public struct HostAccepted {
+        public let viewerKey: Data
+        public let info: GlideHandshake.ViewerInfo
+        /// n_h, to reveal if this connection pairs.
+        public let hostNonce: Data
+        public let handshakeHash: Data
+    }
+
+    private func readFrame(_ done: @escaping (Result<Data, Error>) -> Void) {
+        readExactly(2) { [self] res in
             switch res {
-            case .failure(let e): completion(e)
-            case .success(let raw):
-                do {
-                    let hh = try Handshake.HostHello.decode(raw)
-                    let shared = try Handshake.sharedSecret(privateKey: priv, peerPublic: hh.publicKey)
-                    let pwk = Handshake.passwordKey(password, salt: hh.salt)
-                    let keys = Handshake.deriveKeys(shared: shared, passwordKey: pwk, clientHandshake: chRaw, hostHandshake: raw)
-                    sendCipher = RecordCipher(key: keys.c2s)
-                    recvCipher = RecordCipher(key: keys.s2c)
-                    completion(nil)
-                } catch { completion(error) }
+            case .failure(let e): done(.failure(e))
+            case .success(let h):
+                let n = Int(h[h.startIndex]) | Int(h[h.startIndex + 1]) << 8
+                guard n <= GlideHandshake.maxMessage else { done(.failure(GlideHandshake.HandshakeError.malformed("handshake message too large"))); return }
+                if n == 0 { done(.success(Data())); return }
+                readExactly(n, done)
+            }
+        }
+    }
+
+    /// Host (responder) side. `admission` runs after the ClientPreamble + msg1 arrived and before
+    /// any DH: it returns the HostPreamble status (0 = continue; e.g. 3 = rate limited) and the
+    /// msg2 flags (pairing window open).
+    public func acceptHandshake(identity: Curve25519.KeyAgreement.PrivateKey,
+                                admission: @escaping () -> (status: UInt16, flags: UInt8),
+                                completion: @escaping (Result<HostAccepted, Error>) -> Void) {
+        readExactly(4) { [self] res in
+            guard case .success(let magic) = res else { if case .failure(let e) = res { completion(.failure(e)) }; return }
+            if magic == GlideHandshake.magicV1 {
+                // v1 viewer: let it finish its 54-byte ClientHandshake, answer with the v1 layout
+                // carrying version 2 (it reports "unsupported protocol version 2"), then give up.
+                readExactly(GlideHandshake.v1ClientSize - 4) { [self] _ in
+                    writeRaw(GlideHandshake.v1Rejection()) { _ in completion(.failure(HandshakeFailure.v1Viewer)) }
+                }
+                return
+            }
+            guard magic == GlideHandshake.magic else { completion(.failure(GlideHandshake.HandshakeError.badMagic(v1: false))); return }
+            readExactly(GlideHandshake.clientPreambleSize - 4) { [self] res in
+                guard case .success(let rest) = res else { if case .failure(let e) = res { completion(.failure(e)) }; return }
+                let preamble = magic + rest
+                readFrame { [self] res in
+                    guard case .success(let msg1) = res else { if case .failure(let e) = res { completion(.failure(e)) }; return }
+                    let (status, flags) = admission()
+                    if status != GlideHandshake.statusOK {
+                        writeRaw(GlideHandshake.hostPreamble(status: status)) { _ in completion(.failure(HandshakeFailure.refused(status))) }
+                        return
+                    }
+                    let host: GlideHandshake.Host
+                    do {
+                        host = try GlideHandshake.Host(identity: identity, preamble: preamble, msg1: msg1)
+                    } catch GlideHandshake.HandshakeError.status(_, let st) {
+                        writeRaw(GlideHandshake.hostPreamble(status: st)) { _ in completion(.failure(HandshakeFailure.refused(st))) }
+                        return
+                    } catch { completion(.failure(error)); return }
+                    let flight: Data
+                    do { flight = try host.writeMsg2(flags: flags) } catch { completion(.failure(error)); return }
+                    writeRaw(flight)
+                    readFrame { [self] res in
+                        switch res {
+                        case .failure(let e): completion(.failure(e))
+                        case .success(let msg3):
+                            do {
+                                let (key, info) = try host.readMsg3(msg3)
+                                let est = host.finish()
+                                sendCipher = RecordCipher(key: est.sendKey)
+                                recvCipher = RecordCipher(key: est.recvKey)
+                                completion(.success(HostAccepted(viewerKey: key, info: info, hostNonce: host.nonce, handshakeHash: est.handshakeHash)))
+                            } catch { completion(.failure(error)) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Result of the viewer side of the handshake (msg3 already sent).
+    public struct ViewerConnected {
+        public let hostKey: Data
+        public let hostInfo: GlideHandshake.HostInfo
+        public let viewerNonce: Data
+        public let handshakeHash: Data
+        /// msg3 asked to pair: expect PairReveal next.
+        public let pairing: Bool
+    }
+
+    public enum ViewerFailure: Error, CustomStringConvertible {
+        case hostKeyChanged(pinned: Data, presented: Data)
+        /// The host closed without answering (a v1 host does that).
+        case hostIsV1
+        public var description: String {
+            switch self {
+            case let .hostKeyChanged(p, n): return "host key changed: pinned \(GlideHandshake.fingerprint(p)), presented \(GlideHandshake.fingerprint(n))"
+            case .hostIsV1: return "host closed the connection without answering (still Glide v1?)"
+            }
+        }
+    }
+
+    /// Viewer (initiator) side, for glide-probe. Aborts before msg3 if `pinned` doesn't match.
+    public func performHandshake(identity: Curve25519.KeyAgreement.PrivateKey, name: String, pinned: Data?, requestPairing: Bool = false,
+                                 completion: @escaping (Result<ViewerConnected, Error>) -> Void) {
+        let v = GlideHandshake.Viewer(identity: identity, name: name)
+        writeRaw(v.firstFlight())
+        readExactly(GlideHandshake.hostPreambleSize) { [self] res in
+            guard case .success(let pre) = res else { completion(.failure(ViewerFailure.hostIsV1)); return }
+            let ver: UInt16
+            do { ver = try GlideHandshake.parseHostPreamble(pre) } catch { completion(.failure(error)); return }
+            readFrame { [self] res in
+                switch res {
+                case .failure(let e): completion(.failure(e))
+                case .success(let msg2):
+                    do {
+                        let (key, info) = try v.readMsg2(msg2, preambleVersion: ver)
+                        if let pinned, pinned != key { completion(.failure(ViewerFailure.hostKeyChanged(pinned: pinned, presented: key))); return }
+                        let pairing = pinned == nil || requestPairing
+                        writeRaw(v.writeMsg3(flags: pairing ? GlideHandshake.viewerFlagPairRequest : 0))
+                        let est = v.finish()
+                        sendCipher = RecordCipher(key: est.sendKey)
+                        recvCipher = RecordCipher(key: est.recvKey)
+                        completion(.success(ViewerConnected(hostKey: key, hostInfo: info, viewerNonce: v.nonce, handshakeHash: est.handshakeHash, pairing: pairing)))
+                    } catch { completion(.failure(error)) }
+                }
             }
         }
     }

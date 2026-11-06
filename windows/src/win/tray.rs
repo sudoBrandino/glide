@@ -1,7 +1,6 @@
 //! Notification-area (tray) icon: tooltip = window title; left click brings the viewer to
-//! the front; right click opens Connect / Disconnect / Reconnect / Stats / Mute / Change password /
-//! Open config / Forget password / Forget pinned host / Quit. Commands arrive at the viewer
-//! window as WM_COMMAND.
+//! the front; right click opens Connect / Disconnect / Reconnect / Stats / Mute / Open config /
+//! Forget host (unpair) / Quit. Commands arrive at the viewer window as WM_COMMAND.
 
 use std::sync::OnceLock;
 use windows::core::{w, PCWSTR};
@@ -16,10 +15,8 @@ pub enum MenuCmd {
     Reconnect,
     ToggleHud,
     ToggleMute,
-    ChangePassword,
     OpenConfig,
-    ForgetPassword,
-    ForgetPinned,
+    ForgetHost,
     Quit,
 }
 
@@ -29,21 +26,19 @@ pub struct MenuState {
     pub hud_on: bool,
     /// None = audio disabled; Some(muted).
     pub audio: Option<bool>,
-    /// Listen mode with a pinned/allowed host list.
-    pub has_pinned: bool,
+    /// The host paired for the current target (name), if any: enables "Forget host (unpair)".
+    pub paired: Option<String>,
 }
 
 const BASE: u16 = 0x4100;
-const CMDS: [MenuCmd; 10] = [
+const CMDS: [MenuCmd; 8] = [
     MenuCmd::Connect,
     MenuCmd::Disconnect,
     MenuCmd::Reconnect,
     MenuCmd::ToggleHud,
     MenuCmd::ToggleMute,
-    MenuCmd::ChangePassword,
     MenuCmd::OpenConfig,
-    MenuCmd::ForgetPassword,
-    MenuCmd::ForgetPinned,
+    MenuCmd::ForgetHost,
     MenuCmd::Quit,
 ];
 
@@ -173,10 +168,12 @@ fn show_menu(hwnd: HWND, st: &MenuState) {
         if let Some(muted) = st.audio {
             item(MenuCmd::ToggleMute, "&Mute audio\tCtrl+Alt+Shift+A", if muted { MF_CHECKED } else { MF_UNCHECKED });
         }
-        item(MenuCmd::ChangePassword, "Change &password…", MF_ENABLED);
         item(MenuCmd::OpenConfig, "Open &config file", MF_ENABLED);
-        item(MenuCmd::ForgetPassword, "&Forget saved password", MF_ENABLED);
-        item(MenuCmd::ForgetPinned, "Forget pinned &host", gray(!st.has_pinned));
+        let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+        match &st.paired {
+            Some(name) => item(MenuCmd::ForgetHost, &format!("&Forget host “{}” (unpair)…", name.replace('&', "&&")), MF_ENABLED),
+            None => item(MenuCmd::ForgetHost, "&Forget host (unpair) — not paired", MF_GRAYED),
+        }
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         item(MenuCmd::Quit, "&Quit Glide", MF_ENABLED);
         let mut pt = POINT::default();

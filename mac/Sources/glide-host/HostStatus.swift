@@ -30,6 +30,15 @@ final class HostStatus: @unchecked Sendable {
         var paused = false
         var serverError: String?
         var viewer: Viewer?
+        /// Security v2: pairing window open until this time.
+        var pairingUntil: Date?
+        /// Name of the viewer currently waiting for code confirmation.
+        var pairingWith: String?
+        /// Last notable security event (rejected viewer, paired, v1 viewer), shown in the menu.
+        var note: Note?
+        var pairedViewers: [PairedViewer] = []
+        /// This Mac's key fingerprint (shown in the Paired Viewers submenu).
+        var hostFingerprint: String?
 
         var phase: Phase {
             if paused { return .paused }
@@ -37,6 +46,13 @@ final class HostStatus: @unchecked Sendable {
             if serverError != nil { return .error }
             return dialTarget != nil ? .dialing : .idle
         }
+    }
+
+    struct Note: Equatable {
+        var text: String
+        var at: Date
+        var warning: Bool
+        var count = 1
     }
 
     private let lock = NSLock()
@@ -76,6 +92,14 @@ final class HostStatus: @unchecked Sendable {
         }
         update { $0.viewer = Viewer(sessionId: id, name: name, address: addr, viewW: viewW, viewH: viewH); $0.dialDetail = nil }
     }
+    /// Records a security note; repeats of the same text bump a counter instead of replacing it.
+    func note(_ text: String, warning: Bool) {
+        update { s in
+            if var n = s.note, n.text == text { n.count += 1; n.at = Date(); s.note = n }
+            else { s.note = Note(text: text, at: Date(), warning: warning) }
+        }
+    }
+
     func sessionEnded(id: Int) { update { s in if s.viewer?.sessionId == id { s.viewer = nil } } }
     func viewSize(id: Int, w: Int, h: Int) { updateViewer(id) { $0.viewW = w; $0.viewH = h } }
     func video(id: Int, config: VideoConfig, hybrid: Bool) { updateViewer(id) { $0.video = config; $0.hybrid = hybrid } }

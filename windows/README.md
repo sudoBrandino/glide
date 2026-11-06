@@ -16,7 +16,7 @@ The wire protocol is defined in `../docs/PROTOCOL.md`.
 | `src/clipboard.rs` | Clipboard sync logic without Win32: CRLF↔LF, echo guard, DIB↔PNG (`png` crate). Unit-tested. |
 | `src/annexb.rs`, `src/bench.rs` | Annex-B access-unit splitting, and the headless benchmark driver. |
 | `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain, text panels), `app` (window, input, cursor, fullscreen, hotkeys), `clipboard` (clipboard listener/apply), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`, `dpapi` (saved password), `prompt` (password dialog), `placement` (monitors), `tray`. |
-| `res/`, `build.rs` | Icon, manifest (themed controls, PerMonitorV2), password dialog and version info, linked into the exe: MinGW `windres` for the GNU target, `rc.exe` (via `embed-resource`) for MSVC. Regenerate the icon with `../tools/make_icon.py`. |
+| `res/`, `build.rs` | Icon, manifest (themed controls, PerMonitorV2), pairing dialog and version info, linked into the exe: MinGW `windres` for the GNU target, `rc.exe` (via `embed-resource`) for MSVC. Regenerate the icon with `../tools/make_icon.py`. |
 | `assets/` | Small clips embedded in the exe for `--probe`. Regenerate them with `../tools/make_streams.sh --clips-only`. |
 
 ## Build (on macOS, cross-compiling)

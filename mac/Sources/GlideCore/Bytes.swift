@@ -38,7 +38,7 @@ public enum WireError: Error, CustomStringConvertible {
         case .badMagic: return "bad handshake magic"
         case .badVersion(let v): return "unsupported protocol version \(v)"
         case .unknownMessage(let t): return String(format: "unknown message type 0x%02x", t)
-        case .decryptFailed: return "decrypt failed (wrong password?)"
+        case .decryptFailed: return "record decryption failed"
         case .recordTooLarge(let n): return "record too large (\(n) bytes)"
         case .closed: return "connection closed"
         }
