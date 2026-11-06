@@ -17,6 +17,8 @@ pub enum Action {
     RequestKeyframe = 5,
     Reconnect = 6,
     ToggleMute = 7,
+    /// Latency test mode: read the host's test pattern back (docs/LATENCY.md).
+    LatencyTest = 8,
 }
 
 impl Action {
@@ -29,6 +31,7 @@ impl Action {
             5 => Action::RequestKeyframe,
             6 => Action::Reconnect,
             7 => Action::ToggleMute,
+            8 => Action::LatencyTest,
             _ => return None,
         })
     }
@@ -42,6 +45,7 @@ impl Action {
             "keyframe" | "r" => Action::RequestKeyframe,
             "reconnect" | "d" => Action::Reconnect,
             "mute" | "a" => Action::ToggleMute,
+            "latency" | "l" => Action::LatencyTest,
             _ => return None,
         })
     }
@@ -53,6 +57,7 @@ pub const KEY_D: u16 = 0x07;
 pub const KEY_F: u16 = 0x09;
 pub const KEY_H: u16 = 0x0B;
 pub const KEY_K: u16 = 0x0E;
+pub const KEY_L: u16 = 0x0F;
 pub const KEY_M: u16 = 0x10;
 pub const KEY_R: u16 = 0x15;
 pub const KEY_ENTER: u16 = 0x28;
@@ -67,6 +72,7 @@ pub const TABLE: &[(u16, Action, &str)] = &[
     (KEY_R, Action::RequestKeyframe, "Ctrl+Alt+Shift+R  request a keyframe (fix a smeared picture)"),
     (KEY_D, Action::Reconnect, "Ctrl+Alt+Shift+D  disconnect and reconnect"),
     (KEY_A, Action::ToggleMute, "Ctrl+Alt+Shift+A  mute / unmute audio"),
+    (KEY_L, Action::LatencyTest, "Ctrl+Alt+Shift+L  latency test: read the host's test pattern (glide-probe --pattern-only)"),
 ];
 
 pub fn help() -> String {

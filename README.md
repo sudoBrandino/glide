@@ -21,6 +21,7 @@ layer, so text is pixel-exact at rest and motion stays fast.
 | [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | Wire protocol (normative) |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Pipelines, hybrid/canvas model, threading |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | What's done and what's next |
+| [`docs/LATENCY.md`](docs/LATENCY.md) | Latency breakdown, glass-to-glass test, tuning results |
 | [`windows/README.md`](windows/README.md) | Viewer reference: all flags, env vars, headless modes |
 
 ## Architecture
@@ -115,8 +116,11 @@ The pixel diff runs in parallel with the hardware encode.
 | HEVC 4:4:4 every frame ("sharp" mode) | 27.7 / 42.5 ms |
 | any config, 2 frames in flight | +10–20 ms (queueing) |
 
-Glass-to-glass latency on the real LAN hasn't been measured yet. The viewer's `--bench` prints an
-estimated capture → decoded figure based on the ping/pong clock offset.
+Every frame now carries a per-stage latency breakdown, which shows up in the viewer HUD, the host
+log and menu bar, and `--bench`. A block-code test pattern measures true glass-to-glass latency
+(see [`docs/LATENCY.md`](docs/LATENCY.md)). The live LAN glass-to-glass run is still pending.
+Offline, an idle-then-one-frame encode took about 20 ms because VideoToolbox paced itself by
+wall-clock PTS gaps. With frame-counter PTS it takes about 11 ms, which is now the default.
 
 ## Install and run
 

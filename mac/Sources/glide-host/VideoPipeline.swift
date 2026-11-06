@@ -28,6 +28,11 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         let refresh: Bool
         let sharp: Bool
         let rects: [FrameRect]?
+        /// Host-clock stamps (µs) for FrameTiming (PROTOCOL.md §3.3): the capture callback ran,
+        /// the buffer was handed to the encoder, the encoder output arrived.
+        var callbackUs: UInt64? = nil
+        var submitUs: UInt64? = nil
+        var encodedUs: UInt64? = nil
     }
 
     /// Called on `queue` with each encoded access unit.
@@ -49,8 +54,9 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private(set) var config: VideoConfig?
 
     // Scheduling state (queue-confined)
-    private var latest: (pb: CVPixelBuffer, us: UInt64)?
-    private var latestSharp: (pb: CVPixelBuffer, us: UInt64)?
+    /// `us` = SCK presentation time (capture), `cb` = when our capture callback ran.
+    private var latest: (pb: CVPixelBuffer, us: UInt64, cb: UInt64)?
+    private var latestSharp: (pb: CVPixelBuffer, us: UInt64, cb: UInt64)?
     private var prevBase: CVPixelBuffer?
     private var dirty = false
     private var encoding = 0
@@ -85,6 +91,14 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     // IDR occupies the encoder ~25-40 ms and delays base frames behind it.
     private let sharpMinIntervalUs: UInt64 = 3_000_000
     private var debugRects = Int(ProcessInfo.processInfo.environment["GLIDE_DEBUG_RECTS"] ?? "") ?? 0
+    /// Encoder PTS: a frame counter at the nominal rate (default), or wall-clock time
+    /// (`GLIDE_PTS=wallclock`). VideoToolbox's real-time mode paces itself by PTS gaps: an
+    /// isolated frame after an idle period (the usual interactive case: one keystroke, one frame)
+    /// measured ~20 ms to encode at 2560x1440 with wall-clock PTS vs ~11 ms with consecutive
+    /// PTS, at the same size (docs/LATENCY.md). The PTS is not used for anything else.
+    private let wallclockPts = ProcessInfo.processInfo.environment["GLIDE_PTS"] == "wallclock"
+    private var basePtsIndex: Int64 = 0
+    private var sharpPtsIndex: Int64 = 0
 
     var hybrid: Bool { options.mode == .hybrid }
 
@@ -95,6 +109,10 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         var sharpSent = 0, sharpDropped = 0, rectFrames = 0, rectCount = 0
         var identical = 0
         var encodeMs: [Double] = [], sharpMs: [Double] = [], diffUs: [Double] = []
+        /// SCK frame PTS -> our capture callback (base stream), ms.
+        var captureMs: [Double] = []
+        /// Capture callback -> encoder submit (encoder busy / backpressure wait), ms.
+        var waitMs: [Double] = []
         mutating func reset() { self = Stats() }
     }
 
@@ -126,12 +144,17 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         let autoBps = Int(Double(pw * ph * fps) * (baseChroma == .yuv444 ? 0.25 : 0.2))
         let bps = options.bitrateKbps > 0 ? options.bitrateKbps * 1000 : min(autoBps, 250_000_000)
 
+        // Latency tuning knobs (docs/LATENCY.md hypothesis a): SCK's queue depth and frame-rate cap.
+        let env = ProcessInfo.processInfo.environment
+        let queueDepth = Int(env["GLIDE_SCK_QUEUE_DEPTH"] ?? "").map { max(1, min($0, 8)) } ?? 5
+        let nativeInterval = env["GLIDE_SCK_INTERVAL"] == "native"
         func streamConfig(bgra: Bool, fps: Int) -> SCStreamConfiguration {
             let cfg = SCStreamConfiguration()
             cfg.width = pw
             cfg.height = ph
-            cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-            cfg.queueDepth = 5
+            // "native": no cap (CMTime.zero = every display refresh); default: 1/fps.
+            cfg.minimumFrameInterval = nativeInterval ? .zero : CMTime(value: 1, timescale: CMTimeScale(fps))
+            cfg.queueDepth = queueDepth
             cfg.showsCursor = false
             cfg.capturesAudio = false
             cfg.pixelFormat = bgra ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
@@ -183,6 +206,8 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         baseStream = base
         if let sharp { try await sharp.startCapture(); sharpStream = sharp }
         startIdleTimer()
+        if wallclockPts { log("capture: encoder PTS = wall clock (GLIDE_PTS=wallclock)") }
+        if queueDepth != 5 || nativeInterval { log("capture: SCK queueDepth \(queueDepth), minimumFrameInterval \(nativeInterval ? "native (none)" : "1/\(fps)")") }
         log("capture: display \(display.displayID) \(display.width)x\(display.height)pt (\(nativeW)px wide) -> \(pw)x\(ph)px, mode \(options.mode), \(options.codec) base \(baseChroma == .yuv444 ? "4:4:4" : "4:2:0")\(hybrid ? " + 4:4:4 sharp layer" : ""), \(fps)fps, \(bps / 1_000_000) Mbps")
     }
 
@@ -223,6 +248,7 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     // MARK: Capture
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        let cbUs = hostTimeMicros()
         guard type == .screen, running, sb.isValid else { return }
         guard let atts = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let info = atts.first,
@@ -232,7 +258,7 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         let us = UInt64(max(0, CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))) * 1_000_000)
 
         if stream === sharpStream {
-            latestSharp = (pb, us)
+            latestSharp = (pb, us, cbUs)
             if debugRects > 0 { log("debug: sharp frame us=\(us) lastBase=\(lastBaseCaptureUs)") }
             return
         }
@@ -251,8 +277,9 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         // Start encoding right away; the pixel diff (several ms at 4K) runs while the hardware
         // encoder works, and its rects are attached when the frame is sent.
         stats.captured += 1
+        stats.captureMs.append(Double(Int64(cbUs) - Int64(us)) / 1000)
         if latest != nil, dirty { stats.skippedBusy += 1 }
-        latest = (pb, us)
+        latest = (pb, us, cbUs)
         lastBaseCaptureUs = us
         dirty = true
         refinesLeft = hybrid ? 0 : 2
@@ -341,9 +368,14 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         dirty = false
         let isRefresh = nextIsRefresh
         encoding += 1
-        // Encoder PTS = now (monotonic, strictly increasing even when re-encoding the same buffer).
-        let encPts = CMTime(value: CMTimeValue(hostTimeMicros()), timescale: 1_000_000)
+        // Encoder PTS: strictly increasing even when re-encoding the same buffer (see wallclockPts).
+        let submitUs = hostTimeMicros()
+        if !isRefresh { stats.waitMs.append(Double(Int64(submitUs) - Int64(f.cb)) / 1000) }
+        basePtsIndex += 1
+        let encPts = wallclockPts ? CMTime(value: CMTimeValue(submitUs), timescale: 1_000_000)
+                                  : CMTime(value: basePtsIndex, timescale: CMTimeScale(max(1, options.fps)))
         enc.encode(f.pb, pts: encPts) { [weak self] data, key, _, ms in
+            let encodedUs = hostTimeMicros()
             guard let self else { return }
             self.queue.async {
                 self.encoding -= 1
@@ -353,7 +385,8 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 self.stats.encodeMs.append(ms)
                 let r = isRefresh ? nil : self.takeRects(upTo: f.us, keyframe: key)
                 if let r { self.stats.rectFrames += 1; self.stats.rectCount += r.count }
-                self.onFrame?(Frame(data: data, keyframe: key, captureUs: f.us, refresh: isRefresh, sharp: false, rects: r))
+                self.onFrame?(Frame(data: data, keyframe: key, captureUs: f.us, refresh: isRefresh, sharp: false, rects: r,
+                                    callbackUs: f.cb, submitUs: submitUs, encodedUs: encodedUs))
                 self.pump()
             }
         }
@@ -405,8 +438,10 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         CVBufferSetAttachment(s.pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
         if colorLogged < 2, let base = latest?.pb { colorLogged += 1; logColorSample(base: base, sharp: s.pb) }
         senc.requestKeyframe()
-        let encPts = CMTime(value: CMTimeValue(now), timescale: 1_000_000)
+        sharpPtsIndex += 1
+        let encPts = wallclockPts ? CMTime(value: CMTimeValue(now), timescale: 1_000_000) : CMTime(value: sharpPtsIndex, timescale: 5)
         senc.encode(s.pb, pts: encPts) { [weak self] data, key, _, ms in
+            let encodedUs = hostTimeMicros()
             guard let self else { return }
             self.queue.async {
                 self.sharpEncoding = false
@@ -414,7 +449,8 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 guard key else { self.stats.sharpDropped += 1; self.dirtySinceSharp = true; return }
                 self.stats.sharpSent += 1
                 self.stats.bytes += data.count
-                self.onFrame?(Frame(data: data, keyframe: true, captureUs: s.us, refresh: true, sharp: true, rects: nil))
+                self.onFrame?(Frame(data: data, keyframe: true, captureUs: s.us, refresh: true, sharp: true, rects: nil,
+                                    callbackUs: s.cb, submitUs: now, encodedUs: encodedUs))
                 // Patch whatever changed after the sharp capture (it was already sent on the base
                 // layer, but the sharp frame just overwrote it on the viewer's canvas).
                 if (self.fullDuringSharp || !self.rectsDuringSharp.isEmpty), let cur = self.latest {

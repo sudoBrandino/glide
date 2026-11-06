@@ -13,12 +13,15 @@ use super::audio::Audio;
 use super::cursor::{create_cursor, destroy_cursor, scale_image, CursorImage};
 use super::d3d::Gpu;
 use super::decoder::Decoder;
-use super::render::Renderer;
+use super::render::{Readback, Renderer};
+use super::scanout::ScanoutClock;
 use super::{dpapi, placement, prompt, tray};
 use crate::config::{self, Store};
 use crate::hid;
 use crate::hotkeys::{self, Action};
+use crate::blockcode;
 use crate::hud;
+use crate::latency::Tracker;
 use crate::net::{ClockSync, ConnectError, Connection, NetEvent, Sender};
 use crate::peers;
 use crate::protocol::{self, ClientMsg, HostMsg, Mode, VideoConfig, FRAME_FLAG_KEYFRAME, FRAME_FLAG_SHARP};
@@ -50,6 +53,8 @@ pub struct Options {
     pub audio: bool,
     /// Start muted (config "audio_muted").
     pub audio_muted: bool,
+    /// Start in latency test mode (--latency-test / GLIDE_LATENCY_TEST=1; Ctrl+Alt+Shift+L).
+    pub latency_test: bool,
 }
 
 /// Where the session password came from. Only saved/prompted passwords are re-prompted for
@@ -96,7 +101,7 @@ const TEST_ACTION_TIMER: usize = 5;
 const IDM_MUTE: usize = 0x1F10;
 
 enum RenderCmd {
-    Frame { data: Vec<u8>, keyframe: bool, sharp: bool, rects: Option<Vec<protocol::Rect>> },
+    Frame { frame_id: u32, data: Vec<u8>, keyframe: bool, sharp: bool, rects: Option<Vec<protocol::Rect>> },
     Config(VideoConfig),
     SharpConfig(VideoConfig),
     /// Status overlay text (None = connected, no overlay). Some dims the canvas.
@@ -166,6 +171,15 @@ struct Shared {
     hwnd: AtomicIsize,
     /// Audio output (None with --no-audio).
     audio: Option<Audio>,
+    /// Per-frame latency breakdown (docs/LATENCY.md). Written by the receive and render
+    /// threads, summarized by the UI thread.
+    latency: Mutex<Tracker>,
+    /// Latency test mode: read the host's block-code test pattern back from the canvas.
+    latency_test: AtomicBool,
+    /// Present path facts for latency reports (set by the render thread).
+    present_info: Mutex<String>,
+    /// Clock-sync facts for latency reports (kept after a disconnect).
+    clock_info: Mutex<String>,
 }
 
 /// Process-wide UI context (the low-level keyboard hook has no user pointer).
@@ -203,6 +217,8 @@ struct UiState {
     prompt_declined: bool,
     test_actions: Vec<Action>,
     tray: Option<tray::Tray>,
+    last_latency_report: Option<Instant>,
+    last_latency_log: Option<Instant>,
 }
 
 thread_local! {
@@ -326,6 +342,11 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
     if let Some(s) = shared.status.lock().unwrap().clone() {
         let _ = renderer.set_overlay(Some(&s), overlay_px());
     }
+    // Latency instrumentation: present -> scan-out from DXGI frame statistics, and (test mode)
+    // canvas readback of the host's block-code pattern.
+    let mut scan = ScanoutClock::new();
+    let mut lt = LatencyTest::default();
+    let mut last_info = Instant::now() - Duration::from_secs(10);
 
     let dump = std::env::var("GLIDE_DUMP_FRAME").ok();
     let finish = |renderer: &Renderer| {
@@ -337,9 +358,18 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
         }
     };
     loop {
-        // While a toast is fading, wake up ~30x/s to animate it; otherwise block.
-        let first = if toast_since.is_some() {
-            match rx.recv_timeout(Duration::from_millis(33)) {
+        // While presents await their scan-out time (or readbacks are in flight), poll every 2 ms;
+        // while a toast is fading, wake up ~30x/s to animate it; otherwise block.
+        let awaiting = !renderer.is_offscreen() && shared.latency.lock().unwrap().awaiting_scanout(now_us());
+        let wait = if awaiting || !lt.pending.is_empty() {
+            Some(Duration::from_millis(2))
+        } else if toast_since.is_some() {
+            Some(Duration::from_millis(33))
+        } else {
+            None
+        };
+        let first = if let Some(wait) = wait {
+            match rx.recv_timeout(wait) {
                 Ok(c) => Some(c),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -357,6 +387,8 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
         let mut redraw = false;
         let mut new_frame = false;
         let mut resize = None;
+        // Frames whose canvas updates the next present shows (latency tracking).
+        let mut shown: Vec<u32> = Vec::new();
         for c in cmds {
             match c {
                 RenderCmd::Quit => return finish(&renderer),
@@ -400,7 +432,7 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
                 }
                 RenderCmd::Resize(w, h) => resize = Some((w, h)),
                 RenderCmd::Redraw => redraw = true,
-                RenderCmd::Frame { data, sharp: true, .. } => {
+                RenderCmd::Frame { frame_id, data, sharp: true, .. } => {
                     // Sharp layer: standalone IDR → whole frame into the canvas. Independent of
                     // the base decoder's reference chain.
                     if sdec.is_none() {
@@ -411,11 +443,17 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
                     let t0 = now_us();
                     match d.decode(&data, true) {
                         Ok(n) => {
-                            shared.stats.decode_us_total.fetch_add(now_us() - t0, Ordering::Relaxed);
+                            let t1 = now_us();
+                            shared.stats.decode_us_total.fetch_add(t1 - t0, Ordering::Relaxed);
                             if n > 0 {
                                 if let Some(f) = d.frame.as_ref() {
                                     renderer.apply(f, None);
                                 }
+                                let mut l = shared.latency.lock().unwrap();
+                                l.on_decode(frame_id, t0, t1);
+                                l.on_canvas(frame_id, now_us());
+                                drop(l);
+                                shown.push(frame_id);
                                 shared.stats.decoded.fetch_add(n as u64, Ordering::Relaxed);
                                 shared.stats.sharp.fetch_add(1, Ordering::Relaxed);
                                 shared.stats.showing_sharp.store(1, Ordering::Relaxed);
@@ -432,7 +470,7 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
                         }
                     }
                 }
-                RenderCmd::Frame { data, keyframe, sharp: false, rects } => {
+                RenderCmd::Frame { frame_id, data, keyframe, sharp: false, rects } => {
                     if need_key && !keyframe {
                         continue;
                     }
@@ -441,7 +479,8 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
                     let t0 = now_us();
                     match d.decode(&data, keyframe) {
                         Ok(n) => {
-                            shared.stats.decode_us_total.fetch_add(now_us() - t0, Ordering::Relaxed);
+                            let t1 = now_us();
+                            shared.stats.decode_us_total.fetch_add(t1 - t0, Ordering::Relaxed);
                             if n > 0 {
                                 if let Some(f) = d.frame.as_ref() {
                                     // Rects apply only to non-keyframes (§3.1).
@@ -461,6 +500,11 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
                                 }
                                 shared.stats.decoded.fetch_add(n as u64, Ordering::Relaxed);
                                 new_frame = true;
+                                let mut l = shared.latency.lock().unwrap();
+                                l.on_decode(frame_id, t0, t1);
+                                l.on_canvas(frame_id, now_us());
+                                drop(l);
+                                shown.push(frame_id);
                             }
                         }
                         Err(e) => {
@@ -508,10 +552,133 @@ fn render_thread(hwnd_raw: isize, rx: mpsc::Receiver<RenderCmd>, shared: Arc<Sha
             let (vw, vh) = renderer.canvas_size().unwrap_or((cfg.width as u32, cfg.height as u32));
             // 1:1 when the video matches the window/monitor (no resample blur), else filtered fit.
             let rect = present_rect(bw, bh, vw, vh);
-            if let Err(e) = renderer.present(rect, dim) {
-                eprintln!("present failed: {e}");
-            } else if new_frame {
-                shared.stats.presented.fetch_add(1, Ordering::Relaxed);
+            match renderer.present(rect, dim) {
+                Err(e) => eprintln!("present failed: {e}"),
+                Ok(t_call) => {
+                    if new_frame {
+                        shared.stats.presented.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let present_id = renderer.last_present_count().map(|c| c as u64);
+                    if !shown.is_empty() {
+                        shared.latency.lock().unwrap().on_present(&shown, t_call, present_id);
+                        if shared.latency_test.load(Ordering::Relaxed) {
+                            lt.after_present(&renderer, t_call, present_id, shown.last().copied());
+                        }
+                    }
+                }
+            }
+        }
+        // Scan-out times of earlier presents.
+        if !renderer.is_offscreen() {
+            if let Some(st) = renderer.frame_stats() {
+                let hz = shared.view.lock().unwrap().2.max(1) as f64;
+                if let Some((pc, t)) = scan.poll(st, hz) {
+                    shared.latency.lock().unwrap().on_scanout(pc, t);
+                }
+            }
+        }
+        if !lt.pending.is_empty() {
+            lt.poll(&renderer, &shared);
+        }
+        if last_info.elapsed() > Duration::from_secs(2) {
+            last_info = Instant::now();
+            *shared.present_info.lock().unwrap() = format!(
+                "{{\"offscreen\":{},\"tearing\":{},\"refresh_hz_measured\":{},\"monitor_hz\":{}}}",
+                renderer.is_offscreen(),
+                renderer.tearing(),
+                crate::util::json_opt(scan.refresh_hz()),
+                shared.view.lock().unwrap().2
+            );
+        }
+    }
+}
+
+/// Latency test mode (render thread): copies the block-code region of the canvas after each
+/// present that showed new frames, maps it a few ms later without stalling, decodes the host
+/// clock in it and records the first present that showed each value (docs/LATENCY.md).
+#[derive(Default)]
+struct LatencyTest {
+    loc: Option<blockcode::Loc>,
+    misses: u32,
+    last_locate: Option<Instant>,
+    pending: std::collections::VecDeque<(Readback, RbMeta)>,
+    spare: Option<Readback>,
+    last_value: Option<u32>,
+}
+
+struct RbMeta {
+    full: bool,
+    present_t: u64,
+    present_id: Option<u64>,
+    last_frame: Option<u32>,
+}
+
+impl LatencyTest {
+    fn after_present(&mut self, r: &Renderer, present_t: u64, present_id: Option<u64>, last_frame: Option<u32>) {
+        if self.pending.len() >= 8 {
+            return;
+        }
+        let meta = |full| RbMeta { full, present_t, present_id, last_frame };
+        if let Some(loc) = self.loc {
+            let cell = loc.cell.max(1.0);
+            let x = (loc.x0 - 2.0 * cell).max(0.0) as u32;
+            let w = (60.0 * cell) as u32;
+            let y = loc.y.saturating_sub(1) as u32;
+            if let Some(rb) = r.read_canvas(x, y, w, 3, self.spare.take()) {
+                self.pending.push_back((rb, meta(false)));
+            }
+        } else if self.last_locate.is_none_or(|t| t.elapsed() > Duration::from_millis(500)) && !self.pending.iter().any(|p| p.1.full) {
+            // Full-canvas search (≤ 2x/s until found).
+            self.last_locate = Some(Instant::now());
+            if let Some((cw, ch)) = r.canvas_size() {
+                if let Some(rb) = r.read_canvas(0, 0, cw, ch, None) {
+                    self.pending.push_back((rb, meta(true)));
+                }
+            }
+        }
+    }
+
+    fn poll(&mut self, r: &Renderer, shared: &Shared) {
+        while let Some((rb, _)) = self.pending.front() {
+            let Some(luma) = r.try_read_luma(rb) else { return }; // GPU not done: keep order
+            let (rb, m) = self.pending.pop_front().unwrap();
+            let (w, h) = (rb.w as usize, rb.h as usize);
+            let code = if m.full {
+                let found = blockcode::locate(&luma, w, h, w);
+                if let Some((loc, _)) = found {
+                    eprintln!("latency test: pattern found at x={:.0} y={} cell {:.1}px", loc.x0, loc.y, loc.cell);
+                    self.loc = Some(loc);
+                    self.misses = 0;
+                }
+                found.map(|f| f.1)
+            } else {
+                let loc = self.loc;
+                let c = loc.and_then(|loc| [1usize, 0, 2].iter().filter(|&&y| y < h).find_map(|&y| blockcode::read_at(&luma[y * w..(y + 1) * w], &loc, rb.x as usize)));
+                self.spare = Some(rb);
+                c
+            };
+            match code {
+                Some(c) => {
+                    self.misses = 0;
+                    if self.last_value != Some(c.value) {
+                        self.last_value = Some(c.value);
+                        let clock = shared.clock.lock().unwrap().clone();
+                        let host_now = clock.and_then(|c| c.lock().unwrap().client_to_host_us(m.present_t));
+                        if let Some(hn) = host_now {
+                            let host_us = blockcode::unwrap32(c.value, hn.max(0) as u64);
+                            shared.latency.lock().unwrap().on_ground_truth(host_us, c.kind, m.present_t, m.present_id, m.last_frame);
+                        }
+                    }
+                }
+                None if !m.full => {
+                    self.misses += 1;
+                    if self.misses > 30 {
+                        eprintln!("latency test: pattern lost; searching again");
+                        self.loc = None;
+                        self.misses = 0;
+                    }
+                }
+                None => {}
             }
         }
     }
@@ -814,6 +981,9 @@ fn update_title(hwnd: HWND) {
     let status = sh.status.lock().unwrap().clone();
     let (vw, vh, _) = *sh.view.lock().unwrap();
     let kb_released = STATE.with(|s| s.borrow().kb_released);
+    // Outside the literal below: its `sh.clock` guard temporary lives until the end of the
+    // statement, and latency_tick() locks `sh.clock` too.
+    let latency = latency_tick();
     let info = hud::HudInfo {
         host_name: host_name.clone(),
         status: status.clone(),
@@ -831,6 +1001,8 @@ fn update_title(hwnd: HWND) {
         view: (vw, vh),
         keyboard_captured: !kb_released,
         audio: audio_hud(),
+        latency,
+        latency_test: sh.latency_test.load(Ordering::Relaxed),
     };
     let lines = hud::lines(&info);
     let hud_on = STATE.with(|s| {
@@ -862,6 +1034,100 @@ fn update_title(hwnd: HWND) {
         if let Some(tr) = STATE.with(|s| s.borrow().tray.clone()) {
             tr.set_tip(&t);
         }
+    }
+}
+
+/// Finalize latency records, send the viewer's breakdown to the host every 2 s (§3.3), and in
+/// test mode log it every 10 s. Returns the HUD summary once the host sends FrameTiming.
+fn latency_tick() -> Option<crate::latency::Summary> {
+    let sh = &ui().shared;
+    let clock = sh.clock.lock().unwrap().clone();
+    let mut l = sh.latency.lock().unwrap();
+    match &clock {
+        Some(c) => {
+            let c = c.lock().unwrap();
+            l.tick(now_us(), c.offset_us.is_some().then_some(&*c));
+            *sh.clock_info.lock().unwrap() = format!(
+                "{{\"min_rtt_ms\":{},\"drift_ppm\":{:.2},\"window_samples\":{}}}",
+                crate::util::json_opt(c.min_rtt_us().map(|u| u as f64 / 1000.0)),
+                c.drift_ppm(),
+                c.window_samples()
+            );
+        }
+        None => l.tick(now_us(), None),
+    }
+    if !l.host_timing_seen {
+        return None;
+    }
+    let summary = l.summary();
+    let report = l.report();
+    drop(l);
+    let (send_report, log) = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let due = |t: &mut Option<Instant>, every: u64| {
+            let d = t.is_none_or(|t| t.elapsed() >= Duration::from_secs(every));
+            if d {
+                *t = Some(Instant::now());
+            }
+            d
+        };
+        (due(&mut s.last_latency_report, 2), due(&mut s.last_latency_log, 10))
+    });
+    if send_report && summary.n > 0 {
+        send(ClientMsg::LatencyReport(report));
+    }
+    if log && sh.latency_test.load(Ordering::Relaxed) {
+        eprintln!("latency: {}", hud::latency_lines(&summary, true).join(" | "));
+    }
+    Some(summary)
+}
+
+/// Write the latency test report (all samples since the test started) and return its path.
+fn write_latency_report() -> Option<String> {
+    let sh = &ui().shared;
+    let clock = sh.clock.lock().unwrap().clone();
+    let clock_json = sh.clock_info.lock().unwrap().clone();
+    let cfg = *sh.config.lock().unwrap();
+    let mut l = sh.latency.lock().unwrap();
+    if let Some(c) = &clock {
+        let c = c.lock().unwrap();
+        l.tick(now_us() + crate::latency::SCANOUT_WAIT_US, c.offset_us.is_some().then_some(&*c));
+    }
+    let json = format!(
+        "{{\"host\":{},\"video\":\"{}x{} {} {}\",\"mode\":\"{}\",\"present\":{},\"clock\":{},\"latency\":{}}}",
+        crate::util::json_str(&sh.host_name.lock().unwrap()),
+        cfg.width,
+        cfg.height,
+        cfg.codec.name(),
+        cfg.chroma_name(),
+        current_mode().name(),
+        sh.present_info.lock().unwrap(),
+        clock_json,
+        l.report_json()
+    );
+    drop(l);
+    eprintln!("latency report: {json}");
+    let path = std::env::var("GLIDE_LATENCY_OUT").unwrap_or_else(|_| {
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        std::env::temp_dir().join(format!("glide-latency-{secs}.json")).to_string_lossy().into_owned()
+    });
+    match std::fs::write(&path, json + "\n") {
+        Ok(()) => Some(path),
+        Err(e) => {
+            eprintln!("latency report: cannot write {path}: {e}");
+            None
+        }
+    }
+}
+
+fn set_latency_test(on: bool) {
+    let sh = &ui().shared;
+    sh.latency_test.store(on, Ordering::Relaxed);
+    let mut l = sh.latency.lock().unwrap();
+    l.keep_all = on;
+    if on {
+        l.all.clear();
+        l.all_gt.clear();
     }
 }
 
@@ -936,6 +1202,24 @@ fn do_action(hwnd: HWND, a: Action) {
             }
         }
         Action::ToggleMute => toggle_mute(hwnd),
+        Action::LatencyTest => {
+            if sh.latency_test.load(Ordering::Relaxed) {
+                let path = write_latency_report();
+                set_latency_test(false);
+                toast(match path {
+                    Some(p) => format!("Latency test off — report: {p}"),
+                    None => "Latency test off".to_string(),
+                });
+            } else {
+                set_latency_test(true);
+                // The breakdown is in the HUD: make sure it's visible.
+                if !STATE.with(|s| s.borrow().hud_on) {
+                    do_action(hwnd, Action::ToggleHud);
+                }
+                toast("Latency test on — run glide-probe --pattern-only on the Mac · Ctrl+Alt+Shift+L to stop");
+            }
+            update_title(hwnd);
+        }
         Action::Reconnect => {
             STATE.with(|s| s.borrow_mut().prompt_declined = false);
             sh.paused.store(false, Ordering::Relaxed);
@@ -1659,6 +1943,7 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
     }
     // New configuration: resets the base decoder and canvas (sharp layer follows via SharpLayerConfig).
     let _ = tx.send(RenderCmd::Config(cfg));
+    shared.latency.lock().unwrap().reset();
 
     let (ended_tx, ended_rx) = mpsc::channel::<String>();
     {
@@ -1666,9 +1951,11 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
         let tx = tx.clone();
         let sender = conn.sender.clone();
         conn.spawn_receiver(move |ev| match ev {
-            NetEvent::Msg(HostMsg::VideoFrame { flags, rects, data, .. }) => {
+            NetEvent::Msg(HostMsg::VideoFrame { frame_id, flags, rects, data, .. }) => {
+                shared.latency.lock().unwrap().on_recv(frame_id, flags, now_us());
                 shared.stats.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
                 let _ = tx.send(RenderCmd::Frame {
+                    frame_id,
                     data,
                     keyframe: flags & FRAME_FLAG_KEYFRAME != 0,
                     sharp: flags & FRAME_FLAG_SHARP != 0,
@@ -1678,6 +1965,7 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
             NetEvent::Msg(HostMsg::SharpLayerConfig(c)) => {
                 let _ = tx.send(RenderCmd::SharpConfig(c));
             }
+            NetEvent::Msg(HostMsg::FrameTiming(ft)) => shared.latency.lock().unwrap().on_timing(ft, now_us()),
             NetEvent::Msg(HostMsg::VideoConfig(c)) | NetEvent::Msg(HostMsg::ServerHello { config: c, .. }) => {
                 *shared.config.lock().unwrap() = c;
                 let _ = tx.send(RenderCmd::Config(c));
@@ -1726,7 +2014,9 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
             }
         });
     }
-    let _pinger = conn.spawn_pinger(Duration::from_secs(1));
+    let _pinger = conn.spawn_pinger(crate::net::PING_INTERVAL);
+    // Per-frame host timestamps for the latency breakdown (§3.3); older hosts ignore this.
+    let _ = conn.sender.send(&ClientMsg::LatencyEnable { flags: 1 });
     if let Some(a) = &shared.audio {
         a.on_connected(conn.clock.clone());
         if a.muted() {
@@ -1797,9 +2087,15 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         stats: Stats::default(),
         hwnd: AtomicIsize::new(0),
         audio: opts.audio.then(Audio::start),
+        latency: Mutex::new(Tracker::new(true)),
+        latency_test: AtomicBool::new(false),
+        present_info: Mutex::new("null".into()),
+        clock_info: Mutex::new("null".into()),
     });
     let (render_tx, render_rx) = mpsc::channel::<RenderCmd>();
-    let hud_on = opts.store.config.hud;
+    let latency_test = opts.latency_test || std::env::var("GLIDE_LATENCY_TEST").is_ok_and(|v| v == "1");
+    // The latency test lives in the HUD.
+    let hud_on = opts.store.config.hud || latency_test;
     let opts_audio_muted = opts.audio_muted;
     let restore = {
         let ms = placement::monitors();
@@ -1812,6 +2108,9 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         store: Mutex::new(opts.store),
         password_source: Mutex::new(opts.password_source),
     });
+    if latency_test {
+        set_latency_test(true);
+    }
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         s.hud_on = hud_on;
@@ -1987,6 +2286,11 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         a.shutdown();
     }
     let _ = rt.join();
+    if shared.latency_test.load(Ordering::Relaxed) {
+        if let Some(p) = write_latency_report() {
+            eprintln!("latency report written to {p}");
+        }
+    }
     if exit_after.is_some() {
         let st = &shared.stats;
         eprintln!(

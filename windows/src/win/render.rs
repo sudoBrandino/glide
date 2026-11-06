@@ -568,10 +568,11 @@ impl Renderer {
     }
 
     /// Draw the canvas letterboxed into `rect` (x, y, w, h in back-buffer pixels), multiplied
-    /// by `dim`, then the HUD, toast and status panels if set, and present.
-    pub fn present(&mut self, rect: (i32, i32, i32, i32), dim: f32) -> Result<()> {
+    /// by `dim`, then the HUD, toast and status panels if set, and present. Returns the
+    /// `util::now_us()` time right before the `Present` call (latency instrumentation).
+    pub fn present(&mut self, rect: (i32, i32, i32, i32), dim: f32) -> Result<u64> {
         unsafe {
-            let Some(rtv) = self.rtv.clone() else { return Ok(()) };
+            let Some(rtv) = self.rtv.clone() else { return Ok(crate::util::now_us()) };
             let bg = if self.canvas.is_some() { 0.0 } else { 0.06 };
             self.context.ClearRenderTargetView(&rtv, &[bg, bg, bg * 1.1, 1.0]);
             let mode = self.cb_state.0;
@@ -616,23 +617,117 @@ impl Renderer {
             }
             self.set_cb(mode, dim);
             let ctx = &self.context;
+            let t = crate::util::now_us();
             match &self.swap {
                 Some(s) => {
                     let flags = if self.tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) };
-                    s.Present(0, flags).ok()
+                    s.Present(0, flags).ok().map(|_| t)
                 }
                 None => {
                     ctx.Flush();
-                    Ok(())
+                    Ok(t)
                 }
             }
         }
     }
 }
 
+/// `DXGI_FRAME_STATISTICS` of the swap chain: the most recent present that reached the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameStats {
+    /// Present count (as `GetLastPresentCount`) of the last present that was displayed.
+    pub present_count: u32,
+    /// Vblank count at which it was first displayed.
+    pub present_refresh_count: u32,
+    /// Vblank count / QPC time at which the OS last sampled the vblank clock.
+    pub sync_refresh_count: u32,
+    pub sync_qpc: i64,
+}
+
+/// A canvas region copied to a CPU-readable texture (latency test mode). Mapped later, without
+/// stalling the render thread (`try_read_luma`).
+pub struct Readback {
+    tex: ID3D11Texture2D,
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
 impl Renderer {
     pub fn is_offscreen(&self) -> bool {
         self.swap.is_none()
+    }
+
+    pub fn tearing(&self) -> bool {
+        self.tearing
+    }
+
+    /// `IDXGISwapChain::GetLastPresentCount` (None offscreen).
+    pub fn last_present_count(&self) -> Option<u32> {
+        let s = self.swap.as_ref()?;
+        unsafe { s.GetLastPresentCount().ok() }
+    }
+
+    /// `IDXGISwapChain::GetFrameStatistics` (None offscreen, or while the OS has no data yet,
+    /// e.g. DXGI_ERROR_FRAME_STATISTICS_DISJOINT after a mode change).
+    pub fn frame_stats(&self) -> Option<FrameStats> {
+        let s = self.swap.as_ref()?;
+        let mut st = DXGI_FRAME_STATISTICS::default();
+        unsafe { s.GetFrameStatistics(&mut st).ok()? };
+        (st.PresentCount != 0).then_some(FrameStats {
+            present_count: st.PresentCount,
+            present_refresh_count: st.PresentRefreshCount,
+            sync_refresh_count: st.SyncRefreshCount,
+            sync_qpc: st.SyncQPCTime,
+        })
+    }
+
+    /// Queue a copy of a canvas region (clamped) into a staging texture. Copies run in GPU
+    /// order, so the result is exactly what the last present showed.
+    pub fn read_canvas(&self, x: u32, y: u32, w: u32, h: u32, reuse: Option<Readback>) -> Option<Readback> {
+        let (canvas, _, _, cw, ch) = self.canvas.as_ref()?;
+        let (x, y) = (x.min(cw.saturating_sub(1)), y.min(ch.saturating_sub(1)));
+        let (w, h) = (w.min(cw - x).max(1), h.min(ch - y).max(1));
+        let tex = match reuse {
+            Some(r) if (r.w, r.h) == (w, h) => r.tex,
+            _ => unsafe {
+                let d = D3D11_TEXTURE2D_DESC {
+                    Width: w,
+                    Height: h,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_R10G10B10A2_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Usage: D3D11_USAGE_STAGING,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    ..Default::default()
+                };
+                let mut t = None;
+                self.device.CreateTexture2D(&d, None, Some(&mut t)).ok()?;
+                t?
+            },
+        };
+        let b = D3D11_BOX { left: x, top: y, front: 0, right: x + w, bottom: y + h, back: 1 };
+        unsafe {
+            self.context.CopySubresourceRegion(&tex, 0, 0, 0, 0, canvas, 0, Some(&b));
+        }
+        Some(Readback { tex, x, y, w, h })
+    }
+
+    /// Map a readback if the GPU has finished it: 8-bit luma rows (`w` × `h`), else None.
+    pub fn try_read_luma(&self, r: &Readback) -> Option<Vec<u8>> {
+        unsafe {
+            let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context.Map(&r.tex, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32, Some(&mut m)).ok()?;
+            let mut out = Vec::with_capacity((r.w * r.h) as usize);
+            for y in 0..r.h as usize {
+                let row = std::slice::from_raw_parts((m.pData as *const u8).add(y * m.RowPitch as usize) as *const u32, r.w as usize);
+                out.extend(row.iter().map(|&p| crate::blockcode::luma_rgb10a2(p)));
+            }
+            self.context.Unmap(&r.tex, 0);
+            Some(out)
+        }
     }
 
     /// Write the current back buffer / offscreen target to a 32-bit BMP (diagnostics).

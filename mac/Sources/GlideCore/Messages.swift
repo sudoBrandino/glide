@@ -97,6 +97,61 @@ public struct VideoConfig: Equatable {
     }
 }
 
+/// "Unknown" marker for FrameTiming / LatencyReport fields (PROTOCOL.md §3.3).
+public let timingUnknown: UInt32 = .max
+
+/// `FrameTiming` (0x81, §3.3): host pipeline stamps of one VideoFrame, as µs after `captureUs`.
+public struct FrameTiming: Equatable, Sendable {
+    public var frameId: UInt32
+    public var captureUs: UInt64
+    public var flags: UInt8
+    public var callback: UInt32, submit: UInt32, encoded: UInt32, enqueued: UInt32, sent: UInt32
+
+    public init(frameId: UInt32, captureUs: UInt64, flags: UInt8, callback: UInt32 = timingUnknown, submit: UInt32 = timingUnknown,
+                encoded: UInt32 = timingUnknown, enqueued: UInt32 = timingUnknown, sent: UInt32 = timingUnknown) {
+        self.frameId = frameId; self.captureUs = captureUs; self.flags = flags
+        self.callback = callback; self.submit = submit; self.encoded = encoded; self.enqueued = enqueued; self.sent = sent
+    }
+
+    /// Offset of absolute host time `t` (µs) after the capture, or `timingUnknown`.
+    public static func delta(_ t: UInt64?, from cap: UInt64) -> UInt32 {
+        guard let t else { return timingUnknown }
+        return t <= cap ? 0 : UInt32(min(t - cap, UInt64(timingUnknown - 1)))
+    }
+
+    func write(_ w: inout ByteWriter) {
+        w.u32(frameId); w.u64(captureUs); w.u8(flags)
+        w.u32(callback); w.u32(submit); w.u32(encoded); w.u32(enqueued); w.u32(sent)
+    }
+
+    static func read(_ r: inout ByteReader) throws -> FrameTiming {
+        FrameTiming(frameId: try r.u32(), captureUs: try r.u64(), flags: try r.u8(), callback: try r.u32(), submit: try r.u32(),
+                    encoded: try r.u32(), enqueued: try r.u32(), sent: try r.u32())
+    }
+}
+
+/// `LatencyReport` (0x82, §3.3): the viewer's p50 breakdown (µs) over its last ~2 s.
+public struct LatencyReport: Equatable, Sendable {
+    public var samples: UInt16
+    /// bit0: `totalUs` ends at scan-out (else at the Present call); bit1: ground truth valid.
+    public var flags: UInt8
+    public var hostUs: UInt32, networkUs: UInt32, queueUs: UInt32, decodeUs: UInt32, renderUs: UInt32, scanoutUs: UInt32, totalUs: UInt32
+    public var groundTruthUs: UInt32
+
+    public init(samples: UInt16, flags: UInt8, hostUs: UInt32, networkUs: UInt32, queueUs: UInt32, decodeUs: UInt32, renderUs: UInt32,
+                scanoutUs: UInt32, totalUs: UInt32, groundTruthUs: UInt32) {
+        self.samples = samples; self.flags = flags; self.hostUs = hostUs; self.networkUs = networkUs; self.queueUs = queueUs
+        self.decodeUs = decodeUs; self.renderUs = renderUs; self.scanoutUs = scanoutUs; self.totalUs = totalUs; self.groundTruthUs = groundTruthUs
+    }
+
+    /// One log line, e.g. `n=118 p50 ms: host 11.0 net 1.2 … total(glass) 21.6`.
+    public var summary: String {
+        func f(_ v: UInt32) -> String { v == timingUnknown ? "-" : String(format: "%.1f", Double(v) / 1000) }
+        return "n=\(samples) p50 ms: host \(f(hostUs)) net \(f(networkUs)) queue \(f(queueUs)) decode \(f(decodeUs)) render \(f(renderUs)) scanout \(f(scanoutUs)) total(\(flags & 1 != 0 ? "glass" : "to present")) \(f(totalUs))"
+            + (flags & 2 != 0 ? " ground-truth \(f(groundTruthUs))" : "")
+    }
+}
+
 /// Client -> Host messages.
 public enum ClientMessage {
     case hello(version: UInt16, caps: CodecCaps, viewW: UInt16, viewH: UInt16, mode: StreamMode, maxFps: UInt8, name: String)
@@ -111,6 +166,9 @@ public enum ClientMessage {
     case ping(clientTimeUs: UInt64)
     case clipboard(ClipboardData)
     case audioEnable(Bool)
+    /// §3.3: `flags` bit0 = send FrameTiming for every VideoFrame.
+    case latencyEnable(flags: UInt8)
+    case latencyReport(LatencyReport)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -128,6 +186,10 @@ public enum ClientMessage {
         case let .ping(t): w.u8(0x30); w.u64(t)
         case let .clipboard(c): w = ByteWriter(capacity: c.payloadBytes + 32); w.u8(0x50); c.write(&w)
         case let .audioEnable(on): w.u8(0x62); w.u8(on ? 1 : 0)
+        case let .latencyEnable(f): w.u8(0x80); w.u8(f)
+        case let .latencyReport(r):
+            w.u8(0x82); w.u16(r.samples); w.u8(r.flags)
+            for v in [r.hostUs, r.networkUs, r.queueUs, r.decodeUs, r.renderUs, r.scanoutUs, r.totalUs, r.groundTruthUs] { w.u32(v) }
         }
         return w.data
     }
@@ -151,6 +213,11 @@ public enum ClientMessage {
         case 0x30: return .ping(clientTimeUs: try r.u64())
         case 0x50: return .clipboard(try ClipboardData.read(&r))
         case 0x62: return .audioEnable(try r.u8() != 0)
+        case 0x80: return .latencyEnable(flags: try r.u8())
+        case 0x82:
+            let n = try r.u16(), f = try r.u8()
+            return .latencyReport(LatencyReport(samples: n, flags: f, hostUs: try r.u32(), networkUs: try r.u32(), queueUs: try r.u32(), decodeUs: try r.u32(),
+                                                renderUs: try r.u32(), scanoutUs: try r.u32(), totalUs: try r.u32(), groundTruthUs: try r.u32()))
         default: throw WireError.unknownMessage(t)
         }
     }
@@ -172,6 +239,8 @@ public enum HostMessage {
     case audioConfig(AudioConfig)
     /// `pcm`: interleaved s16le samples (codec 1).
     case audioFrame(seq: UInt32, captureTimeUs: UInt64, pcm: Data)
+    /// §3.3, only after the viewer's LatencyEnable.
+    case frameTiming(FrameTiming)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -200,6 +269,7 @@ public enum HostMessage {
         case let .audioFrame(seq, t, pcm):
             w = ByteWriter(capacity: pcm.count + 13)
             w.u8(0x61); w.u32(seq); w.u64(t); w.bytes(pcm)
+        case let .frameTiming(ft): w.u8(0x81); ft.write(&w)
         }
         return w.data
     }
@@ -231,6 +301,7 @@ public enum HostMessage {
         case 0x51: return .clipboardCaps(formats: try r.u32(), maxBytes: try r.u32())
         case 0x60: return .audioConfig(try AudioConfig.read(&r))
         case 0x61: return .audioFrame(seq: try r.u32(), captureTimeUs: try r.u64(), pcm: r.rest())
+        case 0x81: return .frameTiming(try FrameTiming.read(&r))
         default: throw WireError.unknownMessage(t)
         }
     }
