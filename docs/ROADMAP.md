@@ -16,7 +16,8 @@
 - [ ] UDP video transport with NACK/FEC (TCP head-of-line blocking on loss)
 - [ ] Clipboard sync (text, then images/files), audio (SCK audio → Opus)
 - [ ] Multi-monitor, display picker
-- [ ] Signed `.app` bundle + LaunchAgent so TCC permissions stick to the host, menu-bar UI
+- [x] Signed `.app` bundle + LaunchAgent so TCC permissions stick to the host, menu-bar UI
+- [x] Automatic display-mode policy (match the viewer: crisp 1x / Retina HiDPI), restore on disconnect
 - [ ] Windows viewer UI: connection list, settings, HUD
 
 ## v2 — beyond the LAN

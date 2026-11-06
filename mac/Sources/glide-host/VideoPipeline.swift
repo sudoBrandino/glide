@@ -58,8 +58,6 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private var nextIsRefresh = false
     private var lastNewFrameAt: UInt64 = 0
     private var lastBaseCaptureUs: UInt64 = 0
-    private var baseGeneration: UInt64 = 0
-    private var sharpDoneGeneration: UInt64 = .max
     /// Changes not yet delivered on the base layer: (capture time, rects or nil = full frame).
     /// Consumed by the encoded frame whose capture is at least as new (rects attach at send time,
     /// so the pixel diff runs in parallel with the hardware encode).
@@ -67,9 +65,7 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private var idleTimer: DispatchSourceTimer?
     private var running = false
     private var frameSize = CGSize.zero
-    private var rectScale: CGFloat = 1
     private let sharpDelayUs: UInt64 = UInt64(ProcessInfo.processInfo.environment["GLIDE_SHARP_DELAY_MS"].flatMap { UInt64($0) } ?? 200) * 1000
-    private var loggedRectSpace = false
     private var lastSignificantAt: UInt64 = 0
     private var lastSharpAt: UInt64 = 0
     private var dirtySinceSharp = true
@@ -173,9 +169,6 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             self.pendingChanges = []
             self.prevBase = nil
             self.frameSize = CGSize(width: pw, height: ph)
-            // Dirty rects may come in source pixels or points; resolved on first frame (see capture).
-            self.rectScale = 1
-            self.loggedRectSpace = false
             self.running = true
         }
         queue.async { self.onConfig?(vc, sharpVC) }
@@ -206,6 +199,10 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         if let fps, fps > 0 { options.fps = fps }
         try await start()
     }
+
+    /// Sets the max encoded width for the next (re)start without restarting now (used when a display
+    /// mode switch is about to trigger a re-capture anyway).
+    func setMaxWidth(_ w: Int) { if w > 0 { options.maxWidth = w } }
 
     func requestKeyframe() {
         queue.async {
@@ -250,7 +247,6 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         if latest != nil, dirty { stats.skippedBusy += 1 }
         latest = (pb, us)
         lastBaseCaptureUs = us
-        baseGeneration &+= 1
         dirty = true
         refinesLeft = hybrid ? 0 : 2
         nextIsRefresh = false
