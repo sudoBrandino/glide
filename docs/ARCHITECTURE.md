@@ -169,8 +169,8 @@ The viewer (`windows/src/win/app.rs`) runs these threads:
 - **Session thread:** connects, or listens in `--listen` mode, runs one connection at a time and
   survives disconnects. While disconnected it shows a status line over the dimmed last frame,
   releases held keys, and retries every 2 s or re-listens. Each connection has its own receive
-  thread and a 1 Hz ping thread from `net.rs`. The ping thread tracks RTT and the host clock
-  offset, using the lowest-RTT sample.
+  thread and a 2 Hz ping thread from `net.rs`. The ping thread tracks RTT and the host clock
+  offset: the lowest-RTT samples of a sliding 30 s window, with drift tracking (LATENCY.md).
 
 ### Decode
 
@@ -215,6 +215,16 @@ centered rather than resampled.
 - **Host response:** the host re-captures so the encoded width is at most the view width, and
   never sends more pixels than the viewer can show 1:1. This is why the Mac's display mode should
   match the viewer monitor (see the README's troubleshooting section).
+
+### Latency instrumentation
+
+Every frame is timestamped at each stage on both sides: SCK PTS, capture callback, encoder
+submit and output, enqueue, and send completion on the host, carried in a `FrameTiming` message
+(PROTOCOL.md §3.4). On the viewer: receive, decode, canvas update, `Present()`, and the vblank
+from DXGI frame statistics. `latency::Tracker` joins the two by frame id, using the
+sliding-window min-RTT clock sync. The HUD shows p50s, the viewer reports them back to the host
+log and menu bar, and a block-code test pattern provides ground truth. See
+[LATENCY.md](LATENCY.md).
 
 ## Transport and security
 
