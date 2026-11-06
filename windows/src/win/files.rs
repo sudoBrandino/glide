@@ -95,8 +95,25 @@ fn expand_env(s: &str) -> String {
     out
 }
 
-/// UI thread, once, after the window exists.
-pub fn init(hwnd: HWND, c: &Config) {
+/// Is this process elevated (UAC "Run as administrator")?
+fn elevated() -> bool {
+    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut tok = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok).is_err() {
+            return false;
+        }
+        let mut e = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        let ok = GetTokenInformation(tok, TokenElevation, Some(&mut e as *mut _ as *mut _), std::mem::size_of::<TOKEN_ELEVATION>() as u32, &mut len).is_ok();
+        let _ = CloseHandle(tok);
+        ok && e.TokenIsElevated != 0
+    }
+}
+
+/// UI thread, once, after the window exists. Returns a message for the user, if any.
+pub fn init(hwnd: HWND, c: &Config) -> Option<String> {
     let cfg = service_config(c);
     eprintln!(
         "files: transfer {} — receive {} into {}, limits {} / {} files",
@@ -121,15 +138,18 @@ pub fn init(hwnd: HWND, c: &Config) {
         enabled: c.file_transfer,
         test_sent: AtomicBool::new(false),
     });
-    if c.file_transfer {
-        unsafe {
-            DragAcceptFiles(hwnd, true);
-            // If the viewer runs elevated, still accept drops from a normal Explorer (UIPI).
-            for m in [WM_DROPFILES, WM_COPYDATA, 0x0049 /* WM_COPYGLOBALDATA */] {
-                let _ = ChangeWindowMessageFilterEx(hwnd, m, MSGFLT_ALLOW, None);
-            }
-        }
+    if !c.file_transfer {
+        return None;
     }
+    unsafe { DragAcceptFiles(hwnd, true) };
+    // The UIPI message filter is deliberately left strict: relaxing it for an elevated viewer
+    // would let any lower-integrity process post WM_DROPFILES and make us send arbitrary files to
+    // the Mac. Elevated, drops from a normal Explorer are blocked by Windows; say so.
+    if elevated() {
+        eprintln!("files: running elevated: drag & drop from Explorer is blocked by Windows (UIPI); use the Glide menu's Send files…");
+        return Some("Drag & drop is disabled while Glide runs as administrator — use the Glide menu → Send files to the Mac…".into());
+    }
+    None
 }
 
 fn ctx() -> Option<&'static Ctx> {
@@ -219,6 +239,67 @@ pub fn cancel() -> String {
     match ctx() {
         Some(c) if c.service.cancel_all() => "File transfer cancelled".into(),
         _ => "No file transfer in progress".into(),
+    }
+}
+
+/// FileCaps flags of the connected host (None: not negotiated).
+pub fn peer_flags() -> Option<u32> {
+    ctx()?.service.peer_flags()
+}
+
+/// Menu "Send files…" / "Send folder…": native picker (multi-select) → send to the Mac.
+/// Returns a toast, or None if the user cancelled.
+pub fn pick_and_send(hwnd: HWND, folders: bool) -> Option<String> {
+    let c = ctx()?;
+    let paths = match pick(hwnd, folders) {
+        Ok(p) => p,
+        Err(e) => return Some(format!("Can't open the file picker: {e}")),
+    };
+    if paths.is_empty() {
+        return None;
+    }
+    eprintln!("files: picked {paths:?}");
+    let what = match paths.as_slice() {
+        [one] => format!("“{}”", one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+        many => format!("{} items", many.len()),
+    };
+    c.service.send_paths(paths);
+    Some(format!("Sending {what} to the Mac…"))
+}
+
+/// IFileOpenDialog with FOS_ALLOWMULTISELECT (+ FOS_PICKFOLDERS for folders), file-system items only.
+fn pick(hwnd: HWND, folders: bool) -> windows::core::Result<Vec<PathBuf>> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+    unsafe {
+        // The UI thread is (or becomes) an STA; S_FALSE / RPC_E_CHANGED_MODE are fine here.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+        let mut opts = dlg.GetOptions()? | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
+        if folders {
+            opts |= FOS_PICKFOLDERS;
+        } else {
+            opts |= FOS_FILEMUSTEXIST;
+        }
+        dlg.SetOptions(opts)?;
+        let title: Vec<u16> =
+            if folders { "Send folders to the Mac" } else { "Send files to the Mac" }.encode_utf16().chain(std::iter::once(0)).collect();
+        dlg.SetTitle(PCWSTR(title.as_ptr()))?;
+        dlg.SetOkButtonLabel(w!("Send"))?;
+        if let Err(e) = dlg.Show(Some(hwnd)) {
+            // ERROR_CANCELLED
+            return if e.code() == windows::core::HRESULT::from_win32(1223) { Ok(Vec::new()) } else { Err(e) };
+        }
+        let items = dlg.GetResults()?;
+        let mut out = Vec::new();
+        for i in 0..items.GetCount()? {
+            let p = items.GetItemAt(i)?.GetDisplayName(SIGDN_FILESYSPATH)?;
+            let s = p.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(p.0 as *const _));
+            if !s.is_empty() {
+                out.push(PathBuf::from(s));
+            }
+        }
+        Ok(out)
     }
 }
 

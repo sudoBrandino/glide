@@ -28,6 +28,8 @@ pub const MSG_MOUSE_WHEEL: u8 = 0x12;
 pub const MSG_KEY: u8 = 0x13;
 pub const MSG_RELEASE_ALL: u8 = 0x14;
 pub const MSG_VIEW_SIZE: u8 = 0x15;
+/// Viewer → host: Mac display-mode preference for this session (v1.3).
+pub const MSG_SET_DISPLAY_PREFERENCE: u8 = 0x16;
 pub const MSG_REQUEST_KEYFRAME: u8 = 0x20;
 pub const MSG_SET_MODE: u8 = 0x21;
 pub const MSG_PING: u8 = 0x30;
@@ -38,6 +40,16 @@ pub const MSG_AUDIO_ENABLE: u8 = 0x62;
 pub const MSG_SERVER_HELLO: u8 = 0x02;
 pub const MSG_VIDEO_CONFIG: u8 = 0x03;
 pub const MSG_SHARP_LAYER_CONFIG: u8 = 0x04;
+/// Host → viewer: current display preference + mode (v1.3).
+pub const MSG_DISPLAY_INFO: u8 = 0x05;
+
+/// Mac display-mode preferences (SetDisplayPreference / DisplayInfo `u8 preference`).
+pub const DISPLAY_PREF_AUTOMATIC: u8 = 0;
+pub const DISPLAY_PREF_CRISP: u8 = 1;
+pub const DISPLAY_PREF_SMOOTH: u8 = 2;
+pub const DISPLAY_PREF_RETINA: u8 = 3;
+/// Never change the display mode ("Don't change").
+pub const DISPLAY_PREF_MANUAL: u8 = 4;
 pub const MSG_PONG: u8 = 0x31;
 pub const MSG_VIDEO_FRAME: u8 = 0x40;
 pub const MSG_CURSOR_POS: u8 = 0x41;
@@ -399,6 +411,8 @@ pub enum ClientMsg {
     AudioEnable { enabled: bool },
     /// File transfer (§6).
     File(FileMsg),
+    /// Mac display-mode preference for this session (`DISPLAY_PREF_*`).
+    SetDisplayPreference { mode: u8 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -421,6 +435,9 @@ pub enum HostMsg {
     AudioFrame { seq: u32, capture_time_us: u64, data: Vec<u8> },
     /// File transfer (§6).
     File(FileMsg),
+    /// Current Mac display preference (`DISPLAY_PREF_*`) and mode ("looks like" size in points,
+    /// `hidpi` = Retina backing). Sent after ServerHello and whenever either changes.
+    DisplayInfo { preference: u8, mode_w: u16, mode_h: u16, hidpi: bool },
     /// Unknown message type: ignored for forward compatibility.
     Unknown { msg_type: u8 },
 }
@@ -623,6 +640,7 @@ impl ClientMsg {
             }
             ClientMsg::AudioEnable { enabled } => Writer::new(MSG_AUDIO_ENABLE).u8(*enabled as u8).finish(),
             ClientMsg::File(m) => m.encode(),
+            ClientMsg::SetDisplayPreference { mode } => Writer::new(MSG_SET_DISPLAY_PREFERENCE).u8(*mode).finish(),
         }
     }
 
@@ -652,6 +670,7 @@ impl ClientMsg {
             MSG_CLIPBOARD => ClientMsg::Clipboard(ClipboardData::read(&mut r)?),
             MSG_AUDIO_ENABLE => ClientMsg::AudioEnable { enabled: r.u8()? != 0 },
             t if FileMsg::is_file_type(t) => ClientMsg::File(FileMsg::read(t, &mut r)?),
+            MSG_SET_DISPLAY_PREFERENCE => ClientMsg::SetDisplayPreference { mode: r.u8()? },
             _ => return Err(DecodeError::BadLength(t)),
         })
     }
@@ -728,6 +747,9 @@ impl HostMsg {
                 return Ok(HostMsg::File(FileMsg::Chunk { id, index, offset, data: buf }));
             }
             t if FileMsg::is_file_type(t) => HostMsg::File(FileMsg::read(t, &mut r)?),
+            MSG_DISPLAY_INFO => {
+                HostMsg::DisplayInfo { preference: r.u8()?, mode_w: r.u16()?, mode_h: r.u16()?, hidpi: r.u8()? != 0 }
+            }
             other => HostMsg::Unknown { msg_type: other },
         };
         Ok(msg)
@@ -787,6 +809,9 @@ impl HostMsg {
                 Writer::new(MSG_AUDIO_FRAME).u32(*seq).u64(*capture_time_us).bytes(data).finish()
             }
             HostMsg::File(m) => m.encode(),
+            HostMsg::DisplayInfo { preference, mode_w, mode_h, hidpi } => {
+                Writer::new(MSG_DISPLAY_INFO).u8(*preference).u16(*mode_w).u16(*mode_h).u8(*hidpi as u8).finish()
+            }
             HostMsg::Unknown { msg_type } => vec![*msg_type],
         }
     }
@@ -951,6 +976,23 @@ mod tests {
             HostMsg::AudioFrame { seq: 7, capture_time_us: 1_000_000, data: vec![] }
         );
         assert_eq!(CAP_AUDIO_PCM, 0x200);
+    }
+
+    #[test]
+    fn display_messages_match_reference_bytes() {
+        // docs/PROTOCOL.md §3.3 reference encodings (mac glide-selftest checks the same bytes).
+        let set = ClientMsg::SetDisplayPreference { mode: DISPLAY_PREF_RETINA };
+        assert_eq!(crate::util::hex(&set.encode()), "1603");
+        assert_eq!(ClientMsg::decode(&[0x16, 0x03]).unwrap(), set);
+        assert!(ClientMsg::decode(&[0x16]).is_err());
+        let info = HostMsg::DisplayInfo { preference: DISPLAY_PREF_AUTOMATIC, mode_w: 1920, mode_h: 1080, hidpi: true };
+        assert_eq!(crate::util::hex(&info.encode()), "05008007380401");
+        assert_eq!(HostMsg::decode(crate::util::unhex("05008007380401")).unwrap(), info);
+        assert_eq!(
+            HostMsg::decode(crate::util::unhex("0504000a400600")).unwrap(),
+            HostMsg::DisplayInfo { preference: DISPLAY_PREF_MANUAL, mode_w: 2560, mode_h: 1600, hidpi: false }
+        );
+        assert!(HostMsg::decode(crate::util::unhex("050080073804")).is_err());
     }
 
     #[test]

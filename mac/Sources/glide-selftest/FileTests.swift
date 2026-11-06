@@ -127,6 +127,17 @@ func fileTests(vectorsDir: URL) throws {
     do { try inc2.end(index: 0, sha256: Data(SHA256.hash(data: Data("good".utf8)))) } catch let f as FileFailure { verr = f.status }
     check(verr == FileStatus.verify && listAll(root2).isEmpty, "incoming: SHA-256 mismatch rejected, nothing left")
 
+    // Hostile modification times are ignored, never fatal.
+    check([Int64.max, Int64.min, -1, 0, FileTimes.maxMs + 1].allSatisfy { FileTimes.split($0) == nil }
+          && FileTimes.split(1_700_000_000_123)! == (1_700_000_000, 123_000) && FileTimes.split(FileTimes.maxMs) != nil, "mtime range check")
+    let root3 = tempDir("mtime")
+    defer { try? FileManager.default.removeItem(at: root3) }
+    let inc3 = try FileIncoming(id: 3, root: root3, entries: [FileEntry(path: "t.txt", size: 1, mtimeMs: .max), FileEntry(path: "u", size: 0, mtimeMs: .min)], rel: [["t.txt"], ["u"]])
+    try inc3.chunk(index: 0, offset: 0, data: Data("x".utf8))
+    try inc3.end(index: 0, sha256: Data(SHA256.hash(data: Data("x".utf8))))
+    try inc3.end(index: 1, sha256: Data(SHA256.hash(data: Data())))
+    check(inc3.allDone, "incoming: files with hostile mtimes are saved, mtime ignored")
+
     // Sender walk: symlinks and special files refused.
     let src = tempDir("src")
     defer { try? FileManager.default.removeItem(at: src) }

@@ -149,6 +149,16 @@ public struct FileLimits: Equatable, Sendable {
     }
 }
 
+/// Offer modification times (§6.2): applied only within 1 ms ... 9999-12-31T23:59:59.999Z.
+public enum FileTimes {
+    public static let maxMs: Int64 = 253_402_300_799_999
+    /// (seconds, microseconds) to apply, or nil (unknown, negative or absurd: ignored).
+    public static func split(_ ms: Int64) -> (sec: Int, usec: Int32)? {
+        guard ms >= 1, ms <= maxMs else { return nil }
+        return (Int(ms / 1000), Int32(ms % 1000) * 1000)
+    }
+}
+
 public struct FileFailure: Error, CustomStringConvertible {
     public var status: UInt8
     public var detail: String

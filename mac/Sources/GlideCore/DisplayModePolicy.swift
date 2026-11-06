@@ -41,6 +41,32 @@ public enum DisplayModePreference: String, CaseIterable, Sendable {
     case manual
 }
 
+extension DisplayModePreference {
+    /// Wire value in SetDisplayPreference / DisplayInfo (PROTOCOL.md §3.3).
+    public var wireValue: UInt8 {
+        switch self {
+        case .automatic: return 0
+        case .crisp: return 1
+        case .smooth: return 2
+        case .retina: return 3
+        case .manual: return 4
+        }
+    }
+
+    public init?(wire: UInt8) {
+        guard let p = DisplayModePreference.allCases.first(where: { $0.wireValue == wire }) else { return nil }
+        self = p
+    }
+}
+
+extension HostMessage {
+    /// DisplayInfo (§3.3) for `preference` and the current mode (nil = unknown: 0x0, not HiDPI).
+    public static func displayInfo(preference: DisplayModePreference, mode: DisplayModeInfo?) -> HostMessage {
+        func u16(_ v: Int) -> UInt16 { UInt16(clamping: max(0, v)) }
+        return .displayInfo(preference: preference.wireValue, modeW: u16(mode?.width ?? 0), modeH: u16(mode?.height ?? 0), hidpi: mode?.hiDPI ?? false)
+    }
+}
+
 /// What `automatic` does for 4K-class viewers.
 public enum HighDPIViewerChoice: String, CaseIterable, Sendable {
     case retina, smooth

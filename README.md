@@ -238,12 +238,14 @@ Restart, Quit Until Next Login — plain Quit would just be relaunched by the ag
 
 Files and folders go both ways over the session's encrypted connection ([PROTOCOL.md §6](docs/PROTOCOL.md)):
 
-- **PC → Mac:** drag files or folders from Explorer onto the Glide window. They land in
+- **PC → Mac:** drag files or folders from Explorer onto the Glide window, or use the Glide menu's
+  *Send files to the Mac…* / *Send folder to the Mac…* (multi-select pickers). They land in
   `~/Downloads/Glide/` on the Mac, which posts a notification ("Received 3 files", click to show
   in Finder; the first time macOS asks to allow Glide Host's notifications) and lists them under
   the menu bar's *Recent Transfers*.
 - **Mac → PC:** menu bar → *Send Files to Viewer…* (files and folders, multi-select), or copy
-  files in Finder (Cmd+C) and press **Ctrl+Alt+Shift+V** in the viewer. They land in
+  files in Finder (Cmd+C) and press **Ctrl+Alt+Shift+V** in the viewer (Glide menu: *Receive files
+  copied on the Mac*). They land in
   `%USERPROFILE%\Downloads\Glide\`; a Windows notification opens the folder when clicked.
 - Progress shows as a line at the bottom of the viewer; **Ctrl+Alt+Shift+X** (or the tray menu, or
   the Mac menu's *Cancel File Transfer*) cancels.

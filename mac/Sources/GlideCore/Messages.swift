@@ -211,6 +211,8 @@ public enum ClientMessage {
     case clipboard(ClipboardData)
     case audioEnable(Bool)
     case file(FileMessage)
+    /// Mac display-mode preference for this session (`DisplayModePreference.wireValue`, §3.3).
+    case setDisplayPreference(mode: UInt8)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -229,6 +231,7 @@ public enum ClientMessage {
         case let .clipboard(c): w = ByteWriter(capacity: c.payloadBytes + 32); w.u8(0x50); c.write(&w)
         case let .audioEnable(on): w.u8(0x62); w.u8(on ? 1 : 0)
         case let .file(m): return m.encoded
+        case let .setDisplayPreference(m): w.u8(0x16); w.u8(m)
         }
         return w.data
     }
@@ -253,6 +256,7 @@ public enum ClientMessage {
         case 0x50: return .clipboard(try ClipboardData.read(&r))
         case 0x62: return .audioEnable(try r.u8() != 0)
         case 0x70...0x79: return .file(try FileMessage.read(type: t, &r))
+        case 0x16: return .setDisplayPreference(mode: try r.u8())
         default: throw WireError.unknownMessage(t)
         }
     }
@@ -275,6 +279,9 @@ public enum HostMessage {
     /// `pcm`: interleaved s16le samples (codec 1).
     case audioFrame(seq: UInt32, captureTimeUs: UInt64, pcm: Data)
     case file(FileMessage)
+    /// Current display preference (`DisplayModePreference.wireValue`) and mode: "looks like" size in
+    /// points, `hidpi` = Retina backing (§3.3). Sent after ServerHello and whenever it changes.
+    case displayInfo(preference: UInt8, modeW: UInt16, modeH: UInt16, hidpi: Bool)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -304,6 +311,7 @@ public enum HostMessage {
             w = ByteWriter(capacity: pcm.count + 13)
             w.u8(0x61); w.u32(seq); w.u64(t); w.bytes(pcm)
         case let .file(m): return m.encoded
+        case let .displayInfo(p, mw, mh, hi): w.u8(0x05); w.u8(p); w.u16(mw); w.u16(mh); w.u8(hi ? 1 : 0)
         }
         return w.data
     }
@@ -336,6 +344,7 @@ public enum HostMessage {
         case 0x60: return .audioConfig(try AudioConfig.read(&r))
         case 0x61: return .audioFrame(seq: try r.u32(), captureTimeUs: try r.u64(), pcm: r.rest())
         case 0x70...0x79: return .file(try FileMessage.read(type: t, &r))
+        case 0x05: return .displayInfo(preference: try r.u8(), modeW: try r.u16(), modeH: try r.u16(), hidpi: try r.u8() != 0)
         default: throw WireError.unknownMessage(t)
         }
     }

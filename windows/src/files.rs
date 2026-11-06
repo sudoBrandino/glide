@@ -246,6 +246,17 @@ pub fn validate_offer(id: u32, total: u64, files: &[FileEntry], limits: &Limits,
     Ok(rel)
 }
 
+/// Latest modification time a receiver applies: 9999-12-31T23:59:59.999Z.
+pub const MAX_MTIME_MS: i64 = 253_402_300_799_999;
+
+/// An offer's `mtime_ms` as a time to apply, or None (unknown, negative or absurd: ignored).
+pub fn mtime_from_ms(ms: i64) -> Option<SystemTime> {
+    if !(1..=MAX_MTIME_MS).contains(&ms) {
+        return None;
+    }
+    UNIX_EPOCH.checked_add(Duration::from_millis(ms as u64))
+}
+
 pub fn human_bytes(n: u64) -> String {
     const U: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
     if n < 1000 {
@@ -491,8 +502,7 @@ impl Incoming {
             if !ok {
                 return Err((status::VERIFY, format!("'{}' does not match its SHA-256 / size", e.path)));
             }
-            if e.mtime_ms > 0 {
-                let t = UNIX_EPOCH + Duration::from_millis(e.mtime_ms as u64);
+            if let Some(t) = mtime_from_ms(e.mtime_ms) {
                 let _ = file.set_modified(t);
             }
             file.sync_all().map_err(|err| io_fail("flush failed", &err))?;
@@ -1665,6 +1675,25 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert!(walk_names(&a_dir).is_empty(), "{:?}", walk_names(&a_dir));
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn hostile_mtimes_are_ignored() {
+        for ms in [i64::MAX, i64::MIN, -1, 0, MAX_MTIME_MS + 1, u64::MAX as i64] {
+            assert_eq!(mtime_from_ms(ms), None, "{ms}");
+        }
+        assert!(mtime_from_ms(1_700_000_000_123).is_some());
+        assert!(mtime_from_ms(MAX_MTIME_MS).is_some());
+        // End to end: a file with a hostile mtime is still saved (mtime just not applied).
+        let root = tmpdir("mtime");
+        let files = vec![FileEntry { path: "t.txt".into(), size: 1, mtime_ms: i64::MAX }, FileEntry { path: "u.txt".into(), size: 0, mtime_ms: -5 }];
+        let rel = validate_offer(1, 1, &files, &Limits::default(), false).unwrap();
+        let mut inc = Incoming::new(1, &root, files, rel, no_mark).unwrap();
+        inc.chunk(0, 0, b"x").unwrap();
+        inc.end(0, &sha(b"x")).unwrap();
+        inc.end(1, &sha(b"")).unwrap();
+        assert!(inc.all_done() && root.join("t.txt").is_file() && root.join("u.txt").is_file());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

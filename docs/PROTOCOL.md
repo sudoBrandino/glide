@@ -94,6 +94,7 @@ Any decrypt failure is fatal: close the connection.
 | `0x13` | Key | `u16 hid_usage` (USB HID Keyboard page 0x07), `u8 down` (1/0). A down for an already-held key is an autorepeat |
 | `0x14` | ReleaseAll | (none) — host releases every held key/button |
 | `0x15` | ViewSize | `u16 view_w`, `u16 view_h` — physical pixels of the monitor/area the viewer will present on (the window's current monitor in fullscreen). Sent whenever it changes (window moved to another monitor, display mode change). The host re-captures so the encoded width ≤ `view_w` and follows with `VideoConfig` + keyframe |
+| `0x16` | SetDisplayPreference | `u8 mode` — Mac display-mode preference for this session, see §3.3 |
 | `0x20` | RequestKeyframe | (none) |
 | `0x21` | SetMode | `u8 mode` (0 fast, 1 sharp), `u32 bitrate_kbps` (0 = auto), `u8 max_fps` (0 = keep) |
 | `0x30` | Ping | `u64 client_time_us` |
@@ -118,6 +119,7 @@ the host injects exactly the HID usages it receives.
 |----|----|----|
 | `0x02` | ServerHello | `u16 version`, `str host_name`, then a `VideoConfig` body (below) |
 | `0x04` | SharpLayerConfig | `VideoConfig` body for the refinement layer (hybrid mode only; sent right after `ServerHello`/`VideoConfig`). Same width/height as the base layer, HEVC 4:4:4 |
+| `0x05` | DisplayInfo | `u8 preference`, `u16 mode_w`, `u16 mode_h`, `u8 hidpi` — see §3.3 |
 | `0x03` | VideoConfig | `u16 width`, `u16 height` (encoded pixels), `u8 codec` (1 HEVC, 2 H.264), `u8 chroma` (0 4:2:0, 1 4:4:4), `u8 color` (0 BT.709 limited), `f32 scale` (host backing scale, e.g. 2.0) |
 | `0x31` | Pong | `u64 client_time_us` (echoed), `u64 host_time_us` |
 | `0x40` | VideoFrame | `u32 frame_id`, `u64 capture_time_us` (host monotonic), `u8 flags`, [rects], then Annex-B elementary stream bytes. Flags: bit0 keyframe; bit1 refresh (re-encode of unchanged content for quality — `capture_time_us` is the original capture, so exclude from latency stats); bit2 **sharp layer** (decode with the refinement-layer decoder, see §3.1); bit3 **has rects**: the payload starts with `u16 n` then `n` × (`u16 x, y, w, h`) in encoded pixels, before the Annex-B bytes |
@@ -211,6 +213,38 @@ Reference encodings (both implementations test these):
 AudioConfig {codec 1, 48000 Hz, 2 ch, 480}              60 01 80bb0000 02 e001
 AudioFrame  {seq 7, t 1000000 µs, L/R 1,-1, 32767,-32768} 61 07000000 40420f0000000000 0100 ffff ff7f 0080
 AudioEnable {0}                                         62 00
+```
+
+## 3.3 Mac display preference (v1.3)
+
+The host may switch the Mac's display mode to suit the viewer (`automatic` policy, configurable on
+the Mac). The viewer can choose the preference **for the current session**:
+
+| dir | type | name | payload |
+|----|----|----|----|
+| C→H | `0x16` | SetDisplayPreference | `u8 mode` |
+| H→C | `0x05` | DisplayInfo | `u8 preference`, `u16 mode_w`, `u16 mode_h`, `u8 hidpi` |
+
+`mode` / `preference`: `0` automatic, `1` crisp (non-HiDPI, pixels 1:1 with the viewer), `2` smooth
+(HiDPI looking like ~2/3 of the viewer), `3` retina (HiDPI, backing pixels 1:1 with the viewer),
+`4` manual ("don't change").
+
+- `SetDisplayPreference` applies immediately (the host may switch modes, then re-captures:
+  `VideoConfig` + keyframe as usual). It lasts until the session ends; it is not persisted, and a
+  change of the policy on the Mac itself overrides it. Unknown values are ignored.
+- `DisplayInfo` reports the preference in force for this session and the current mode: `mode_w` ×
+  `mode_h` is the "looks like" size in points, `hidpi` = 1 if the mode has Retina backing (pixels =
+  2× points). `0×0` = unknown. The host sends it right after `ServerHello` (and the clipboard/audio
+  messages that follow it) and again whenever the preference or mode changes.
+- Older peers ignore these: viewers ignore unknown host message types; a host that doesn't know
+  `0x16` logs and drops it. A viewer that never got `DisplayInfo` should treat the feature as unavailable.
+
+Reference encodings (both implementations test these):
+
+```
+SetDisplayPreference {3 retina}                     16 03
+DisplayInfo {automatic, 1920x1080, hidpi}           05 00 8007 3804 01
+DisplayInfo {manual, 2560x1600, not hidpi}          05 04 000a 4006 00
 ```
 
 ## 4. Test vectors
@@ -313,7 +347,7 @@ Both implementations use the same guards (`ClipboardEchoGuard` in Swift, `EchoGu
 Both implementations and `tools/mock_host.py --selftest` check these.
 
 
-## 6. File transfer (v1.3)
+## 6. File transfer (v1.4)
 
 Message types `0x70–0x7F` are reserved for file transfer: files and folders in both directions,
 over the existing encrypted record layer, only inside an authenticated session.
@@ -348,7 +382,8 @@ over the existing encrypted record layer, only inside an authenticated session.
   `Photos` yields `Photos/a.jpg`, `Photos/2024/b.jpg`). Only regular files are listed: folders are
   implied by the paths (empty folders are not transferred). Invalid UTF-8 in any `str` of these
   messages is replaced (U+FFFD), never fatal.
-- `mtime_ms`: modification time in ms since the Unix epoch (0 = unknown); the receiver applies it.
+- `mtime_ms`: modification time in ms since the Unix epoch (0 = unknown). The receiver applies it
+  only if `1 ≤ mtime_ms ≤ 253402300799999` (year 9999); any other value is ignored, never an error.
 - `total_bytes` must equal the sum of the sizes.
 - **Transfer ids** are chosen by the sender: the viewer's are `1..=0x7FFFFFFF`, the host's have
   bit 31 set. A `FileCancel` therefore always identifies the transfer unambiguously. An offer whose

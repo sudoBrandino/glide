@@ -147,9 +147,8 @@ public final class FileIncoming {
         guard written == e.size, digest == sha256 else {
             throw FileFailure(FileStatus.verify, "'\(e.path)' does not match its SHA-256 / size")
         }
-        if e.mtimeMs > 0 {
-            let s = e.mtimeMs / 1000, us = (e.mtimeMs % 1000) * 1000
-            var tv = [timeval(tv_sec: Int(s), tv_usec: Int32(us)), timeval(tv_sec: Int(s), tv_usec: Int32(us))]
+        if let t = FileTimes.split(e.mtimeMs) {
+            var tv = [timeval(tv_sec: t.sec, tv_usec: t.usec), timeval(tv_sec: t.sec, tv_usec: t.usec)]
             _ = futimes(fd, &tv)
         }
         if fsync(fd) != 0 { throw errnoText("flush failed") }

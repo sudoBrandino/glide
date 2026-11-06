@@ -416,6 +416,23 @@ func audioTests() throws {
     check(ms < 500, String(format: "packetize 10 s of audio in %.1f ms (%.3f ms per 21 ms buffer)", ms, ms / 469))
 }
 
+func displayWireTests() throws {
+    // docs/PROTOCOL.md §3.3 reference bytes; windows/src/protocol.rs checks the same.
+    check(ClientMessage.setDisplayPreference(mode: DisplayModePreference.retina.wireValue).encoded.hex == "1603", "SetDisplayPreference encoding")
+    if case let .setDisplayPreference(m) = try ClientMessage.decode(Data(hex: "1603")!) {
+        check(DisplayModePreference(wire: m) == .retina, "SetDisplayPreference decode")
+    } else { check(false, "SetDisplayPreference decode") }
+    let retina1080 = DisplayModeInfo(width: 1920, height: 1080, pixelWidth: 3840, pixelHeight: 2160)
+    let info = HostMessage.displayInfo(preference: .automatic, mode: retina1080)
+    check(info.encoded.hex == "05008007380401", "DisplayInfo encoding")
+    if case let .displayInfo(p, w, h, hi) = try HostMessage.decode(Data(hex: "0504000a400600")!) {
+        check(p == 4 && w == 2560 && h == 1600 && !hi, "DisplayInfo decode")
+    } else { check(false, "DisplayInfo decode") }
+    check(DisplayModePreference.allCases.map(\.wireValue) == [0, 1, 2, 3, 4], "display preference wire values")
+    check(DisplayModePreference.allCases.allSatisfy { DisplayModePreference(wire: $0.wireValue) == $0 } && DisplayModePreference(wire: 5) == nil, "display preference wire roundtrip")
+    check(HostMessage.displayInfo(preference: .manual, mode: nil).encoded.hex == "05040000000000", "DisplayInfo unknown mode")
+}
+
 func trackerChecks() {
     let crisp = DisplayModeInfo(width: 2560, height: 1440, pixelWidth: 2560, pixelHeight: 1440)
     let retina = DisplayModeInfo(width: 1920, height: 1080, pixelWidth: 3840, pixelHeight: 2160)
@@ -466,5 +483,6 @@ do {
     let vpath = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "../docs/test-vectors.json"
     try fileTests(vectorsDir: URL(fileURLWithPath: vpath).deletingLastPathComponent())
 } catch { failures += 1; print("  FAIL file transfer threw \(error)") }
+do { try displayWireTests() } catch { failures += 1; print("  FAIL display wire threw \(error)") }
 print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)

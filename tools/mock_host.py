@@ -728,6 +728,9 @@ class Session:
                     threading.Thread(target=self.file_send_later, args=(self.args.file_send,), daemon=True).start()
                 if self.args.file_evil:
                     threading.Thread(target=self.file_evil, daemon=True).start()
+            # DisplayInfo (§3.3): pretend the Mac runs 1920x1080 Retina under "automatic".
+            self.display_pref = 0
+            self.send_display_info()
             self.send_cursor()
             t = threading.Thread(target=self.video_loop, args=(st,), daemon=True)
             t.start()
@@ -999,7 +1002,7 @@ class Session:
         cur["fh"].close()
         if cur["n"] != size or cur["h"].digest() != f["sha"]:
             return self._inc_fail(ST_VERIFY, f"file {idx} ({path}): size/SHA-256 mismatch")
-        if mtime > 0:
+        if 1 <= mtime <= 253402300799999:  # PROTOCOL.md §6.2: other values are ignored
             os.utime(cur["tmp"], (mtime / 1000, mtime / 1000))
         name, n = inc["rel"][idx][-1], 1
         while True:  # never overwrite: reserve the name, then move the verified file over it
@@ -1172,6 +1175,12 @@ class Session:
         except (OSError, EOFError):
             self.alive = False
 
+    DISPLAY_MODES = {0: (1920, 1080, 1), 1: (3840, 2160, 0), 2: (2560, 1440, 1), 3: (1920, 1080, 1), 4: (1920, 1080, 1)}
+
+    def send_display_info(self):
+        w, h, hi = self.DISPLAY_MODES.get(self.display_pref, (1920, 1080, 1))
+        self.send_msg(bytes([0x05, self.display_pref]) + struct.pack("<HHB", w, h, hi))
+
     def input_loop(self):
         names = {0x10: "MouseMove", 0x11: "MouseButton", 0x12: "MouseWheel", 0x13: "Key", 0x14: "ReleaseAll",
                  0x20: "RequestKeyframe", 0x21: "SetMode", 0x50: "Clipboard"}
@@ -1208,6 +1217,12 @@ class Session:
             elif t == 0x15:
                 vw, vh = struct.unpack("<HH", m[1:5])
                 log(f"{self.addr}: ViewSize {vw}x{vh}")
+            elif t == 0x16:
+                names16 = ["automatic", "crisp", "smooth", "retina", "manual"]
+                log(f"{self.addr}: SetDisplayPreference {names16[m[1]] if m[1] < 5 else m[1]}")
+                if m[1] < 5:
+                    self.display_pref = m[1]
+                    self.send_display_info()
             elif t == 0x20:
                 log(f"{self.addr}: RequestKeyframe -> restarting stream at first keyframe")
                 self.restart.set()
