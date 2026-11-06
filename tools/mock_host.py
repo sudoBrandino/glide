@@ -15,16 +15,23 @@
 - --selftest checks the clipboard codec against the PROTOCOL.md §5 reference bytes and exits.
 - Hybrid (mode 2, needs HEVC 4:4:4 cap): ServerHello + SharpLayerConfig, base 4:2:0 stream, a
   sharp-layer 4:4:4 IDR (flags bit2) each --hybrid-period frames, and rect-only base frames (bit3).
+- Audio (§3.2, client caps bit 9): AudioConfig + a continuous sine (default 440 Hz, -12 dBFS,
+  48 kHz stereo) as ≤10 ms AudioFrames. Any glitch (drop, underrun, click) is easy to hear on a
+  pure tone. --audio-burst 1024 mimics ScreenCaptureKit's buffer size, --audio-drift-ppm a host
+  clock running fast/slow, --audio-jitter-ms random send delay, --audio-pattern 2000:1000 sends
+  nothing for 1 s out of every 3 (like the Mac while silent). AudioEnable(0/1) stops/resumes.
 
 Usage:
   GLIDE_PASSWORD=... python3 tools/mock_host.py [--port 7421 | --connect HOST:PORT [--once]] [--fps 60]
       [--hevc streams/hevc420_1440p.h265] [--hevc444 streams/hevc444_1440p.h265]
       [--h264 streams/h264_1440p.h264] [--switch-every SECONDS] [--quiet-input]
       [--clip-text TEXT | --clip-png FILE] [--clip-every SECONDS] [--clip-bounce] [--clip-save DIR]
+      [--no-audio] [--audio-freq HZ] [--audio-right-freq HZ] [--audio-db DBFS] [--audio-burst FRAMES]
+      [--audio-drift-ppm PPM] [--audio-jitter-ms MS] [--audio-pattern ON_MS:OFF_MS]
   python3 tools/mock_host.py --selftest
 Generate streams first with tools/make_streams.sh.
 """
-import argparse, hashlib, os, socket, struct, sys, threading, time
+import argparse, array, hashlib, math, os, random, socket, struct, sys, threading, time
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -254,9 +261,11 @@ class Session:
         self.alive = True
         self.restart = threading.Event()
         self.switch_to = None
-        self.stats = {"frames": 0, "bytes": 0}
+        self.stats = {"frames": 0, "bytes": 0, "audio_frames": 0}
         self.clip_seq = 0
         self.clipboard = False
+        self.audio_enabled = True
+        self.audio_need_config = True
 
     def recv_exact(self, n):
         buf = bytearray()
@@ -362,6 +371,8 @@ class Session:
             self.send_cursor()
             t = threading.Thread(target=self.video_loop, args=(st,), daemon=True)
             t.start()
+            if caps & (1 << 9) and not self.args.no_audio:
+                threading.Thread(target=self.audio_loop, daemon=True).start()
             self.input_loop()
         except (EOFError, ConnectionError, OSError) as e:
             log(f"{self.addr}: disconnected ({e})")
@@ -376,6 +387,8 @@ class Session:
             extra = ""
             if "sharp" in self.stats or "rect_frames" in self.stats:
                 extra = f" (sharp {self.stats.get('sharp', 0)}, rect frames {self.stats.get('rect_frames', 0)})"
+            if self.stats["audio_frames"]:
+                extra += f", {self.stats['audio_frames']} audio frames"
             log(f"{self.addr}: session ended; sent {self.stats['frames']} frames{extra}, {self.stats['bytes'] / 1e6:.1f} MB")
 
     def video_loop(self, st):
@@ -485,6 +498,59 @@ class Session:
         if self.args.clip_bounce:
             self.send_clip(text=text, png=png)
 
+    def audio_loop(self):
+        """48 kHz stereo s16le sine, sent as ≤10 ms AudioFrames (docs/PROTOCOL.md §3.2)."""
+        a = self.args
+        rate, ch, max_frames = 48000, 2, 480
+        amp = 32767 * 10 ** (a.audio_db / 20)
+
+        def table(freq):  # one second of the tone (repeats exactly for integer Hz)
+            return array.array("h", (int(round(amp * math.sin(2 * math.pi * freq * i / rate))) for i in range(rate)))
+
+        left = table(a.audio_freq)
+        right = left if a.audio_right_freq in (None, a.audio_freq) else table(a.audio_right_freq)
+        block = a.audio_burst or max_frames  # frames produced per "capture callback"
+        host_rate = rate * (1 + a.audio_drift_ppm / 1e6)  # frames per real second (host clock skew)
+        log(f"{self.addr}: audio: {a.audio_freq:g} Hz sine at {a.audio_db:g} dBFS, {block}-frame blocks"
+            f"{f', drift {a.audio_drift_ppm:+g} ppm' if a.audio_drift_ppm else ''}"
+            f"{f', send jitter 0..{a.audio_jitter_ms:g} ms' if a.audio_jitter_ms else ''}")
+        on_ms, off_ms = (float(x) for x in a.audio_pattern.split(":")) if a.audio_pattern else (1, 0)
+        n, seq = 0, 0
+        t0 = time.monotonic()
+        try:
+            while self.alive:
+                # Wait until this block has been "captured" (its last sample is in the past).
+                d = t0 + (n + block) / host_rate - time.monotonic()
+                if d > 0:
+                    time.sleep(d)
+                if a.audio_jitter_ms:
+                    time.sleep(random.random() * a.audio_jitter_ms / 1000)
+                first_us = mono_us() - int((time.monotonic() - (t0 + n / host_rate)) * 1e6)
+                quiet = off_ms > 0 and (n * 1000 / rate) % (on_ms + off_ms) >= on_ms
+                if self.audio_enabled and not quiet:
+                    if self.audio_need_config:
+                        self.audio_need_config = False
+                        self.send_msg(bytes([0x60]) + struct.pack("<BIBH", 1, rate, ch, max_frames))
+                    k = (block + max_frames - 1) // max_frames  # near-equal split, like the Mac host
+                    off = 0
+                    for i in range(k):
+                        m = block // k + (1 if i < block % k else 0)
+                        pcm = array.array("h", bytes(4 * m))
+                        for j in range(m):
+                            idx = (n + off + j) % rate
+                            pcm[2 * j] = left[idx]
+                            pcm[2 * j + 1] = right[idx]
+                        if sys.byteorder != "little":
+                            pcm.byteswap()
+                        ts = first_us + off * 1_000_000 // rate
+                        self.send_msg(bytes([0x61]) + struct.pack("<IQ", seq, ts) + pcm.tobytes())
+                        self.stats["audio_frames"] += 1
+                        seq = (seq + 1) & 0xFFFFFFFF
+                        off += m
+                n += block
+        except (OSError, EOFError):
+            self.alive = False
+
     def input_loop(self):
         names = {0x10: "MouseMove", 0x11: "MouseButton", 0x12: "MouseWheel", 0x13: "Key", 0x14: "ReleaseAll",
                  0x20: "RequestKeyframe", 0x21: "SetMode", 0x50: "Clipboard"}
@@ -519,6 +585,12 @@ class Session:
                 self.restart.set()
             elif t == 0x50:
                 self.on_clipboard(m)
+            elif t == 0x62:
+                on = bool(m[1])
+                log(f"{self.addr}: AudioEnable {'on' if on else 'off (muted)'}")
+                if on and not self.audio_enabled:
+                    self.audio_need_config = True
+                self.audio_enabled = on
             elif t == 0x21:
                 mode, kbps, fps = struct.unpack("<BIB", m[1:7])
                 log(f"{self.addr}: SetMode mode={mode} bitrate={kbps} max_fps={fps}")
@@ -543,6 +615,15 @@ def main():
     ap.add_argument("--hybrid-period", type=int, default=60,
                     help="hybrid mode (ClientHello mode 2): frames per cycle; a sharp 4:4:4 IDR at 2/3, rect-only base frames after")
     ap.add_argument("--quiet-input", action="store_true")
+    ap.add_argument("--no-audio", action="store_true", help="don't stream audio even if the client supports it")
+    ap.add_argument("--audio-freq", type=float, default=440.0, help="test tone frequency (Hz), left channel")
+    ap.add_argument("--audio-right-freq", type=float, default=None, help="right channel frequency (default: same as left)")
+    ap.add_argument("--audio-db", type=float, default=-12.0, help="tone level in dBFS (default -12)")
+    ap.add_argument("--audio-burst", type=int, default=0,
+                    help="frames per capture block (e.g. 1024 like ScreenCaptureKit); default 480 = 10 ms")
+    ap.add_argument("--audio-drift-ppm", type=float, default=0.0, help="host audio clock error vs real time (ppm)")
+    ap.add_argument("--audio-jitter-ms", type=float, default=0.0, help="random 0..N ms delay before each block is sent")
+    ap.add_argument("--audio-pattern", metavar="ON_MS:OFF_MS", help="send audio ON_MS, then nothing for OFF_MS (silence gaps)")
     ap.add_argument("--connect", metavar="HOST:PORT",
                     help="reverse mode: dial out to a client running `glide-client --listen` (retries; re-dials after each session)")
     ap.add_argument("--once", action="store_true", help="with --connect: exit after one session")

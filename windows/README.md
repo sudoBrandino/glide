@@ -10,11 +10,12 @@ The wire protocol is defined in `../docs/PROTOCOL.md`.
 |---|---|
 | `src/protocol.rs`, `src/crypto.rs` | Message codec, handshake, KDF, ChaCha20-Poly1305 record layer. Works on any OS and is unit-tested against `../docs/test-vectors.json`. |
 | `src/net.rs` | TCP (NODELAY), shared encrypted writer, receive thread, 1 Hz ping, RTT and clock offset. Includes `--listen` reverse mode. |
+| `src/audio.rs` | Audio jitter buffer (priming, drift-correcting resample, underrun/overflow handling). Platform independent, unit-tested. |
 | `src/hid.rs` | Set-1 scancode → USB HID usage table, plus the Ctrl↔Cmd / Win↔Control remap. Unit-tested. |
 | `src/config.rs`, `src/hotkeys.rs`, `src/hud.rs` | Config file (load/save/migration, CLI-vs-config precedence, per-monitor window placement), hotkey table, stats-HUD text. Pure Rust, unit-tested. |
 | `src/clipboard.rs` | Clipboard sync logic without Win32: CRLF↔LF, echo guard, DIB↔PNG (`png` crate). Unit-tested. |
 | `src/annexb.rs`, `src/bench.rs` | Annex-B access-unit splitting, and the headless benchmark driver. |
-| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain, text panels), `app` (window, input, cursor, fullscreen, hotkeys), `clipboard` (clipboard listener/apply), `cursor`, `probe`, `bench_decoder`, `dpapi` (saved password), `prompt` (password dialog), `placement` (monitors), `tray`. |
+| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain, text panels), `app` (window, input, cursor, fullscreen, hotkeys), `clipboard` (clipboard listener/apply), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`, `dpapi` (saved password), `prompt` (password dialog), `placement` (monitors), `tray`. |
 | `res/`, `build.rs` | Icon, manifest (themed controls, PerMonitorV2), password dialog and version info, linked into the exe: MinGW `windres` for the GNU target, `rc.exe` (via `embed-resource`) for MSVC. Regenerate the icon with `../tools/make_icon.py`. |
 | `assets/` | Small clips embedded in the exe for `--probe`. Regenerate them with `../tools/make_streams.sh --clips-only`. |
 
@@ -34,7 +35,7 @@ Shaders are compiled at runtime with `D3DCompile` from `d3dcompiler_47.dll`, whi
 
 ```
 glide-client.exe                               (uses the config file: listen on 7420 by default)
-glide-client.exe <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--bench SECONDS] [--probe]
+glide-client.exe <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--no-audio] [--bench SECONDS] [--probe]
 glide-client.exe --listen [PORT] [same options]
 glide-client.exe --forget-password
 ```
@@ -52,6 +53,8 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   "mode": null,             // "fast" | "hybrid" | "sharp"; null = auto (hybrid if 4:4:4 decodes)
   "ctrl_as_cmd": true,
   "hud": false,             // stats overlay, toggled with Ctrl+Alt+Shift+H
+  "audio": true,            // play the Mac's sound (false = --no-audio)
+  "audio_muted": false,     // Ctrl+Alt+Shift+A
   "clipboard": true,        // clipboard sync with the host (false = --no-clipboard)
   "clipboard_sync_secrets": false,
   "allowed_peers": [],      // listen mode: IPs/CIDRs allowed to connect; [] = pin the first host that authenticates  // also send clipboard items password managers mark private (= --clipboard-sync-secrets)
@@ -66,6 +69,7 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   - A positional `host`, then `--listen [PORT]`, then the config's `host`, then listening on `listen_port`.
   - `--mode` wins over `"mode"`, which wins over auto.
   - `--no-ctrl-as-cmd` / `--ctrl-as-cmd` win over `"ctrl_as_cmd"`.
+  - `--no-audio` wins over `"audio"`.
   - `--no-clipboard` wins over `"clipboard"`.
 - **Password:** `--password`, then `GLIDE_PASSWORD`, then the saved password, then a password dialog.
   - The dialog has a *Remember on this PC* box, on by default.
@@ -82,7 +86,8 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
 - **Listen-mode admission control** (defense in depth; see `src/peers.rs`):
   - **Allowlist:** if `allowed_peers` is non-empty, connections from any other IP are closed right after `accept()`, before a single handshake byte is sent or read. Entries are IPs or CIDRs, for example `"192.168.50.4"` or `"192.168.50.0/24"`.
   - **Trust on first use:** if `allowed_peers` is empty, the IP of the first peer that completes an authenticated session is pinned there (logged, and shown in the "Connected" toast). Tray → *Forget pinned host* clears the list.
-  - **Backoff:** a failed handshake from an IP blocks that IP for 1 s, doubling on each further failure up to 60 s. Connections from a blocked IP are dropped without a handshake. A successful session resets it.
+  - **Backoff:** a failed handshake blocks the peer for 1 s, doubling on each further failure up to 60 s. Connections from a blocked peer are dropped without a handshake, and a successful session resets it. Peers are tracked per IPv4 address and per IPv6 /64, so a peer can't escape by rotating addresses within its /64.
+  - **Global budget (unpinned only):** while nothing is pinned, more than 10 failed handshakes from all peers within 60 s refuse every unpinned peer for 60 s. Pinned or allowlisted hosts are never affected.
   - **Pre-auth timeout:** a peer that hasn't completed the handshake after 5 s is disconnected.
 
   These are mitigations only. In protocol v1 an attacker who can see or relay a handshake can still run an offline
@@ -140,6 +145,7 @@ To replace a `.cmd` launcher that sets `GLIDE_PASSWORD`, run `glide-client.exe` 
   | Ctrl+Alt+Shift+K | release the keyboard: the low-level hook is removed, `ReleaseAll` is sent, and keys stay on Windows (Alt+Tab, Win, Alt+F4…). Press again to recapture |
   | Ctrl+Alt+Shift+R | request a keyframe |
   | Ctrl+Alt+Shift+D | disconnect and reconnect immediately (in listen mode, the host redials within about 2 s) |
+  | Ctrl+Alt+Shift+A | mute / unmute audio (saved in the config) |
 
   While the window has focus and the keyboard is captured, a low-level keyboard hook sends Win, Alt+Tab, Alt+Space and similar keys to the host.
   To leave the window, click outside it, press Ctrl+Alt+Shift+K, or press Ctrl+Alt+Del, which cannot be intercepted.
@@ -148,10 +154,25 @@ To replace a `.cmd` launcher that sets `GLIDE_PASSWORD`, run `glide-client.exe` 
   - fps, decode ms and RTT;
   - Mbps and the video size and codec;
   - the mode and the current layer (4:2:0/4:4:4), with sharp and rect frame counts;
-  - the view size and the decoder.
+  - the view size and the decoder;
+  - audio latency and underruns, or "muted".
 
   The text is rasterized with GDI into a texture only when it changes (at most twice a second) and blended 1:1, so it stays crisp.
   The window title now shows only `<host> — Glide`; the stats moved to the HUD.
+- **Audio** (protocol §3.2): the Mac's sound plays on this PC's default output device. On by default; `--no-audio`
+  turns it off (the viewer then doesn't advertise it, so the host doesn't even capture audio).
+  - **Ctrl+Alt+Shift+A**, the tray menu or the window menu's *Mute audio* mutes/unmutes. The host stops sending while
+    muted. Mute is saved in the config (`audio_muted`), so it persists across reconnects and restarts. Config `"audio": false` is the same as `--no-audio`.
+    (The audio branch's Ctrl+F11 was dropped to keep all viewer hotkeys on Ctrl+Alt+Shift; Cmd+F11 now reaches the Mac.)
+  - Uncompressed 48 kHz stereo PCM (1.5 Mbit/s), WASAPI shared mode, event-driven, on an MMCSS "Pro Audio" thread.
+    A jitter buffer primes to 30 ms and holds it against clock drift with a tiny (≤0.2 %) resample only when it
+    leaves a ±8 ms band; underruns raise the target 10 ms (max 120 ms, decays back); more than target + 60 ms
+    is dropped, so latency stays bounded.
+  - Switching the Windows default output device moves playback within ~1 s; a device error reopens it.
+  - The stats HUD (Ctrl+Alt+Shift+H) shows `audio N ms` (estimated host capture → speaker, from the ping clock sync), underruns, or "muted".
+  - Tuning (environment): `GLIDE_AUDIO_TARGET_MS` (jitter target, default 30), `GLIDE_AUDIO_FILL_MS` (audio kept
+    queued in the device, default 16), `GLIDE_AUDIO_LOWLAT=1` (IAudioClient3 minimum engine period, if the device
+    supports one below 10 ms; the CORSAIR headset doesn't).
 - Modifier remap (on by default; turn it off with `--no-ctrl-as-cmd`): Ctrl → Command, Win → Control, Alt → Option.
 - When a key is held, its typematic repeats are sent as repeated `Key down=1` messages.
 - **Clipboard sync** (PROTOCOL.md §5; off with `--no-clipboard`): text and images, both directions,
@@ -182,6 +203,10 @@ Then start the host on the Mac: `mac/.build/release/glide-host --password-file .
 
 ### Headless modes (these work over SSH in session 0)
 
+- `--audio-selftest [SECONDS]` opens the default output device exactly like the viewer and runs the real render path
+  on **digital silence** (inaudible) for N seconds (default 3). It prints JSON with the output devices, the mix format,
+  engine event cadence, device queue, `device_starved` (device ran dry) and jitter-buffer underruns.
+
 - `--probe` prints JSON with:
   - the decoder MFTs (HEVC, H.264, AV1),
   - the D3D11 video decoder profiles and the output formats each supports,
@@ -194,6 +219,7 @@ Then start the host on the Mac: `mac/.build/release/glide-host --password-file .
   - `layers`, which holds base and sharp frame counts, `sharp_decode_ms`, `rect_frames`, `avg_rects` and rect area %;
   - `rtt_ms`;
   - `e2e_capture_to_decoded_ms`, estimated from the ping/pong clock offset and counting base-layer frames only (refresh and sharp frames are excluded);
+  - `audio`: format, frames, lost frames, and `capture_to_arrival_ms` for audio frames (null if the host sent no audio);
   - errors.
 - `--clipboard-selftest` exercises the real Win32 clipboard path (apply, read back, CRLF, PNG/DIB,
   echo suppression, external changes) on hidden windows and prints one line per check. Session 0
@@ -227,4 +253,8 @@ The mock host:
   clipboard back once (the viewer must keep it as is and not echo it), `--clip-save DIR` keeps PNGs;
   `--selftest` checks the codec against the §5 reference bytes;
 - in hybrid mode, sends SharpLayerConfig, then each `--hybrid-period` frames (default 60) a 4:4:4 sharp IDR,
-  followed by base frames limited to small rects.
+  followed by base frames limited to small rects;
+- if the viewer advertises audio, streams a continuous 440 Hz sine at -12 dBFS (`--audio-freq`, `--audio-db`,
+  `--no-audio`). A pure tone makes every glitch audible. `--audio-burst 1024` mimics ScreenCaptureKit's buffer
+  size, `--audio-drift-ppm` a fast/slow host clock, `--audio-jitter-ms` random send delays, `--audio-pattern 2000:1000`
+  gaps like the Mac sends while silent.

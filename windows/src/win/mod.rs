@@ -1,6 +1,7 @@
 //! Windows-only: D3D11 + Media Foundation decode, renderer, window/input, probe.
 
 pub mod app;
+pub mod audio;
 pub mod bench_decoder;
 pub mod clipboard;
 pub mod console;

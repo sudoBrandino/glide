@@ -135,7 +135,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             if let c = v.video {
                 let chroma = v.hybrid ? "4:2:0 + 4:4:4 refine" : (c.chroma == .yuv444 ? "4:4:4" : "4:2:0")
                 let mode = v.hybrid ? "Hybrid" : (c.chroma == .yuv444 ? "Sharp" : "Fast")
-                streamItem.title = "Stream: \(mode) · \(c.codec == .hevc ? "HEVC" : "H.264") \(chroma)"
+                streamItem.title = "Stream: \(mode) · \(c.codec == .hevc ? "HEVC" : "H.264") \(chroma)" + (v.audio.map { " · audio \($0)" } ?? "")
                 resolutionItem.title = "Video: \(c.width)×\(c.height) · viewer \(v.viewW)×\(v.viewH)"
             } else {
                 streamItem.title = "Stream: starting…"

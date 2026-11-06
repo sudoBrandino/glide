@@ -9,6 +9,7 @@
 //! failure (`prompt`), and a tray icon (`tray`).
 
 use super::clipboard;
+use super::audio::Audio;
 use super::cursor::{create_cursor, destroy_cursor, scale_image, CursorImage};
 use super::d3d::Gpu;
 use super::decoder::Decoder;
@@ -45,6 +46,10 @@ pub struct Options {
     /// Persisted preferences (HUD, mode, window placement).
     pub store: Store,
     pub password_source: PasswordSource,
+    /// Play the host's audio (§3.2); false with --no-audio / config "audio": false.
+    pub audio: bool,
+    /// Start muted (config "audio_muted").
+    pub audio_muted: bool,
 }
 
 /// Where the session password came from. Only saved/prompted passwords are re-prompted for
@@ -87,6 +92,8 @@ const VIEW_TIMER: usize = 3;
 const PLACEMENT_TIMER: usize = 4;
 /// `GLIDE_TEST_ACTIONS` test hook: fires one queued action per tick.
 const TEST_ACTION_TIMER: usize = 5;
+/// Window-menu command: mute/unmute audio (low 4 bits zero, below 0xF000, as WM_SYSCOMMAND requires).
+const IDM_MUTE: usize = 0x1F10;
 
 enum RenderCmd {
     Frame { data: Vec<u8>, keyframe: bool, sharp: bool, rects: Option<Vec<protocol::Rect>> },
@@ -157,6 +164,8 @@ struct Shared {
     cursor: Mutex<CursorState>,
     stats: Stats,
     hwnd: AtomicIsize,
+    /// Audio output (None with --no-audio).
+    audio: Option<Audio>,
 }
 
 /// Process-wide UI context (the low-level keyboard hook has no user pointer).
@@ -821,6 +830,7 @@ fn update_title(hwnd: HWND) {
         decode_errors: sh.stats.decode_errors.load(Ordering::Relaxed),
         view: (vw, vh),
         keyboard_captured: !kb_released,
+        audio: audio_hud(),
     };
     let lines = hud::lines(&info);
     let hud_on = STATE.with(|s| {
@@ -925,6 +935,7 @@ fn do_action(hwnd: HWND, a: Action) {
                 toast("Not connected");
             }
         }
+        Action::ToggleMute => toggle_mute(hwnd),
         Action::Reconnect => {
             STATE.with(|s| s.borrow_mut().prompt_declined = false);
             sh.paused.store(false, Ordering::Relaxed);
@@ -1059,6 +1070,44 @@ fn ask_new_password(hwnd: HWND, msg: &str, remember: bool) {
     }
 }
 
+/// Mute/unmute: stops local playback and tells the host to stop/start sending (AudioEnable).
+/// Persisted in the config (`audio_muted`).
+fn toggle_mute(hwnd: HWND) {
+    let Some(a) = &ui().shared.audio else {
+        toast("Audio is off (--no-audio or config \"audio\": false)");
+        return;
+    };
+    let muted = a.set_muted(!a.muted());
+    eprintln!("audio: {}", if muted { "muted" } else { "unmuted" });
+    send(ClientMsg::AudioEnable { enabled: !muted });
+    sync_mute_menu(hwnd, muted);
+    ui().store.lock().unwrap().update(|c| c.audio_muted = muted);
+    toast(if muted { "Audio muted" } else { "Audio on" });
+    update_title(hwnd);
+}
+
+fn sync_mute_menu(hwnd: HWND, muted: bool) {
+    unsafe {
+        let menu = GetSystemMenu(hwnd, false);
+        let _ = CheckMenuItem(menu, IDM_MUTE as u32, (MF_BYCOMMAND | if muted { MF_CHECKED } else { MF_UNCHECKED }).0);
+    }
+}
+
+fn audio_hud() -> Option<hud::AudioHud> {
+    let a = ui().shared.audio.as_ref()?;
+    let st = a.status();
+    let muted = a.muted();
+    Some(hud::AudioHud {
+        muted,
+        // status_text() is empty exactly when no AudioConfig has arrived (and not muted).
+        streaming: muted || !a.status_text().is_empty(),
+        e2e_ms: st.e2e_ms,
+        buffer_ms: st.jitter_ms + st.device_ms,
+        underruns: st.underruns,
+        error: st.error.clone(),
+    })
+}
+
 fn render_cmd(c: RenderCmd) {
     let _ = ui().render_tx.lock().unwrap().send(c);
 }
@@ -1118,6 +1167,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_APP_TRAY => {
             let st = tray::MenuState {
+                audio: ui().shared.audio.as_ref().map(|a| a.muted()),
                 paused: ui().shared.paused.load(Ordering::Relaxed),
                 hud_on: STATE.with(|s| s.borrow().hud_on),
                 has_pinned: ui().shared.listening && !ui().store.lock().unwrap().config.allowed_peers.is_empty(),
@@ -1144,6 +1194,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     toast(if had { "Saved password removed" } else { "No saved password" });
                 }
                 Some(tray::MenuCmd::ChangePassword) => change_password(hwnd),
+                Some(tray::MenuCmd::ToggleMute) => toggle_mute(hwnd),
                 Some(tray::MenuCmd::ForgetPinned) => {
                     let mut old = Vec::new();
                     ui().store.lock().unwrap().update(|c| old = std::mem::take(&mut c.allowed_peers));
@@ -1251,6 +1302,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_SYSCHAR | WM_CHAR => LRESULT(0),
         WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_KEYMENU => LRESULT(0),
+        WM_SYSCOMMAND if wparam.0 & 0xFFF0 == IDM_MUTE => {
+            toggle_mute(hwnd);
+            LRESULT(0)
+        }
         WM_TIMER if wparam.0 == TITLE_TIMER => {
             update_title(hwnd);
             LRESULT(0)
@@ -1645,6 +1700,16 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
                 drop(c);
                 post(hwnd_raw, WM_APP_CURSOR);
             }
+            NetEvent::Msg(HostMsg::AudioConfig(c)) => {
+                if let Some(a) = &shared.audio {
+                    a.on_config(&c);
+                }
+            }
+            NetEvent::Msg(HostMsg::AudioFrame { seq, capture_time_us, data }) => {
+                if let Some(a) = &shared.audio {
+                    a.on_frame(seq, capture_time_us, &data);
+                }
+            }
             NetEvent::Msg(HostMsg::CursorPos { visible, .. }) => {
                 let mut c = shared.cursor.lock().unwrap();
                 if c.visible != visible {
@@ -1662,6 +1727,13 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
         });
     }
     let _pinger = conn.spawn_pinger(Duration::from_secs(1));
+    if let Some(a) = &shared.audio {
+        a.on_connected(conn.clock.clone());
+        if a.muted() {
+            // Mute persists across reconnects; audio is on by default host-side.
+            let _ = conn.sender.send(&ClientMsg::AudioEnable { enabled: false });
+        }
+    }
     *shared.sender.lock().unwrap() = Some(conn.sender.clone());
     set_status(shared, tx, hwnd_raw, None);
     post(hwnd_raw, WM_APP_CONNECTED);
@@ -1680,6 +1752,9 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
     *shared.sender.lock().unwrap() = None;
     *shared.clock.lock().unwrap() = None;
     clipboard::disable();
+    if let Some(a) = &shared.audio {
+        a.on_disconnected();
+    }
     conn.stop();
     post(hwnd_raw, WM_APP_DISCONNECTED);
     reason
@@ -1721,9 +1796,11 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         cursor: Mutex::new(CursorState { visible: true, ..Default::default() }),
         stats: Stats::default(),
         hwnd: AtomicIsize::new(0),
+        audio: opts.audio.then(Audio::start),
     });
     let (render_tx, render_rx) = mpsc::channel::<RenderCmd>();
     let hud_on = opts.store.config.hud;
+    let opts_audio_muted = opts.audio_muted;
     let restore = {
         let ms = placement::monitors();
         config::choose_placement(&opts.store.config, &ms, placement::cursor_monitor_index(&ms))
@@ -1829,6 +1906,19 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
     if let Some(p) = &restore {
         eprintln!("restored window on monitor {} (fullscreen={}, maximized={})", p.monitor, p.fullscreen, p.maximized);
     }
+    if shared.audio.is_some() {
+        unsafe {
+            let menu = GetSystemMenu(hwnd, false);
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            let _ = AppendMenuW(menu, MF_STRING, IDM_MUTE, w!("Mute audio\tCtrl+Alt+Shift+A"));
+        }
+        if opts_audio_muted {
+            if let Some(a) = &shared.audio {
+                a.set_muted(true); // run_connection tells the host (AudioEnable false) on connect
+            }
+            sync_mute_menu(hwnd, true);
+        }
+    }
     check_view(hwnd); // view = the monitor the window actually opened on (before the first hello)
     clipboard::init(hwnd);
 
@@ -1893,6 +1983,9 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         s.shutdown();
     }
     let _ = render_tx.send(RenderCmd::Quit);
+    if let Some(a) = &shared.audio {
+        a.shutdown();
+    }
     let _ = rt.join();
     if exit_after.is_some() {
         let st = &shared.stats;

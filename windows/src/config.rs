@@ -45,6 +45,10 @@ pub struct Config {
     pub ctrl_as_cmd: bool,
     /// Stats overlay (Ctrl+Alt+Shift+H).
     pub hud: bool,
+    /// Play the Mac's audio (`--no-audio` overrides to off).
+    pub audio: bool,
+    /// Audio muted (Ctrl+Alt+Shift+A / tray / window menu); persists across restarts.
+    pub audio_muted: bool,
     /// Clipboard sync with the host (`--no-clipboard` overrides to off).
     pub clipboard: bool,
     /// Also sync clipboard items marked secret/concealed (password managers). Off by default.
@@ -67,6 +71,8 @@ impl Default for Config {
             mode: None,
             ctrl_as_cmd: true,
             hud: false,
+            audio: true,
+            audio_muted: false,
             clipboard: true,
             clipboard_sync_secrets: false,
             allowed_peers: Vec::new(),
@@ -172,6 +178,8 @@ pub fn parse(text: &str) -> Loaded {
     field!(mode);
     field!(ctrl_as_cmd);
     field!(hud);
+    field!(audio);
+    field!(audio_muted);
     field!(clipboard);
     field!(clipboard_sync_secrets);
     field!(allowed_peers);
@@ -444,6 +452,8 @@ mod tests {
         c.set_mode(Mode::Sharp);
         c.host = Some("mac.local:7420".into());
         c.clipboard = false;
+        c.audio = false;
+        c.audio_muted = true;
         c.clipboard_sync_secrets = true;
         c.allowed_peers = vec!["192.168.50.4".into(), "192.168.50.0/24".into()];
         record_placement(
@@ -462,6 +472,7 @@ mod tests {
         // new keys default sensibly when missing from an older file
         let old = parse(r#"{"version":1,"hud":true}"#).config;
         assert!(old.clipboard && !old.clipboard_sync_secrets && old.allowed_peers.is_empty());
+        assert!(old.audio && !old.audio_muted);
     }
 
     #[test]

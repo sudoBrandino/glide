@@ -1,5 +1,5 @@
 //! Notification-area (tray) icon: tooltip = window title; left click brings the viewer to
-//! the front; right click opens Connect / Disconnect / Reconnect / Stats / Change password /
+//! the front; right click opens Connect / Disconnect / Reconnect / Stats / Mute / Change password /
 //! Open config / Forget password / Forget pinned host / Quit. Commands arrive at the viewer
 //! window as WM_COMMAND.
 
@@ -15,6 +15,7 @@ pub enum MenuCmd {
     Disconnect,
     Reconnect,
     ToggleHud,
+    ToggleMute,
     ChangePassword,
     OpenConfig,
     ForgetPassword,
@@ -26,16 +27,19 @@ pub enum MenuCmd {
 pub struct MenuState {
     pub paused: bool,
     pub hud_on: bool,
+    /// None = audio disabled; Some(muted).
+    pub audio: Option<bool>,
     /// Listen mode with a pinned/allowed host list.
     pub has_pinned: bool,
 }
 
 const BASE: u16 = 0x4100;
-const CMDS: [MenuCmd; 9] = [
+const CMDS: [MenuCmd; 10] = [
     MenuCmd::Connect,
     MenuCmd::Disconnect,
     MenuCmd::Reconnect,
     MenuCmd::ToggleHud,
+    MenuCmd::ToggleMute,
     MenuCmd::ChangePassword,
     MenuCmd::OpenConfig,
     MenuCmd::ForgetPassword,
@@ -166,6 +170,9 @@ fn show_menu(hwnd: HWND, st: &MenuState) {
         item(MenuCmd::Reconnect, "&Reconnect\tCtrl+Alt+Shift+D", gray(paused));
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         item(MenuCmd::ToggleHud, "&Stats overlay\tCtrl+Alt+Shift+H", if hud_on { MF_CHECKED } else { MF_UNCHECKED });
+        if let Some(muted) = st.audio {
+            item(MenuCmd::ToggleMute, "&Mute audio\tCtrl+Alt+Shift+A", if muted { MF_CHECKED } else { MF_UNCHECKED });
+        }
         item(MenuCmd::ChangePassword, "Change &password…", MF_ENABLED);
         item(MenuCmd::OpenConfig, "Open &config file", MF_ENABLED);
         item(MenuCmd::ForgetPassword, "&Forget saved password", MF_ENABLED);

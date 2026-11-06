@@ -28,6 +28,10 @@ pub struct Args {
     clipboard_selftest: bool,
     /// Also sync clipboard content marked private (password managers).
     clipboard_sync_secrets: bool,
+    /// Audio playback. None = config ("audio", default on); --no-audio.
+    audio: Option<bool>,
+    /// Headless WASAPI check (plays digital silence only), seconds.
+    audio_selftest: Option<f64>,
 }
 
 const USAGE: &str = "usage: glide-client [host[:port] | --listen [PORT]] [options...]
@@ -45,6 +49,10 @@ const USAGE: &str = "usage: glide-client [host[:port] | --listen [PORT]] [option
   --no-ctrl-as-cmd   don't map Ctrl->Cmd / Win->Control (also --ctrl-as-cmd to force it on)
   --no-clipboard     don't sync the clipboard (text + images) with the host (config: \"clipboard\")
   --forget-password  delete the saved (DPAPI-encrypted) password and exit
+  --no-audio         don't stream the Mac's sound (config \"audio\"; Ctrl+Alt+Shift+A mutes)
+  --audio-selftest [SECONDS]
+                     headless: open the default output device and run the audio path on
+                     digital silence (inaudible) for N seconds (default 3); print JSON
   --clipboard-sync-secrets  also send clipboard content that password managers mark private
                      (default: respected, not sent). Env GLIDE_CLIPBOARD_SYNC_SECRETS=1, or config
                      \"clipboard_sync_secrets\": true
@@ -82,6 +90,14 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Strin
                 a.bench = Some(v.parse::<f64>().map_err(|_| format!("bad --bench value {v}"))?);
             }
             "--probe" => a.probe = true,
+            "--no-audio" => a.audio = Some(false),
+            "--audio-selftest" => {
+                let secs = match it.peek() {
+                    Some(v) if v.parse::<f64>().is_ok() => it.next().unwrap().parse().unwrap(),
+                    _ => 3.0,
+                };
+                a.audio_selftest = Some(secs);
+            }
             "--listen" => {
                 // Optional PORT argument.
                 let port = match it.peek() {
@@ -224,6 +240,20 @@ fn main() -> ExitCode {
         }
     }
 
+    if let Some(secs) = args.audio_selftest {
+        #[cfg(windows)]
+        {
+            println!("{}", glide::win::audio::selftest_json(secs));
+            return ExitCode::SUCCESS;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = secs;
+            eprintln!("--audio-selftest is only available on Windows");
+            return ExitCode::from(1);
+        }
+    }
+
     // Persistent settings (+ migration of a legacy plaintext password into DPAPI).
     let (mut store, legacy_pw, warnings) = Store::open(config::config_dir());
     for w in &warnings {
@@ -295,6 +325,10 @@ fn main() -> ExitCode {
             caps |= protocol::CAP_CLIPBOARD;
         }
     }
+    let audio_on = args.audio.unwrap_or(store.config.audio);
+    if audio_on {
+        caps |= protocol::CAP_AUDIO_PCM;
+    }
     let has444 = caps & protocol::CAP_HEVC_444 != 0;
     let (mode, note) = config::resolve_mode(args.mode, &store.config, has444);
     if let Some(n) = note {
@@ -334,7 +368,16 @@ fn main() -> ExitCode {
                 TargetSpec::Listen(port) => Target::Listen(port),
                 TargetSpec::Connect(h) => Target::Connect(h),
             };
-            let opts = Options { ctrl_as_cmd, mode, host_label: host, has444, store, password_source };
+            let opts = Options {
+                ctrl_as_cmd,
+                mode,
+                host_label: host,
+                has444,
+                password_source,
+                audio: audio_on,
+                audio_muted: store.config.audio_muted,
+                store,
+            };
             return match glide::win::app::run(Connector { target, password, hello }, opts) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -426,8 +469,11 @@ mod tests {
         let a = p(&["--listen", "7421", "--password", "x"]).unwrap();
         assert_eq!(a.listen, Some(7421));
         assert_eq!(a.password.as_deref(), Some("x"));
-        let a = p(&["mac.local:7420", "--ctrl-as-cmd", "--forget-password", "--no-clipboard"]).unwrap();
+        let a = p(&["mac.local:7420", "--ctrl-as-cmd", "--forget-password", "--no-clipboard", "--no-audio"]).unwrap();
         assert_eq!(a.clipboard, Some(false));
+        assert_eq!(a.audio, Some(false));
+        assert_eq!(p(&["--audio-selftest"]).unwrap().audio_selftest, Some(3.0));
+        assert_eq!(p(&["--audio-selftest", "5"]).unwrap().audio_selftest, Some(5.0));
         assert_eq!(a.host.as_deref(), Some("mac.local:7420"));
         assert_eq!(a.ctrl_as_cmd, Some(true));
         assert!(a.forget_password);

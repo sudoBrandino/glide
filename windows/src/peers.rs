@@ -89,23 +89,49 @@ pub fn pin_first(allowed: &mut Vec<String>, ip: IpAddr) -> bool {
 pub const BACKOFF_START: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
-/// Per-IP exponential backoff after failed handshakes.
+/// While the allowlist is unpinned: more than this many failed handshakes (all peers) within
+/// `GLOBAL_WINDOW` refuses every unpinned peer for `GLOBAL_LOCKOUT`.
+pub const GLOBAL_FAILURES: usize = 10;
+pub const GLOBAL_WINDOW: Duration = Duration::from_secs(60);
+pub const GLOBAL_LOCKOUT: Duration = Duration::from_secs(60);
+
+/// Backoff bucket for an address: IPv4 per address, IPv6 per /64 (a peer can rotate freely
+/// within its /64), IPv4-mapped IPv6 as its IPv4.
+pub fn backoff_key(ip: IpAddr) -> IpAddr {
+    match canonical(ip) {
+        IpAddr::V6(v6) => IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64))),
+        v4 => v4,
+    }
+}
+
+/// Exponential backoff after failed handshakes, per IPv4 address / IPv6 /64, plus a global
+/// failure budget that applies while no host is pinned.
 #[derive(Debug, Default)]
 pub struct Backoff {
-    /// ip → (consecutive failures, blocked until)
+    /// key → (consecutive failures, blocked until)
     state: HashMap<IpAddr, (u32, Instant)>,
+    /// Times of recent failed handshakes (any peer), for the global budget.
+    recent: std::collections::VecDeque<Instant>,
+    global_until: Option<Instant>,
 }
 
 impl Backoff {
     /// Some(remaining) if connections from `ip` must be dropped right now.
     pub fn blocked(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
-        let (_, until) = self.state.get(&canonical(ip))?;
+        let (_, until) = self.state.get(&backoff_key(ip))?;
         (now < *until).then(|| *until - now)
+    }
+
+    /// Some(remaining) while the global budget is exhausted. Only enforced for *unpinned*
+    /// peers (empty allowlist); an allowlisted host is never affected.
+    pub fn global_blocked(&self, now: Instant) -> Option<Duration> {
+        let until = self.global_until?;
+        (now < until).then(|| until - now)
     }
 
     /// Record a failed handshake; returns the new block duration (1 s, 2 s, 4 s … 60 s).
     pub fn failed(&mut self, ip: IpAddr, now: Instant) -> Duration {
-        let e = self.state.entry(canonical(ip)).or_insert((0, now));
+        let e = self.state.entry(backoff_key(ip)).or_insert((0, now));
         e.0 = e.0.saturating_add(1);
         let d = BACKOFF_START.saturating_mul(1u32 << (e.0 - 1).min(16)).min(BACKOFF_MAX);
         e.1 = now + d;
@@ -113,12 +139,21 @@ impl Backoff {
         if self.state.len() > 1024 {
             self.state.retain(|_, (_, until)| now < *until + BACKOFF_MAX);
         }
+        // Global budget.
+        self.recent.push_back(now);
+        while self.recent.front().is_some_and(|t| now.duration_since(*t) > GLOBAL_WINDOW) {
+            self.recent.pop_front();
+        }
+        if self.recent.len() > GLOBAL_FAILURES {
+            self.global_until = Some(now + GLOBAL_LOCKOUT);
+            self.recent.clear();
+        }
         d
     }
 
-    /// A successful authenticated session clears the IP's record.
+    /// A successful authenticated session clears the peer's record.
     pub fn succeeded(&mut self, ip: IpAddr) {
-        self.state.remove(&canonical(ip));
+        self.state.remove(&backoff_key(ip));
     }
 }
 
@@ -126,7 +161,8 @@ impl Backoff {
 /// - Peers not in `allowed_peers` (when non-empty) and peers in a failed-handshake backoff window
 ///   are dropped right after accept(), before any handshake byte is sent or read.
 /// - A peer that doesn't complete the handshake within `deadline` is cut off (and backed off).
-/// - Any failed handshake starts/extends that IP's backoff; a successful one clears it.
+/// - Any failed handshake starts/extends that IP's (IPv6: /64's) backoff; a successful one clears it.
+/// - While nothing is pinned (empty allowlist), a global failure budget applies too.
 ///
 /// Ok(None) = interrupted by quit/pause.
 pub fn accept_admitted(
@@ -156,6 +192,12 @@ pub fn accept_admitted(
         if !is_allowed(&allowed, ip) {
             eprintln!("refused connection from {peer}: not in allowed_peers {allowed:?}");
             continue; // dropping the stream closes it
+        }
+        if allowed.is_empty() {
+            if let Some(rem) = backoff.global_blocked(Instant::now()) {
+                eprintln!("refused connection from {peer}: too many failed handshakes recently ({:.0} s left)", rem.as_secs_f64().ceil());
+                continue;
+            }
         }
         if let Some(rem) = backoff.blocked(ip, Instant::now()) {
             eprintln!("refused connection from {peer}: backing off after failed handshakes ({:.0} s left)", rem.as_secs_f64().ceil());
@@ -272,6 +314,40 @@ mod tests {
         assert!(!pin_first(&mut l, ip("192.168.10.9")), "already pinned");
         assert_eq!(l.len(), 1);
         assert!(is_allowed(&l, ip("192.168.50.4")) && !is_allowed(&l, ip("192.168.10.9")));
+    }
+
+    #[test]
+    fn ipv6_backoff_is_per_64() {
+        let mut b = Backoff::default();
+        let t0 = Instant::now();
+        b.failed(ip("2001:db8:1:2::1"), t0);
+        assert!(b.blocked(ip("2001:db8:1:2:ffff:1234:5678:9abc"), t0).is_some(), "same /64");
+        assert!(b.blocked(ip("2001:db8:1:3::1"), t0).is_none(), "other /64");
+        assert_eq!(b.failed(ip("2001:db8:1:2::77"), t0), Duration::from_secs(2), "rotation keeps doubling");
+        assert_eq!(backoff_key(ip("::ffff:10.0.0.9")), ip("10.0.0.9"));
+        assert_eq!(backoff_key(ip("10.0.0.9")), ip("10.0.0.9"), "IPv4 stays per address");
+        b.failed(ip("10.0.0.9"), t0);
+        assert!(b.blocked(ip("10.0.0.10"), t0).is_none());
+    }
+
+    #[test]
+    fn global_budget() {
+        let mut b = Backoff::default();
+        let t0 = Instant::now();
+        // failures spread over time don't trip it
+        for i in 0..30u64 {
+            b.failed(ip(&format!("10.1.0.{i}")), t0 + Duration::from_secs(i * 7));
+        }
+        assert!(b.global_blocked(t0 + Duration::from_secs(211)).is_none());
+        // > 10 within 60 s from distinct peers does
+        let t1 = t0 + Duration::from_secs(1000);
+        for i in 0..GLOBAL_FAILURES {
+            b.failed(ip(&format!("10.2.0.{i}")), t1);
+            assert!(b.global_blocked(t1).is_none(), "{i}");
+        }
+        b.failed(ip("10.2.0.99"), t1);
+        assert_eq!(b.global_blocked(t1), Some(GLOBAL_LOCKOUT));
+        assert!(b.global_blocked(t1 + GLOBAL_LOCKOUT).is_none(), "expires");
     }
 
     #[test]
@@ -425,5 +501,21 @@ mod accept_tests {
         let mut allowed = Vec::new();
         assert!(pin_first(&mut allowed, ip));
         assert_eq!(allowed, vec!["127.0.0.1"]);
+    }
+
+    #[test]
+    fn global_lockout_spares_pinned_hosts() {
+        let mut b = Backoff::default();
+        let t = Instant::now();
+        for i in 0..=GLOBAL_FAILURES {
+            b.failed(format!("10.3.0.{i}").parse().unwrap(), t);
+        }
+        assert!(b.global_blocked(Instant::now()).is_some());
+        // unpinned: everyone refused before the handshake
+        let (n, b, what) = probe(vec![], b, Duration::from_millis(300));
+        assert_eq!((n, what.as_str()), (0, "aborted"));
+        // pinned + allowlisted: still gets the handshake
+        let (n, _, _) = probe(vec!["127.0.0.1".into()], b, Duration::from_millis(300));
+        assert_eq!(n, crate::crypto::CLIENT_HS_LEN);
     }
 }

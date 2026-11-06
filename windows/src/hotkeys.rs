@@ -16,6 +16,7 @@ pub enum Action {
     ToggleKeyboardCapture = 4,
     RequestKeyframe = 5,
     Reconnect = 6,
+    ToggleMute = 7,
 }
 
 impl Action {
@@ -27,6 +28,7 @@ impl Action {
             4 => Action::ToggleKeyboardCapture,
             5 => Action::RequestKeyframe,
             6 => Action::Reconnect,
+            7 => Action::ToggleMute,
             _ => return None,
         })
     }
@@ -39,12 +41,14 @@ impl Action {
             "keyboard" | "k" => Action::ToggleKeyboardCapture,
             "keyframe" | "r" => Action::RequestKeyframe,
             "reconnect" | "d" => Action::Reconnect,
+            "mute" | "a" => Action::ToggleMute,
             _ => return None,
         })
     }
 }
 
 /// HID usages of the hotkey letters.
+pub const KEY_A: u16 = 0x04;
 pub const KEY_D: u16 = 0x07;
 pub const KEY_F: u16 = 0x09;
 pub const KEY_H: u16 = 0x0B;
@@ -62,6 +66,7 @@ pub const TABLE: &[(u16, Action, &str)] = &[
     (KEY_K, Action::ToggleKeyboardCapture, "Ctrl+Alt+Shift+K  release/recapture the keyboard (released: keys go to Windows)"),
     (KEY_R, Action::RequestKeyframe, "Ctrl+Alt+Shift+R  request a keyframe (fix a smeared picture)"),
     (KEY_D, Action::Reconnect, "Ctrl+Alt+Shift+D  disconnect and reconnect"),
+    (KEY_A, Action::ToggleMute, "Ctrl+Alt+Shift+A  mute / unmute audio"),
 ];
 
 pub fn help() -> String {
@@ -142,7 +147,8 @@ mod tests {
         assert_eq!(match_hotkey(CAS, KEY_K), Some(Action::ToggleKeyboardCapture));
         assert_eq!(match_hotkey(CAS, KEY_R), Some(Action::RequestKeyframe));
         assert_eq!(match_hotkey(CAS, KEY_D), Some(Action::Reconnect));
-        assert_eq!(match_hotkey(CAS, 0x04 /* A */), None);
+        assert_eq!(match_hotkey(CAS, KEY_A), Some(Action::ToggleMute));
+        assert_eq!(match_hotkey(CAS, 0x05 /* B */), None);
         // missing any modifier → forwarded to the host as usual (e.g. Cmd+Shift+H, Cmd+Opt+H)
         for m in [
             Mods { ctrl: false, ..CAS },

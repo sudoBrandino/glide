@@ -71,6 +71,15 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
     let mut need_key = true;
     let mut skipped_until_key = 0u64;
     let mut closed: Option<String> = None;
+    // Audio (§3.2): arrival statistics only (nothing is played).
+    let mut audio_cfg: Option<crate::protocol::AudioConfig> = None;
+    let mut audio_frames = 0u64;
+    let mut audio_samples = 0u64;
+    let mut audio_lost = 0u64;
+    let mut audio_next_seq: Option<u32> = None;
+    let mut audio_delay_ms: Vec<f64> = Vec::new(); // first-sample capture -> arrival
+    let mut audio_last_rx: Option<u64> = None;
+    let mut audio_max_gap_ms = 0f64;
 
     while Instant::now() < deadline {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -187,6 +196,30 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
                 }
             }
             NetEvent::Msg(HostMsg::CursorShape { .. }) => cursor_shapes += 1,
+            NetEvent::Msg(HostMsg::AudioConfig(c)) => {
+                audio_cfg = Some(c);
+                audio_next_seq = None;
+            }
+            NetEvent::Msg(HostMsg::AudioFrame { seq, capture_time_us, data }) => {
+                audio_frames += 1;
+                if let Some(c) = audio_cfg.filter(|c| c.channels > 0) {
+                    audio_samples += data.len() as u64 / (2 * c.channels as u64);
+                }
+                if let Some(e) = audio_next_seq {
+                    let d = seq.wrapping_sub(e);
+                    if d != 0 && d < 1 << 31 {
+                        audio_lost += d as u64;
+                    }
+                }
+                audio_next_seq = Some(seq.wrapping_add(1));
+                if let Some(cap) = conn.clock.lock().unwrap().host_to_client_us(capture_time_us) {
+                    audio_delay_ms.push((rx_us as i64 - cap) as f64 / 1000.0);
+                }
+                if let Some(l) = audio_last_rx {
+                    audio_max_gap_ms = audio_max_gap_ms.max((rx_us - l) as f64 / 1000.0);
+                }
+                audio_last_rx = Some(rx_us);
+            }
             NetEvent::Msg(_) => {}
         }
     }
@@ -209,6 +242,22 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
         clock.rtts_ms.iter().cloned().fold(f64::INFINITY, f64::min) / 2.0
     );
     let errs: Vec<String> = errors.iter().map(|e| json_str(e)).collect();
+    let audio = match audio_cfg {
+        None => "null".to_string(),
+        Some(c) => format!(
+            "{{\"codec\":{},\"rate\":{},\"channels\":{},\"frames\":{},\"seconds_of_audio\":{:.2},\"lost_frames\":{},\"capture_to_arrival_ms\":{{\"p50\":{},\"p95\":{},\"max\":{}}},\"max_arrival_gap_ms\":{:.1}}}",
+            c.codec,
+            c.sample_rate,
+            c.channels,
+            audio_frames,
+            audio_samples as f64 / c.sample_rate.max(1) as f64,
+            audio_lost,
+            json_opt(percentile(&audio_delay_ms, 50.0)),
+            json_opt(percentile(&audio_delay_ms, 95.0)),
+            json_opt(audio_delay_ms.iter().cloned().reduce(f64::max)),
+            audio_max_gap_ms
+        ),
+    };
     let layers = format!(
         concat!(
             "{{\"base_frames\":{},\"sharp_frames\":{},\"sharp_received\":{},\"sharp_configs\":{},\"sharp_mbytes\":{:.3},",
@@ -235,7 +284,7 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
             "\"keyframes\":{},\"configs\":{},\"cursor_shapes\":{},\"bytes\":{},\"mbps\":{:.3},\"layers\":{},",
             "\"decode_ms\":{{\"p50\":{},\"p95\":{},\"max\":{}}},\"recv_to_decode_start_ms_p50\":{},",
             "\"rtt_ms\":{{\"p50\":{},\"min\":{},\"samples\":{}}},\"e2e_capture_to_decoded_ms\":{{\"p50\":{},\"p95\":{},\"samples\":{}}},",
-            "\"est_latency_notes\":{},\"errors\":[{}]}}"
+            "\"audio\":{},\"est_latency_notes\":{},\"errors\":[{}]}}"
         ),
         json_str(&conn.host_name),
         elapsed,
@@ -266,6 +315,7 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
         json_opt(percentile(&e2e_ms, 50.0)),
         json_opt(percentile(&e2e_ms, 95.0)),
         e2e_ms.len(),
+        audio,
         json_str(&notes),
         errs.join(",")
     )

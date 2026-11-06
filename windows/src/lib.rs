@@ -4,6 +4,7 @@
 //! build and test on any OS; the Windows-only decoder/renderer/UI live in `win`.
 
 pub mod annexb;
+pub mod audio;
 pub mod bench;
 pub mod clipboard;
 pub mod config;
