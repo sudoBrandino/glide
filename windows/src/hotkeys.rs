@@ -17,6 +17,7 @@ pub enum Action {
     RequestKeyframe = 5,
     Reconnect = 6,
     ToggleMute = 7,
+    OpenMenu = 8,
 }
 
 impl Action {
@@ -29,6 +30,7 @@ impl Action {
             5 => Action::RequestKeyframe,
             6 => Action::Reconnect,
             7 => Action::ToggleMute,
+            8 => Action::OpenMenu,
             _ => return None,
         })
     }
@@ -42,6 +44,7 @@ impl Action {
             "keyframe" | "r" => Action::RequestKeyframe,
             "reconnect" | "d" => Action::Reconnect,
             "mute" | "a" => Action::ToggleMute,
+            "menu" | "space" => Action::OpenMenu,
             _ => return None,
         })
     }
@@ -55,6 +58,7 @@ pub const KEY_H: u16 = 0x0B;
 pub const KEY_K: u16 = 0x0E;
 pub const KEY_M: u16 = 0x10;
 pub const KEY_R: u16 = 0x15;
+pub const KEY_SPACE: u16 = 0x2C;
 pub const KEY_ENTER: u16 = 0x28;
 pub const KEY_F11: u16 = 0x44;
 
@@ -67,6 +71,7 @@ pub const TABLE: &[(u16, Action, &str)] = &[
     (KEY_R, Action::RequestKeyframe, "Ctrl+Alt+Shift+R  request a keyframe (fix a smeared picture)"),
     (KEY_D, Action::Reconnect, "Ctrl+Alt+Shift+D  disconnect and reconnect"),
     (KEY_A, Action::ToggleMute, "Ctrl+Alt+Shift+A  mute / unmute audio"),
+    (KEY_SPACE, Action::OpenMenu, "Ctrl+Alt+Shift+Space  open the Glide menu at the mouse pointer"),
 ];
 
 pub fn help() -> String {
@@ -148,6 +153,8 @@ mod tests {
         assert_eq!(match_hotkey(CAS, KEY_R), Some(Action::RequestKeyframe));
         assert_eq!(match_hotkey(CAS, KEY_D), Some(Action::Reconnect));
         assert_eq!(match_hotkey(CAS, KEY_A), Some(Action::ToggleMute));
+        assert_eq!(match_hotkey(CAS, KEY_SPACE), Some(Action::OpenMenu));
+        assert_eq!(match_hotkey(Mods { ctrl: true, ..Default::default() }, KEY_SPACE), None, "Cmd+Space goes to the Mac");
         assert_eq!(match_hotkey(CAS, 0x05 /* B */), None);
         // missing any modifier → forwarded to the host as usual (e.g. Cmd+Shift+H, Cmd+Opt+H)
         for m in [

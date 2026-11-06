@@ -368,6 +368,9 @@ class Session:
                 log(f"{self.addr}: clipboard sync negotiated (sent ClipboardCaps)")
                 if self.args.clip_text is not None or self.args.clip_png:
                     threading.Thread(target=self.clip_push_loop, daemon=True).start()
+            # DisplayInfo (§3.3): pretend the Mac runs 1920x1080 Retina under "automatic".
+            self.display_pref = 0
+            self.send_display_info()
             self.send_cursor()
             t = threading.Thread(target=self.video_loop, args=(st,), daemon=True)
             t.start()
@@ -551,6 +554,12 @@ class Session:
         except (OSError, EOFError):
             self.alive = False
 
+    DISPLAY_MODES = {0: (1920, 1080, 1), 1: (3840, 2160, 0), 2: (2560, 1440, 1), 3: (1920, 1080, 1), 4: (1920, 1080, 1)}
+
+    def send_display_info(self):
+        w, h, hi = self.DISPLAY_MODES.get(self.display_pref, (1920, 1080, 1))
+        self.send_msg(bytes([0x05, self.display_pref]) + struct.pack("<HHB", w, h, hi))
+
     def input_loop(self):
         names = {0x10: "MouseMove", 0x11: "MouseButton", 0x12: "MouseWheel", 0x13: "Key", 0x14: "ReleaseAll",
                  0x20: "RequestKeyframe", 0x21: "SetMode", 0x50: "Clipboard"}
@@ -580,6 +589,12 @@ class Session:
             elif t == 0x15:
                 vw, vh = struct.unpack("<HH", m[1:5])
                 log(f"{self.addr}: ViewSize {vw}x{vh}")
+            elif t == 0x16:
+                names16 = ["automatic", "crisp", "smooth", "retina", "manual"]
+                log(f"{self.addr}: SetDisplayPreference {names16[m[1]] if m[1] < 5 else m[1]}")
+                if m[1] < 5:
+                    self.display_pref = m[1]
+                    self.send_display_info()
             elif t == 0x20:
                 log(f"{self.addr}: RequestKeyframe -> restarting stream at first keyframe")
                 self.restart.set()
