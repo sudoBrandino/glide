@@ -24,6 +24,105 @@ public struct CodecCaps: OptionSet, Sendable {
     public static let audioPCM = CodecCaps(rawValue: 1 << 9)
     /// Reserved: Opus audio.
     public static let audioOpus = CodecCaps(rawValue: 1 << 10)
+    /// File transfer, both directions (§6).
+    public static let files = CodecCaps(rawValue: 1 << 11)
+}
+
+/// One file of a FileOffer (PROTOCOL.md §6). `path` is '/'-separated and relative; receivers sanitize it.
+public struct FileEntry: Equatable, Sendable {
+    public var path: String
+    public var size: UInt64
+    /// Modification time, ms since the Unix epoch (0 = unknown).
+    public var mtimeMs: Int64
+    public init(path: String, size: UInt64, mtimeMs: Int64) { self.path = path; self.size = size; self.mtimeMs = mtimeMs }
+}
+
+/// File-transfer messages (§6, types 0x70-0x7F), carried by both ClientMessage and HostMessage.
+public enum FileMessage: Equatable, Sendable {
+    /// 0x70 H->C. `flags`: FileMessage.capsReceive | capsSend.
+    case caps(flags: UInt32, maxTotalBytes: UInt64, maxFiles: UInt32)
+    case offer(id: UInt32, totalBytes: UInt64, files: [FileEntry])
+    /// status 0 = accepted, else a decline reason (FileStatus).
+    case answer(id: UInt32, status: UInt8, detail: String)
+    case chunk(id: UInt32, index: UInt32, offset: UInt64, data: Data)
+    case end(id: UInt32, index: UInt32, sha256: Data)
+    case ack(id: UInt32, bytes: UInt64)
+    case cancel(id: UInt32, reason: UInt8, detail: String)
+    case done(id: UInt32, files: UInt32)
+    /// 0x78 C->H: send the files on the pasteboard.
+    case pull
+    /// 0x79 H->C: 0 = an offer follows.
+    case pullResult(status: UInt8, detail: String)
+
+    public static let capsReceive: UInt32 = 1 << 0
+    public static let capsSend: UInt32 = 1 << 1
+    /// Largest FileChunk payload.
+    public static let chunkMax = 256 * 1024
+    /// A sender keeps at most this many chunk bytes unacknowledged (protocol maximum).
+    public static let window: UInt64 = 1 << 20
+    /// The window Glide's senders use: ≤ 512 KiB of file data ahead of a video frame / input
+    /// event anywhere in the pipe (~4 ms at 1 Gbit/s).
+    public static let sendWindow: UInt64 = 512 << 10
+    /// Unwritten chunk bytes a receiver tolerates before cancelling (sender ignored the window).
+    public static let receiveQueueMax: UInt64 = 4 << 20
+    /// Host-chosen transfer ids have bit 31 set.
+    public static let hostIdBit: UInt32 = 0x8000_0000
+
+    func write(_ w: inout ByteWriter) {
+        switch self {
+        case let .caps(f, t, n): w.u8(0x70); w.u32(f); w.u64(t); w.u32(n)
+        case let .offer(id, total, files):
+            w.u8(0x71); w.u32(id); w.u64(total); w.u32(UInt32(files.count))
+            for f in files { w.str(f.path); w.u64(f.size); w.u64(UInt64(bitPattern: f.mtimeMs)) }
+        case let .answer(id, st, d): w.u8(0x72); w.u32(id); w.u8(st); w.str(d)
+        case let .chunk(id, idx, off, data): w.u8(0x73); w.u32(id); w.u32(idx); w.u64(off); w.bytes(data)
+        case let .end(id, idx, sha): w.u8(0x74); w.u32(id); w.u32(idx); w.bytes(sha)
+        case let .ack(id, n): w.u8(0x75); w.u32(id); w.u64(n)
+        case let .cancel(id, r, d): w.u8(0x76); w.u32(id); w.u8(r); w.str(d)
+        case let .done(id, n): w.u8(0x77); w.u32(id); w.u32(n)
+        case .pull: w.u8(0x78)
+        case let .pullResult(st, d): w.u8(0x79); w.u8(st); w.str(d)
+        }
+    }
+
+    public var encoded: Data {
+        var w: ByteWriter
+        if case let .chunk(_, _, _, data) = self { w = ByteWriter(capacity: data.count + 17) } else { w = ByteWriter() }
+        write(&w)
+        return w.data
+    }
+
+    static func read(type t: UInt8, _ r: inout ByteReader) throws -> FileMessage {
+        switch t {
+        case 0x70: return .caps(flags: try r.u32(), maxTotalBytes: try r.u64(), maxFiles: try r.u32())
+        case 0x71:
+            let id = try r.u32(), total = try r.u64(), n = Int(try r.u32())
+            // Each entry is at least 18 bytes: don't trust `n` for the allocation.
+            guard n <= r.remaining / 18 else { throw WireError.truncated }
+            var files: [FileEntry] = []
+            files.reserveCapacity(n)
+            for _ in 0..<n {
+                let p = try r.str()  // invalid UTF-8 is replaced (U+FFFD), never fatal
+                files.append(FileEntry(path: p, size: try r.u64(), mtimeMs: Int64(bitPattern: try r.u64())))
+            }
+            return .offer(id: id, totalBytes: total, files: files)
+        case 0x72: return .answer(id: try r.u32(), status: try r.u8(), detail: try r.str())
+        case 0x73: return .chunk(id: try r.u32(), index: try r.u32(), offset: try r.u64(), data: r.rest())
+        case 0x74: return .end(id: try r.u32(), index: try r.u32(), sha256: try r.bytes(32))
+        case 0x75: return .ack(id: try r.u32(), bytes: try r.u64())
+        case 0x76: return .cancel(id: try r.u32(), reason: try r.u8(), detail: try r.str())
+        case 0x77: return .done(id: try r.u32(), files: try r.u32())
+        case 0x78: return .pull
+        case 0x79: return .pullResult(status: try r.u8(), detail: try r.str())
+        default: throw WireError.unknownMessage(t)
+        }
+    }
+
+    public static func decode(_ d: Data) throws -> FileMessage {
+        var r = ByteReader(d)
+        let t = try r.u8()
+        return try read(type: t, &r)
+    }
 }
 
 /// One clipboard snapshot (PROTOCOL.md §5): `u32 seq`, `u8 count`, count x (`u8 format`, `u32 len`, bytes).
@@ -168,6 +267,7 @@ public enum ClientMessage {
     case audioEnable(Bool)
     /// Pairing (§2.4): the user compared the codes (true = they match).
     case pairConfirm(Bool)
+    case file(FileMessage)
     /// §3.4: `flags` bit0 = send FrameTiming for every VideoFrame.
     case latencyEnable(flags: UInt8)
     case latencyReport(LatencyReport)
@@ -191,6 +291,7 @@ public enum ClientMessage {
         case let .clipboard(c): w = ByteWriter(capacity: c.payloadBytes + 32); w.u8(0x50); c.write(&w)
         case let .audioEnable(on): w.u8(0x62); w.u8(on ? 1 : 0)
         case let .pairConfirm(ok): w.u8(0x0A); w.u8(ok ? 1 : 0)
+        case let .file(m): return m.encoded
         case let .latencyEnable(f): w.u8(0x80); w.u8(f)
         case let .latencyReport(r):
             w.u8(0x82); w.u16(r.samples); w.u8(r.flags)
@@ -220,6 +321,7 @@ public enum ClientMessage {
         case 0x50: return .clipboard(try ClipboardData.read(&r))
         case 0x62: return .audioEnable(try r.u8() != 0)
         case 0x0A: return .pairConfirm(try r.u8() != 0)
+        case 0x70...0x79: return .file(try FileMessage.read(type: t, &r))
         case 0x80: return .latencyEnable(flags: try r.u8())
         case 0x82:
             let n = try r.u16(), f = try r.u8()
@@ -251,6 +353,7 @@ public enum HostMessage {
     case audioConfig(AudioConfig)
     /// `pcm`: interleaved s16le samples (codec 1).
     case audioFrame(seq: UInt32, captureTimeUs: UInt64, pcm: Data)
+    case file(FileMessage)
     /// §3.4, only after the viewer's LatencyEnable.
     case frameTiming(FrameTiming)
     /// Current display preference (`DisplayModePreference.wireValue`) and mode: "looks like" size in
@@ -286,6 +389,7 @@ public enum HostMessage {
         case let .audioFrame(seq, t, pcm):
             w = ByteWriter(capacity: pcm.count + 13)
             w.u8(0x61); w.u32(seq); w.u64(t); w.bytes(pcm)
+        case let .file(m): return m.encoded
         case let .frameTiming(ft): w.u8(0x81); ft.write(&w)
         case let .displayInfo(p, mw, mh, hi): w.u8(0x05); w.u8(p); w.u16(mw); w.u16(mh); w.u8(hi ? 1 : 0)
         }
@@ -321,6 +425,7 @@ public enum HostMessage {
         case 0x51: return .clipboardCaps(formats: try r.u32(), maxBytes: try r.u32())
         case 0x60: return .audioConfig(try AudioConfig.read(&r))
         case 0x61: return .audioFrame(seq: try r.u32(), captureTimeUs: try r.u64(), pcm: r.rest())
+        case 0x70...0x79: return .file(try FileMessage.read(type: t, &r))
         case 0x81: return .frameTiming(try FrameTiming.read(&r))
         case 0x05: return .displayInfo(preference: try r.u8(), modeW: try r.u16(), modeH: try r.u16(), hidpi: try r.u8() != 0)
         default: throw WireError.unknownMessage(t)

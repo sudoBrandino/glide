@@ -12,6 +12,7 @@ pub mod clipboard;
 pub mod config;
 pub mod connbar;
 pub mod crypto;
+pub mod files;
 pub mod handshake;
 pub mod hid;
 pub mod hotkeys;

@@ -9,6 +9,7 @@
 //! security v2: key pinning + a 6-digit code confirmed on both screens), and a tray icon (`tray`).
 
 use super::clipboard;
+use super::files;
 use super::audio::Audio;
 use super::cursor::{create_cursor, destroy_cursor, scale_image, CursorImage};
 use super::d3d::Gpu;
@@ -242,6 +243,8 @@ struct UiState {
     /// Mouse buttons whose down went to the connection bar (their ups aren't forwarded either).
     bar_buttons: u8,
     tray: Option<tray::Tray>,
+    /// The last tray balloon was "files received": clicking it shows them in Explorer.
+    balloon_shows_files: bool,
     last_latency_report: Option<Instant>,
     last_latency_log: Option<Instant>,
 }
@@ -1081,6 +1084,10 @@ fn update_title(hwnd: HWND) {
         s.hud_on
     });
     render_cmd(RenderCmd::Hud(hud_on.then_some(lines)));
+    // File transfer progress: keep a toast line up while transfers run (this runs every 500 ms).
+    if let Some(line) = files::progress_line() {
+        toast(line);
+    }
 
     // Title: just who we're looking at (stats live in the HUD, Ctrl+Alt+Shift+H).
     let mut t = match &status {
@@ -1263,6 +1270,8 @@ fn do_action(hwnd: HWND, a: Action) {
             }
         }
         Action::ToggleMute => toggle_mute(hwnd),
+        Action::PullFiles => toast(files::pull()),
+        Action::CancelFiles => toast(files::cancel()),
         Action::LatencyTest => {
             if sh.latency_test.load(Ordering::Relaxed) {
                 let path = write_latency_report();
@@ -1336,8 +1345,10 @@ fn menu_state() -> menu_model::MenuState {
             fullscreen: s.fullscreen_saved.is_some(),
             keyboard_released: s.kb_released,
             bar_pinned: cbar::pinned(),
-            // TODO(file-transfer): true once the host negotiated file transfer (caps bit 11).
-            file_transfer: false,
+            files_on: files::enabled(),
+            file_transfer: files::peer_flags().is_some_and(|f| f & protocol::FILE_CAPS_RECEIVE != 0),
+            file_pull: files::peer_flags().is_some_and(|f| f & protocol::FILE_CAPS_SEND != 0),
+            files_busy: files::busy(),
             latency_test: sh.latency_test.load(Ordering::Relaxed),
         }
     })
@@ -1407,8 +1418,14 @@ fn run_menu_cmd(hwnd: HWND, c: Cmd) {
             None => toast("No config file (APPDATA not set)"),
         },
         Cmd::OpenMenu => open_menu(hwnd, menu::Anchor::Cursor),
-        // TODO(file-transfer): open a file picker and start the transfer (feat/file-transfer).
-        Cmd::SendFiles => toast("Sending files isn't available yet"),
+        Cmd::SendFiles | Cmd::SendFolder => {
+            if let Some(t) = files::pick_and_send(hwnd, c == Cmd::SendFolder) {
+                toast(t);
+            }
+        }
+        Cmd::ReceiveFiles => do_action(hwnd, Action::PullFiles),
+        Cmd::CancelFiles => do_action(hwnd, Action::CancelFiles),
+        Cmd::OpenReceived => files::open_folder(),
         _ => {}
     }
 }
@@ -1692,12 +1709,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_APP_TRAY if (lparam.0 & 0xFFFF) as u32 == windows::Win32::UI::Shell::NIN_BALLOONUSERCLICK => {
+            if STATE.with(|s| s.borrow().balloon_shows_files) {
+                files::open_folder();
+            }
+            LRESULT(0)
+        }
         WM_APP_TRAY => {
             let st = tray::MenuState {
                 audio: ui().shared.audio.as_ref().map(|a| a.muted()),
                 paused: ui().shared.paused.load(Ordering::Relaxed),
                 hud_on: STATE.with(|s| s.borrow().hud_on),
                 paired: ui().store.lock().unwrap().config.pinned_hosts.get(&ui().shared.pin_target).map(|p| p.name.clone()),
+                files: files::enabled().then(files::busy),
             };
             tray::on_notify(hwnd, lparam, &st);
             LRESULT(0)
@@ -1717,6 +1741,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 Some(tray::MenuCmd::ToggleMute) => toggle_mute(hwnd),
                 Some(tray::MenuCmd::ForgetHost) => forget_host(hwnd),
+                Some(tray::MenuCmd::CancelFiles) => do_action(hwnd, Action::CancelFiles),
+                Some(tray::MenuCmd::OpenDownloads) => files::open_folder(),
                 Some(tray::MenuCmd::Quit) => {
                     let _ = DestroyWindow(hwnd);
                 }
@@ -1856,6 +1882,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         clipboard::WM_APP_CLIPBOARD => {
             clipboard::on_app_clipboard(hwnd);
+            LRESULT(0)
+        }
+        WM_DROPFILES => {
+            if let Some(t) = files::on_drop(windows::Win32::UI::Shell::HDROP(wparam.0 as *mut _)) {
+                toast(t);
+            }
+            LRESULT(0)
+        }
+        files::WM_APP_FILES => {
+            let tray = STATE.with(|s| s.borrow().tray.clone());
+            for n in files::take_notices() {
+                eprintln!("files: {}", n.toast);
+                toast(n.toast);
+                if let (Some((title, body)), Some(t)) = (n.balloon, &tray) {
+                    STATE.with(|s| s.borrow_mut().balloon_shows_files = title.starts_with("Received"));
+                    t.notify(&title, &body);
+                }
+            }
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == EXIT_TIMER => {
@@ -2294,6 +2338,7 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
                 *shared.display_info.lock().unwrap() = Some(d);
             }
             NetEvent::Msg(HostMsg::Clipboard(c)) => clipboard::incoming(c),
+            NetEvent::Msg(HostMsg::File(m)) => files::incoming(m),
             NetEvent::Msg(_) => {}
             NetEvent::Closed(reason) => {
                 let _ = ended_tx.send(reason);
@@ -2311,6 +2356,7 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
         }
     }
     *shared.sender.lock().unwrap() = Some(conn.sender.clone());
+    files::connected(conn.sender.clone());
     set_status(shared, tx, hwnd_raw, None);
     post(hwnd_raw, WM_APP_CONNECTED);
 
@@ -2328,6 +2374,7 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
     *shared.sender.lock().unwrap() = None;
     *shared.clock.lock().unwrap() = None;
     clipboard::disable();
+    files::disconnected();
     if let Some(a) = &shared.audio {
         a.on_disconnected();
     }
@@ -2511,6 +2558,9 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
     check_view(hwnd); // view = the monitor the window actually opened on (before the first hello)
     clipboard::set_active(hwnd, opts_clipboard);
     clipboard::init(hwnd);
+    if let Some(m) = files::init(hwnd, &ui().store.lock().unwrap().config.clone()) {
+        toast(m);
+    }
 
     // --- render thread
     let init = client_size(hwnd);

@@ -37,6 +37,8 @@ final class Session: @unchecked Sendable {
     }
     /// Created at auth if the viewer advertised clipboard support; started after ServerHello.
     private var clipboard: ClipboardSync?
+    /// Created at auth if the viewer advertised file transfer (caps bit 11) and it's enabled.
+    private var files: SessionFiles?
     var onEnd: ((Session) -> Void)?
     /// Called (on the session queue) once a paired viewer sent a valid ClientHello, before
     /// streaming starts. Until then the session must not affect any other session.
@@ -251,6 +253,8 @@ final class Session: @unchecked Sendable {
         displayRestart?.cancel()
         cursor.stop()
         clipboard?.stop(); clipboard = nil
+        files?.stop(); files = nil
+        HostStatus.shared.fileProgress = nil
         inputQueue.async { self.injector.releaseAll() }
         if let p = pipeline { Task { await p.stop() } }
         pipeline = nil
@@ -260,6 +264,15 @@ final class Session: @unchecked Sendable {
     }
 
     func send(_ m: HostMessage) { channel.send(m.encoded) }
+
+    /// Menu "Send Files to Viewer…". False if this viewer can't take files.
+    func sendFiles(_ urls: [URL]) -> Bool {
+        guard let f = files else { return false }
+        f.send(urls)
+        return true
+    }
+
+    func cancelFiles() { files?.engine.cancelAll() }
 
     // MARK: Messages
 
@@ -301,6 +314,15 @@ final class Session: @unchecked Sendable {
             log("session \(id): '\(name)' (\(GlideHandshake.fingerprint(viewerKey ?? Data()))) authenticated from \(peer) (proto v\(version), view \(vw)x\(vh), caps \(caps.rawValue), mode \(mode), fps \(maxFps))")
             if caps.contains(.clipboard) {
                 clipboard = ClipboardSync(sessionId: id, syncConcealed: settings.clipboardSyncConcealed) { [weak self] c in self?.send(.clipboard(c)) }
+            }
+            if caps.contains(.files) && settings.files.enabled {
+                let ch = channel
+                let f = SessionFiles(sessionId: id, viewerName: name, config: settings.files,
+                                     send: { m, onSent in ch.send(HostMessage.file(m).encoded, completion: onSent.map { f in { _ in f() } }) },
+                                     backlog: { ch.bytesInFlight })
+                files = f
+                HostStatus.shared.fileProgress = { f.engine.progress }
+                HostStatus.shared.files(id: id, true)
             }
             // Switch the Mac's display mode for this viewer first (if the policy says so), then capture once.
             DisplayModeController.shared.sessionBegan(id: id, viewW: Int(vw), viewH: Int(vh)) { [weak self] in
@@ -349,6 +371,7 @@ final class Session: @unchecked Sendable {
             audio?.setEnabled(on)
             if audio != nil { HostStatus.shared.audio(id: id, on ? "on" : "muted") }
         case let .clipboard(c): clipboard?.apply(c)
+        case let .file(m): files?.handle(m)  // nil unless negotiated in this authenticated session
         case let .latencyEnable(f):
             timingEnabled = f & 1 != 0
             log("session \(id): viewer \(timingEnabled ? "enabled" : "disabled") per-frame latency timing")
@@ -386,6 +409,8 @@ final class Session: @unchecked Sendable {
                     self.send(.clipboardCaps(formats: ClipboardData.capsText | ClipboardData.capsPNG, maxBytes: UInt32(ClipboardData.maxBytes)))
                     clip.start()
                 }
+                // Only to viewers with caps bit 11 (PROTOCOL.md §6), after ServerHello.
+                if let f = self.files { self.send(.file(f.caps)) }
                 if self.audioOff { self.send(.audioConfig(.off)) }
                 self.audio?.arm()
                 self.helloSent = true

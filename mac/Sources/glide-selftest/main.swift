@@ -8,6 +8,7 @@ import GlideCore
 // docs/test-vectors-rust.json (Rust-generated transcript) and docs/noise-vectors.json (official
 // Noise vectors), all next to the path given (default ../docs/test-vectors.json).
 // Usage: glide-selftest [path/to/test-vectors.json]
+//        glide-selftest --file-host PORT [--key-file F] [...]   (file-transfer e2e host, FileHost.swift)
 
 var failures = 0
 func check(_ ok: Bool, _ what: String) {
@@ -439,6 +440,7 @@ func trackerChecks() {
     check(t6.observe(current: other, now: 1) == .manual, "tracker: change with no switch is manual")
 }
 
+if CommandLine.arguments.dropFirst().first == "--file-host" { runFileHost(Array(CommandLine.arguments.dropFirst(2))) }
 /// PROTOCOL.md §3.4 reference bytes and the docs/LATENCY.md block code (the Rust viewer and
 /// tools/mock_host.py --selftest check the same vectors).
 func latencyTests() throws {
@@ -476,6 +478,10 @@ trackerChecks()
 do { try clipboardTests() } catch { failures += 1; print("  FAIL clipboard threw \(error)") }
 pasteboardTests()
 do { try audioTests() } catch { failures += 1; print("  FAIL audio threw \(error)") }
+do {
+    let vpath = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "../docs/test-vectors.json"
+    try fileTests(vectorsDir: URL(fileURLWithPath: vpath).deletingLastPathComponent())
+} catch { failures += 1; print("  FAIL file transfer threw \(error)") }
 do { try displayWireTests() } catch { failures += 1; print("  FAIL display wire threw \(error)") }
 print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)

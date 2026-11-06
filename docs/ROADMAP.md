@@ -64,6 +64,9 @@ Done:
   (PROTOCOL.md §5).
 - [x] **Audio:** ScreenCaptureKit system audio on the base capture stream → PCM s16le 48 kHz
   stereo → WASAPI through a drift-correcting jitter buffer (PROTOCOL.md §3.2). Mute with Ctrl+F11.
+- [x] **File transfer:** both directions (drag & drop, Finder copy + Ctrl+Alt+Shift+V, menu),
+  sanitized names, no overwrite, SHA-256 verify, quarantine / Mark-of-the-Web, low-priority
+  chunks with an ack window (PROTOCOL.md §6).
 - [x] **CI:** a GitHub Actions workflow that runs:
   - the Mac release build and selftest;
   - Rust tests on Linux and Windows;
@@ -87,13 +90,15 @@ Next:
 - [ ] **UDP video transport with NACK/FEC**, because TCP head-of-line blocking hurts on loss
 - [ ] Multi-monitor support and a display picker
 - [ ] Glass-to-glass latency measurement on the real LAN
-- [ ] Clipboard: files (with file transfer); chunked transfer so big images don't stall video
+- [ ] Clipboard: delayed-render virtual files on Windows paste (Explorer Ctrl+V of Mac files); big
+  clipboard images could reuse the chunked file path so they don't stall video
+- [ ] File transfer: OLE `IDropTarget` (drop feedback, virtual files from Outlook/zip), resume of
+  interrupted transfers, a "Send files to Mac…" picker in the tray
 - [ ] Audio: Opus (codec 2) for non-LAN links; needs a Windows decoder that builds with MinGW
 
 ## v2 — beyond the LAN
 
 - [ ] A self-hosted rendezvous or relay server, for example on the home server, for NAT traversal
-- [ ] File transfer
 
 ## Known issues
 

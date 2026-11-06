@@ -15,6 +15,8 @@ struct HostSettings {
     var maxInFlightBytes = 6 * 1024 * 1024
     /// host.json `clipboard.syncConcealed`: also sync password-manager (concealed) items.
     var clipboardSyncConcealed = false
+    /// host.json `files` (PROTOCOL.md §6).
+    var files = HostFileConfig()
 }
 
 /// host.json `"clipboard": {"syncConcealed": false}` (PROTOCOL.md §5).
@@ -37,6 +39,8 @@ struct HostConfig: Codable {
     var clipboard: ClipboardSettings? = nil
     /// Viewers allowed to connect (security v2 pairing).
     var pairedViewers: [PairedViewer]? = nil
+    /// File transfer options (HostFiles.swift).
+    var files: FileSettings? = nil
 
     static var dir: URL {
         let base: URL
@@ -158,6 +162,7 @@ log("pairing: \(TrustStore.shared.list.count) paired viewer(s)\(TrustStore.share
 var settings = HostSettings(identity: identity)
 if let v = takeValue("--port"), let n = UInt16(v) { settings.port = n }
 settings.clipboardSyncConcealed = config.clipboard?.syncConcealed ?? false
+settings.files = HostFileConfig(config.files)
 if let v = ProcessInfo.processInfo.environment["GLIDE_FPS"], let n = Int(v), n > 0 { settings.fps = n }  // LaunchAgent-friendly
 if let v = takeValue("--fps"), let n = Int(v) { settings.fps = n }
 if let v = takeValue("--bitrate-kbps"), let n = Int(v) { settings.bitrateKbps = n }
@@ -369,8 +374,13 @@ let statusMenu = StatusMenu(actions: .init(disconnect: { server.disconnect() }, 
                                                let gone = TrustStore.shared.remove(matching: v.key)
                                                for g in gone { log("pairing: removed viewer “\(g.name)” (\(g.fingerprint)) via menu") }
                                                server.endSessions(of: gone.compactMap(\.keyData))
-                                           }),
+                                           },
+                                           sendFiles: { server.current?.sendFiles($0) ?? false },
+                                           cancelFiles: { server.current?.cancelFiles() }),
                             displayID: settings.displayID, showStatusItem: !hostTestMode)
+HostNotifier.shared.setUp()
+statusMenu.downloadDir = settings.files.downloadDir
+log("files: transfer \(settings.files.enabled ? "on" : "off"), receiving \(settings.files.receive ? "on" : "off") into \(settings.files.downloadDir.path)")
 if let target = connectTarget {
     let parts = target.split(separator: ":")
     server.dial(host: String(parts[0]), port: parts.count > 1 ? UInt16(parts[1]) ?? 7420 : 7420)

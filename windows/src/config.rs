@@ -80,6 +80,16 @@ pub struct Config {
     pub clipboard: bool,
     /// Also sync clipboard items marked secret/concealed (password managers). Off by default.
     pub clipboard_sync_secrets: bool,
+    /// File transfer with the host (drag & drop onto the window, Ctrl+Alt+Shift+V; §6).
+    pub file_transfer: bool,
+    /// Accept files the Mac sends (menu "Send Files to Viewer…", Ctrl+Alt+Shift+V).
+    pub file_receive: bool,
+    /// Where received files go; None = `<Downloads>\Glide`.
+    pub download_dir: Option<String>,
+    /// Largest transfer (bytes) accepted or sent.
+    pub file_max_total_bytes: u64,
+    /// Most files per transfer.
+    pub file_max_files: u32,
     /// Listen mode: only these IPs / CIDRs may connect (checked before any handshake byte).
     /// Empty = trust on first use: the first host that authenticates is pinned here.
     pub allowed_peers: Vec<String>,
@@ -106,6 +116,11 @@ impl Default for Config {
             audio_muted: false,
             clipboard: true,
             clipboard_sync_secrets: false,
+            file_transfer: true,
+            file_receive: true,
+            download_dir: None,
+            file_max_total_bytes: 8 << 30,
+            file_max_files: 10_000,
             allowed_peers: Vec::new(),
             pinned_hosts: BTreeMap::new(),
             last_monitor: None,
@@ -243,6 +258,11 @@ pub fn parse(text: &str) -> Loaded {
     field!(audio_muted);
     field!(clipboard);
     field!(clipboard_sync_secrets);
+    field!(file_transfer);
+    field!(file_receive);
+    field!(download_dir);
+    field!(file_max_total_bytes);
+    field!(file_max_files);
     field!(allowed_peers);
     field!(pinned_hosts);
     field!(last_monitor);
@@ -262,6 +282,9 @@ pub fn parse(text: &str) -> Loaded {
     }
     if c.host.as_deref().is_some_and(|h| h.trim().is_empty()) {
         c.host = None;
+    }
+    if c.download_dir.as_deref().is_some_and(|h| h.trim().is_empty()) {
+        c.download_dir = None;
     }
     c.version = CONFIG_VERSION;
     if !bad.is_empty() {
@@ -541,6 +564,9 @@ mod tests {
         c.audio = false;
         c.audio_muted = true;
         c.clipboard_sync_secrets = true;
+        c.file_receive = false;
+        c.download_dir = Some(r"D:\Inbox".into());
+        c.file_max_total_bytes = 1 << 30;
         c.allowed_peers = vec!["192.168.50.4".into(), "192.168.50.0/24".into()];
         record_placement(
             &mut c,
@@ -559,6 +585,9 @@ mod tests {
         let old = parse(r#"{"version":1,"hud":true}"#).config;
         assert!(old.clipboard && !old.clipboard_sync_secrets && old.allowed_peers.is_empty());
         assert!(old.audio && !old.audio_muted);
+        assert!(old.file_transfer && old.file_receive && old.download_dir.is_none());
+        assert_eq!((old.file_max_total_bytes, old.file_max_files), (8 << 30, 10_000));
+        assert_eq!(parse(r#"{"version":1,"download_dir":"  "}"#).config.download_dir, None);
     }
 
     #[test]

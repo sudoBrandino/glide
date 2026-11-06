@@ -10,6 +10,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         var openPairing: () -> Void = {}
         var cancelPairing: () -> Void = {}
         var removeViewer: (PairedViewer) -> Void = { _ in }
+        /// Send files to the connected viewer; false if it can't take files.
+        var sendFiles: ([URL]) -> Bool = { _ in false }
+        var cancelFiles: () -> Void = {}
     }
 
     let menu = NSMenu()
@@ -46,6 +49,14 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private let restoreNowItem = NSMenuItem(title: "Restore Now", action: #selector(restoreNow), keyEquivalent: "")
     private let displayInfoItem = NSMenuItem()
     private let displayActionItem = NSMenuItem()
+    // File transfer (§6)
+    private let sendFilesItem = NSMenuItem(title: "Send Files to Viewer…", action: #selector(sendFiles), keyEquivalent: "")
+    private let fileProgressItem = NSMenuItem()
+    private let cancelFilesItem = NSMenuItem(title: "Cancel File Transfer", action: #selector(cancelFiles), keyEquivalent: "")
+    private let recentItem = NSMenuItem(title: "Recent Transfers", action: nil, keyEquivalent: "")
+    private let recentMenu = NSMenu()
+    /// Where received files go (host.json files.downloadDir).
+    var downloadDir: URL?
 
     init(actions: Actions, displayID: CGDirectDisplayID, showStatusItem: Bool = true) {
         self.actions = actions
@@ -81,6 +92,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         viewersMenu.autoenablesItems = false
         viewersItem.submenu = viewersMenu
         menu.addItem(viewersItem)
+        for i in [sendFilesItem, cancelFilesItem] { i.target = self }
+        fileProgressItem.isEnabled = false
+        recentMenu.autoenablesItems = false
+        recentItem.submenu = recentMenu
+        for i in [sendFilesItem, fileProgressItem, cancelFilesItem, recentItem] { menu.addItem(i) }
         menu.addItem(.separator())
 
         displayMenu.autoenablesItems = false
@@ -212,6 +228,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         rebuildViewers(s.pairedViewers, hostFingerprint: s.hostFingerprint)
 
         disconnectItem.isEnabled = s.viewer != nil
+        refreshFiles(s)
         pauseItem.title = s.paused ? (s.dialTarget != nil ? "Resume Dialing" : "Resume") : (s.dialTarget != nil ? "Pause Dialing" : "Pause (Refuse Connections)")
 
         // Display submenu
@@ -268,6 +285,40 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let me = NSMenuItem(title: "This Mac's key: \(hostFingerprint ?? "?")", action: nil, keyEquivalent: "")
         me.isEnabled = false
         viewersMenu.addItem(me)
+    }
+
+    private func refreshFiles(_ s: HostStatus.Snapshot) {
+        sendFilesItem.isEnabled = s.viewer?.files == true
+        sendFilesItem.toolTip = s.viewer == nil ? "No viewer connected" : (s.viewer?.files == true ? nil : "This viewer doesn't support file transfer")
+        let progress = HostStatus.shared.fileProgress?() ?? []
+        fileProgressItem.title = progress.map { p in
+            let pct = p.total == 0 ? 100 : Int(min(100, p.done * 100 / p.total))
+            return "\(p.incoming ? "Receiving" : "Sending") \(FileOffers.fileText(p.files)) — \(pct)% of \(FileOffers.byteText(p.total))"
+        }.joined(separator: " · ")
+        fileProgressItem.isHidden = progress.isEmpty
+        cancelFilesItem.isHidden = progress.isEmpty
+
+        recentMenu.removeAllItems()
+        let tf = DateFormatter()
+        tf.timeStyle = .short; tf.dateStyle = .none
+        for t in s.transfers {
+            let when = tf.string(from: t.date)
+            let title: String
+            if !t.ok { title = "⚠︎ \(t.text ?? "Transfer failed") — \(when)" }
+            else if t.incoming { title = "Received \(FileOffers.fileText(t.files)) · \(FileOffers.byteText(t.bytes)) — \(when)" }
+            else { title = "Sent \(FileOffers.fileText(t.files)) · \(FileOffers.byteText(t.bytes)) — \(when)" }
+            let i = NSMenuItem(title: title, action: t.incoming && t.ok ? #selector(revealTransfer(_:)) : nil, keyEquivalent: "")
+            i.target = self
+            i.representedObject = t.items
+            i.isEnabled = t.incoming && t.ok
+            if t.incoming && t.ok { i.toolTip = "Show in Finder" }
+            recentMenu.addItem(i)
+        }
+        if !s.transfers.isEmpty { recentMenu.addItem(.separator()) }
+        let open = NSMenuItem(title: "Open Received Files Folder", action: #selector(openDownloads), keyEquivalent: "")
+        open.target = self
+        recentMenu.addItem(open)
+        recentItem.title = s.transfers.isEmpty ? "File Transfers" : "Recent Transfers"
     }
 
     static func phaseTitle(_ p: HostStatus.Phase) -> String {
@@ -330,6 +381,34 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     // MARK: Actions
 
     @objc private func disconnect() { log("menu: disconnect viewer"); actions.disconnect() }
+
+    /// NSOpenPanel (files and folders, multi-select) -> the connected viewer's Downloads\\Glide.
+    @objc private func sendFiles() {
+        let p = NSOpenPanel()
+        p.title = "Send Files to Viewer"
+        p.prompt = "Send"
+        p.message = "Choose files or folders to send to \(HostStatus.shared.snapshot.viewer?.name ?? "the viewer")."
+        p.canChooseFiles = true
+        p.canChooseDirectories = true
+        p.allowsMultipleSelection = true
+        p.resolvesAliases = false
+        NSApp.activate(ignoringOtherApps: true)
+        guard p.runModal() == .OK, !p.urls.isEmpty else { return }
+        log("menu: send \(p.urls.count) item(s) to the viewer")
+        if !actions.sendFiles(p.urls) { log("menu: the viewer can't take files (not connected or no file transfer support)") }
+    }
+
+    @objc private func cancelFiles() { log("menu: cancel file transfer"); actions.cancelFiles() }
+
+    @objc private func revealTransfer(_ sender: NSMenuItem) {
+        HostNotifier.reveal(sender.representedObject as? [URL] ?? [])
+    }
+
+    @objc private func openDownloads() {
+        guard let d = downloadDir else { return }
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        NSWorkspace.shared.activateFileViewerSelecting([d])
+    }
 
     @objc private func togglePause() {
         let paused = !HostStatus.shared.snapshot.paused

@@ -17,6 +17,8 @@ pub const CAP_CLIPBOARD: u32 = 1 << 8;
 pub const CAP_AUDIO_PCM: u32 = 1 << 9;
 /// Reserved: Opus audio.
 pub const CAP_AUDIO_OPUS: u32 = 1 << 10;
+/// File transfer in both directions (§6).
+pub const CAP_FILES: u32 = 1 << 11;
 
 // Client -> Host message types
 pub const MSG_CLIENT_HELLO: u8 = 0x01;
@@ -84,6 +86,34 @@ pub const CLIP_CAPS_PNG: u32 = 1 << 1;
 pub const CLIPBOARD_MAX_BYTES: usize = 16 << 20;
 pub const MSG_AUDIO_CONFIG: u8 = 0x60;
 pub const MSG_AUDIO_FRAME: u8 = 0x61;
+
+// File transfer (§6): 0x70-0x7F, both directions unless noted.
+/// H→C only.
+pub const MSG_FILE_CAPS: u8 = 0x70;
+pub const MSG_FILE_OFFER: u8 = 0x71;
+pub const MSG_FILE_ANSWER: u8 = 0x72;
+pub const MSG_FILE_CHUNK: u8 = 0x73;
+pub const MSG_FILE_END: u8 = 0x74;
+pub const MSG_FILE_ACK: u8 = 0x75;
+pub const MSG_FILE_CANCEL: u8 = 0x76;
+pub const MSG_FILE_DONE: u8 = 0x77;
+/// C→H only.
+pub const MSG_FILE_PULL: u8 = 0x78;
+/// H→C only.
+pub const MSG_FILE_PULL_RESULT: u8 = 0x79;
+/// Largest FileChunk payload.
+pub const FILE_CHUNK_MAX: usize = 256 << 10;
+/// A sender keeps at most this many chunk bytes unacknowledged (FileAck); protocol maximum.
+pub const FILE_WINDOW: u64 = 1 << 20;
+/// The window Glide's senders actually use: ≤ 512 KiB of file data sits ahead of an input event
+/// or video frame anywhere in the pipe (~4 ms at 1 Gbit/s), still > the LAN bandwidth-delay product.
+pub const FILE_SEND_WINDOW: u64 = 512 << 10;
+/// FileCaps.flags: the host accepts files from the viewer.
+pub const FILE_CAPS_RECEIVE: u32 = 1 << 0;
+/// FileCaps.flags: the host can send files (menu, FilePull).
+pub const FILE_CAPS_SEND: u32 = 1 << 1;
+/// Host-chosen transfer ids have bit 31 set; viewer ids are 1..=0x7FFF_FFFF.
+pub const FILE_HOST_ID_BIT: u32 = 0x8000_0000;
 
 // AudioConfig codecs
 pub const AUDIO_CODEC_OFF: u8 = 0;
@@ -247,6 +277,133 @@ pub struct AudioConfig {
     pub frame_samples: u16,
 }
 
+/// One file of a FileOffer (§6). `path` is '/'-separated and relative; receivers sanitize it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    pub path: String,
+    pub size: u64,
+    /// Modification time, ms since the Unix epoch (0 = unknown).
+    pub mtime_ms: i64,
+}
+
+/// File-transfer messages (§6), carried by both `ClientMsg::File` and `HostMsg::File`.
+#[derive(Clone, PartialEq, Eq)]
+pub enum FileMsg {
+    /// 0x70, H→C: `flags` = FILE_CAPS_* bits.
+    Caps { flags: u32, max_total_bytes: u64, max_files: u32 },
+    /// 0x71: `total_bytes` = sum of the sizes.
+    Offer { id: u32, total_bytes: u64, files: Vec<FileEntry> },
+    /// 0x72: `status` 0 = accepted, else a decline reason (`files::status`).
+    Answer { id: u32, status: u8, detail: String },
+    /// 0x73: 1..=FILE_CHUNK_MAX bytes of file `index` at `offset`.
+    Chunk { id: u32, index: u32, offset: u64, data: Vec<u8> },
+    /// 0x74: file `index` is complete; SHA-256 of its content.
+    End { id: u32, index: u32, sha256: [u8; 32] },
+    /// 0x75: receiver has written `bytes` bytes of this transfer so far (flow control).
+    Ack { id: u32, bytes: u64 },
+    /// 0x76: either side gives up on transfer `id`.
+    Cancel { id: u32, reason: u8, detail: String },
+    /// 0x77: receiver verified and saved all `files` files.
+    Done { id: u32, files: u32 },
+    /// 0x78, C→H: send the files on the Mac's pasteboard.
+    Pull,
+    /// 0x79, H→C: answer to Pull (0 = an offer follows).
+    PullResult { status: u8, detail: String },
+}
+
+impl fmt::Debug for FileMsg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // Never dump chunk payloads into logs.
+            FileMsg::Chunk { id, index, offset, data } => {
+                write!(f, "Chunk {{ id: {id:#x}, index: {index}, offset: {offset}, len: {} }}", data.len())
+            }
+            FileMsg::Caps { flags, max_total_bytes, max_files } => {
+                write!(f, "Caps {{ flags: {flags:#x}, max_total_bytes: {max_total_bytes}, max_files: {max_files} }}")
+            }
+            FileMsg::Offer { id, total_bytes, files } => write!(f, "Offer {{ id: {id:#x}, total_bytes: {total_bytes}, files: {files:?} }}"),
+            FileMsg::Answer { id, status, detail } => write!(f, "Answer {{ id: {id:#x}, status: {status}, detail: {detail:?} }}"),
+            FileMsg::End { id, index, .. } => write!(f, "End {{ id: {id:#x}, index: {index} }}"),
+            FileMsg::Ack { id, bytes } => write!(f, "Ack {{ id: {id:#x}, bytes: {bytes} }}"),
+            FileMsg::Cancel { id, reason, detail } => write!(f, "Cancel {{ id: {id:#x}, reason: {reason}, detail: {detail:?} }}"),
+            FileMsg::Done { id, files } => write!(f, "Done {{ id: {id:#x}, files: {files} }}"),
+            FileMsg::Pull => write!(f, "Pull"),
+            FileMsg::PullResult { status, detail } => write!(f, "PullResult {{ status: {status}, detail: {detail:?} }}"),
+        }
+    }
+}
+
+impl FileMsg {
+    pub fn is_file_type(t: u8) -> bool {
+        (MSG_FILE_CAPS..=MSG_FILE_PULL_RESULT).contains(&t)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            FileMsg::Caps { flags, max_total_bytes, max_files } => {
+                Writer::new(MSG_FILE_CAPS).u32(*flags).u64(*max_total_bytes).u32(*max_files).finish()
+            }
+            FileMsg::Offer { id, total_bytes, files } => {
+                let mut w = Writer::new(MSG_FILE_OFFER);
+                w.u32(*id).u64(*total_bytes).u32(files.len() as u32);
+                for f in files {
+                    w.str(&f.path).u64(f.size).u64(f.mtime_ms as u64);
+                }
+                w.finish()
+            }
+            FileMsg::Answer { id, status, detail } => Writer::new(MSG_FILE_ANSWER).u32(*id).u8(*status).str(detail).finish(),
+            FileMsg::Chunk { id, index, offset, data } => {
+                let mut w = Writer::new(MSG_FILE_CHUNK);
+                w.buf.reserve(data.len() + 16);
+                w.u32(*id).u32(*index).u64(*offset).bytes(data).finish()
+            }
+            FileMsg::End { id, index, sha256 } => Writer::new(MSG_FILE_END).u32(*id).u32(*index).bytes(sha256).finish(),
+            FileMsg::Ack { id, bytes } => Writer::new(MSG_FILE_ACK).u32(*id).u64(*bytes).finish(),
+            FileMsg::Cancel { id, reason, detail } => Writer::new(MSG_FILE_CANCEL).u32(*id).u8(*reason).str(detail).finish(),
+            FileMsg::Done { id, files } => Writer::new(MSG_FILE_DONE).u32(*id).u32(*files).finish(),
+            FileMsg::Pull => vec![MSG_FILE_PULL],
+            FileMsg::PullResult { status, detail } => Writer::new(MSG_FILE_PULL_RESULT).u8(*status).str(detail).finish(),
+        }
+    }
+
+    /// Decode a file message (type byte `t` already read). Strings are decoded lossily: a bad
+    /// name must not be a fatal protocol error (receivers sanitize/refuse it instead).
+    fn read(t: u8, r: &mut Reader) -> Result<FileMsg, DecodeError> {
+        Ok(match t {
+            MSG_FILE_CAPS => FileMsg::Caps { flags: r.u32()?, max_total_bytes: r.u64()?, max_files: r.u32()? },
+            MSG_FILE_OFFER => {
+                let id = r.u32()?;
+                let total_bytes = r.u64()?;
+                let n = r.u32()? as usize;
+                // Each entry is at least 18 bytes: don't trust `n` for the allocation.
+                if n > r.remaining() / 18 {
+                    return Err(DecodeError::BadLength(t));
+                }
+                let mut files = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let path = r.str_lossy()?;
+                    files.push(FileEntry { path, size: r.u64()?, mtime_ms: r.u64()? as i64 });
+                }
+                FileMsg::Offer { id, total_bytes, files }
+            }
+            MSG_FILE_ANSWER => FileMsg::Answer { id: r.u32()?, status: r.u8()?, detail: r.str_lossy()? },
+            MSG_FILE_CHUNK => FileMsg::Chunk { id: r.u32()?, index: r.u32()?, offset: r.u64()?, data: r.rest().to_vec() },
+            MSG_FILE_END => {
+                let id = r.u32()?;
+                let index = r.u32()?;
+                let sha256: [u8; 32] = r.take(32)?.try_into().unwrap();
+                FileMsg::End { id, index, sha256 }
+            }
+            MSG_FILE_ACK => FileMsg::Ack { id: r.u32()?, bytes: r.u64()? },
+            MSG_FILE_CANCEL => FileMsg::Cancel { id: r.u32()?, reason: r.u8()?, detail: r.str_lossy()? },
+            MSG_FILE_DONE => FileMsg::Done { id: r.u32()?, files: r.u32()? },
+            MSG_FILE_PULL => FileMsg::Pull,
+            MSG_FILE_PULL_RESULT => FileMsg::PullResult { status: r.u8()?, detail: r.str_lossy()? },
+            _ => return Err(DecodeError::BadLength(t)),
+        })
+    }
+}
+
 /// "Unknown" marker for `FrameTiming` / `LatencyReport` fields.
 pub const TIMING_UNKNOWN: u32 = u32::MAX;
 
@@ -322,6 +479,8 @@ pub enum ClientMsg {
     AudioEnable { enabled: bool },
     /// Pairing: the user compared the codes (§2.4).
     PairConfirm { matched: bool },
+    /// File transfer (§6).
+    File(FileMsg),
     /// Ask the host for `FrameTiming` messages (§3.4). `flags` bit0 = enabled.
     LatencyEnable { flags: u8 },
     LatencyReport(LatencyReport),
@@ -351,6 +510,8 @@ pub enum HostMsg {
     AudioConfig(AudioConfig),
     /// `data`: interleaved s16le PCM (codec 1); `capture_time_us` is the first sample's host time.
     AudioFrame { seq: u32, capture_time_us: u64, data: Vec<u8> },
+    /// File transfer (§6).
+    File(FileMsg),
     FrameTiming(FrameTiming),
     /// Current Mac display preference (`DISPLAY_PREF_*`) and mode ("looks like" size in points,
     /// `hidpi` = Retina backing). Sent after ServerHello and whenever either changes.
@@ -495,6 +656,14 @@ impl<'a> Reader<'a> {
         let b = self.take(n)?;
         String::from_utf8(b.to_vec()).map_err(|_| DecodeError::BadUtf8)
     }
+    /// `str` with invalid UTF-8 replaced (U+FFFD) instead of failing.
+    pub fn str_lossy(&mut self) -> Result<String, DecodeError> {
+        let n = self.u16()? as usize;
+        Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
+    }
+    pub fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
     pub fn rest(&mut self) -> &'a [u8] {
         let s = &self.data[self.pos..];
         self.pos = self.data.len();
@@ -549,6 +718,7 @@ impl ClientMsg {
             }
             ClientMsg::AudioEnable { enabled } => Writer::new(MSG_AUDIO_ENABLE).u8(*enabled as u8).finish(),
             ClientMsg::PairConfirm { matched } => Writer::new(MSG_PAIR_CONFIRM).u8(*matched as u8).finish(),
+            ClientMsg::File(m) => m.encode(),
             ClientMsg::LatencyEnable { flags } => Writer::new(MSG_LATENCY_ENABLE).u8(*flags).finish(),
             ClientMsg::LatencyReport(r) => Writer::new(MSG_LATENCY_REPORT)
                 .u16(r.samples)
@@ -592,6 +762,7 @@ impl ClientMsg {
             MSG_CLIPBOARD => ClientMsg::Clipboard(ClipboardData::read(&mut r)?),
             MSG_AUDIO_ENABLE => ClientMsg::AudioEnable { enabled: r.u8()? != 0 },
             MSG_PAIR_CONFIRM => ClientMsg::PairConfirm { matched: r.u8()? != 0 },
+            t if FileMsg::is_file_type(t) => ClientMsg::File(FileMsg::read(t, &mut r)?),
             MSG_LATENCY_ENABLE => ClientMsg::LatencyEnable { flags: r.u8()? },
             MSG_LATENCY_REPORT => ClientMsg::LatencyReport(LatencyReport {
                 samples: r.u16()?,
@@ -683,6 +854,13 @@ impl HostMsg {
                 buf.drain(..1 + r.pos());
                 return Ok(HostMsg::AudioFrame { seq, capture_time_us, data: buf });
             }
+            MSG_FILE_CHUNK => {
+                // Like VideoFrame: keep the allocation, drop the 17-byte header in place.
+                let (id, index, offset) = (r.u32()?, r.u32()?, r.u64()?);
+                buf.drain(..1 + r.pos());
+                return Ok(HostMsg::File(FileMsg::Chunk { id, index, offset, data: buf }));
+            }
+            t if FileMsg::is_file_type(t) => HostMsg::File(FileMsg::read(t, &mut r)?),
             MSG_FRAME_TIMING => HostMsg::FrameTiming(FrameTiming {
                 frame_id: r.u32()?,
                 capture_us: r.u64()?,
@@ -760,6 +938,7 @@ impl HostMsg {
             HostMsg::AudioFrame { seq, capture_time_us, data } => {
                 Writer::new(MSG_AUDIO_FRAME).u32(*seq).u64(*capture_time_us).bytes(data).finish()
             }
+            HostMsg::File(m) => m.encode(),
             HostMsg::FrameTiming(t) => Writer::new(MSG_FRAME_TIMING)
                 .u32(t.frame_id)
                 .u64(t.capture_us)
@@ -876,7 +1055,7 @@ mod tests {
                 assert!(HostMsg::decode(enc[..enc.len() - 1].to_vec()).is_err());
             }
         }
-        assert_eq!(HostMsg::decode(vec![0x77, 1, 2]).unwrap(), HostMsg::Unknown { msg_type: 0x77 });
+        assert_eq!(HostMsg::decode(vec![0x9E, 1, 2]).unwrap(), HostMsg::Unknown { msg_type: 0x9E });
         assert!(HostMsg::decode(vec![]).is_err());
     }
 
@@ -1030,6 +1209,83 @@ mod tests {
         assert_eq!(crate::util::hex(&caps.encode()), "510300000000000001");
         assert_eq!(HostMsg::decode(caps.encode()).unwrap(), caps);
         assert_eq!(CAP_CLIPBOARD, 0x100);
+    }
+
+    /// docs/file-transfer-vectors.json "messages" (also checked by glide-selftest and mock_host.py).
+    pub(crate) fn file_vector(name: &str) -> Vec<u8> {
+        let v: serde_json::Value = serde_json::from_str(include_str!("../../docs/file-transfer-vectors.json")).unwrap();
+        let m = v["messages"].as_array().unwrap().iter().find(|m| m["name"] == name).unwrap_or_else(|| panic!("no vector {name}"));
+        crate::util::unhex(m["hex"].as_str().unwrap())
+    }
+
+    #[test]
+    fn file_messages_match_reference_bytes() {
+        use sha2::Digest;
+        let sha: [u8; 32] = sha2::Sha256::digest(b"hello").into();
+        let cases = [
+            ("FileCaps", FileMsg::Caps { flags: FILE_CAPS_RECEIVE | FILE_CAPS_SEND, max_total_bytes: 8 << 30, max_files: 10000 }),
+            (
+                "FileOffer",
+                FileMsg::Offer {
+                    id: 1,
+                    total_bytes: 5,
+                    files: vec![
+                        FileEntry { path: "Photos/a.jpg".into(), size: 5, mtime_ms: 1_700_000_000_123 },
+                        FileEntry { path: "b.txt".into(), size: 0, mtime_ms: -1 },
+                    ],
+                },
+            ),
+            ("FileAnswer", FileMsg::Answer { id: 1, status: 0, detail: String::new() }),
+            ("FileAnswerDecline", FileMsg::Answer { id: 0x8000_0002, status: 2, detail: "max 1 GiB".into() }),
+            ("FileChunk", FileMsg::Chunk { id: 1, index: 0, offset: 0, data: b"hello".to_vec() }),
+            ("FileEnd", FileMsg::End { id: 1, index: 0, sha256: sha }),
+            ("FileAck", FileMsg::Ack { id: 1, bytes: 5 }),
+            ("FileCancel", FileMsg::Cancel { id: 0x8000_0001, reason: 7, detail: "user".into() }),
+            ("FileDone", FileMsg::Done { id: 1, files: 2 }),
+            ("FilePull", FileMsg::Pull),
+            ("FilePullResult", FileMsg::PullResult { status: 11, detail: "no files".into() }),
+        ];
+        for (name, m) in cases {
+            let want = file_vector(name);
+            assert_eq!(m.encode(), want, "{name}");
+            assert_eq!(ClientMsg::File(m.clone()).encode(), want, "{name}");
+            assert_eq!(ClientMsg::decode(&want).unwrap(), ClientMsg::File(m.clone()), "{name}");
+            assert_eq!(HostMsg::decode(want.clone()).unwrap(), HostMsg::File(m.clone()), "{name}");
+            assert_eq!(HostMsg::File(m).encode(), want, "{name}");
+            // Every strict prefix fails, except where the tail is a variable-length payload.
+            for n in 1..want.len() {
+                let r = HostMsg::decode(want[..n].to_vec());
+                if name == "FileChunk" && n >= 17 {
+                    assert!(r.is_ok());
+                } else {
+                    assert!(r.is_err(), "{name} prefix {n} decoded as {r:?}");
+                }
+            }
+        }
+        assert_eq!(CAP_FILES, 0x800);
+    }
+
+    #[test]
+    fn file_offer_decoding_is_robust() {
+        // A huge declared count with no entries must not allocate or panic.
+        let mut raw = vec![MSG_FILE_OFFER];
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.extend_from_slice(&0u64.to_le_bytes());
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(HostMsg::decode(raw).is_err());
+        // Invalid UTF-8 in a path is replaced, not fatal (the receiver then sanitizes it).
+        let mut raw = vec![MSG_FILE_OFFER];
+        raw.extend_from_slice(&7u32.to_le_bytes());
+        raw.extend_from_slice(&1u64.to_le_bytes());
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.extend_from_slice(&[2, 0, 0xFF, b'a']);
+        raw.extend_from_slice(&1u64.to_le_bytes());
+        raw.extend_from_slice(&0u64.to_le_bytes());
+        let HostMsg::File(FileMsg::Offer { files, .. }) = HostMsg::decode(raw).unwrap() else { panic!() };
+        assert_eq!(files[0].path, "\u{FFFD}a");
+        // Chunk payloads are not printed by Debug.
+        let dbg = format!("{:?}", FileMsg::Chunk { id: 1, index: 2, offset: 3, data: b"secret".to_vec() });
+        assert!(!dbg.contains("secret") && dbg.contains("len: 6"));
     }
 
     #[test]
