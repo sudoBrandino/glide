@@ -84,7 +84,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the details.
 | Power management: no idle sleep while hosting, display kept awake during a session | done |
 | CI: Swift build + selftest, Rust tests, Windows cross-build artifact, vector check | done |
 | Clipboard sync (text + images, both directions) | done |
-| Audio (SCK audio → Opus) | in progress |
+| Audio (SCK system audio → PCM → WASAPI, jitter buffer) | done (§3.2) |
 | Viewer UX | in progress |
 | Host UX: menu-bar item, automatic display mode, auth-gated session replacement | done |
 | Security v2: PAKE + pinned host identity | next ([roadmap](docs/ROADMAP.md)) |

@@ -10,10 +10,11 @@ The wire protocol is defined in `../docs/PROTOCOL.md`.
 |---|---|
 | `src/protocol.rs`, `src/crypto.rs` | Message codec, handshake, KDF, ChaCha20-Poly1305 record layer. Works on any OS and is unit-tested against `../docs/test-vectors.json`. |
 | `src/net.rs` | TCP (NODELAY), shared encrypted writer, receive thread, 1 Hz ping, RTT and clock offset. Includes `--listen` reverse mode. |
+| `src/audio.rs` | Audio jitter buffer (priming, drift-correcting resample, underrun/overflow handling). Platform independent, unit-tested. |
 | `src/hid.rs` | Set-1 scancode → USB HID usage table, plus the Ctrl↔Cmd / Win↔Control remap. Unit-tested. |
 | `src/clipboard.rs` | Clipboard sync logic without Win32: CRLF↔LF, echo guard, DIB↔PNG (`png` crate). Unit-tested. |
 | `src/annexb.rs`, `src/bench.rs` | Annex-B access-unit splitting, and the headless benchmark driver. |
-| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain), `app` (window, input, cursor, fullscreen), `clipboard` (clipboard listener/apply), `cursor`, `probe`, `bench_decoder`. |
+| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain), `app` (window, input, cursor, fullscreen), `clipboard` (clipboard listener/apply), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`. |
 | `assets/` | Small clips embedded in the exe for `--probe`. Regenerate them with `../tools/make_streams.sh --clips-only`. |
 
 ## Build (on macOS, cross-compiling)
@@ -31,7 +32,7 @@ Shaders are compiled at runtime with `D3DCompile` from `d3dcompiler_47.dll`, whi
 ## Run
 
 ```
-glide-client.exe <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--bench SECONDS] [--probe]
+glide-client.exe <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--no-audio] [--bench SECONDS] [--probe]
 glide-client.exe --listen [PORT] [same options]
 ```
 
@@ -68,7 +69,20 @@ glide-client.exe --listen [PORT] [same options]
   - Sharp-layer frames are decoded by a second, independent decoder (AYUV output) and replace the whole canvas.
   - Resizing or exposing the window re-presents the canvas without needing a new frame.
   - The title bar shows `hybrid [4:4:4]` while the sharp layer is on screen, along with sharp and rect frame counts.
-- Viewer keys: **F11** or **Alt+Enter** toggles borderless fullscreen. These two keys are not sent to the host.
+- **Audio** (protocol §3.2): the Mac's sound plays on this PC's default output device. On by default; `--no-audio`
+  turns it off (the viewer then doesn't advertise it, so the host doesn't even capture audio).
+  - **Ctrl+F11** or the window menu's *Mute audio* mutes/unmutes; the host stops sending while muted, and mute
+    persists across reconnects.
+  - Uncompressed 48 kHz stereo PCM (1.5 Mbit/s), WASAPI shared mode, event-driven, on an MMCSS "Pro Audio" thread.
+    A jitter buffer primes to 30 ms and holds it against clock drift with a tiny (≤0.2 %) resample only when it
+    leaves a ±8 ms band; underruns raise the target 10 ms (max 120 ms, decays back); more than target + 60 ms
+    is dropped, so latency stays bounded.
+  - Switching the Windows default output device moves playback within ~1 s; a device error reopens it.
+  - The title bar shows `audio N ms` (estimated host capture → speaker, from the ping clock sync) and underruns.
+  - Tuning (environment): `GLIDE_AUDIO_TARGET_MS` (jitter target, default 30), `GLIDE_AUDIO_FILL_MS` (audio kept
+    queued in the device, default 16), `GLIDE_AUDIO_LOWLAT=1` (IAudioClient3 minimum engine period, if the device
+    supports one below 10 ms; the CORSAIR headset doesn't).
+- Viewer keys: **F11** or **Alt+Enter** toggles borderless fullscreen; **Ctrl+F11** mutes audio. These keys are not sent to the host.
   While the window has focus, a low-level keyboard hook sends Win, Alt+Tab, Alt+Space and similar keys to the host.
   To leave the window, click outside it, or press Ctrl+Alt+Del, which cannot be intercepted.
 - Modifier remap (on by default; turn it off with `--no-ctrl-as-cmd`): Ctrl → Command, Win → Control, Alt → Option.
@@ -99,6 +113,10 @@ Then start the host on the Mac: `mac/.build/release/glide-host --password-file .
 
 ### Headless modes (these work over SSH in session 0)
 
+- `--audio-selftest [SECONDS]` opens the default output device exactly like the viewer and runs the real render path
+  on **digital silence** (inaudible) for N seconds (default 3). It prints JSON with the output devices, the mix format,
+  engine event cadence, device queue, `device_starved` (device ran dry) and jitter-buffer underruns.
+
 - `--probe` prints JSON with:
   - the decoder MFTs (HEVC, H.264, AV1),
   - the D3D11 video decoder profiles and the output formats each supports,
@@ -111,6 +129,7 @@ Then start the host on the Mac: `mac/.build/release/glide-host --password-file .
   - `layers`, which holds base and sharp frame counts, `sharp_decode_ms`, `rect_frames`, `avg_rects` and rect area %;
   - `rtt_ms`;
   - `e2e_capture_to_decoded_ms`, estimated from the ping/pong clock offset and counting base-layer frames only (refresh and sharp frames are excluded);
+  - `audio`: format, frames, lost frames, and `capture_to_arrival_ms` for audio frames (null if the host sent no audio);
   - errors.
 - `--clipboard-selftest` exercises the real Win32 clipboard path (apply, read back, CRLF, PNG/DIB,
   echo suppression, external changes) on hidden windows and prints one line per check. Session 0
@@ -140,4 +159,8 @@ The mock host:
   clipboard back once (the viewer must keep it as is and not echo it), `--clip-save DIR` keeps PNGs;
   `--selftest` checks the codec against the §5 reference bytes;
 - in hybrid mode, sends SharpLayerConfig, then each `--hybrid-period` frames (default 60) a 4:4:4 sharp IDR,
-  followed by base frames limited to small rects.
+  followed by base frames limited to small rects;
+- if the viewer advertises audio, streams a continuous 440 Hz sine at -12 dBFS (`--audio-freq`, `--audio-db`,
+  `--no-audio`). A pure tone makes every glitch audible. `--audio-burst 1024` mimics ScreenCaptureKit's buffer
+  size, `--audio-drift-ppm` a fast/slow host clock, `--audio-jitter-ms` random send delays, `--audio-pattern 2000:1000`
+  gaps like the Mac sends while silent.

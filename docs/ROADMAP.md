@@ -72,6 +72,8 @@ Done:
   - Fullscreen is kept across reconnects.
 - [x] **Clipboard sync:** text + images (PNG) both directions with loop/echo suppression
   (PROTOCOL.md §5).
+- [x] **Audio:** ScreenCaptureKit system audio on the base capture stream → PCM s16le 48 kHz
+  stereo → WASAPI through a drift-correcting jitter buffer (PROTOCOL.md §3.2). Mute with Ctrl+F11.
 - [x] **CI:** a GitHub Actions workflow that runs:
   - the Mac release build and selftest;
   - Rust tests on Linux and Windows;
@@ -81,7 +83,6 @@ Done:
 
 In progress, on feature branches:
 
-- [ ] Audio (`feat/audio`): ScreenCaptureKit audio → Opus
 - [ ] Viewer UX (`feat/viewer-ux`)
 - [x] Host UX (merged): menu-bar status item, automatic display-mode policy (crisp 1x / Retina
   HiDPI to match the viewer, restore on disconnect), auth-gated session replacement, pending
@@ -97,6 +98,7 @@ Next:
 - [ ] Multi-monitor support and a display picker
 - [ ] Glass-to-glass latency measurement on the real LAN
 - [ ] Clipboard: files (with file transfer); chunked transfer so big images don't stall video
+- [ ] Audio: Opus (codec 2) for non-LAN links; needs a Windows decoder that builds with MinGW
 
 ## v2 — beyond the LAN
 

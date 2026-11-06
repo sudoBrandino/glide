@@ -18,6 +18,8 @@ final class HostStatus: @unchecked Sendable {
         var captureError: String?
         var fps: Double?, mbps: Double?, encodeMs: Double?
         var statsAt: Date?
+        /// "on", "muted" or "off"; nil when the viewer doesn't take audio (PROTOCOL.md §3.2).
+        var audio: String?
     }
 
     struct Snapshot {
@@ -77,6 +79,7 @@ final class HostStatus: @unchecked Sendable {
     func sessionEnded(id: Int) { update { s in if s.viewer?.sessionId == id { s.viewer = nil } } }
     func viewSize(id: Int, w: Int, h: Int) { updateViewer(id) { $0.viewW = w; $0.viewH = h } }
     func video(id: Int, config: VideoConfig, hybrid: Bool) { updateViewer(id) { $0.video = config; $0.hybrid = hybrid } }
+    func audio(id: Int, _ state: String?) { updateViewer(id) { $0.audio = state } }
     func captureError(id: Int, _ e: String?) { updateViewer(id) { $0.captureError = e } }
     func stats(id: Int, fps: Double, mbps: Double, encodeMs: Double) {
         updateViewer(id) { $0.fps = fps; $0.mbps = mbps; $0.encodeMs = encodeMs; $0.statsAt = Date() }
