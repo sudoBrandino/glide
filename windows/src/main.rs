@@ -18,13 +18,17 @@ pub struct Args {
     probe: bool,
     /// Reverse-connect: listen on this port and let the host dial in.
     listen: Option<u16>,
+    /// Clipboard sync (GUI viewer only); off with --no-clipboard.
+    clipboard: bool,
+    /// Headless Win32 clipboard self-test (no connection).
+    clipboard_selftest: bool,
     /// Don't advertise/play audio.
     no_audio: bool,
     /// Headless WASAPI check (plays digital silence only), seconds.
     audio_selftest: Option<f64>,
 }
 
-const USAGE: &str = "usage: glide-client <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--bench SECONDS] [--probe]
+const USAGE: &str = "usage: glide-client <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--bench SECONDS] [--probe]
        glide-client --listen [PORT] [options...]
 
   host[:port]        Glide host (default port 7420)
@@ -34,8 +38,10 @@ const USAGE: &str = "usage: glide-client <host[:port]> [--password PW] [--mode f
   --mode M           fast = 4:2:0 only; sharp = 4:4:4 every frame; hybrid = 4:2:0 while moving +
                      4:4:4 refinement at rest. Default: hybrid if this PC decodes HEVC 4:4:4, else fast
   --no-ctrl-as-cmd   don't swap Ctrl<->Win (default maps Ctrl->Cmd, Win->Control)
+  --no-clipboard     don't sync the clipboard (text + images) with the host
   --bench SECONDS    headless: connect, decode for N seconds, print one JSON line
   --probe            print decoder capabilities as JSON (no connection)
+  --clipboard-selftest  exercise the Win32 clipboard path headlessly (no connection; run over SSH)
   --no-audio         don't stream the Mac's sound (default: on; Ctrl+F11 or the window menu mutes)
   --audio-selftest [SECONDS]
                      headless: open the default output device and run the audio path on
@@ -44,7 +50,19 @@ const USAGE: &str = "usage: glide-client <host[:port]> [--password PW] [--mode f
 In the viewer: F11 or Alt+Enter toggles borderless fullscreen; Ctrl+F11 mutes/unmutes audio.";
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { host: None, password: None, mode: None, ctrl_as_cmd: true, bench: None, probe: false, listen: None, no_audio: false, audio_selftest: None };
+    let mut a = Args {
+        host: None,
+        password: None,
+        mode: None,
+        ctrl_as_cmd: true,
+        bench: None,
+        probe: false,
+        listen: None,
+        clipboard: true,
+        clipboard_selftest: false,
+        no_audio: false,
+        audio_selftest: None,
+    };
     let mut it = std::env::args().skip(1).peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -58,6 +76,8 @@ fn parse_args() -> Result<Args, String> {
                 })
             }
             "--no-ctrl-as-cmd" => a.ctrl_as_cmd = false,
+            "--no-clipboard" => a.clipboard = false,
+            "--clipboard-selftest" => a.clipboard_selftest = true,
             "--bench" => {
                 let v = it.next().ok_or("--bench needs SECONDS")?;
                 a.bench = Some(v.parse::<f64>().map_err(|_| format!("bad --bench value {v}"))?);
@@ -89,7 +109,7 @@ fn parse_args() -> Result<Args, String> {
             }
         }
     }
-    if !a.probe && a.audio_selftest.is_none() && a.host.is_none() && a.listen.is_none() {
+    if !a.probe && !a.clipboard_selftest && a.audio_selftest.is_none() && a.host.is_none() && a.listen.is_none() {
         return Err("missing host".into());
     }
     Ok(a)
@@ -138,6 +158,24 @@ fn main() -> ExitCode {
         }
     };
 
+    if args.clipboard_selftest {
+        #[cfg(windows)]
+        {
+            return match glide::win::clipboard::selftest() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("--clipboard-selftest is only available on Windows");
+            return ExitCode::from(1);
+        }
+    }
+
     if args.probe {
         #[cfg(windows)]
         {
@@ -179,6 +217,10 @@ fn main() -> ExitCode {
     {
         if glide::win::probe::hevc444_supported() {
             caps |= protocol::CAP_HEVC_444;
+        }
+        // Clipboard sync (§5) needs the viewer window; the headless bench never advertises it.
+        if args.clipboard && args.bench.is_none() {
+            caps |= protocol::CAP_CLIPBOARD;
         }
     }
     if !args.no_audio {

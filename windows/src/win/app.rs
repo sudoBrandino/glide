@@ -4,6 +4,7 @@
 //! thread from `net`) and survives disconnects. Frames go network → render thread over a
 //! channel and are presented as soon as they decode.
 
+use super::clipboard;
 use super::audio::Audio;
 use super::cursor::{create_cursor, destroy_cursor, scale_image, CursorImage};
 use super::d3d::Gpu;
@@ -876,6 +877,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             update_title(hwnd);
             LRESULT(0)
         }
+        WM_TIMER if clipboard::is_timer(wparam.0) => {
+            clipboard::on_timer(hwnd, wparam.0);
+            LRESULT(0)
+        }
+        WM_CLIPBOARDUPDATE => {
+            clipboard::on_clipboard_update(hwnd);
+            LRESULT(0)
+        }
+        clipboard::WM_APP_CLIPBOARD => {
+            clipboard::on_app_clipboard(hwnd);
+            LRESULT(0)
+        }
         WM_TIMER if wparam.0 == EXIT_TIMER => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -930,6 +943,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_DESTROY => {
             set_focus_state(hwnd, false);
+            clipboard::shutdown(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -1133,6 +1147,7 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
     {
         let shared = shared.clone();
         let tx = tx.clone();
+        let sender = conn.sender.clone();
         conn.spawn_receiver(move |ev| match ev {
             NetEvent::Msg(HostMsg::VideoFrame { flags, rects, data, .. }) => {
                 shared.stats.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -1186,6 +1201,8 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
                     post(hwnd_raw, WM_APP_CURSOR);
                 }
             }
+            NetEvent::Msg(HostMsg::ClipboardCaps { formats, max_bytes }) => clipboard::enable(sender.clone(), formats, max_bytes),
+            NetEvent::Msg(HostMsg::Clipboard(c)) => clipboard::incoming(c),
             NetEvent::Msg(_) => {}
             NetEvent::Closed(reason) => {
                 let _ = ended_tx.send(reason);
@@ -1217,6 +1234,7 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
     };
     *shared.sender.lock().unwrap() = None;
     *shared.clock.lock().unwrap() = None;
+    clipboard::disable();
     if let Some(a) = &shared.audio {
         a.on_disconnected();
     }
@@ -1319,6 +1337,7 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         }
     }
     check_view(hwnd); // view = the monitor the window actually opened on (before the first hello)
+    clipboard::init(hwnd);
 
     // --- render thread
     let init = client_size(hwnd);

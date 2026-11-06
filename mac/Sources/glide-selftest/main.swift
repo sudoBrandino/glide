@@ -1,3 +1,4 @@
+import AppKit
 import CoreMedia
 import CryptoKit
 import Foundation
@@ -73,6 +74,214 @@ func run() throws {
         missing.append(String(format: "0x%02x", u))
     }
     check(missing.isEmpty, "keymap coverage \(missing)")
+}
+
+func policyChecks() {
+    // Mode list of the BetterDisplay 16:9 virtual display on the M3 Pro host (plus 4:3 extras).
+    var modes: [DisplayModeInfo] = []
+    for (w, h) in [(800, 600), (1024, 768), (1280, 960), (1344, 1008), (1600, 1200)] { modes.append(.init(width: w, height: h, pixelWidth: w, pixelHeight: h)) }
+    let sixteenNine = [960, 1024, 1280, 1344, 1408, 1472, 1536, 1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048, 2112, 2176, 2240, 2304,
+                       2368, 2432, 2496, 2560, 2624, 2688, 2752, 2816, 2880, 2944, 3008, 3072, 3136, 3200, 3264, 3328, 3392, 3456, 3520, 3584, 3648, 3712, 3840]
+    for w in sixteenNine {
+        let h = w * 9 / 16
+        modes.append(.init(width: w, height: h, pixelWidth: w * 2, pixelHeight: h * 2))   // HiDPI
+        if w % 128 == 0 || w == 1344 || w == 1408 || w == 1600 || w == 1664 || w == 1792 || w == 2176 || w == 2304 || w == 2432 || w == 2688 || w == 2816 || w == 2944 || w == 3200 || w == 3328 || w == 3456 || w == 3712 {
+            modes.append(.init(width: w, height: h, pixelWidth: w, pixelHeight: h))      // 1x
+        }
+    }
+    for w in [3968, 4096, 4224, 4352, 4480, 4608, 4736, 4864, 4992, 5120] { modes.append(.init(width: w, height: w * 9 / 16, pixelWidth: w, pixelHeight: w * 9 / 16)) }
+    func one(_ w: Int, _ h: Int) -> DisplayModeInfo { .init(width: w, height: h, pixelWidth: w, pixelHeight: h) }
+    func hi(_ w: Int, _ h: Int) -> DisplayModeInfo { .init(width: w, height: h, pixelWidth: w * 2, pixelHeight: h * 2) }
+    func pick(_ p: DisplayModePreference, _ w: Int, _ h: Int, current: DisplayModeInfo? = nil, k: HighDPIViewerChoice = .retina, _ m: [DisplayModeInfo]? = nil) -> DisplayModeInfo? {
+        DisplayModePolicy.choose(preference: p, viewerW: w, viewerH: h, modes: m ?? modes, current: current, highDPIChoice: k)
+    }
+    check(pick(.automatic, 2560, 1440) == one(2560, 1440), "policy: 1440p viewer -> 2560x1440 crisp (HiDPI off)")
+    check(pick(.automatic, 3840, 2160) == hi(1920, 1080), "policy: 4K viewer -> looks like 1920x1080 HiDPI (retina)")
+    check(pick(.automatic, 3840, 2160, k: .smooth) == hi(2560, 1440), "policy: 4K viewer, more-space choice -> looks like 2560x1440 HiDPI")
+    check(pick(.automatic, 1920, 1080) == one(1920, 1080), "policy: 1080p viewer -> 1920x1080 crisp")
+    check(pick(.crisp, 3840, 2160) == one(3840, 2160), "policy: crisp on 4K -> 3840x2160 1x")
+    check(pick(.retina, 2560, 1440) == hi(1280, 720), "policy: retina on 1440p -> looks like 1280x720")
+    check(pick(.smooth, 2560, 1440) == hi(1664, 936), "policy: smooth on 1440p -> looks like 1664x936 (3328px, downscaled)")
+    check(pick(.automatic, 3440, 1440) == one(2560, 1440), "policy: ultrawide 3440x1440 -> largest fitting 2560x1440")
+    check(pick(.crisp, 1920, 1200) == one(1920, 1080), "policy: 16:10 viewer -> largest fitting 1920x1080")
+    check(pick(.crisp, 1600, 1200) == one(1600, 1200), "policy: 4:3 viewer -> matching aspect 1600x1200")
+    check(pick(.crisp, 640, 480) == one(800, 600), "policy: tiny viewer -> smallest mode")
+    check(pick(.automatic, 5120, 2880) == hi(2560, 1440), "policy: 5K viewer -> retina looks like 2560x1440")
+    check(pick(.manual, 2560, 1440) == nil, "policy: manual -> no change")
+    check(pick(.automatic, 0, 0) == nil, "policy: unknown viewer size -> no change")
+    var cur = one(2560, 1440); cur.refreshRate = 60
+    check(pick(.automatic, 2560, 1440, current: cur) == cur, "policy: already matching -> current mode (no switch)")
+    let noHi = modes.filter { !$0.hiDPI }
+    check(pick(.retina, 3840, 2160, noHi) == one(3840, 2160), "policy: no HiDPI modes -> falls back to crisp")
+    let hz = [DisplayModeInfo(width: 2560, height: 1440, pixelWidth: 2560, pixelHeight: 1440, refreshRate: 60),
+              DisplayModeInfo(width: 2560, height: 1440, pixelWidth: 2560, pixelHeight: 1440, refreshRate: 120)]
+    check(pick(.crisp, 2560, 1440, hz)?.refreshRate == 120, "policy: prefers higher refresh")
+    check(pick(.crisp, 2560, 1440, current: hz[0], hz)?.refreshRate == 60, "policy: keeps current refresh when it matches")
+}
+
+func registryChecks() {
+    final class S { let id: Int; init(_ i: Int) { id = i } }
+    let r = SessionRegistry<S>(maxPending: 2, maxPendingPerSource: 2)
+    let a = S(1), b = S(2), c = S(3), d = S(4), e = S(5)
+    check(r.admit(a, source: "10.0.0.1") == nil, "registry: admit first")
+    check(r.current == nil, "registry: unauthenticated is not current")
+    let ra = r.authenticated(a)
+    check(ra.promoted && ra.replaced == nil && r.current === a, "registry: authenticated -> current")
+    check(r.admit(b, source: "10.0.0.2") == nil && r.admit(c, source: "10.0.0.3") == nil, "registry: admit two pending")
+    check(r.admit(d, source: "10.0.0.4") === b, "registry: full -> evicts oldest pending, never refuses")
+    check(r.current === a, "registry: pending connections don't touch the active session")
+    let x1 = S(10), x2 = S(11), x3 = S(12)
+    let r2 = SessionRegistry<S>(maxPending: 8, maxPendingPerSource: 2)
+    r2.admit(x1, source: "x"); r2.admit(x2, source: "x")
+    check(r2.admit(x3, source: "x") === x1 && r2.pendingCount == 2, "registry: per-source cap evicts that source's oldest")
+    r.ended(b)  // evicted / wrong password / auth timeout
+    check(r.current === a && r.pendingCount == 2, "registry: failed auth leaves active session alone")
+    let rc = r.authenticated(c)
+    check(rc.promoted && rc.replaced === a && r.current === c, "registry: new viewer replaces old only after auth")
+    check(!r.ended(a) && r.current === c, "registry: replaced session ending doesn't clear current")
+    check(!r.authenticated(e).promoted, "registry: never-admitted session can't be promoted")
+    check(r.ended(c) && r.current == nil, "registry: active session ending clears current")
+}
+
+/// Clipboard sync (PROTOCOL.md §5): wire format, line endings, echo suppression.
+func clipboardTests() throws {
+    print("clipboard:")
+    // Reference bytes from PROTOCOL.md §5 (also checked by the Rust tests and mock_host.py --selftest).
+    let textMsg = ClientMessage.clipboard(ClipboardData(seq: 1, text: "hi\n"))
+    check(textMsg.encoded.hex == "5001000000010103000000" + "68690a", "Clipboard text reference bytes")
+    check(HostMessage.clipboard(ClipboardData(seq: 1, text: "hi\n")).encoded == textMsg.encoded, "Clipboard same layout both directions")
+    let caps = HostMessage.clipboardCaps(formats: ClipboardData.capsText | ClipboardData.capsPNG, maxBytes: UInt32(ClipboardData.maxBytes))
+    check(caps.encoded.hex == "510300000000000001", "ClipboardCaps reference bytes")
+    if case let .clipboardCaps(f, m) = try HostMessage.decode(caps.encoded) {
+        check(f == 3 && m == 16 << 20, "ClipboardCaps decode")
+    } else { check(false, "ClipboardCaps decode") }
+
+    // Round trips.
+    let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3])
+    for c in [ClipboardData(seq: 7, text: "héllo — 世界 🎉\nline2"), ClipboardData(seq: 8, png: png),
+              ClipboardData(seq: UInt32.max, text: "", png: png), ClipboardData(seq: 9)] {
+        if case let .clipboard(d) = try ClientMessage.decode(ClientMessage.clipboard(c).encoded) {
+            check(d == c, "Clipboard c2s roundtrip seq \(c.seq)")
+        } else { check(false, "Clipboard c2s decode seq \(c.seq)") }
+        if case let .clipboard(d) = try HostMessage.decode(HostMessage.clipboard(c).encoded) {
+            check(d == c, "Clipboard s2c roundtrip seq \(c.seq)")
+        } else { check(false, "Clipboard s2c decode seq \(c.seq)") }
+    }
+    // A text bigger than the old u16 `str` limit survives.
+    let big = String(repeating: "x", count: 100_000)
+    if case let .clipboard(d) = try HostMessage.decode(HostMessage.clipboard(ClipboardData(seq: 1, text: big)).encoded) {
+        check(d.text == big, "Clipboard text > 64 KiB")
+    } else { check(false, "Clipboard big decode") }
+
+    // Unknown formats skipped, duplicate formats: first wins, invalid UTF-8 replaced.
+    var w = Data([0x50, 2, 0, 0, 0, 4])
+    w += Data([9, 2, 0, 0, 0, 0xAA, 0xBB])        // unknown format 9
+    w += Data([1, 2, 0, 0, 0, 0x6F, 0x6B])        // text "ok"
+    w += Data([1, 1, 0, 0, 0, 0x78])              // duplicate text: ignored
+    w += Data([2, 2, 0, 0, 0, 0xFF, 0xC0])        // png
+    if case let .clipboard(d) = try ClientMessage.decode(w) {
+        check(d.seq == 2 && d.text == "ok" && d.png == Data([0xFF, 0xC0]), "Clipboard unknown/duplicate formats")
+    } else { check(false, "Clipboard unknown/duplicate decode") }
+    if case let .clipboard(d) = try ClientMessage.decode(Data([0x50, 1, 0, 0, 0, 1, 1, 2, 0, 0, 0, 0xFF, 0x41])) {
+        check(d.text == "\u{FFFD}A", "Clipboard invalid UTF-8 replaced")
+    } else { check(false, "Clipboard invalid UTF-8 decode") }
+    let enc = textMsg.encoded
+    var truncatedRejected = true
+    for n in 1..<enc.count where (try? ClientMessage.decode(enc.prefix(n))) != nil { truncatedRejected = false }
+    check(truncatedRejected, "Clipboard truncation rejected")
+
+    // Line endings.
+    check(ClipboardText.toWire("a\r\nb\rc\nd") == "a\nb\nc\nd", "CRLF/CR -> LF")
+    check(ClipboardText.toWire("plain\n") == "plain\n", "LF unchanged")
+    check(ClipboardText.toWire("x\r\ny\r\n") == "x\ny\n", "CRLF-only text converted")
+
+    // FNV-1a 64 known values.
+    check(fnv1a64(Data()) == 0xcbf2_9ce4_8422_2325 && fnv1a64(Data("a".utf8)) == 0xaf63_dc4c_8601_ec8c, "FNV-1a 64")
+
+    // Echo suppression.
+    var g = ClipboardEchoGuard()
+    let h1 = ClipboardEchoGuard.hash(format: 1, Data("one".utf8)), h2 = ClipboardEchoGuard.hash(ClipboardData(text: "two"))!
+    check(h1 != ClipboardEchoGuard.hash(format: 2, Data("one".utf8)), "hash distinguishes text from image bytes")
+    g.baseline(marker: 5)
+    check(!g.changed(marker: 5), "guard: baseline content not sent")
+    check(g.changed(marker: 6) && g.shouldSend(hash: h1, marker: 6), "guard: local change sent")
+    check(!g.changed(marker: 6), "guard: same marker not re-sent")
+    check(!g.shouldApply(hash: h1, marker: 6), "guard: echo of what we sent not re-applied while unchanged")
+    check(g.shouldApply(hash: h2, marker: 6), "guard: different content applied")
+    check(g.changed(marker: 7) && !g.shouldSend(hash: h1, marker: 7), "guard: identical content not re-sent")
+    check(g.shouldApply(hash: h1, marker: 7), "guard: same content applied after a local change")
+    g.didApply(hash: h2, marker: 9)              // remote "two" written locally -> marker 9
+    check(!g.changed(marker: 9), "guard: own write not echoed")
+    check(g.changed(marker: 10) && !g.shouldSend(hash: h2, marker: 10), "guard: re-write of received content not echoed")
+    check(g.changed(marker: 11) && g.shouldSend(hash: h1, marker: 11), "guard: new local content after apply sent")
+    g.didApply(hash: h1, marker: 12)             // peer sends back what we sent: applied, never re-sent
+    check(!g.changed(marker: 12) && !g.shouldSend(hash: h1, marker: 12), "guard: ping-pong stops")
+}
+
+/// NSPasteboard read/write rules on a private named pasteboard (never the user's general one).
+func pasteboardTests() {
+    print("pasteboard (private):")
+    let pb = NSPasteboard(name: NSPasteboard.Name("io.github.sudobrandino.glide.selftest.\(getpid())"))
+    defer { pb.releaseGlobally() }
+    var g = ClipboardEchoGuard()
+    g.baseline(marker: pb.changeCount)
+
+    // Received text: written, our own write is not echoed, read back identical (hash match).
+    let remote = ClipboardData(seq: 1, text: "a\nb ✓")
+    guard case let .success((prepared, tiff0)) = ClipboardPasteboard.prepare(remote) else { return check(false, "prepare text") }
+    check(prepared == remote && tiff0 == nil, "prepare text")
+    let m1 = ClipboardPasteboard.write(prepared, tiff: nil, to: pb)
+    g.didApply(hash: ClipboardEchoGuard.hash(prepared), marker: m1)
+    check(!g.changed(marker: pb.changeCount), "own pasteboard write not echoed")
+    let back = ClipboardPasteboard.read(pb)
+    check(back == .text("a\nb ✓") && back?.hash == ClipboardEchoGuard.hash(remote), "text read back, same hash")
+    check(!g.shouldApply(hash: ClipboardEchoGuard.hash(remote), marker: pb.changeCount), "re-received same text not re-applied")
+
+    // Another app copies CRLF text: detected and normalized.
+    pb.clearContents(); pb.setString("x\r\ny", forType: .string)
+    check(g.changed(marker: pb.changeCount), "external change detected")
+    let ext = ClipboardPasteboard.read(pb)
+    check(ext == .text("x\ny"), "CRLF -> LF on read")
+    check(g.shouldSend(hash: ext!.hash!, marker: pb.changeCount), "external text would be sent")
+    if case let .success(c) = ext!.message(seq: 2, maxBytes: ClipboardData.maxBytes) { check(c.text == "x\ny" && c.seq == 2, "text message") }
+    else { check(false, "text message") }
+    check((try? ext!.message(seq: 3, maxBytes: 2).get()) == nil, "oversized text refused (no truncation)")
+
+    // Received image: PNG kept byte-for-byte + TIFF rendered; reading prefers the PNG.
+    let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 4, pixelsHigh: 3, bitsPerSample: 8, samplesPerPixel: 4,
+                               hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 16, bitsPerPixel: 32)!
+    for y in 0..<3 { for x in 0..<4 { rep.setColor(NSColor(deviceRed: CGFloat(x) / 3, green: CGFloat(y) / 2, blue: 0.5, alpha: 1), atX: x, y: y) } }
+    let png = rep.representation(using: .png, properties: [:])!
+    guard case let .success((img, tiff)) = ClipboardPasteboard.prepare(ClipboardData(seq: 4, png: png)) else { return check(false, "prepare png") }
+    check(tiff != nil, "TIFF rendered for received PNG")
+    ClipboardPasteboard.write(img, tiff: tiff, to: pb)
+    check(ClipboardPasteboard.read(pb) == .png(png), "image read back as the exact PNG")
+    check(pb.data(forType: .tiff) != nil, "TIFF representation present")
+
+    // TIFF-only image (e.g. older apps): converted to PNG with the same pixels.
+    pb.clearContents(); pb.setData(rep.tiffRepresentation!, forType: .tiff)
+    let t = ClipboardPasteboard.read(pb)
+    check(t?.needsConversion == true, "TIFF-only content needs conversion")
+    if case let .success(c)? = t?.message(seq: 5, maxBytes: ClipboardData.maxBytes), let p = c.png, let r = NSBitmapImageRep(data: p) {
+        check(r.pixelsWide == 4 && r.pixelsHigh == 3 && p.starts(with: [0x89, 0x50, 0x4E, 0x47]), "TIFF -> PNG")
+    } else { check(false, "TIFF -> PNG") }
+
+    // Text wins over an image; empty text falls through to the image; transient is skipped.
+    pb.clearContents(); pb.setString("cells", forType: .string); pb.setData(png, forType: .png)
+    check(ClipboardPasteboard.read(pb) == .text("cells"), "text preferred over image")
+    pb.clearContents(); pb.setString("", forType: .string); pb.setData(png, forType: .png)
+    check(ClipboardPasteboard.read(pb) == .png(png), "empty text falls through to image")
+    pb.clearContents(); pb.setString("otp", forType: .string); pb.setData(Data(), forType: ClipboardPasteboard.transientType)
+    if case .skipped? = ClipboardPasteboard.read(pb) { check(true, "transient content skipped") } else { check(false, "transient content skipped") }
+    pb.clearContents()
+    check(ClipboardPasteboard.read(pb) == nil, "empty pasteboard -> nothing")
+
+    // Invalid received PNG: refused alone, text kept when present.
+    check((try? ClipboardPasteboard.prepare(ClipboardData(seq: 6, png: Data([1, 2, 3]))).get()) == nil, "invalid PNG refused")
+    if case let .success((c, tf)) = ClipboardPasteboard.prepare(ClipboardData(seq: 7, text: "t", png: Data([1, 2, 3]))) {
+        check(c.text == "t" && c.png == nil && tf == nil, "invalid PNG dropped, text kept")
+    } else { check(false, "invalid PNG dropped, text kept") }
+    check((try? ClipboardPasteboard.prepare(ClipboardData(seq: 8)).get()) == nil, "empty message ignored")
 }
 
 // MARK: Audio (§3.2)
@@ -187,6 +396,11 @@ func audioTests() throws {
 }
 
 do { try run() } catch { failures += 1; print("  FAIL threw \(error)") }
+policyChecks()
+registryChecks()
+
+do { try clipboardTests() } catch { failures += 1; print("  FAIL clipboard threw \(error)") }
+pasteboardTests()
 do { try audioTests() } catch { failures += 1; print("  FAIL audio threw \(error)") }
 print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)

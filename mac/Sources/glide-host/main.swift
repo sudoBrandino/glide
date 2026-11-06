@@ -21,6 +21,8 @@ struct HostConfig: Codable {
     var password: String?
     /// Default `--connect` target (viewer running `--listen`), used when no CLI flag is given.
     var connect: String?
+    /// Display-mode policy (DisplayModeController.swift).
+    var display: DisplaySettings? = nil
 
     static var url: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Glide", isDirectory: true)
@@ -48,6 +50,7 @@ func usage() -> Never {
            glide-host --request-permissions     (prompt for Screen Recording + Accessibility, wait, exit)
            glide-host --set-connect HOST[:PORT] (save the default dial-out target in host.json)
            glide-host --set-password-file PATH  (save the password in host.json)
+           glide-host --selftest-ui [--out DIR] (print the status menu per state + display-mode picks; no capture)
       --connect: dial out to a client running `glide-client --listen` (reconnects automatically)
                  instead of listening. Use when the network only allows Mac -> viewer connections.
       Password resolution: --password, --password-file, $GLIDE_PASSWORD, saved password in
@@ -65,6 +68,7 @@ func takeValue(_ flag: String) -> String? {
     return v
 }
 if args.contains("-h") || args.contains("--help") { usage() }
+if args.contains("--selftest-ui") { runSelfTestUI(outDir: takeValue("--out")) }  // offscreen; never captures
 
 if args.contains("--request-permissions") {
     // Run from the app bundle so macOS attributes the grants to Glide Host itself.
@@ -125,9 +129,15 @@ if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedVal
 final class Server: @unchecked Sendable {
     let settings: HostSettings
     let listener: NWListener
-    var current: Session?
+    /// Active session + connections still authenticating (an unauthenticated connection never
+    /// touches the active session; see SessionRegistry).
+    let sessions = SessionRegistry<Session>(maxPending: 4)
+    var current: Session? { sessions.current }
     var nextId = 1
     let lock = NSLock()
+    private var paused = false
+    private var dialTarget: (host: String, port: UInt16)?
+    private var dialLoopActive = false
 
     init(settings: HostSettings) throws {
         self.settings = settings
@@ -136,6 +146,12 @@ final class Server: @unchecked Sendable {
 
     /// Outbound mode: keep a connection to `host:port` alive, redialing after it drops.
     func dial(host: String, port: UInt16) {
+        lock.lock()
+        dialTarget = (host, port)
+        if paused { dialLoopActive = false; lock.unlock(); return }
+        dialLoopActive = true
+        lock.unlock()
+        HostStatus.shared.update { $0.dialTarget = "\(host):\(port)"; $0.dialDetail = "connecting" }
         let conn = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: SecureChannel.tcpParameters())
         log("dialer: connecting to \(host):\(port)")
         let redial = { [weak self] in
@@ -150,9 +166,13 @@ final class Server: @unchecked Sendable {
                 // Hand the live connection to a Session (it re-installs its own state handler).
                 self.adopt(conn, onEnd: redial)
             case .waiting(let e):
-                log("dialer: waiting (\(e)); retrying"); conn.cancel(); redial()
+                log("dialer: waiting (\(e)); retrying"); conn.cancel()
+                HostStatus.shared.update { $0.dialDetail = "\(e)" }
+                redial()
             case .failed(let e) where !sessionStarted:
-                log("dialer: failed (\(e)); retrying"); redial()
+                log("dialer: failed (\(e)); retrying")
+                HostStatus.shared.update { $0.dialDetail = "\(e)" }
+                redial()
             default: break
             }
         }
@@ -162,41 +182,60 @@ final class Server: @unchecked Sendable {
     private func adopt(_ conn: NWConnection, onEnd extra: (() -> Void)? = nil) {
         lock.lock()
         let id = nextId; nextId += 1
-        let old = current
-        let s = Session(id: id, connection: conn, settings: settings)
-        current = s
+        let isPaused = paused
         lock.unlock()
-        if let old { log("server: new connection replaces session \(old.id)"); old.end() }
-        log("server: connection \(id) with \(conn.endpoint)")
-        s.onEnd = { [weak self] ended in
+        let s = Session(id: id, connection: conn, settings: settings)
+        guard !isPaused else {
+            log("server: refusing connection from \(conn.endpoint) (paused)")
+            conn.cancel(); extra?(); return
+        }
+        var source = "\(conn.endpoint)"
+        if case let .hostPort(host, _) = conn.endpoint { source = "\(host)" }
+        if let evicted = sessions.admit(s, source: source) {
+            log("server: too many unauthenticated connections; dropping pending session \(evicted.id)")
+            evicted.end()
+        }
+        log("server: connection \(id) with \(conn.endpoint) (authenticating)")
+        s.onAuthenticated = { [weak self] s in
             guard let self else { return }
-            self.lock.lock(); if self.current === ended { self.current = nil }; self.lock.unlock()
+            self.lock.lock(); let isPaused = self.paused; self.lock.unlock()
+            if isPaused { log("server: paused; closing session \(s.id)"); s.end(); return }
+            // Only now may the new viewer replace the active one.
+            let r = self.sessions.authenticated(s)
+            if let old = r.replaced { log("server: session \(s.id) replaces session \(old.id)"); old.end() }
+        }
+        s.onEnd = { [weak self] ended in
+            self?.sessions.ended(ended)
             extra?()
         }
         s.start()
     }
 
+    /// Ends the active session (menu). In dial mode the host redials after 2 s.
+    func disconnect() { current?.end() }
+
+    /// Paused: refuse new connections, stop dialing, and end any current/pending session.
+    func setPaused(_ p: Bool) {
+        lock.lock()
+        paused = p
+        let target = dialTarget
+        let needDial = !p && target != nil && !dialLoopActive
+        lock.unlock()
+        HostStatus.shared.update { $0.paused = p; if p { $0.dialDetail = nil } }
+        log("server: \(p ? "paused" : "resumed")")
+        if p { sessions.all.forEach { $0.end() } }
+        if needDial, let t = target { dial(host: t.host, port: t.port) }
+    }
+
     func start() {
         listener.newConnectionHandler = { [weak self] conn in
-            guard let self else { return }
-            self.adopt(conn); return
-            self.lock.lock()
-            let id = self.nextId; self.nextId += 1
-            let old = self.current
-            let s = Session(id: id, connection: conn, settings: self.settings)
-            self.current = s
-            self.lock.unlock()
-            if let old { log("server: new connection replaces session \(old.id)"); old.end() }
-            log("server: connection \(id) from \(conn.endpoint)")
-            s.onEnd = { [weak self] ended in
-                guard let self else { return }
-                self.lock.lock(); if self.current === ended { self.current = nil }; self.lock.unlock()
-            }
-            s.start()
+            self?.adopt(conn)
         }
         listener.stateUpdateHandler = { st in
             switch st {
-            case .ready: log("server: listening on port \(self.settings.port)")
+            case .ready:
+                log("server: listening on port \(self.settings.port)")
+                HostStatus.shared.update { $0.listenPort = self.settings.port }
             case .failed(let e): log("server: listener failed: \(e)"); exit(1)
             default: break
             }
@@ -208,8 +247,11 @@ final class Server: @unchecked Sendable {
 let app = NSApplication.shared
 let sleepAssertion = Power.preventSystemSleep()
 log(sleepAssertion != nil ? "power: preventing idle system sleep while the host runs" : "power: could not create sleep assertion")
-app.setActivationPolicy(.prohibited)
+app.setActivationPolicy(.accessory)  // LSUIElement: menu-bar status item only
 let server = try Server(settings: settings)
+DisplayModeController.shared.start(displayID: settings.displayID)
+let statusMenu = StatusMenu(actions: .init(disconnect: { server.disconnect() }, setPaused: { server.setPaused($0) }),
+                            password: password, displayID: settings.displayID)
 if let target = connectTarget {
     let parts = target.split(separator: ":")
     server.dial(host: String(parts[0]), port: parts.count > 1 ? UInt16(parts[1]) ?? 7420 : 7420)

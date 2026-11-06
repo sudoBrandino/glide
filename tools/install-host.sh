@@ -19,6 +19,8 @@ fi
 
 mkdir -p "$HOME/Applications" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+# bootout is asynchronous; wait until launchd has really unloaded the agent before re-bootstrapping
+for _ in $(seq 1 50); do launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || break; sleep 0.2; done
 rm -rf "$APP"
 cp -R "$ROOT/dist/Glide Host.app" "$APP"
 cat > "$PLIST" <<PLIST
@@ -41,6 +43,10 @@ cat > "$PLIST" <<PLIST
 PLIST
 echo "installed $APP and $PLIST"
 if [[ "${1:-}" != "--no-start" ]]; then
-  launchctl bootstrap "$DOMAIN" "$PLIST"
+  for attempt in 1 2 3 4 5; do
+    launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null && break
+    [[ $attempt == 5 ]] && { echo "launchctl bootstrap failed"; exit 1; }
+    sleep 1
+  done
   echo "started ($LABEL); log: ~/Library/Logs/glide-host.log"
 fi

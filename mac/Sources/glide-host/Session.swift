@@ -20,7 +20,13 @@ final class Session: @unchecked Sendable {
     private var displayAssertion: IOPMAssertionID?
     private var statsTimer: DispatchSourceTimer?
     private var clientName = "?"
+    /// Created at auth if the viewer advertised clipboard support; started after ServerHello.
+    private var clipboard: ClipboardSync?
     var onEnd: ((Session) -> Void)?
+    /// Called (on the session queue) once the peer proved the password with a valid ClientHello,
+    /// before streaming starts. Until then the session must not affect any other session.
+    var onAuthenticated: ((Session) -> Void)?
+    static let authTimeout: TimeInterval = 5
 
     init(id: Int, connection: NWConnection, settings: HostSettings) {
         self.id = id
@@ -46,6 +52,13 @@ final class Session: @unchecked Sendable {
             }
         }
         channel.onMessage = { [weak self] d in self?.handle(d) }
+        // Outbound (dialed) connections can sit in the viewer's accept backlog for a moment: allow longer.
+        let authTimeout = Session.authTimeout * (channel.connection.state == .ready ? 2 : 1)
+        channel.queue.asyncAfter(deadline: .now() + authTimeout) { [weak self] in
+            guard let self, !self.authed, !self.ended else { return }
+            log("session \(self.id): no valid ClientHello within \(Int(authTimeout))s from \(self.peer); closing")
+            self.end()
+        }
         channel.onClose = { [weak self] err in
             guard let self else { return }
             if let err, case WireError.decryptFailed = err, !self.authed {
@@ -73,9 +86,11 @@ final class Session: @unchecked Sendable {
         if let o = displayObserver { NotificationCenter.default.removeObserver(o) }
         displayRestart?.cancel()
         cursor.stop()
+        clipboard?.stop(); clipboard = nil
         inputQueue.async { self.injector.releaseAll() }
         if let p = pipeline { Task { await p.stop() } }
         pipeline = nil
+        if authed { DisplayModeController.shared.sessionEnded(id: id); HostStatus.shared.sessionEnded(id: id) }
         log("session \(id): ended")
         onEnd?(self)
     }
@@ -91,10 +106,22 @@ final class Session: @unchecked Sendable {
             guard case let .hello(version, caps, vw, vh, mode, maxFps, name) = msg else { log("session \(id): expected ClientHello"); end(); return }
             authed = true
             clientName = name
+            onAuthenticated?(self)
+            if ended { return }  // rejected by the server (e.g. paused)
+            HostStatus.shared.sessionAuthed(id: id, name: name, endpoint: channel.connection.endpoint, viewW: Int(vw), viewH: Int(vh))
             Power.wakeDisplay()
             displayAssertion = Power.preventDisplaySleep()
             log("session \(id): '\(name)' authenticated from \(peer) (proto v\(version), view \(vw)x\(vh), caps \(caps.rawValue), mode \(mode), fps \(maxFps))")
-            startStreaming(caps: caps, mode: mode, maxFps: maxFps, viewW: vw)
+            if caps.contains(.clipboard) {
+                clipboard = ClipboardSync(sessionId: id) { [weak self] c in self?.send(.clipboard(c)) }
+            }
+            // Switch the Mac's display mode for this viewer first (if the policy says so), then capture once.
+            DisplayModeController.shared.sessionBegan(id: id, viewW: Int(vw), viewH: Int(vh)) { [weak self] in
+                self?.channel.queue.async {
+                    guard let self, !self.ended else { return }
+                    self.startStreaming(caps: caps, mode: mode, maxFps: maxFps, viewW: vw)
+                }
+            }
             return
         }
         switch msg {
@@ -104,14 +131,19 @@ final class Session: @unchecked Sendable {
         case let .key(u, down): Power.wakeDisplay(); inputQueue.async { self.injector.key(usage: u, down: down) }
         case .releaseAll: inputQueue.async { self.injector.releaseAll() }
         case .requestKeyframe: pipeline?.requestKeyframe()
-        case let .viewSize(vw, _):
-            guard let p = pipeline else { return }
-            let target = min(settings.maxWidth, Int(vw))
-            guard target != p.options.maxWidth else { return }
-            log("session \(id): viewer now \(vw)px wide -> re-capturing at max width \(target)")
-            Task {
-                do { try await p.restart(maxWidth: target) }
-                catch { log("session \(self.id): restart failed: \(error)") }
+        case let .viewSize(vw, vh):
+            HostStatus.shared.viewSize(id: id, w: Int(vw), h: Int(vh))
+            // Debounced; may switch the display mode, in which case the display-change observer re-captures.
+            DisplayModeController.shared.viewSizeChanged(id: id, viewW: Int(vw), viewH: Int(vh)) { [weak self] switched in
+                guard let self, !self.ended, let p = self.pipeline else { return }
+                let target = min(self.settings.maxWidth, Int(vw))
+                if switched { p.setMaxWidth(target); return }
+                guard target != p.options.maxWidth else { return }
+                log("session \(self.id): viewer now \(vw)px wide -> re-capturing at max width \(target)")
+                Task {
+                    do { try await p.restart(maxWidth: target) }
+                    catch { log("session \(self.id): restart failed: \(error)") }
+                }
             }
         case let .setMode(mode, br, fps):
             guard let p = pipeline else { return }
@@ -124,13 +156,14 @@ final class Session: @unchecked Sendable {
         case let .audioEnable(on):
             log("session \(id): viewer \(on ? "unmuted" : "muted") audio")
             audio?.setEnabled(on)
-        case .clipboard: break
+            if audio != nil { HostStatus.shared.audio(id: id, on ? "on" : "muted") }
+        case let .clipboard(c): clipboard?.apply(c)
         case .hello: break
         }
     }
 
     private func startStreaming(caps: CodecCaps, mode: StreamMode, maxFps: UInt8, viewW: UInt16) {
-        let codec: Codec = caps.contains(.hevc420) || caps.isEmpty ? .hevc : .h264
+        let codec: Codec = caps.contains(.hevc420) || caps.intersection(.codecMask).isEmpty ? .hevc : .h264
         var m = mode
         if (m == .sharp || m == .hybrid) && !caps.contains(.hevc444) { m = .fast }
         let fps = maxFps > 0 ? min(Int(maxFps), settings.fps) : settings.fps
@@ -147,12 +180,19 @@ final class Session: @unchecked Sendable {
             if !sentHello {
                 sentHello = true
                 self.send(.serverHello(version: Handshake.version, hostName: Host.current().localizedName ?? "Mac", config: cfg))
+                if let sharpCfg { self.send(.sharpLayerConfig(sharpCfg)) }
+                if let clip = self.clipboard {
+                    // Only to viewers with caps bit 8 (PROTOCOL.md §5), and only after ServerHello.
+                    self.send(.clipboardCaps(formats: ClipboardData.capsText | ClipboardData.capsPNG, maxBytes: UInt32(ClipboardData.maxBytes)))
+                    clip.start()
+                }
                 if self.audioOff { self.send(.audioConfig(.off)) }
                 self.audio?.arm()
             } else {
                 self.send(.videoConfig(cfg))
+                if let sharpCfg { self.send(.sharpLayerConfig(sharpCfg)) }
             }
-            if let sharpCfg { self.send(.sharpLayerConfig(sharpCfg)) }
+            HostStatus.shared.video(id: self.id, config: cfg, hybrid: sharpCfg != nil)
             // Cursor bitmaps are in encoded pixels: backing scale x (encoded width / native width).
             let mode = CGDisplayCopyDisplayMode(self.settings.displayID)
             let native = CGFloat(mode?.pixelWidth ?? Int(cfg.width))
@@ -178,6 +218,7 @@ final class Session: @unchecked Sendable {
         guard ProcessInfo.processInfo.environment["GLIDE_NO_AUDIO"] != "1" else {
             log("session \(id): audio disabled on this host (GLIDE_NO_AUDIO=1)")
             audioOff = true  // tell the viewer right after ServerHello
+            HostStatus.shared.audio(id: id, "off")
             return
         }
         let a = AudioPipeline()
@@ -190,6 +231,7 @@ final class Session: @unchecked Sendable {
         a.canSend = { [weak self] in (self?.channel.bytesInFlight ?? 0) < maxInFlight * 2 }
         p.audio = a
         audio = a
+        HostStatus.shared.audio(id: id, "on")
     }
 
     /// Starts capture, retrying until it works or the session ends. The display can be unavailable
@@ -209,11 +251,13 @@ final class Session: @unchecked Sendable {
                 if statsTimer == nil { startStats() }
                 if displayObserver == nil { watchDisplayChanges() }
                 if attempt > 1 { log("session \(id): capture started after \(attempt) attempts") }
+                HostStatus.shared.captureError(id: id, nil)
                 return
             } catch {
                 if attempt <= 3 || attempt % 15 == 0 {
                     log("session \(id): capture unavailable (attempt \(attempt), screen recording \(CGPreflightScreenCaptureAccess() ? "granted" : "NOT granted")): \(error.localizedDescription) — waking display and retrying")
                 }
+                HostStatus.shared.captureError(id: id, CGPreflightScreenCaptureAccess() ? "display unavailable, retrying" : "Screen Recording not granted")
                 Power.wakeDisplay()
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
@@ -252,6 +296,7 @@ final class Session: @unchecked Sendable {
                 s.sharpMs.sort(); s.diffUs.sort()
                 let diffMed = s.diffUs.isEmpty ? 0 : s.diffUs[s.diffUs.count / 2] / 1000
                 let sharpMed = s.sharpMs.isEmpty ? 0 : s.sharpMs[s.sharpMs.count / 2]
+                HostStatus.shared.stats(id: self.id, fps: Double(s.encoded) / 5, mbps: Double(s.bytes) * 8 / 5 / 1e6, encodeMs: med)
                 log(String(format: "stats: sent %.1f fps, %.1f Mbps, encode p50 %.1fms p95 %.1fms, captured %d, keyframes %d, rect frames %d (avg %.1f rects), sharp %d sent/%d dropped (p50 %.1fms), diff p50 %.2fms, identical %d, skipped busy %d / net %d, in-flight %d KB",
                            Double(s.encoded) / 5, Double(s.bytes) * 8 / 5 / 1e6, med, p95, s.captured, s.keyframes, s.rectFrames, s.rectFrames > 0 ? Double(s.rectCount) / Double(s.rectFrames) : 0, s.sharpSent, s.sharpDropped, sharpMed, diffMed, s.identical, s.skippedBusy, s.skippedNet, self.channel.bytesInFlight / 1024))
             }
