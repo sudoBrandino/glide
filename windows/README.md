@@ -34,7 +34,7 @@ Shaders are compiled at runtime with `D3DCompile` from `d3dcompiler_47.dll`, whi
 
 ```
 glide-client.exe                               (uses the config file: listen on 7420 by default)
-glide-client.exe <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--bench SECONDS] [--probe]
+glide-client.exe <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--bench SECONDS] [--probe]
 glide-client.exe --listen [PORT] [same options]
 glide-client.exe --forget-password
 ```
@@ -53,7 +53,7 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   "ctrl_as_cmd": true,
   "hud": false,             // stats overlay, toggled with Ctrl+Alt+Shift+H
   "clipboard": true,        // clipboard sync with the host (false = --no-clipboard)
-  "clipboard_sync_secrets": false,  // reserved: also sync clipboard items marked as secret
+  "clipboard_sync_secrets": false,  // also send clipboard items password managers mark private (= --clipboard-sync-secrets)
   "last_monitor": "\\.\DISPLAY1",
   "windows": { "\\.\DISPLAY1": { "x": 0, "y": 0, "w": 2400, "h": 1400, "maximized": false, "fullscreen": true, "mon_w": 3840, "mon_h": 2160 } }
 }
@@ -149,7 +149,12 @@ To replace a `.cmd` launcher that sets `GLIDE_PASSWORD`, run `glide-client.exe` 
   - PC → Mac: CF_UNICODETEXT (CRLF → LF) if there is text, else the registered "PNG" format, else
     CF_DIB converted to PNG on a worker thread. Mac → PC: CF_UNICODETEXT (LF → CRLF), or
     "PNG" + CF_DIB (translucent pixels composited over white in the DIB).
-  - Max 16 MiB per clipboard; bigger content is not sent (logged, never truncated).
+  - Max 16 MiB per clipboard; bigger content is not sent (logged, never truncated). Received
+    images are checked (PNG signature, IHDR ≤ 64 Mpx) before decoding.
+  - Content that password managers mark private (`ExcludeClipboardContentFromMonitorProcessing`,
+    `Clipboard Viewer Ignore`, `CanIncludeInClipboardHistory`/`CanUploadToCloudClipboard` = 0)
+    is not sent unless `--clipboard-sync-secrets` (or `GLIDE_CLIPBOARD_SYNC_SECRETS=1`) is given.
+    This moves to `%APPDATA%\Glide\config.json` once that lands.
   - Echo suppression: our own writes are recognized by `GetClipboardSequenceNumber()` / clipboard
     owner, plus a content hash, so nothing ping-pongs.
 

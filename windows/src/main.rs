@@ -26,6 +26,8 @@ pub struct Args {
     clipboard: Option<bool>,
     /// Headless Win32 clipboard self-test (no connection).
     clipboard_selftest: bool,
+    /// Also sync clipboard content marked private (password managers).
+    clipboard_sync_secrets: bool,
 }
 
 const USAGE: &str = "usage: glide-client [host[:port] | --listen [PORT]] [options...]
@@ -43,6 +45,9 @@ const USAGE: &str = "usage: glide-client [host[:port] | --listen [PORT]] [option
   --no-ctrl-as-cmd   don't map Ctrl->Cmd / Win->Control (also --ctrl-as-cmd to force it on)
   --no-clipboard     don't sync the clipboard (text + images) with the host (config: \"clipboard\")
   --forget-password  delete the saved (DPAPI-encrypted) password and exit
+  --clipboard-sync-secrets  also send clipboard content that password managers mark private
+                     (default: respected, not sent). Env GLIDE_CLIPBOARD_SYNC_SECRETS=1, or config
+                     \"clipboard_sync_secrets\": true
   --bench SECONDS    headless: connect, decode for N seconds, print one JSON line
   --probe            print decoder capabilities as JSON (no connection)
   --clipboard-selftest  exercise the Win32 clipboard path headlessly (no connection; run over SSH)
@@ -71,6 +76,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Strin
             "--forget-password" => a.forget_password = true,
             "--no-clipboard" => a.clipboard = Some(false),
             "--clipboard-selftest" => a.clipboard_selftest = true,
+            "--clipboard-sync-secrets" => a.clipboard_sync_secrets = true,
             "--bench" => {
                 let v = it.next().ok_or("--bench needs SECONDS")?;
                 a.bench = Some(v.parse::<f64>().map_err(|_| format!("bad --bench value {v}"))?);
@@ -182,6 +188,11 @@ fn main() -> ExitCode {
         }
     };
 
+    #[cfg(windows)]
+    glide::win::clipboard::set_sync_secrets(
+        args.clipboard_sync_secrets || std::env::var("GLIDE_CLIPBOARD_SYNC_SECRETS").is_ok_and(|v| v == "1"),
+    );
+
     if args.clipboard_selftest {
         #[cfg(windows)]
         {
@@ -219,6 +230,10 @@ fn main() -> ExitCode {
         eprintln!("warning: {w}");
     }
     let cfg_dir = store.dir.clone();
+    #[cfg(windows)]
+    if store.config.clipboard_sync_secrets {
+        glide::win::clipboard::set_sync_secrets(true);
+    }
     if let Some(pw) = legacy_pw {
         #[cfg(windows)]
         match cfg_dir.as_deref().map(|d| glide::win::dpapi::store_password(d, &pw)) {

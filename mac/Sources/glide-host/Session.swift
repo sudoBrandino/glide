@@ -111,7 +111,7 @@ final class Session: @unchecked Sendable {
             displayAssertion = Power.preventDisplaySleep()
             log("session \(id): '\(name)' authenticated from \(peer) (proto v\(version), view \(vw)x\(vh), caps \(caps.rawValue), mode \(mode), fps \(maxFps))")
             if caps.contains(.clipboard) {
-                clipboard = ClipboardSync(sessionId: id) { [weak self] c in self?.send(.clipboard(c)) }
+                clipboard = ClipboardSync(sessionId: id, syncConcealed: settings.clipboardSyncConcealed) { [weak self] c in self?.send(.clipboard(c)) }
             }
             // Switch the Mac's display mode for this viewer first (if the policy says so), then capture once.
             DisplayModeController.shared.sessionBegan(id: id, viewW: Int(vw), viewH: Int(vh)) { [weak self] in
