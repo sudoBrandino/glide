@@ -7,9 +7,13 @@ pub mod annexb;
 pub mod audio;
 pub mod bench;
 pub mod clipboard;
+pub mod config;
 pub mod crypto;
 pub mod hid;
+pub mod hotkeys;
+pub mod hud;
 pub mod net;
+pub mod peers;
 pub mod protocol;
 pub mod util;
 

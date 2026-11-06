@@ -1,10 +1,12 @@
 //! D3D11 flip-model renderer. Decoded YUV layers (NV12/P010/AYUV/Y410/Y416) are converted
 //! (BT.709 limited range) into a video-sized RGB canvas — whole frame or scissored update
 //! rects — and the canvas is drawn aspect-fit into a waitable swap chain (max latency 1).
+//! Text (status line, stats HUD, hotkey toasts) is rasterized with GDI into small premultiplied
+//! BGRA textures only when it changes, and alpha-blended 1:1 on top at present time.
 
 use super::d3d::Gpu;
 use super::decoder::FrameTex;
-use windows::core::{Interface, Result, PCSTR};
+use windows::core::{Interface, Result, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{HANDLE, HWND, RECT};
 use windows::Win32::Graphics::Direct3D::Fxc::*;
 use windows::Win32::Graphics::Direct3D::*;
@@ -56,6 +58,11 @@ float4 ps_main(VO i) : SV_Target {
 float4 ps_copy(VO i) : SV_Target {
     return float4(t0.Sample(smp, i.uv).rgb * dim, 1.0);
 }
+
+// Text panels: premultiplied BGRA drawn 1:1, faded by `dim` (opacity).
+float4 ps_overlay(VO i) : SV_Target {
+    return t0.Sample(smp, i.uv) * dim;
+}
 "#;
 
 fn compile(entry: &str, target: &str) -> Result<Vec<u8>> {
@@ -103,6 +110,9 @@ pub struct Renderer {
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
     ps_copy: ID3D11PixelShader,
+    ps_overlay: ID3D11PixelShader,
+    /// Premultiplied-alpha blending for text panels.
+    blend: ID3D11BlendState,
     sampler: ID3D11SamplerState,
     raster: ID3D11RasterizerState,
     /// Canvas (§3.1): video-sized RGB10A2 texture that decoded layers are converted into
@@ -110,8 +120,12 @@ pub struct Renderer {
     canvas: Option<(ID3D11Texture2D, ID3D11RenderTargetView, ID3D11ShaderResourceView, u32, u32)>,
     cb: ID3D11Buffer,
     cb_state: (u32, f32),
-    /// Centered status text (e.g. "Waiting for host…"), rasterized with GDI.
-    overlay: Option<(ID3D11ShaderResourceView, u32, u32)>,
+    /// Centered status text (e.g. "Waiting for host…").
+    overlay: Option<Panel>,
+    /// Stats HUD, top-left.
+    hud: Option<Panel>,
+    /// Hotkey toast, bottom-center, with its current opacity.
+    toast: Option<(Panel, f32)>,
     flags: DXGI_SWAP_CHAIN_FLAG,
     tearing: bool,
     pub size: (u32, u32),
@@ -173,12 +187,28 @@ impl Renderer {
             let vs_code = compile("vs_main", "vs_5_0")?;
             let ps_code = compile("ps_main", "ps_5_0")?;
             let ps_copy_code = compile("ps_copy", "ps_5_0")?;
+            let ps_overlay_code = compile("ps_overlay", "ps_5_0")?;
             let mut vs = None;
             gpu.device.CreateVertexShader(&vs_code, None, Some(&mut vs))?;
             let mut ps = None;
             gpu.device.CreatePixelShader(&ps_code, None, Some(&mut ps))?;
             let mut ps_copy = None;
             gpu.device.CreatePixelShader(&ps_copy_code, None, Some(&mut ps_copy))?;
+            let mut ps_overlay = None;
+            gpu.device.CreatePixelShader(&ps_overlay_code, None, Some(&mut ps_overlay))?;
+            let mut bd = D3D11_BLEND_DESC::default();
+            bd.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: true.into(),
+                SrcBlend: D3D11_BLEND_ONE,
+                DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
+                BlendOp: D3D11_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D11_BLEND_ONE,
+                DestBlendAlpha: D3D11_BLEND_INV_SRC_ALPHA,
+                BlendOpAlpha: D3D11_BLEND_OP_ADD,
+                RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            };
+            let mut blend = None;
+            gpu.device.CreateBlendState(&bd, Some(&mut blend))?;
             let rd = D3D11_RASTERIZER_DESC {
                 FillMode: D3D11_FILL_SOLID,
                 CullMode: D3D11_CULL_NONE,
@@ -221,12 +251,16 @@ impl Renderer {
                 vs: vs.unwrap(),
                 ps: ps.unwrap(),
                 ps_copy: ps_copy.unwrap(),
+                ps_overlay: ps_overlay.unwrap(),
+                blend: blend.unwrap(),
                 sampler: sampler.unwrap(),
                 raster: raster.unwrap(),
                 canvas: None,
                 cb: cb.unwrap(),
                 cb_state: (0, 1.0),
                 overlay: None,
+                hud: None,
+                toast: None,
                 flags,
                 tearing,
                 size: (w.max(1), h.max(1)),
@@ -381,9 +415,40 @@ impl Renderer {
     pub fn set_overlay(&mut self, text: Option<&str>, px: i32) -> Result<()> {
         self.overlay = None;
         let Some(text) = text else { return Ok(()) };
+        self.overlay = Some(self.make_panel(&[text], px, &PanelStyle::STATUS)?);
+        Ok(())
+    }
+
+    /// Set (or clear) the stats HUD lines.
+    pub fn set_hud(&mut self, lines: Option<&[String]>, px: i32) -> Result<()> {
+        self.hud = None;
+        let Some(lines) = lines.filter(|l| !l.is_empty()) else { return Ok(()) };
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        self.hud = Some(self.make_panel(&refs, px, &PanelStyle::HUD)?);
+        Ok(())
+    }
+
+    /// Set (or clear) the toast; it starts fully opaque.
+    pub fn set_toast(&mut self, text: Option<&str>, px: i32) -> Result<()> {
+        self.toast = None;
+        let Some(text) = text else { return Ok(()) };
+        self.toast = Some((self.make_panel(&[text], px, &PanelStyle::TOAST)?, 1.0));
+        Ok(())
+    }
+
+    pub fn set_toast_opacity(&mut self, a: f32) {
+        if let Some(t) = self.toast.as_mut() {
+            t.1 = a.clamp(0.0, 1.0);
+        }
+    }
+
+    /// Rasterize `lines` with GDI (grayscale AA, white on black → coverage), then compose a
+    /// premultiplied BGRA rounded panel and upload it as an immutable texture.
+    fn make_panel(&self, lines: &[&str], px: i32, st: &PanelStyle) -> Result<Panel> {
         use windows::Win32::Foundation::SIZE;
         use windows::Win32::Graphics::Gdi::*;
-        let wide: Vec<u16> = text.encode_utf16().collect();
+        let px = px.max(8);
+        let wides: Vec<Vec<u16>> = lines.iter().map(|l| l.encode_utf16().collect()).collect();
         unsafe {
             let hdc = CreateCompatibleDC(None);
             let font = CreateFontW(
@@ -391,7 +456,7 @@ impl Renderer {
                 0,
                 0,
                 0,
-                FW_SEMIBOLD.0 as i32,
+                st.weight,
                 0,
                 0,
                 0,
@@ -400,13 +465,21 @@ impl Renderer {
                 CLIP_DEFAULT_PRECIS,
                 ANTIALIASED_QUALITY,
                 0,
-                windows::core::w!("Segoe UI"),
+                st.face,
             );
             let old_font = SelectObject(hdc, font.into());
-            let mut sz = SIZE::default();
-            let _ = GetTextExtentPoint32W(hdc, &wide, &mut sz);
-            let (padx, pady) = (px, px / 2);
-            let (w, h) = ((sz.cx + 2 * padx).max(1) as u32, (sz.cy + 2 * pady).max(1) as u32);
+            let mut tm = TEXTMETRICW::default();
+            let _ = GetTextMetricsW(hdc, &mut tm);
+            let line_h = tm.tmHeight + (px as f32 * st.line_gap) as i32;
+            let mut text_w = 0;
+            for wl in &wides {
+                let mut sz = SIZE::default();
+                let _ = GetTextExtentPoint32W(hdc, wl, &mut sz);
+                text_w = text_w.max(sz.cx);
+            }
+            let (padx, pady) = ((px as f32 * st.pad.0) as i32, (px as f32 * st.pad.1) as i32);
+            let text_h = line_h * (wides.len() as i32 - 1) + tm.tmHeight;
+            let (w, h) = ((text_w + 2 * padx).max(1) as u32, (text_h + 2 * pady).max(1) as u32);
             let bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -424,36 +497,18 @@ impl Renderer {
             let result = match bmp {
                 Ok(bmp) => {
                     let old_bmp = SelectObject(hdc, bmp.into());
-                    let px_slice = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
-                    px_slice.fill(0xFF22_2226); // dark panel (BGRA: 26 22 22 FF)
+                    let cov = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
+                    cov.fill(0);
                     SetBkMode(hdc, TRANSPARENT);
-                    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(0x00F2_F2F2));
-                    let _ = TextOutW(hdc, padx, pady, &wide);
+                    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(0x00FF_FFFF));
+                    for (i, wl) in wides.iter().enumerate() {
+                        let _ = TextOutW(hdc, padx, pady + i as i32 * line_h, wl);
+                    }
                     let _ = GdiFlush();
-                    let mut data: Vec<u32> = px_slice.iter().map(|p| p | 0xFF00_0000).collect();
-                    data.shrink_to_fit();
+                    let data = compose_panel(cov, w, h, (px as f32 * st.radius).min(h as f32 / 2.0), st);
                     SelectObject(hdc, old_bmp);
                     let _ = DeleteObject(bmp.into());
-                    let d = D3D11_TEXTURE2D_DESC {
-                        Width: w,
-                        Height: h,
-                        MipLevels: 1,
-                        ArraySize: 1,
-                        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                        Usage: D3D11_USAGE_IMMUTABLE,
-                        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                        ..Default::default()
-                    };
-                    let init = D3D11_SUBRESOURCE_DATA { pSysMem: data.as_ptr() as *const _, SysMemPitch: w * 4, SysMemSlicePitch: 0 };
-                    let mut t = None;
-                    let r = self.device.CreateTexture2D(&d, Some(&init), Some(&mut t)).and_then(|_| {
-                        let t: ID3D11Texture2D = t.unwrap();
-                        let mut srv = None;
-                        self.device.CreateShaderResourceView(&t, None, Some(&mut srv))?;
-                        Ok(srv.unwrap())
-                    });
-                    r.map(|srv| self.overlay = Some((srv, w, h)))
+                    self.upload_bgra(&data, w, h)
                 }
                 Err(e) => Err(e),
             };
@@ -464,8 +519,56 @@ impl Renderer {
         }
     }
 
+    fn upload_bgra(&self, data: &[u32], w: u32, h: u32) -> Result<Panel> {
+        unsafe {
+            let d = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_IMMUTABLE,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                ..Default::default()
+            };
+            let init = D3D11_SUBRESOURCE_DATA { pSysMem: data.as_ptr() as *const _, SysMemPitch: w * 4, SysMemSlicePitch: 0 };
+            let mut t = None;
+            self.device.CreateTexture2D(&d, Some(&init), Some(&mut t))?;
+            let t: ID3D11Texture2D = t.unwrap();
+            let mut srv = None;
+            self.device.CreateShaderResourceView(&t, None, Some(&mut srv))?;
+            Ok(Panel { srv: srv.unwrap(), w, h })
+        }
+    }
+
+    /// Alpha-blend a panel 1:1 at (x, y) in back-buffer pixels.
+    fn draw_panel(&mut self, rtv: &ID3D11RenderTargetView, p: &Panel, x: i32, y: i32, opacity: f32) {
+        let mode = self.cb_state.0;
+        self.set_cb(mode, opacity);
+        let ctx = &self.context;
+        unsafe {
+            ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+            ctx.OMSetBlendState(&self.blend, None, 0xFFFF_FFFF);
+            let vp = D3D11_VIEWPORT { TopLeftX: x as f32, TopLeftY: y as f32, Width: p.w as f32, Height: p.h as f32, MinDepth: 0.0, MaxDepth: 1.0 };
+            ctx.RSSetViewports(Some(&[vp]));
+            ctx.RSSetState(&self.raster);
+            ctx.RSSetScissorRects(Some(&[RECT { left: x, top: y, right: x + p.w as i32, bottom: y + p.h as i32 }]));
+            ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.IASetInputLayout(None);
+            ctx.VSSetShader(&self.vs, None);
+            ctx.PSSetShader(&self.ps_overlay, None);
+            ctx.PSSetShaderResources(0, Some(&[Some(p.srv.clone())]));
+            ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            ctx.PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
+            ctx.Draw(3, 0);
+            ctx.PSSetShaderResources(0, Some(&[None]));
+            ctx.OMSetBlendState(None, None, 0xFFFF_FFFF);
+        }
+    }
+
     /// Draw the canvas letterboxed into `rect` (x, y, w, h in back-buffer pixels), multiplied
-    /// by `dim`, plus the status overlay if set, and present.
+    /// by `dim`, then the HUD, toast and status panels if set, and present.
     pub fn present(&mut self, rect: (i32, i32, i32, i32), dim: f32) -> Result<()> {
         unsafe {
             let Some(rtv) = self.rtv.clone() else { return Ok(()) };
@@ -497,26 +600,21 @@ impl Renderer {
                 ctx.Draw(3, 0);
                 ctx.PSSetShaderResources(0, Some(&[None]));
             }
-            if let Some((srv, w, h)) = self.overlay.clone() {
-                let (bw, bh) = self.size;
-                let (x, y) = ((bw as i32 - w as i32) / 2, (bh as i32 - h as i32) / 2);
-                self.set_cb(mode, 1.0);
-                let ctx = &self.context;
-                ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
-                let vp = D3D11_VIEWPORT { TopLeftX: x as f32, TopLeftY: y as f32, Width: w as f32, Height: h as f32, MinDepth: 0.0, MaxDepth: 1.0 };
-                ctx.RSSetViewports(Some(&[vp]));
-                ctx.RSSetState(&self.raster);
-                ctx.RSSetScissorRects(Some(&[RECT { left: x, top: y, right: x + w as i32, bottom: y + h as i32 }]));
-                ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                ctx.IASetInputLayout(None);
-                ctx.VSSetShader(&self.vs, None);
-                ctx.PSSetShader(&self.ps_copy, None);
-                ctx.PSSetShaderResources(0, Some(&[Some(srv)]));
-                ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
-                ctx.PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
-                ctx.Draw(3, 0);
-                ctx.PSSetShaderResources(0, Some(&[None]));
+            let (bw, bh) = (self.size.0 as i32, self.size.1 as i32);
+            if let Some(p) = self.hud.clone() {
+                let m = (p.h as i32 / 12).clamp(8, 24);
+                self.draw_panel(&rtv, &p, m, m, 1.0);
             }
+            if let Some((p, a)) = self.toast.clone() {
+                if a > 0.0 {
+                    let y = (bh - p.h as i32 - bh / 10).max(0);
+                    self.draw_panel(&rtv, &p, (bw - p.w as i32) / 2, y, a);
+                }
+            }
+            if let Some(p) = self.overlay.clone() {
+                self.draw_panel(&rtv, &p, (bw - p.w as i32) / 2, (bh - p.h as i32) / 2, 1.0);
+            }
+            self.set_cb(mode, dim);
             let ctx = &self.context;
             match &self.swap {
                 Some(s) => {
@@ -593,4 +691,79 @@ impl Drop for Renderer {
             }
         }
     }
+}
+
+#[derive(Clone)]
+struct Panel {
+    srv: ID3D11ShaderResourceView,
+    w: u32,
+    h: u32,
+}
+
+/// Look of a text panel. Sizes are fractions of the font pixel height.
+pub struct PanelStyle {
+    face: PCWSTR,
+    weight: i32,
+    fg: [f32; 3],
+    bg: [f32; 3],
+    bg_alpha: f32,
+    radius: f32,
+    pad: (f32, f32),
+    line_gap: f32,
+}
+
+impl PanelStyle {
+    const STATUS: PanelStyle = PanelStyle {
+        face: windows::core::w!("Segoe UI"),
+        weight: 600,
+        fg: [0.95, 0.95, 0.95],
+        bg: [0.133, 0.133, 0.149],
+        bg_alpha: 0.96,
+        radius: 0.5,
+        pad: (1.0, 0.5),
+        line_gap: 0.2,
+    };
+    const HUD: PanelStyle = PanelStyle {
+        face: windows::core::w!("Consolas"),
+        weight: 400,
+        fg: [0.93, 0.95, 0.97],
+        bg: [0.0, 0.0, 0.0],
+        bg_alpha: 0.62,
+        radius: 0.45,
+        pad: (0.75, 0.5),
+        line_gap: 0.18,
+    };
+    const TOAST: PanelStyle = PanelStyle {
+        face: windows::core::w!("Segoe UI"),
+        weight: 600,
+        fg: [1.0, 1.0, 1.0],
+        bg: [0.08, 0.08, 0.1],
+        bg_alpha: 0.82,
+        radius: 0.9,
+        pad: (1.1, 0.55),
+        line_gap: 0.2,
+    };
+}
+
+/// Text coverage (GDI white-on-black, grayscale AA) → premultiplied BGRA rounded panel.
+fn compose_panel(cov: &[u32], w: u32, h: u32, radius: f32, st: &PanelStyle) -> Vec<u32> {
+    let (fw, fh) = (w as f32, h as f32);
+    let mut out = Vec::with_capacity(cov.len());
+    for y in 0..h {
+        for x in 0..w {
+            let c = cov[(y * w + x) as usize];
+            let a = ((c & 0xFF).max((c >> 8) & 0xFF).max((c >> 16) & 0xFF)) as f32 / 255.0;
+            // rounded-rect signed distance at the pixel center → 1px antialiased edge
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+            let qx = (px - fw / 2.0).abs() - (fw / 2.0 - radius);
+            let qy = (py - fh / 2.0).abs() - (fh / 2.0 - radius);
+            let d = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - radius;
+            let m = (0.5 - d).clamp(0.0, 1.0);
+            let ba = st.bg_alpha * m * (1.0 - a);
+            let out_a = a * m + ba;
+            let ch = |i: usize| ((st.fg[i] * a * m + st.bg[i] * ba) * 255.0 + 0.5).min(255.0) as u32;
+            out.push(ch(2) | ch(1) << 8 | ch(0) << 16 | ((out_a * 255.0 + 0.5).min(255.0) as u32) << 24);
+        }
+    }
+    out
 }

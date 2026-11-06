@@ -1,87 +1,88 @@
 //! glide-client: Glide remote desktop viewer.
 //!
-//! Usage: glide-client <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd]
-//!                     [--bench SECONDS] [--probe]
+//! Usage: glide-client [host[:port] | --listen [PORT]] [--password PW] [--mode fast|sharp|hybrid]
+//!                     [--no-ctrl-as-cmd] [--bench SECONDS] [--probe] [--forget-password]
+//! With no target, the viewer uses %APPDATA%\Glide\config.json (default: listen on 7420).
 
+use glide::config::{self, Store, TargetSpec};
 use glide::net::Connection;
 use glide::protocol::{self, ClientMsg, Mode};
 use std::process::ExitCode;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Args {
     host: Option<String>,
     password: Option<String>,
-    /// None = default (hybrid if this machine decodes HEVC 4:4:4, else fast).
+    /// None = config, else automatic (hybrid if this machine decodes HEVC 4:4:4, else fast).
     mode: Option<Mode>,
-    ctrl_as_cmd: bool,
+    /// None = config (default on).
+    ctrl_as_cmd: Option<bool>,
     bench: Option<f64>,
     probe: bool,
     /// Reverse-connect: listen on this port and let the host dial in.
     listen: Option<u16>,
-    /// Clipboard sync (GUI viewer only); off with --no-clipboard.
-    clipboard: bool,
+    forget_password: bool,
+    /// Clipboard sync (GUI viewer only). None = config ("clipboard", default on); --no-clipboard.
+    clipboard: Option<bool>,
     /// Headless Win32 clipboard self-test (no connection).
     clipboard_selftest: bool,
     /// Also sync clipboard content marked private (password managers).
     clipboard_sync_secrets: bool,
-    /// Don't advertise/play audio.
-    no_audio: bool,
+    /// Audio playback. None = config ("audio", default on); --no-audio.
+    audio: Option<bool>,
     /// Headless WASAPI check (plays digital silence only), seconds.
     audio_selftest: Option<f64>,
 }
 
-const USAGE: &str = "usage: glide-client <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--no-audio] [--bench SECONDS] [--probe]
-       glide-client --listen [PORT] [options...]
+const USAGE: &str = "usage: glide-client [host[:port] | --listen [PORT]] [options...]
 
-  host[:port]        Glide host (default port 7420)
-  --listen [PORT]    reverse connect: listen on 0.0.0.0:PORT (default 7420) and accept ONE
-                     connection from the host (e.g. glide-host --connect); same protocol
-  --password PW      session password (else env GLIDE_PASSWORD, else prompt)
+  (no target)        use the config file: dial its \"host\" if set, else listen on its
+                     \"listen_port\" (default 7420)
+  host[:port]        dial a Glide host (default port 7420)
+  --listen [PORT]    reverse connect: listen on 0.0.0.0:PORT (default 7420) and let the host
+                     dial in (glide-host --connect); same protocol
+  --password PW      session password (else env GLIDE_PASSWORD, else the saved password, else a
+                     password dialog with a \"Remember\" option)
   --mode M           fast = 4:2:0 only; sharp = 4:4:4 every frame; hybrid = 4:2:0 while moving +
-                     4:4:4 refinement at rest. Default: hybrid if this PC decodes HEVC 4:4:4, else fast
-  --no-ctrl-as-cmd   don't swap Ctrl<->Win (default maps Ctrl->Cmd, Win->Control)
-  --no-clipboard     don't sync the clipboard (text + images) with the host
-  --clipboard-sync-secrets  also send clipboard content that password managers mark private
-                     (default: respected, not sent). Env: GLIDE_CLIPBOARD_SYNC_SECRETS=1
-  --bench SECONDS    headless: connect, decode for N seconds, print one JSON line
-  --probe            print decoder capabilities as JSON (no connection)
-  --clipboard-selftest  exercise the Win32 clipboard path headlessly (no connection; run over SSH)
-  --no-audio         don't stream the Mac's sound (default: on; Ctrl+F11 or the window menu mutes)
+                     4:4:4 refinement at rest. Default: config, else hybrid if this PC decodes
+                     HEVC 4:4:4, else fast
+  --no-ctrl-as-cmd   don't map Ctrl->Cmd / Win->Control (also --ctrl-as-cmd to force it on)
+  --no-clipboard     don't sync the clipboard (text + images) with the host (config: \"clipboard\")
+  --forget-password  delete the saved (DPAPI-encrypted) password and exit
+  --no-audio         don't stream the Mac's sound (config \"audio\"; Ctrl+Alt+Shift+A mutes)
   --audio-selftest [SECONDS]
                      headless: open the default output device and run the audio path on
                      digital silence (inaudible) for N seconds (default 3); print JSON
+  --clipboard-sync-secrets  also send clipboard content that password managers mark private
+                     (default: respected, not sent). Env GLIDE_CLIPBOARD_SYNC_SECRETS=1, or config
+                     \"clipboard_sync_secrets\": true
+  --bench SECONDS    headless: connect, decode for N seconds, print one JSON line
+  --probe            print decoder capabilities as JSON (no connection)
+  --clipboard-selftest  exercise the Win32 clipboard path headlessly (no connection; run over SSH)
 
-In the viewer: F11 or Alt+Enter toggles borderless fullscreen; Ctrl+F11 mutes/unmutes audio.";
+Config: %APPDATA%\\Glide\\config.json (GLIDE_CONFIG_DIR overrides the folder); the saved
+password is password.dpapi next to it (only this Windows account can decrypt it).
+
+Viewer hotkeys (handled locally, never sent to the Mac; F11 / Alt+Enter also toggle fullscreen):";
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args {
-        host: None,
-        password: None,
-        mode: None,
-        ctrl_as_cmd: true,
-        bench: None,
-        probe: false,
-        listen: None,
-        clipboard: true,
-        clipboard_selftest: false,
-        clipboard_sync_secrets: false,
-        no_audio: false,
-        audio_selftest: None,
-    };
-    let mut it = std::env::args().skip(1).peekable();
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    let mut a = Args::default();
+    let mut it = args.into_iter().peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--password" => a.password = Some(it.next().ok_or("--password needs a value")?),
             "--mode" => {
-                a.mode = Some(match it.next().as_deref() {
-                    Some("fast") => Mode::Fast,
-                    Some("sharp") => Mode::Sharp,
-                    Some("hybrid") => Mode::Hybrid,
-                    _ => return Err("--mode must be fast, sharp or hybrid".into()),
-                })
+                let v = it.next().unwrap_or_default();
+                a.mode = Some(config::mode_from_str(&v).ok_or("--mode must be fast, sharp or hybrid")?);
             }
-            "--no-ctrl-as-cmd" => a.ctrl_as_cmd = false,
-            "--no-clipboard" => a.clipboard = false,
+            "--no-ctrl-as-cmd" => a.ctrl_as_cmd = Some(false),
+            "--ctrl-as-cmd" => a.ctrl_as_cmd = Some(true),
+            "--forget-password" => a.forget_password = true,
+            "--no-clipboard" => a.clipboard = Some(false),
             "--clipboard-selftest" => a.clipboard_selftest = true,
             "--clipboard-sync-secrets" => a.clipboard_sync_secrets = true,
             "--bench" => {
@@ -89,7 +90,7 @@ fn parse_args() -> Result<Args, String> {
                 a.bench = Some(v.parse::<f64>().map_err(|_| format!("bad --bench value {v}"))?);
             }
             "--probe" => a.probe = true,
-            "--no-audio" => a.no_audio = true,
+            "--no-audio" => a.audio = Some(false),
             "--audio-selftest" => {
                 let secs = match it.peek() {
                     Some(v) if v.parse::<f64>().is_ok() => it.next().unwrap().parse().unwrap(),
@@ -105,7 +106,7 @@ fn parse_args() -> Result<Args, String> {
                 };
                 a.listen = Some(port);
             }
-            "-h" | "--help" => return Err(String::new()),
+            "-h" | "--help" | "/?" => return Err(String::new()),
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             s => {
                 if a.host.is_some() {
@@ -115,22 +116,61 @@ fn parse_args() -> Result<Args, String> {
             }
         }
     }
-    if !a.probe && !a.clipboard_selftest && a.audio_selftest.is_none() && a.host.is_none() && a.listen.is_none() {
-        return Err("missing host".into());
-    }
     Ok(a)
 }
 
-fn get_password(a: &Args) -> String {
+#[cfg(windows)]
+type PasswordSource = glide::win::app::PasswordSource;
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum PasswordSource {
+    Cli,
+    Env,
+    Saved,
+    Prompted,
+}
+
+/// CLI, then GLIDE_PASSWORD, then the DPAPI-saved password. None = must ask.
+fn known_password(a: &Args, dir: Option<&std::path::Path>) -> Option<(String, PasswordSource)> {
     if let Some(p) = &a.password {
-        return p.clone();
+        return Some((p.clone(), PasswordSource::Cli));
     }
     if let Ok(p) = std::env::var("GLIDE_PASSWORD") {
         if !p.is_empty() {
-            return p;
+            return Some((p, PasswordSource::Env));
         }
     }
-    prompt_password()
+    #[cfg(windows)]
+    if let Some(p) = dir.and_then(glide::win::dpapi::load_password) {
+        return Some((p, PasswordSource::Saved));
+    }
+    let _ = dir;
+    None
+}
+
+/// GUI: the password dialog (optionally saving it). Some(None) = user cancelled.
+#[cfg(windows)]
+fn dialog_password(dir: Option<&std::path::Path>, target: &str) -> Option<Option<(String, PasswordSource)>> {
+    let msg = format!("Enter the password for the Glide host ({target}).");
+    match glide::win::prompt::ask_password(None, &msg, true) {
+        Ok(Some(a)) => {
+            let mut src = PasswordSource::Prompted;
+            if a.remember {
+                match dir.map(|d| glide::win::dpapi::store_password(d, &a.password)) {
+                    Some(Ok(())) => src = PasswordSource::Saved,
+                    Some(Err(e)) => eprintln!("warning: cannot save password: {e}"),
+                    None => eprintln!("warning: no config folder; password not saved"),
+                }
+            }
+            Some(Some((a.password, src)))
+        }
+        Ok(None) => Some(None),
+        Err(e) => {
+            eprintln!("{e}; falling back to the console");
+            None
+        }
+    }
 }
 
 fn prompt_password() -> String {
@@ -159,7 +199,7 @@ fn main() -> ExitCode {
             if !e.is_empty() {
                 eprintln!("error: {e}");
             }
-            eprintln!("{USAGE}");
+            eprintln!("{USAGE}\n{}", glide::hotkeys::help());
             return ExitCode::from(2);
         }
     };
@@ -214,12 +254,63 @@ fn main() -> ExitCode {
         }
     }
 
-    let host = match (&args.host, args.listen) {
-        (Some(h), _) => h.clone(),
-        (None, Some(p)) => format!("listen:{p}"),
-        _ => unreachable!(),
+    // Persistent settings (+ migration of a legacy plaintext password into DPAPI).
+    let (mut store, legacy_pw, warnings) = Store::open(config::config_dir());
+    for w in &warnings {
+        eprintln!("warning: {w}");
+    }
+    let cfg_dir = store.dir.clone();
+    #[cfg(windows)]
+    if store.config.clipboard_sync_secrets {
+        glide::win::clipboard::set_sync_secrets(true);
+    }
+    if let Some(pw) = legacy_pw {
+        #[cfg(windows)]
+        match cfg_dir.as_deref().map(|d| glide::win::dpapi::store_password(d, &pw)) {
+            Some(Ok(())) => eprintln!("moved the plaintext password from config.json into password.dpapi (encrypted)"),
+            Some(Err(e)) => eprintln!("warning: cannot encrypt the config password ({e}); it was removed from config.json"),
+            None => {}
+        }
+        let _ = pw;
+        if let Err(e) = store.save() {
+            eprintln!("warning: cannot write config: {e}");
+        }
+    }
+    if args.forget_password {
+        #[cfg(windows)]
+        let had = cfg_dir.as_deref().map(glide::win::dpapi::forget_password).unwrap_or(false);
+        #[cfg(not(windows))]
+        let had = false;
+        eprintln!("{}", if had { "saved password removed" } else { "no saved password" });
+        return ExitCode::SUCCESS;
+    }
+
+    let target = config::resolve_target(args.host.as_deref(), args.listen, &store.config);
+    let host = match &target {
+        TargetSpec::Connect(h) => h.clone(),
+        TargetSpec::Listen(p) => format!("listen:{p}"),
     };
-    let password = get_password(&args);
+    let target_desc = match &target {
+        TargetSpec::Connect(h) => h.clone(),
+        TargetSpec::Listen(p) => format!("waiting on port {p}"),
+    };
+    let ctrl_as_cmd = args.ctrl_as_cmd.unwrap_or(store.config.ctrl_as_cmd);
+
+    let (password, password_source) = match known_password(&args, cfg_dir.as_deref()) {
+        Some(p) => p,
+        None => {
+            #[cfg(windows)]
+            let from_dialog = if args.bench.is_none() { dialog_password(cfg_dir.as_deref(), &target_desc) } else { None };
+            #[cfg(not(windows))]
+            let from_dialog: Option<Option<(String, PasswordSource)>> = None;
+            let _ = &target_desc;
+            match from_dialog {
+                Some(Some(p)) => p,
+                Some(None) => return ExitCode::SUCCESS, // cancelled
+                None => (prompt_password(), PasswordSource::Prompted),
+            }
+        }
+    };
 
     // Capabilities: HEVC 4:2:0 + H.264 always; HEVC 4:4:4 only if this machine can decode it.
     #[allow(unused_mut)]
@@ -230,24 +321,19 @@ fn main() -> ExitCode {
             caps |= protocol::CAP_HEVC_444;
         }
         // Clipboard sync (§5) needs the viewer window; the headless bench never advertises it.
-        if args.clipboard && args.bench.is_none() {
+        if args.clipboard.unwrap_or(store.config.clipboard) && args.bench.is_none() {
             caps |= protocol::CAP_CLIPBOARD;
         }
     }
-    if !args.no_audio {
+    let audio_on = args.audio.unwrap_or(store.config.audio);
+    if audio_on {
         caps |= protocol::CAP_AUDIO_PCM;
     }
     let has444 = caps & protocol::CAP_HEVC_444 != 0;
-    let mode = match args.mode {
-        None => {
-            if has444 { Mode::Hybrid } else { Mode::Fast }
-        }
-        Some(m @ (Mode::Sharp | Mode::Hybrid)) if !has444 => {
-            eprintln!("note: --mode {} requested but this machine can't decode HEVC 4:4:4; using fast", m.name());
-            Mode::Fast
-        }
-        Some(m) => m,
-    };
+    let (mode, note) = config::resolve_mode(args.mode, &store.config, has444);
+    if let Some(n) = note {
+        eprintln!("note: {n}");
+    }
 
     #[cfg(windows)]
     let (view_w, view_h, max_fps) = glide::win::display_info();
@@ -278,11 +364,20 @@ fn main() -> ExitCode {
         #[cfg(windows)]
         {
             use glide::win::app::{Connector, Options, Target};
-            let target = match args.listen {
-                Some(port) => Target::Listen(port),
-                None => Target::Connect(host.clone()),
+            let target = match target {
+                TargetSpec::Listen(port) => Target::Listen(port),
+                TargetSpec::Connect(h) => Target::Connect(h),
             };
-            let opts = Options { ctrl_as_cmd: args.ctrl_as_cmd, mode, host_label: host, audio: !args.no_audio };
+            let opts = Options {
+                ctrl_as_cmd,
+                mode,
+                host_label: host,
+                has444,
+                password_source,
+                audio: audio_on,
+                audio_muted: store.config.audio_muted,
+                store,
+            };
             return match glide::win::app::run(Connector { target, password, hello }, opts) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -299,9 +394,10 @@ fn main() -> ExitCode {
     }
 
     // Bench: one-shot connection.
-    let res = match args.listen {
-        Some(port) => Connection::listen(port, &password, &hello),
-        None => Connection::connect(&host, &password, &hello),
+    let _ = (ctrl_as_cmd, password_source, &mut store);
+    let res = match &target {
+        TargetSpec::Listen(port) => Connection::listen(*port, &password, &hello),
+        TargetSpec::Connect(h) => Connection::connect(h, &password, &hello),
     };
     let conn = match res {
         Ok(c) => c,
@@ -349,4 +445,61 @@ fn main() -> ExitCode {
     }
 
     unreachable!()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(v: &[&str]) -> Result<Args, String> {
+        parse_args_from(v.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn no_args_is_valid() {
+        assert_eq!(p(&[]).unwrap(), Args::default());
+    }
+
+    #[test]
+    fn flags_override() {
+        let a = p(&["--listen", "--mode", "sharp", "--no-ctrl-as-cmd"]).unwrap();
+        assert_eq!(a.listen, Some(protocol::DEFAULT_PORT));
+        assert_eq!(a.mode, Some(Mode::Sharp));
+        assert_eq!(a.ctrl_as_cmd, Some(false));
+        let a = p(&["--listen", "7421", "--password", "x"]).unwrap();
+        assert_eq!(a.listen, Some(7421));
+        assert_eq!(a.password.as_deref(), Some("x"));
+        let a = p(&["mac.local:7420", "--ctrl-as-cmd", "--forget-password", "--no-clipboard", "--no-audio"]).unwrap();
+        assert_eq!(a.clipboard, Some(false));
+        assert_eq!(a.audio, Some(false));
+        assert_eq!(p(&["--audio-selftest"]).unwrap().audio_selftest, Some(3.0));
+        assert_eq!(p(&["--audio-selftest", "5"]).unwrap().audio_selftest, Some(5.0));
+        assert_eq!(a.host.as_deref(), Some("mac.local:7420"));
+        assert_eq!(a.ctrl_as_cmd, Some(true));
+        assert!(a.forget_password);
+        assert!(p(&["--mode", "ultra"]).is_err());
+        assert!(p(&["a", "b"]).is_err());
+        assert!(p(&["--nope"]).is_err());
+        assert_eq!(p(&["--help"]), Err(String::new()));
+    }
+
+    #[test]
+    fn cli_overrides_config() {
+        let mut c = config::Config::default();
+        c.host = Some("cfg-host".into());
+        c.set_mode(Mode::Fast);
+        let a = p(&["--listen", "--mode", "hybrid"]).unwrap();
+        assert_eq!(config::resolve_target(a.host.as_deref(), a.listen, &c), TargetSpec::Listen(7420));
+        assert_eq!(config::resolve_mode(a.mode, &c, true).0, Mode::Hybrid);
+        let a = p(&[]).unwrap();
+        assert_eq!(config::resolve_target(a.host.as_deref(), a.listen, &c), TargetSpec::Connect("cfg-host".into()));
+        assert_eq!(config::resolve_mode(a.mode, &c, true).0, Mode::Fast);
+        assert!(a.ctrl_as_cmd.unwrap_or(c.ctrl_as_cmd));
+    }
+
+    #[test]
+    fn password_precedence() {
+        let a = p(&["--password", "cli"]).unwrap();
+        assert_eq!(known_password(&a, None).map(|x| x.1), Some(PasswordSource::Cli));
+    }
 }

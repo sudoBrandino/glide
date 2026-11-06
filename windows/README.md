@@ -12,9 +12,11 @@ The wire protocol is defined in `../docs/PROTOCOL.md`.
 | `src/net.rs` | TCP (NODELAY), shared encrypted writer, receive thread, 1 Hz ping, RTT and clock offset. Includes `--listen` reverse mode. |
 | `src/audio.rs` | Audio jitter buffer (priming, drift-correcting resample, underrun/overflow handling). Platform independent, unit-tested. |
 | `src/hid.rs` | Set-1 scancode → USB HID usage table, plus the Ctrl↔Cmd / Win↔Control remap. Unit-tested. |
+| `src/config.rs`, `src/hotkeys.rs`, `src/hud.rs` | Config file (load/save/migration, CLI-vs-config precedence, per-monitor window placement), hotkey table, stats-HUD text. Pure Rust, unit-tested. |
 | `src/clipboard.rs` | Clipboard sync logic without Win32: CRLF↔LF, echo guard, DIB↔PNG (`png` crate). Unit-tested. |
 | `src/annexb.rs`, `src/bench.rs` | Annex-B access-unit splitting, and the headless benchmark driver. |
-| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain), `app` (window, input, cursor, fullscreen), `clipboard` (clipboard listener/apply), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`. |
+| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain, text panels), `app` (window, input, cursor, fullscreen, hotkeys), `clipboard` (clipboard listener/apply), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`, `dpapi` (saved password), `prompt` (password dialog), `placement` (monitors), `tray`. |
+| `res/`, `build.rs` | Icon, manifest (themed controls, PerMonitorV2), password dialog and version info, linked into the exe: MinGW `windres` for the GNU target, `rc.exe` (via `embed-resource`) for MSVC. Regenerate the icon with `../tools/make_icon.py`. |
 | `assets/` | Small clips embedded in the exe for `--probe`. Regenerate them with `../tools/make_streams.sh --clips-only`. |
 
 ## Build (on macOS, cross-compiling)
@@ -32,9 +34,70 @@ Shaders are compiled at runtime with `D3DCompile` from `d3dcompiler_47.dll`, whi
 ## Run
 
 ```
+glide-client.exe                               (uses the config file: listen on 7420 by default)
 glide-client.exe <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--no-audio] [--bench SECONDS] [--probe]
 glide-client.exe --listen [PORT] [same options]
+glide-client.exe --forget-password
 ```
+
+### Config file and saved password
+
+Settings live in `%APPDATA%\Glide\config.json` (set `GLIDE_CONFIG_DIR` to use another folder). The file
+is created on first run and rewritten when settings change. Edit it by hand, or use the tray icon → *Open config file*.
+
+```json
+{
+  "version": 1,
+  "listen_port": 7420,      // used when "host" is null: wait for glide-host --connect
+  "host": null,             // "mac.local:7420" = dial the Mac instead
+  "mode": null,             // "fast" | "hybrid" | "sharp"; null = auto (hybrid if 4:4:4 decodes)
+  "ctrl_as_cmd": true,
+  "hud": false,             // stats overlay, toggled with Ctrl+Alt+Shift+H
+  "audio": true,            // play the Mac's sound (false = --no-audio)
+  "audio_muted": false,     // Ctrl+Alt+Shift+A
+  "clipboard": true,        // clipboard sync with the host (false = --no-clipboard)
+  "clipboard_sync_secrets": false,
+  "allowed_peers": [],      // listen mode: IPs/CIDRs allowed to connect; [] = pin the first host that authenticates  // also send clipboard items password managers mark private (= --clipboard-sync-secrets)
+  "last_monitor": "\\.\DISPLAY1",
+  "windows": { "\\.\DISPLAY1": { "x": 0, "y": 0, "w": 2400, "h": 1400, "maximized": false, "fullscreen": true, "mon_w": 3840, "mon_h": 2160 } }
+}
+```
+
+(The real file is plain JSON, without comments.)
+
+- **Precedence:** command-line flags win over the config file.
+  - A positional `host`, then `--listen [PORT]`, then the config's `host`, then listening on `listen_port`.
+  - `--mode` wins over `"mode"`, which wins over auto.
+  - `--no-ctrl-as-cmd` / `--ctrl-as-cmd` win over `"ctrl_as_cmd"`.
+  - `--no-audio` wins over `"audio"`.
+  - `--no-clipboard` wins over `"clipboard"`.
+- **Password:** `--password`, then `GLIDE_PASSWORD`, then the saved password, then a password dialog.
+  - The dialog has a *Remember on this PC* box, on by default.
+  - The saved password is `password.dpapi` next to `config.json`. It is encrypted with DPAPI (`CryptProtectData`, current user), so only this Windows account on this PC can read it.
+  - The saved password is never deleted automatically, only by *Forget saved password* or `--forget-password`.
+  - **Connect mode** (the viewer dials the configured host): after two authentication failures in a row, the dialog asks for the password again. This only happens for saved or typed passwords; `--password` and `GLIDE_PASSWORD` are never re-prompted or saved.
+  - **Listen mode** never prompts. Anyone who can reach the port can cause a failed handshake, so the window shows a neutral status ("A connection attempt failed authentication — still waiting for …") and keeps listening. Use tray → *Change password…* to enter a new one.
+  - Cancel on the first dialog exits. `--forget-password`, or the tray menu, deletes the saved password.
+  - Migration: a plaintext `"password"` key in `config.json` is moved into `password.dpapi` and removed from the file on the next start. Older key names (`port`, `listen`, `connect`, `no_ctrl_as_cmd`) are also migrated.
+- **Window:** the window placement is remembered per monitor: the position, the size, and whether it is maximized or fullscreen.
+  - At startup the window reopens on the last monitor it was on, in the same state.
+  - If that monitor is gone, it uses the saved state of the monitor under the cursor, or opens centered.
+  - A saved rect that no longer fits (for example after a resolution change) is clamped into the monitor's work area.
+- **Listen-mode admission control** (defense in depth; see `src/peers.rs`):
+  - **Allowlist:** if `allowed_peers` is non-empty, connections from any other IP are closed right after `accept()`, before a single handshake byte is sent or read. Entries are IPs or CIDRs, for example `"192.168.50.4"` or `"192.168.50.0/24"`.
+  - **Trust on first use:** if `allowed_peers` is empty, the IP of the first peer that completes an authenticated session is pinned there (logged, and shown in the "Connected" toast). Tray → *Forget pinned host* clears the list.
+  - **Backoff:** a failed handshake blocks the peer for 1 s, doubling on each further failure up to 60 s. Connections from a blocked peer are dropped without a handshake, and a successful session resets it. Peers are tracked per IPv4 address and per IPv6 /64, so a peer can't escape by rotating addresses within its /64.
+  - **Global budget (unpinned only):** while nothing is pinned, more than 10 failed handshakes from all peers within 60 s refuse every unpinned peer for 60 s. Pinned or allowlisted hosts are never affected.
+  - **Pre-auth timeout:** a peer that hasn't completed the handshake after 5 s is disconnected.
+
+  These are mitigations only. In protocol v1 an attacker who can see or relay a handshake can still run an offline
+  dictionary attack on the password. The real fix is the planned PAKE handshake (SPAKE2 plus pinned host keys, security v2 in `docs/ROADMAP.md`).
+- **Tray icon:** Connect / Disconnect / Reconnect, Stats overlay, Change password…, Open config file, Forget saved password, Forget pinned host, Quit.
+  - *Disconnect* also stops listening, so the host can't reconnect until you choose *Connect*.
+  - Left-click brings the window to the front.
+
+To replace a `.cmd` launcher that sets `GLIDE_PASSWORD`, run `glide-client.exe` with no arguments (or with
+`--listen 7420`). Enter the password once in the dialog with *Remember* checked.
 
 - **The viewer survives disconnects.** The window opens right away and shows a centered status line, for example
   "Waiting for host on port 7420…".
@@ -69,22 +132,47 @@ glide-client.exe --listen [PORT] [same options]
   - Sharp-layer frames are decoded by a second, independent decoder (AYUV output) and replace the whole canvas.
   - Resizing or exposing the window re-presents the canvas without needing a new frame.
   - The title bar shows `hybrid [4:4:4]` while the sharp layer is on screen, along with sharp and rect frame counts.
+- **Viewer hotkeys.** These are handled locally and never sent to the host.
+
+  All the letter hotkeys use **Ctrl+Alt+Shift**, which arrives on the Mac as Cmd+Option+Shift, a combination
+  that Mac apps rarely bind. They are matched on the physical keys, before the Ctrl→Cmd remap. Each hotkey shows a short toast at the bottom of the window.
+
+  | keys | action |
+  |---|---|
+  | F11, Alt+Enter, Ctrl+Alt+Shift+F | toggle borderless fullscreen (remembered per monitor) |
+  | Ctrl+Alt+Shift+H | toggle the stats overlay (HUD), saved in the config |
+  | Ctrl+Alt+Shift+M | cycle the mode fast → hybrid → sharp (`SetMode`; saved, and used for reconnects). Only fast is available if this PC can't decode 4:4:4 |
+  | Ctrl+Alt+Shift+K | release the keyboard: the low-level hook is removed, `ReleaseAll` is sent, and keys stay on Windows (Alt+Tab, Win, Alt+F4…). Press again to recapture |
+  | Ctrl+Alt+Shift+R | request a keyframe |
+  | Ctrl+Alt+Shift+D | disconnect and reconnect immediately (in listen mode, the host redials within about 2 s) |
+  | Ctrl+Alt+Shift+A | mute / unmute audio (saved in the config) |
+
+  While the window has focus and the keyboard is captured, a low-level keyboard hook sends Win, Alt+Tab, Alt+Space and similar keys to the host.
+  To leave the window, click outside it, press Ctrl+Alt+Shift+K, or press Ctrl+Alt+Del, which cannot be intercepted.
+- **Stats HUD** (off by default): a small translucent panel in the top-left corner. It shows:
+  - host name;
+  - fps, decode ms and RTT;
+  - Mbps and the video size and codec;
+  - the mode and the current layer (4:2:0/4:4:4), with sharp and rect frame counts;
+  - the view size and the decoder;
+  - audio latency and underruns, or "muted".
+
+  The text is rasterized with GDI into a texture only when it changes (at most twice a second) and blended 1:1, so it stays crisp.
+  The window title now shows only `<host> — Glide`; the stats moved to the HUD.
 - **Audio** (protocol §3.2): the Mac's sound plays on this PC's default output device. On by default; `--no-audio`
   turns it off (the viewer then doesn't advertise it, so the host doesn't even capture audio).
-  - **Ctrl+F11** or the window menu's *Mute audio* mutes/unmutes; the host stops sending while muted, and mute
-    persists across reconnects.
+  - **Ctrl+Alt+Shift+A**, the tray menu or the window menu's *Mute audio* mutes/unmutes. The host stops sending while
+    muted. Mute is saved in the config (`audio_muted`), so it persists across reconnects and restarts. Config `"audio": false` is the same as `--no-audio`.
+    (The audio branch's Ctrl+F11 was dropped to keep all viewer hotkeys on Ctrl+Alt+Shift; Cmd+F11 now reaches the Mac.)
   - Uncompressed 48 kHz stereo PCM (1.5 Mbit/s), WASAPI shared mode, event-driven, on an MMCSS "Pro Audio" thread.
     A jitter buffer primes to 30 ms and holds it against clock drift with a tiny (≤0.2 %) resample only when it
     leaves a ±8 ms band; underruns raise the target 10 ms (max 120 ms, decays back); more than target + 60 ms
     is dropped, so latency stays bounded.
   - Switching the Windows default output device moves playback within ~1 s; a device error reopens it.
-  - The title bar shows `audio N ms` (estimated host capture → speaker, from the ping clock sync) and underruns.
+  - The stats HUD (Ctrl+Alt+Shift+H) shows `audio N ms` (estimated host capture → speaker, from the ping clock sync), underruns, or "muted".
   - Tuning (environment): `GLIDE_AUDIO_TARGET_MS` (jitter target, default 30), `GLIDE_AUDIO_FILL_MS` (audio kept
     queued in the device, default 16), `GLIDE_AUDIO_LOWLAT=1` (IAudioClient3 minimum engine period, if the device
     supports one below 10 ms; the CORSAIR headset doesn't).
-- Viewer keys: **F11** or **Alt+Enter** toggles borderless fullscreen; **Ctrl+F11** mutes audio. These keys are not sent to the host.
-  While the window has focus, a low-level keyboard hook sends Win, Alt+Tab, Alt+Space and similar keys to the host.
-  To leave the window, click outside it, or press Ctrl+Alt+Del, which cannot be intercepted.
 - Modifier remap (on by default; turn it off with `--no-ctrl-as-cmd`): Ctrl → Command, Win → Control, Alt → Option.
 - When a key is held, its typematic repeats are sent as repeated `Key down=1` messages.
 - **Clipboard sync** (PROTOCOL.md §5; off with `--no-clipboard`): text and images, both directions,
@@ -102,12 +190,14 @@ glide-client.exe --listen [PORT] [same options]
   - Echo suppression: our own writes are recognized by `GetClipboardSequenceNumber()` / clipboard
     owner, plus a content hash, so nothing ping-pongs.
 
-The GUI command for the real host (run it in the interactive desktop session):
+The GUI command for the real host (run it in the interactive desktop session, e.g. from a shortcut):
 
 ```
-set GLIDE_PASSWORD=...        (PowerShell: $env:GLIDE_PASSWORD="...")
-C:\Users\me\glide\glide-client.exe --listen 7420
+C:\Users\me\glide\glide-client.exe
 ```
+
+With the default config this listens on port 7420. On first run it asks for the password once (*Remember* on).
+`GLIDE_PASSWORD` / `--password` still work for scripting.
 
 Then start the host on the Mac: `mac/.build/release/glide-host --password-file .dev/password --connect 192.168.10.212:7420`.
 
@@ -139,6 +229,10 @@ Then start the host on the Mac: `mac/.build/release/glide-host --password-file .
   - `GLIDE_DUMP_FRAME=path.bmp` writes the last rendered frame.
   - `GLIDE_OFFSCREEN=1` forces offscreen rendering. This is automatic in session 0, where no swap chain can be created.
   - `GLIDE_TEARING=1` presents with `ALLOW_TEARING`.
+  - `GLIDE_CONFIG_DIR=dir` uses another config folder. Use it for tests, so the real `%APPDATA%\Glide` is never touched.
+  - `GLIDE_TEST_ACTIONS=mode,keyframe,hud,fullscreen,keyboard,reconnect` fires those hotkey actions one at a time, every `GLIDE_TEST_ACTIONS_MS` (default 1500 ms).
+  - `GLIDE_PROMPT_AUTOFILL=pw` fills in the password dialog and presses Connect. `GLIDE_PROMPT_AUTOFILL_RETRY` is used for later prompts, `GLIDE_PROMPT_REMEMBER=1` ticks the box, and `GLIDE_PROMPT_DUMP=x.bmp` captures the dialog.
+  - `GLIDE_NO_TRAY=1` skips the tray icon.
 
 ## Testing without the Mac host
 

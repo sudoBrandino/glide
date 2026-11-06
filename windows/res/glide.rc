@@ -1,0 +1,70 @@
+// Windows resources for glide-client.exe (compiled by build.rs: MinGW windres for the GNU
+// target, rc.exe via embed-resource for MSVC). Self-contained on purpose: no <windows.h>, so
+// rc.exe works without a configured SDK INCLUDE path (e.g. on CI runners).
+
+#define DS_SHELLFONT      0x48
+#define DS_MODALFRAME     0x80
+#define DS_SETFOREGROUND  0x200
+#define DS_CENTER         0x800
+#define WS_POPUP          0x80000000L
+#define WS_CAPTION        0x00C00000L
+#define WS_SYSMENU        0x00080000L
+#define WS_TABSTOP        0x00010000L
+#define WS_EX_APPWINDOW   0x00040000L
+#define SS_ICON           0x3
+#define SS_CENTERIMAGE    0x200
+#define ES_PASSWORD       0x20
+#define ES_AUTOHSCROLL    0x80
+#define IDOK              1
+#define IDCANCEL          2
+#define VOS_NT_WINDOWS32  0x40004L
+#define VFT_APP           0x1L
+
+#define IDI_GLIDE        1
+#define IDD_PASSWORD     101
+#define IDC_PW_ICON      1000
+#define IDC_PW_TEXT      1001
+#define IDC_PW_EDIT      1002
+#define IDC_PW_REMEMBER  1003
+
+IDI_GLIDE ICON "glide.ico"
+1 24 "glide.manifest"
+
+IDD_PASSWORD DIALOGEX 0, 0, 262, 98
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | DS_SETFOREGROUND | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "Glide"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    CONTROL         "", IDC_PW_ICON, "Static", SS_ICON | SS_CENTERIMAGE, 10, 10, 24, 24
+    LTEXT           "Enter the password for the Glide host.", IDC_PW_TEXT, 44, 10, 208, 18
+    EDITTEXT        IDC_PW_EDIT, 44, 31, 208, 14, ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP
+    AUTOCHECKBOX    "&Remember on this PC (encrypted for your Windows account)", IDC_PW_REMEMBER, 44, 52, 208, 10, WS_TABSTOP
+    DEFPUSHBUTTON   "Connect", IDOK, 148, 74, 50, 14, WS_TABSTOP
+    PUSHBUTTON      "Cancel", IDCANCEL, 202, 74, 50, 14, WS_TABSTOP
+END
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     0,1,0,0
+PRODUCTVERSION  0,1,0,0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Glide"
+            VALUE "FileDescription", "Glide remote desktop viewer"
+            VALUE "FileVersion", "0.1.0"
+            VALUE "InternalName", "glide-client"
+            VALUE "OriginalFilename", "glide-client.exe"
+            VALUE "ProductName", "Glide"
+            VALUE "ProductVersion", "0.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
