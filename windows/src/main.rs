@@ -331,6 +331,10 @@ fn main() -> ExitCode {
         if args.bench.is_none() {
             caps |= protocol::CAP_CLIPBOARD;
         }
+        // File transfer (§6): GUI viewer only (drag & drop, hotkeys, notifications).
+        if store.config.file_transfer && args.bench.is_none() {
+            caps |= protocol::CAP_FILES;
+        }
     }
     let audio_on = args.audio.unwrap_or(store.config.audio);
     if audio_on {

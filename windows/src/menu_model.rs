@@ -31,15 +31,21 @@ pub enum Cmd {
     Disconnect,
     Connect,
     Settings,
-    /// TODO(file-transfer): enable once feat/file-transfer lands (msgs 0x70–0x7F, caps bit 11).
+    /// File transfer (PROTOCOL.md §6): pick files (multi-select) → Mac.
     SendFiles,
     /// System menu only: open the full Glide menu at the cursor.
     OpenMenu,
+    /// Pick folders → Mac.
+    SendFolder,
+    /// FilePull: the files copied in Finder (= Ctrl+Alt+Shift+V).
+    ReceiveFiles,
+    CancelFiles,
+    OpenReceived,
     /// Latency test mode (docs/LATENCY.md).
     LatencyTest,
 }
 
-const ALL: [Cmd; 28] = [
+const ALL: [Cmd; 32] = [
     Cmd::ModeFast,
     Cmd::ModeHybrid,
     Cmd::ModeSharp,
@@ -67,6 +73,10 @@ const ALL: [Cmd; 28] = [
     Cmd::Settings,
     Cmd::SendFiles,
     Cmd::OpenMenu,
+    Cmd::SendFolder,
+    Cmd::ReceiveFiles,
+    Cmd::CancelFiles,
+    Cmd::OpenReceived,
     Cmd::LatencyTest,
 ];
 
@@ -183,8 +193,14 @@ pub struct MenuState {
     pub fullscreen: bool,
     pub keyboard_released: bool,
     pub bar_pinned: bool,
-    /// File transfer available (feat/file-transfer). Until then "Send files…" is disabled.
+    /// File transfer is on in this viewer (config `file_transfer`).
+    pub files_on: bool,
+    /// The connected host accepts files (FileCaps bit 0).
     pub file_transfer: bool,
+    /// The connected host can send files (FileCaps bit 1: "Receive files copied on the Mac").
+    pub file_pull: bool,
+    /// A file transfer is running (or queued).
+    pub files_busy: bool,
     /// Latency test mode is on (Ctrl+Alt+Shift+L).
     pub latency_test: bool,
 }
@@ -266,13 +282,19 @@ pub fn build(s: &MenuState) -> Vec<Item> {
     } else {
         v.push(cmd(Cmd::Disconnect, "D&isconnect", false, true));
     }
-    v.extend([
-        Item::Separator,
-        // TODO(file-transfer): feat/file-transfer enables this (MenuState::file_transfer) and
-        // handles Cmd::SendFiles in win/app.rs `run_menu_cmd`.
-        cmd(Cmd::SendFiles, "Send &files…", false, live && s.file_transfer),
-        cmd(Cmd::Settings, "S&ettings…", false, true),
-    ]);
+    v.push(Item::Separator);
+    if s.files_on {
+        let send = live && s.file_transfer;
+        v.extend([
+            cmd(Cmd::SendFiles, "Send &files to the Mac…", false, send),
+            cmd(Cmd::SendFolder, "Send f&older to the Mac…", false, send),
+            cmd(Cmd::ReceiveFiles, "Recei&ve files copied on the Mac\tCtrl+Alt+Shift+V", false, live && s.file_pull),
+            cmd(Cmd::CancelFiles, "Cancel file trans&fer\tCtrl+Alt+Shift+X", false, s.files_busy),
+            cmd(Cmd::OpenReceived, "Open recei&ved files folder", false, true),
+            Item::Separator,
+        ]);
+    }
+    v.push(cmd(Cmd::Settings, "S&ettings…", false, true));
     v
 }
 
@@ -386,12 +408,36 @@ mod tests {
         assert!(to_text(&m).contains("Latency test    Ctrl+Alt+Shift+L"));
         assert_eq!(state(&build(&MenuState { latency_test: true, ..s.clone() }), Cmd::LatencyTest), (true, true));
         assert_eq!(state(&m, Cmd::SendSpotlight), (false, true));
-        assert_eq!(state(&m, Cmd::SendFiles), (false, false), "placeholder until file transfer lands");
+        assert!(find(&m, Cmd::SendFiles).is_none(), "file transfer off in this viewer → no file items");
         assert!(find(&m, Cmd::Disconnect).is_some() && find(&m, Cmd::Connect).is_none());
         let text = to_text(&m);
         assert!(text.contains("— Now: 1920×1080 Retina"), "{text}");
         assert!(text.contains("(•) Retina (HiDPI, 1:1 backing)"), "{text}");
         assert!(text.contains("Mute audio    Ctrl+Alt+Shift+A"), "{text}");
+    }
+
+    #[test]
+    fn file_items() {
+        let base = MenuState { connected: true, files_on: true, ..Default::default() };
+        // Host without file transfer: send/receive disabled, the folder is always reachable.
+        let m = build(&base);
+        assert_eq!(state(&m, Cmd::SendFiles), (false, false));
+        assert_eq!(state(&m, Cmd::SendFolder), (false, false));
+        assert_eq!(state(&m, Cmd::ReceiveFiles), (false, false));
+        assert_eq!(state(&m, Cmd::CancelFiles), (false, false));
+        assert_eq!(state(&m, Cmd::OpenReceived), (false, true));
+        let m = build(&MenuState { file_transfer: true, file_pull: true, ..base.clone() });
+        assert_eq!(state(&m, Cmd::SendFiles), (false, true));
+        assert_eq!(state(&m, Cmd::SendFolder), (false, true));
+        assert_eq!(state(&m, Cmd::ReceiveFiles), (false, true));
+        assert_eq!(state(&m, Cmd::CancelFiles), (false, false), "cancel only while a transfer runs");
+        let m = build(&MenuState { file_transfer: true, files_busy: true, ..base.clone() });
+        assert_eq!(state(&m, Cmd::CancelFiles), (false, true));
+        assert_eq!(state(&m, Cmd::ReceiveFiles), (false, false), "host can't send");
+        // Disconnected: nothing to send to.
+        let m = build(&MenuState { connected: false, file_transfer: true, file_pull: true, ..base });
+        assert_eq!(state(&m, Cmd::SendFiles), (false, false));
+        assert!(to_text(&m).contains("Receive files copied on the Mac    Ctrl+Alt+Shift+V"));
     }
 
     #[test]

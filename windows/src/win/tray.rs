@@ -1,6 +1,7 @@
 //! Notification-area (tray) icon: tooltip = window title; left click brings the viewer to
-//! the front; right click opens Connect / Disconnect / Reconnect / Stats / Mute / Change password /
-//! Open config / Forget password / Forget pinned host / Quit. Commands arrive at the viewer
+//! the front; right click opens Connect / Disconnect / Reconnect / Stats / Mute / received files /
+//! cancel file transfer / Change password / Open config / Forget password / Forget pinned host /
+//! Quit. `notify` shows a notification balloon (file transfer results). Commands arrive at the viewer
 //! window as WM_COMMAND.
 
 use std::sync::OnceLock;
@@ -20,6 +21,8 @@ pub enum MenuCmd {
     OpenConfig,
     ForgetPassword,
     ForgetPinned,
+    CancelFiles,
+    OpenDownloads,
     Quit,
 }
 
@@ -31,10 +34,12 @@ pub struct MenuState {
     pub audio: Option<bool>,
     /// Listen mode with a pinned/allowed host list.
     pub has_pinned: bool,
+    /// None = file transfer off; Some(a transfer is running).
+    pub files: Option<bool>,
 }
 
 const BASE: u16 = 0x4100;
-const CMDS: [MenuCmd; 10] = [
+const CMDS: [MenuCmd; 12] = [
     MenuCmd::Connect,
     MenuCmd::Disconnect,
     MenuCmd::Reconnect,
@@ -44,6 +49,8 @@ const CMDS: [MenuCmd; 10] = [
     MenuCmd::OpenConfig,
     MenuCmd::ForgetPassword,
     MenuCmd::ForgetPinned,
+    MenuCmd::CancelFiles,
+    MenuCmd::OpenDownloads,
     MenuCmd::Quit,
 ];
 
@@ -128,6 +135,17 @@ impl Tray {
         }
     }
 
+    /// A notification balloon/toast from the tray icon (clicks arrive as NIN_BALLOONUSERCLICK).
+    pub fn notify(&self, title: &str, body: &str) {
+        let mut d = self.data(NIF_INFO);
+        wcopy(&mut d.szInfoTitle, title);
+        wcopy(&mut d.szInfo, body);
+        d.dwInfoFlags = NIIF_INFO;
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
+        }
+    }
+
     pub fn remove(&self) {
         let d = self.data(NOTIFY_ICON_DATA_FLAGS(0));
         unsafe {
@@ -172,6 +190,12 @@ fn show_menu(hwnd: HWND, st: &MenuState) {
         item(MenuCmd::ToggleHud, "&Stats overlay\tCtrl+Alt+Shift+H", if hud_on { MF_CHECKED } else { MF_UNCHECKED });
         if let Some(muted) = st.audio {
             item(MenuCmd::ToggleMute, "&Mute audio\tCtrl+Alt+Shift+A", if muted { MF_CHECKED } else { MF_UNCHECKED });
+        }
+        if let Some(busy) = st.files {
+            let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+            item(MenuCmd::OpenDownloads, "Open &received files folder", MF_ENABLED);
+            item(MenuCmd::CancelFiles, "Cancel file &transfer\tCtrl+Alt+Shift+X", gray(!busy));
+            let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         }
         item(MenuCmd::ChangePassword, "Change &password…", MF_ENABLED);
         item(MenuCmd::OpenConfig, "Open &config file", MF_ENABLED);

@@ -12,6 +12,12 @@
   Clipboard it receives (--clip-save DIR keeps received PNGs). --clip-text/--clip-png push a
   clipboard to the client (--clip-every N repeats it); --clip-bounce sends each received
   clipboard straight back once, to check that the viewer does not echo it again (no ping-pong).
+- --selftest checks the clipboard codec against the PROTOCOL.md §5 reference bytes and the file-transfer
+  codec/name sanitizer against docs/file-transfer-vectors.json (§6), and exits.
+- File transfer (§6, client caps bit 11): sends FileCaps, saves files from the viewer into --file-recv
+  (SHA-256 verified, never overwriting); --file-send PATH... offers files ~2 s after connect, --file-pull
+  PATH... answers FilePull (Ctrl+Alt+Shift+V), --file-evil sends adversarial offers, --file-decline
+  declines everything, --log-pings logs Ping queueing (input priority during uploads).
 - --selftest checks the clipboard codec against the PROTOCOL.md §5 reference bytes (and the §3.4
   latency messages + the docs/LATENCY.md block code) and exits.
 - Latency (§3.4): after the client's LatencyEnable (0x80) every VideoFrame is followed by a
@@ -390,6 +396,7 @@ def selftest():
     check(clip_decode(raw) == (2, "ok", None), "unknown format skipped, duplicate ignored")
     trunc = all(_raises(lambda n=n: clip_decode(both[:n])) for n in range(1, len(both)))
     check(trunc, "truncation rejected")
+    file_selftest(check)
     check(crc8(b"123456789") == 0xF4, "CRC-8/SMBUS check value")
     check("".join(map(str, block_bits(0x12345678, 1, 5))) == BLOCK_REF, "block code reference bits (docs/LATENCY.md)")
     ft = frame_timing(7, 1_000_000, 1, 1_001_500, 1_001_600, 1_009_800, 1_009_900, 1_010_100)
@@ -406,6 +413,347 @@ def _raises(f):
     except (ValueError, struct.error):
         return True
     return False
+
+
+# ---------------------------------------------------------------- file transfer (§6)
+
+CAP_FILES = 1 << 11
+FILE_CHUNK_MAX = 256 << 10
+FILE_WINDOW = 1 << 20  # protocol maximum
+FILE_SEND_WINDOW = 512 << 10  # what Glide senders use
+FILE_PATH_MAX = 4096
+FILE_MAX_DEPTH = 32
+FILE_COMPONENT_MAX = 200
+HOST_ID_BIT = 0x80000000
+# status / reason codes (FileAnswer, FileCancel, FilePullResult)
+ST_OK, ST_DECLINED, ST_TOO_LARGE, ST_BAD_NAME, ST_BUSY, ST_NO_SPACE, ST_IO, ST_CANCELLED, ST_VERIFY, \
+    ST_PROTOCOL, ST_SOURCE_CHANGED, ST_NOTHING = range(12)
+FORMAT_CHARS = set([0x061C, 0xFEFF] + list(range(0x200B, 0x2010)) + list(range(0x202A, 0x202F)) +
+                   list(range(0x2060, 0x2065)) + list(range(0x2066, 0x206A)))
+RESERVED = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} | {f"{p}{d}" for p in ("COM", "LPT")
+                                                               for d in list("0123456789") + ["\u00b9", "\u00b2", "\u00b3"]}
+
+
+class PathError(ValueError):
+    pass
+
+
+def _ascii_upper(s):
+    return "".join(c.upper() if "a" <= c <= "z" else c for c in s)
+
+
+def _trunc_utf8(s, n):
+    b = s.encode()
+    if len(b) <= n:
+        return s
+    return b[:n].decode("utf-8", "ignore")
+
+
+def sanitize_component(c):
+    """One received path component -> a name safe on Windows and macOS (PROTOCOL.md §6.3)."""
+    c = "".join("_" if (ord(ch) < 0x20 or ord(ch) == 0x7F or ch in '\\:*?"<>|' or ord(ch) in FORMAT_CHARS) else ch
+                for ch in c)
+    c = c.rstrip(". ") or "_"
+    if _ascii_upper(c.split(".", 1)[0].rstrip(" ")) in RESERVED:
+        c = "_" + c
+    if len(c.encode()) > FILE_COMPONENT_MAX:
+        i = c.rfind(".")
+        ext = c[i:] if i > 0 and len(c[i:].encode()) <= 32 else ""
+        stem = c[:len(c) - len(ext)]
+        c = _trunc_utf8(stem, FILE_COMPONENT_MAX - len(ext.encode())) + ext
+        c = c.rstrip(". ") or "_"
+    return c
+
+
+def sanitize_path(p):
+    """Wire path -> list of safe components; raises PathError for paths that must be refused."""
+    if not p:
+        raise PathError("empty path")
+    if len(p.encode()) > FILE_PATH_MAX:
+        raise PathError("path too long")
+    if p[0] in "/\\" or (len(p) >= 2 and p[1] == ":" and p[0].isascii() and p[0].isalpha()):
+        raise PathError("absolute path")
+    comps = p.split("/")
+    if len(comps) > FILE_MAX_DEPTH:
+        raise PathError("too deep")
+    for c in comps:
+        if c == "":
+            raise PathError("empty component")
+        if c in (".", ".."):
+            raise PathError("dot component")
+    return [sanitize_component(c) for c in comps]
+
+
+def with_suffix(name, n, is_dir=False):
+    """'a.txt', 2 -> 'a (2).txt' (collision rename; folders and dotfiles get the suffix at the end)."""
+    if n <= 1:
+        return name
+    i = -1 if is_dir else name.rfind(".")
+    return f"{name[:i]} ({n}){name[i:]}" if i > 0 else f"{name} ({n})"
+
+
+def _fstr(s):
+    b = s.encode()[:0xFFFF]
+    return struct.pack("<H", len(b)) + b
+
+
+def file_caps(flags, max_total, max_files):
+    return bytes([0x70]) + struct.pack("<IQI", flags, max_total, max_files)
+
+
+def file_offer(tid, entries):
+    """entries: [(path, size, mtime_ms)]"""
+    out = bytes([0x71]) + struct.pack("<IQI", tid, sum(e[1] for e in entries), len(entries))
+    for path, size, mtime in entries:
+        out += _fstr(path) + struct.pack("<Qq", size, mtime)
+    return out
+
+
+def file_answer(tid, status, detail=""):
+    return bytes([0x72]) + struct.pack("<IB", tid, status) + _fstr(detail)
+
+
+def file_chunk(tid, index, offset, data):
+    return bytes([0x73]) + struct.pack("<IIQ", tid, index, offset) + data
+
+
+def file_end(tid, index, sha):
+    return bytes([0x74]) + struct.pack("<II", tid, index) + sha
+
+
+def file_ack(tid, nbytes):
+    return bytes([0x75]) + struct.pack("<IQ", tid, nbytes)
+
+
+def file_cancel(tid, reason, detail=""):
+    return bytes([0x76]) + struct.pack("<IB", tid, reason) + _fstr(detail)
+
+
+def file_done(tid, nfiles):
+    return bytes([0x77]) + struct.pack("<II", tid, nfiles)
+
+
+def file_pull():
+    return bytes([0x78])
+
+
+def file_pull_result(status, detail=""):
+    return bytes([0x79]) + struct.pack("<B", status) + _fstr(detail)
+
+
+def file_decode(m):
+    """File message (type byte included) -> (name, dict). Raises ValueError/struct.error on bad input."""
+    t, b = m[0], m[1:]
+
+    def rstr(p):
+        (n,) = struct.unpack_from("<H", b, p)
+        if p + 2 + n > len(b):
+            raise ValueError("truncated str")
+        return b[p + 2:p + 2 + n].decode("utf-8", "replace"), p + 2 + n
+
+    if t == 0x70:
+        f, mt, mf = struct.unpack("<IQI", b)
+        return "caps", dict(flags=f, max_total=mt, max_files=mf)
+    if t == 0x71:
+        tid, total, n = struct.unpack_from("<IQI", b)
+        p, files = 16, []
+        if n > (len(b) - p) // 18:
+            raise ValueError("bad file count")
+        for _ in range(n):
+            path, p = rstr(p)
+            size, mtime = struct.unpack_from("<Qq", b, p)
+            p += 16
+            files.append((path, size, mtime))
+        if p != len(b):
+            raise ValueError("trailing bytes")
+        return "offer", dict(id=tid, total=total, files=files)
+    if t in (0x72, 0x76):
+        tid, st = struct.unpack_from("<IB", b)
+        detail, p = rstr(5)
+        return ("answer" if t == 0x72 else "cancel"), dict(id=tid, status=st, detail=detail)
+    if t == 0x73:
+        tid, idx, off = struct.unpack_from("<IIQ", b)
+        return "chunk", dict(id=tid, index=idx, offset=off, data=b[16:])
+    if t == 0x74:
+        tid, idx = struct.unpack_from("<II", b)
+        if len(b) != 40:
+            raise ValueError("bad FileEnd length")
+        return "end", dict(id=tid, index=idx, sha=b[8:40])
+    if t == 0x75:
+        tid, nb = struct.unpack("<IQ", b)
+        return "ack", dict(id=tid, bytes=nb)
+    if t == 0x77:
+        tid, nf = struct.unpack("<II", b)
+        return "done", dict(id=tid, files=nf)
+    if t == 0x78:
+        return "pull", {}
+    if t == 0x79:
+        (st,) = struct.unpack_from("<B", b)
+        detail, _ = rstr(1)
+        return "pull_result", dict(status=st, detail=detail)
+    raise ValueError(f"not a file message: {t:#x}")
+
+
+def file_vectors():
+    """The shared reference encodings (docs/file-transfer-vectors.json "messages")."""
+    sha_hello = hashlib.sha256(b"hello").digest()
+    return [
+        ("FileCaps", file_caps(3, 8 << 30, 10000)),
+        ("FileOffer", file_offer(1, [("Photos/a.jpg", 5, 1700000000123), ("b.txt", 0, -1)])),
+        ("FileAnswer", file_answer(1, ST_OK)),
+        ("FileAnswerDecline", file_answer(0x80000002, ST_TOO_LARGE, "max 1 GiB")),
+        ("FileChunk", file_chunk(1, 0, 0, b"hello")),
+        ("FileEnd", file_end(1, 0, sha_hello)),
+        ("FileAck", file_ack(1, 5)),
+        ("FileCancel", file_cancel(0x80000001, ST_CANCELLED, "user")),
+        ("FileDone", file_done(1, 2)),
+        ("FilePull", file_pull()),
+        ("FilePullResult", file_pull_result(ST_NOTHING, "no files")),
+    ]
+
+
+# Adversarial / edge-case names: (wire path, expected components or None = refused).
+PATH_VECTORS = [
+    ("a.txt", ["a.txt"]),
+    ("Photos/2024/IMG 1.jpg", ["Photos", "2024", "IMG 1.jpg"]),
+    ("../evil.txt", None),
+    ("a/../../evil.txt", None),
+    ("./a.txt", None),
+    ("a/./b", None),
+    ("..", None),
+    ("/etc/passwd", None),
+    ("\\\\server\\share\\x", None),
+    ("\\x", None),
+    ("C:\\Windows\\x.dll", None),
+    ("c:x.txt", None),
+    ("C:/x", None),
+    ("a//b", None),
+    ("a/", None),
+    ("", None),
+    ("..\\..\\evil.txt", [".._.._evil.txt"]),
+    ("a\\b.txt", ["a_b.txt"]),
+    ("x:y.txt", None),
+    ("ab:c.txt", ["ab_c.txt"]),
+    ("file.txt:Zone.Identifier", ["file.txt_Zone.Identifier"]),
+    ("file.txt::$DATA", ["file.txt__$DATA"]),
+    ("what?.txt", ["what_.txt"]),
+    ("a*b<c>d|e\"f.txt", ["a_b_c_d_e_f.txt"]),
+    ("CON", ["_CON"]),
+    ("con.txt", ["_con.txt"]),
+    ("Con .txt", ["_Con .txt"]),
+    ("nul.tar.gz", ["_nul.tar.gz"]),
+    ("COM1", ["_COM1"]),
+    ("lpt9.log", ["_lpt9.log"]),
+    ("COM\u00b9.txt", ["_COM\u00b9.txt"]),
+    ("CONIN$", ["_CONIN$"]),
+    ("console.txt", ["console.txt"]),
+    ("COM10", ["COM10"]),
+    ("dir/AUX/x", ["dir", "_AUX", "x"]),
+    ("trailing.", ["trailing"]),
+    ("trailing ", ["trailing"]),
+    ("dots...", ["dots"]),
+    ("...", ["_"]),
+    (". .", ["_"]),
+    ("a/ ../b", ["a", "_", "b"]),
+    ("tab\there.txt", ["tab_here.txt"]),
+    ("nul\x00byte", ["nul_byte"]),
+    ("del\x7f.txt", ["del_.txt"]),
+    ("invoice\u202etxt.exe", ["invoice_txt.exe"]),
+    ("zero\u200bwidth\ufeff.txt", ["zero_width_.txt"]),
+    (".hidden", [".hidden"]),
+    ("caf\u00e9/\u65e5\u672c.txt", ["caf\u00e9", "\u65e5\u672c.txt"]),
+    ("x" * 250 + ".txt", ["x" * 196 + ".txt"]),
+    ("\u65e5" * 100 + ".png", ["\u65e5" * 65 + ".png"]),
+    ("y" * 300, ["y" * 200]),
+    ("z" * 190 + "." + "e" * 40, ["z" * 190 + "." + "e" * 9]),
+    ("/".join(["d"] * 32), ["d"] * 32),
+    ("/".join(["d"] * 33), None),
+    ("p" * 4097, None),
+]
+
+SUFFIX_VECTORS = [
+    ("a.txt", 2, False, "a (2).txt"),
+    ("archive.tar.gz", 3, False, "archive.tar (3).gz"),
+    ("README", 2, False, "README (2)"),
+    (".bashrc", 2, False, ".bashrc (2)"),
+    ("My.Folder", 2, True, "My.Folder (2)"),
+    ("a.txt", 1, False, "a.txt"),
+]
+
+
+def file_vectors_json():
+    import json
+    j = lambda v: json.dumps(v, ensure_ascii=True)
+    rows = lambda items: ",\n".join("  " + j(x) for x in items)
+    return ("{\n" + ' "comment": ' + j("Generated by tools/mock_host.py --file-vectors; checked by glide-selftest, "
+                                          "cargo test and mock_host.py --selftest (docs/PROTOCOL.md §6). "
+                                          "paths: out = sanitized components, null = refused.") + ",\n"
+            ' "messages": [\n' + rows({"name": n, "hex": b.hex()} for n, b in file_vectors()) + "\n ],\n"
+            ' "paths": [\n' + rows({"in": i, "out": o} for i, o in PATH_VECTORS) + "\n ],\n"
+            ' "suffix": [\n' + rows({"name": n, "n": k, "dir": d, "out": o} for n, k, d, o in SUFFIX_VECTORS) + "\n ]\n}\n")
+
+
+def collect_files(paths):
+    """Paths (files or folders) -> [(abs, rel, size, mtime_ms)], skipping symlinks and special files."""
+    out = []
+    for top in paths:
+        top = os.path.abspath(top)
+        name = os.path.basename(top.rstrip("/"))
+        if os.path.islink(top):
+            log(f"files: skipping symlink {top}")
+            continue
+        if os.path.isdir(top):
+            for root, dirs, files in os.walk(top, followlinks=False):
+                dirs.sort()
+                for f in sorted(files):
+                    a = os.path.join(root, f)
+                    if os.path.islink(a) or not os.path.isfile(a) or f == ".DS_Store":
+                        continue
+                    rel = name + "/" + os.path.relpath(a, top).replace(os.sep, "/")
+                    st = os.stat(a)
+                    out.append((a, rel, st.st_size, int(st.st_mtime * 1000)))
+        elif os.path.isfile(top):
+            st = os.stat(top)
+            out.append((top, name, st.st_size, int(st.st_mtime * 1000)))
+    return out
+
+
+def file_selftest(check):
+    import json
+    vec_path = os.path.join(HERE, "../docs/file-transfer-vectors.json")
+    try:
+        disk = open(vec_path).read()
+    except OSError:
+        disk = ""
+    check(disk == file_vectors_json(), "docs/file-transfer-vectors.json is up to date (--file-vectors)")
+    for name, b in file_vectors():
+        kind, f = file_decode(b)
+        re = {
+            "caps": lambda: file_caps(f["flags"], f["max_total"], f["max_files"]),
+            "offer": lambda: file_offer(f["id"], f["files"]),
+            "answer": lambda: file_answer(f["id"], f["status"], f["detail"]),
+            "cancel": lambda: file_cancel(f["id"], f["status"], f["detail"]),
+            "chunk": lambda: file_chunk(f["id"], f["index"], f["offset"], f["data"]),
+            "end": lambda: file_end(f["id"], f["index"], f["sha"]),
+            "ack": lambda: file_ack(f["id"], f["bytes"]),
+            "done": lambda: file_done(f["id"], f["files"]),
+            "pull": lambda: file_pull(),
+            "pull_result": lambda: file_pull_result(f["status"], f["detail"]),
+        }[kind]()
+        check(re == b, f"{name} decode/encode roundtrip")
+    bad = 0
+    for i, want in PATH_VECTORS:
+        try:
+            got = sanitize_path(i)
+        except PathError:
+            got = None
+        if got != want:
+            bad += 1
+            print(f"    path {i[:40]!r}: got {got!r}, want {want!r}")
+    check(bad == 0, f"{len(PATH_VECTORS)} path sanitizer vectors")
+    check(all(with_suffix(n, k, d) == o for n, k, d, o in SUFFIX_VECTORS), "collision suffix vectors")
+    offer = file_vectors()[1][1]
+    check(all(_raises(lambda n=n: file_decode(offer[:n])) for n in range(1, len(offer))), "FileOffer truncation rejected")
 
 
 # ---------------------------------------------------------------- session
@@ -425,6 +773,11 @@ class Session:
         self.clipboard = False
         self.audio_enabled = True
         self.audio_need_config = True
+        self.files = False
+        self.fcond = threading.Condition()
+        self.fout = None  # outgoing transfer state (dict)
+        self.finc = None  # incoming transfer state (dict)
+        self.next_tid = HOST_ID_BIT | 1
         self.timing = False
 
     def recv_exact(self, n):
@@ -533,6 +886,14 @@ class Session:
                 log(f"{self.addr}: clipboard sync negotiated (sent ClipboardCaps)")
                 if self.args.clip_text is not None or self.args.clip_png:
                     threading.Thread(target=self.clip_push_loop, daemon=True).start()
+            if caps & CAP_FILES and not self.args.no_files:
+                self.files = True
+                self.send_msg(file_caps(3, self.args.file_max_total, self.args.file_max_files))
+                log(f"{self.addr}: file transfer negotiated (sent FileCaps); receiving into {self.args.file_recv}")
+                if self.args.file_send:
+                    threading.Thread(target=self.file_send_later, args=(self.args.file_send,), daemon=True).start()
+                if self.args.file_evil:
+                    threading.Thread(target=self.file_evil, daemon=True).start()
             # DisplayInfo (§3.3): pretend the Mac runs 1920x1080 Retina under "automatic".
             self.display_pref = 0
             self.send_display_info()
@@ -698,6 +1059,267 @@ class Session:
         if self.args.clip_bounce:
             self.send_clip(text=text, png=png)
 
+    # ------------------------------------------------------------ file transfer (§6)
+
+    def on_file(self, m):
+        try:
+            kind, f = file_decode(m)
+        except (ValueError, struct.error) as e:
+            log(f"{self.addr}: files: bad message {m[:1].hex()}: {e}")
+            return
+        if not self.files:
+            log(f"{self.addr}: WARNING client sent a file message without caps bit 11 / FileCaps")
+        if kind == "offer":
+            self.file_on_offer(f)
+        elif kind == "chunk":
+            self.file_on_chunk(f)
+        elif kind == "end":
+            self.file_on_end(f)
+        elif kind == "pull":
+            if self.args.file_pull:
+                log(f"{self.addr}: files: FilePull -> offering {self.args.file_pull}")
+                self.send_msg(file_pull_result(ST_OK))
+                threading.Thread(target=self.file_send, args=(self.args.file_pull,), daemon=True).start()
+            else:
+                log(f"{self.addr}: files: FilePull -> nothing to send")
+                self.send_msg(file_pull_result(ST_NOTHING, "No files on the Mac clipboard"))
+        else:
+            if kind == "cancel" and self.finc and self.finc["id"] == f["id"]:
+                log(f"{self.addr}: files: <- FileCancel for incoming {f['id']:#x}: reason {f['status']} {f['detail']!r}")
+                self.file_abort_incoming()
+            with self.fcond:
+                if self.fout and self.fout["id"] == f["id"]:
+                    self.fout.setdefault("events", []).append((kind, f))
+                    if kind == "ack":
+                        self.fout["acked"] = f["bytes"]
+                    self.fcond.notify_all()
+                else:
+                    log(f"{self.addr}: files: <- {kind} for unknown transfer {f.get('id', 0):#x} {f}")
+
+    def file_on_offer(self, f):
+        tid, files = f["id"], f["files"]
+        log(f"{self.addr}: files: <- FileOffer {tid:#x}: {len(files)} files, {f['total']} bytes: "
+            + ", ".join(repr(p) for p, _, _ in files[:8]) + (" …" if len(files) > 8 else ""))
+
+        def decline(st, why):
+            log(f"{self.addr}: files: -> decline {tid:#x}: status {st} ({why})")
+            self.send_msg(file_answer(tid, st, why))
+
+        if tid == 0 or tid & HOST_ID_BIT:
+            return decline(ST_PROTOCOL, "transfer id not in the viewer's range")
+        if self.finc:
+            return decline(ST_BUSY, "another transfer is in progress")
+        if self.args.file_decline:
+            return decline(ST_DECLINED, "declined (--file-decline)")
+        if not files or sum(e[1] for e in files) != f["total"]:
+            return decline(ST_PROTOCOL, "bad file list")
+        if len(files) > self.args.file_max_files or f["total"] > self.args.file_max_total:
+            return decline(ST_TOO_LARGE, "over the mock host's limits")
+        rel = []
+        for i, (p, _, _) in enumerate(files):
+            try:
+                rel.append(sanitize_path(p))
+            except PathError as e:
+                return decline(ST_BAD_NAME, f"file {i + 1}: {e}")
+        root = self.args.file_recv
+        os.makedirs(root, exist_ok=True)
+        self.finc = dict(id=tid, files=files, rel=rel, root=root, next=0, cur=None, got=0, tops={}, saved=[])
+        log(f"{self.addr}: files: -> accept {tid:#x}")
+        self.send_msg(file_answer(tid, ST_OK))
+
+    def _inc_fail(self, st, why):
+        inc = self.finc
+        log(f"{self.addr}: files: incoming {inc['id']:#x} failed: status {st} ({why}) -> FileCancel")
+        self.send_msg(file_cancel(inc["id"], st, why))
+        self.file_abort_incoming()
+
+    def file_abort_incoming(self):
+        inc, self.finc = self.finc, None
+        if inc and inc["cur"]:
+            inc["cur"]["fh"].close()
+            try:
+                os.unlink(inc["cur"]["tmp"])
+            except OSError:
+                pass
+
+    def _inc_dir(self, inc, comps):
+        """Directory for a file: a fresh top-level folder per transfer (never merged into an existing one)."""
+        if len(comps) == 1:
+            return inc["root"]
+        top = comps[0]
+        if top not in inc["tops"]:
+            n = 1
+            while True:
+                cand = with_suffix(top, n, True)
+                try:
+                    os.mkdir(os.path.join(inc["root"], cand))
+                    inc["tops"][top] = cand
+                    inc["saved"].append(os.path.join(inc["root"], cand))
+                    break
+                except FileExistsError:
+                    n += 1
+        d = os.path.join(inc["root"], inc["tops"][top], *comps[1:-1])
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _inc_open(self, inc, index):
+        d = self._inc_dir(inc, inc["rel"][index])
+        tmp = os.path.join(d, f".glide-{inc['id']:08x}-{index}.part")
+        inc["cur"] = dict(index=index, tmp=tmp, dir=d, fh=open(tmp, "xb"), n=0, h=hashlib.sha256())
+
+    def file_on_chunk(self, f):
+        inc = self.finc
+        if not inc or inc["id"] != f["id"]:
+            return  # late chunk of a cancelled transfer: ignore
+        idx = f["index"]
+        if idx != inc["next"] or idx >= len(inc["files"]):
+            return self._inc_fail(ST_PROTOCOL, f"chunk for file {idx}, expected {inc['next']}")
+        if inc["cur"] is None:
+            self._inc_open(inc, idx)
+        cur = inc["cur"]
+        size = inc["files"][idx][1]
+        if f["offset"] != cur["n"] or cur["n"] + len(f["data"]) > size or not f["data"] or len(f["data"]) > FILE_CHUNK_MAX:
+            return self._inc_fail(ST_PROTOCOL, f"bad chunk offset {f['offset']} / length {len(f['data'])}")
+        cur["fh"].write(f["data"])
+        cur["h"].update(f["data"])
+        cur["n"] += len(f["data"])
+        inc["got"] += len(f["data"])
+        self.send_msg(file_ack(inc["id"], inc["got"]))
+
+    def file_on_end(self, f):
+        inc = self.finc
+        if not inc or inc["id"] != f["id"]:
+            return
+        idx = f["index"]
+        if idx != inc["next"]:
+            return self._inc_fail(ST_PROTOCOL, f"FileEnd for file {idx}, expected {inc['next']}")
+        if inc["cur"] is None:
+            self._inc_open(inc, idx)  # empty file
+        cur = inc["cur"]
+        path, size, mtime = inc["files"][idx]
+        cur["fh"].close()
+        if cur["n"] != size or cur["h"].digest() != f["sha"]:
+            return self._inc_fail(ST_VERIFY, f"file {idx} ({path}): size/SHA-256 mismatch")
+        if 1 <= mtime <= 253402300799999:  # PROTOCOL.md §6.2: other values are ignored
+            os.utime(cur["tmp"], (mtime / 1000, mtime / 1000))
+        name, n = inc["rel"][idx][-1], 1
+        while True:  # never overwrite: reserve the name, then move the verified file over it
+            final = os.path.join(cur["dir"], with_suffix(name, n))
+            try:
+                os.close(os.open(final, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                break
+            except FileExistsError:
+                n += 1
+        os.replace(cur["tmp"], final)
+        if len(inc["rel"][idx]) == 1:
+            inc["saved"].append(final)
+        log(f"{self.addr}: files: saved {final} ({size} bytes, sha256 {cur['h'].hexdigest()} verified)")
+        inc["cur"] = None
+        inc["next"] += 1
+        self.send_msg(file_ack(inc["id"], inc["got"]))
+        if inc["next"] == len(inc["files"]):
+            log(f"{self.addr}: files: incoming {inc['id']:#x} complete: {len(inc['files'])} files -> FileDone")
+            self.send_msg(file_done(inc["id"], len(inc["files"])))
+            self.finc = None
+
+    def file_send_later(self, paths):
+        time.sleep(2)
+        self.file_send(paths)
+
+    def file_send(self, paths):
+        items = collect_files(paths)
+        if not items:
+            log(f"{self.addr}: files: nothing to send in {paths}")
+            return
+        entries = [(rel, size, mtime, (lambda a=a: open(a, "rb"))) for a, rel, size, mtime in items]
+        self.file_transfer(entries)
+
+    def file_transfer(self, entries, corrupt=False, chunk=FILE_CHUNK_MAX, expect=None):
+        """entries: [(rel, size, mtime_ms, opener)]. Returns the final event kind ('done', 'answer', 'cancel', ...)."""
+        with self.fcond:
+            tid = self.next_tid
+            self.next_tid += 1
+            self.fout = dict(id=tid, acked=0, events=[])
+        total = sum(e[1] for e in entries)
+        log(f"{self.addr}: files: -> FileOffer {tid:#x}: {len(entries)} files, {total} bytes")
+        self.send_msg(file_offer(tid, [(r, s, m) for r, s, m, _ in entries]))
+
+        def wait_event(kinds, timeout=30):
+            end = time.monotonic() + timeout
+            with self.fcond:
+                while self.alive:
+                    ev = self.fout["events"]
+                    for i, (k, f) in enumerate(ev):
+                        if k in kinds or k == "cancel":
+                            del ev[i]
+                            return k, f
+                    left = end - time.monotonic()
+                    if left <= 0:
+                        return "timeout", {}
+                    self.fcond.wait(left)
+            return "closed", {}
+
+        k, f = wait_event(("answer",))
+        if k != "answer" or f["status"] != ST_OK:
+            log(f"{self.addr}: files: offer {tid:#x} not accepted: {k} {f}")
+            self.fout = None
+            return k if k != "answer" else f"declined:{f['status']}"
+        t0, sent = time.monotonic(), 0
+        for idx, (rel, size, mtime, opener) in enumerate(entries):
+            h, off = hashlib.sha256(), 0
+            with opener() as fh:
+                while off < size:
+                    data = fh.read(min(chunk, size - off))
+                    if not data:
+                        log(f"{self.addr}: files: {rel} shrank while reading -> cancel")
+                        self.send_msg(file_cancel(tid, ST_SOURCE_CHANGED, rel))
+                        return "source-changed"
+                    with self.fcond:  # flow control: ≤ FILE_SEND_WINDOW unacknowledged
+                        while self.alive and sent - self.fout["acked"] > FILE_SEND_WINDOW - len(data):
+                            if any(k == "cancel" for k, _ in self.fout["events"]):
+                                break
+                            self.fcond.wait(1)
+                        if any(k == "cancel" for k, _ in self.fout["events"]):
+                            k, f = wait_event(())
+                            log(f"{self.addr}: files: receiver cancelled {tid:#x}: {f}")
+                            self.fout = None
+                            return "cancel"
+                    self.send_msg(file_chunk(tid, idx, off, data))
+                    h.update(data)
+                    off += len(data)
+                    sent += len(data)
+            sha = h.digest()
+            if corrupt:
+                sha = bytes([sha[0] ^ 0xFF]) + sha[1:]
+            self.send_msg(file_end(tid, idx, sha))
+        k, f = wait_event(("done",), timeout=60)
+        dt = time.monotonic() - t0
+        log(f"{self.addr}: files: outgoing {tid:#x} finished: {k} {f} ({sent / 1e6:.1f} MB in {dt:.2f} s, "
+            f"{sent * 8 / 1e6 / max(dt, 1e-6):.0f} Mbit/s)")
+        self.fout = None
+        return k
+
+    def file_evil(self):
+        """Adversarial offers to the viewer; logs what it did with each (check the viewer's folder)."""
+        time.sleep(2)
+        now = int(time.time() * 1000)
+        mem = lambda b: (lambda: __import__("io").BytesIO(b))
+        res = self.file_transfer([("../escape.txt", 4, now, mem(b"evil"))])
+        log(f"{self.addr}: files: EVIL traversal offer -> {res} (want declined:{ST_BAD_NAME})")
+        res = self.file_transfer([("C:\\Windows\\evil.dll", 4, now, mem(b"evil"))])
+        log(f"{self.addr}: files: EVIL absolute offer -> {res} (want declined:{ST_BAD_NAME})")
+        names = ["CON.txt", "ab:cd.txt", "invoice\u202etxt.exe", "trailing. ", "evil/x.txt", "evil/X.txt",
+                 "evil/sub/file.txt:Zone.Identifier", "nul"]
+        res = self.file_transfer([(n, len(n), now, mem(n.encode())) for n in names])
+        log(f"{self.addr}: files: EVIL names offer -> {res} (want done; names sanitized)")
+        res = self.file_transfer([("corrupt.bin", 300000, now, mem(os.urandom(300000)))], corrupt=True)
+        log(f"{self.addr}: files: EVIL bad SHA-256 -> {res} (want cancel {ST_VERIFY}, no corrupt.bin left)")
+        res = self.file_transfer([("huge.bin", 1 << 50, now, mem(b""))])
+        log(f"{self.addr}: files: EVIL 1 PiB offer -> {res} (want declined:{ST_TOO_LARGE})")
+        res = self.file_transfer([("dup", 1, now, mem(b"1")), ("dup/inner.txt", 1, now, mem(b"2"))])
+        log(f"{self.addr}: files: EVIL file/folder clash -> {res} (want declined:{ST_BAD_NAME})")
+        log(f"{self.addr}: files: EVIL sequence finished")
+
     def audio_loop(self):
         """48 kHz stereo s16le sine, sent as ≤10 ms AudioFrames (docs/PROTOCOL.md §3.2)."""
         a = self.args
@@ -767,6 +1389,13 @@ class Session:
             if t == 0x30:
                 (ct,) = struct.unpack("<Q", m[1:9])
                 self.send_msg(bytes([0x31]) + struct.pack("<QQ", ct, mono_us()))
+                if self.args.log_pings:
+                    # One-way delay up to a constant clock offset: the excess over the minimum is
+                    # queueing (e.g. behind file chunks on the viewer's uplink).
+                    owd = mono_us() - ct
+                    self.min_owd = min(getattr(self, "min_owd", owd), owd)
+                    busy = "during file transfer" if self.finc else "idle"
+                    log(f"{self.addr}: ping queueing +{(owd - self.min_owd) / 1000:.2f} ms ({busy})")
                 continue
             if t == 0x10:
                 moves += 1
@@ -797,6 +1426,8 @@ class Session:
                 self.restart.set()
             elif t == 0x50:
                 self.on_clipboard(m)
+            elif 0x70 <= t <= 0x7F:
+                self.on_file(m)
             elif t == 0x80:
                 self.timing = bool(m[1] & 1)
                 log(f"{self.addr}: LatencyEnable {m[1]:#x} -> FrameTiming {'on' if self.timing else 'off'}")
@@ -850,7 +1481,18 @@ def main():
     ap.add_argument("--clip-every", type=float, default=0, help="repeat the clipboard push every N s (text gets a counter)")
     ap.add_argument("--clip-bounce", action="store_true", help="send every received clipboard back once (echo test)")
     ap.add_argument("--clip-save", metavar="DIR", help="save received clipboard PNGs here")
-    ap.add_argument("--selftest", action="store_true", help="check the clipboard codec against PROTOCOL.md §5 and exit")
+    ap.add_argument("--selftest", action="store_true",
+                    help="check the clipboard/latency/file codecs (PROTOCOL.md §5/§3.4/§6, docs/file-transfer-vectors.json) and exit")
+    ap.add_argument("--file-vectors", metavar="OUT", help="write docs/file-transfer-vectors.json to OUT and exit")
+    ap.add_argument("--no-files", action="store_true", help="don't negotiate file transfer (caps bit 11)")
+    ap.add_argument("--file-recv", default=os.path.join(HERE, "../.dev/mock-recv"), help="save files from the viewer here")
+    ap.add_argument("--file-send", nargs="+", metavar="PATH", help="offer these files/folders to the viewer ~2 s after connect")
+    ap.add_argument("--file-pull", nargs="+", metavar="PATH", help="answer the viewer's FilePull (Ctrl+Alt+Shift+V) with these")
+    ap.add_argument("--file-decline", action="store_true", help="decline every offer from the viewer")
+    ap.add_argument("--file-evil", action="store_true", help="send adversarial offers (traversal, reserved names, bad SHA-256)")
+    ap.add_argument("--file-max-total", type=int, default=8 << 30)
+    ap.add_argument("--log-pings", action="store_true", help="log each Ping's queueing delay (input-priority check during transfers)")
+    ap.add_argument("--file-max-files", type=int, default=10000)
     ap.add_argument("--latency-pattern", action="store_true",
                     help="stream a live-encoded block-code clock pattern (docs/LATENCY.md) instead of the files")
     ap.add_argument("--pattern-size", default="1280x720", help="--latency-pattern frame size (default 1280x720)")
@@ -858,6 +1500,9 @@ def main():
     args = ap.parse_args()
     if args.selftest:
         sys.exit(0 if selftest() else 1)
+    if args.file_vectors:
+        open(args.file_vectors, "w").write(file_vectors_json())
+        sys.exit(0)
 
     password = os.environ.get("GLIDE_PASSWORD")
     if not password and os.path.exists(args.password_file):

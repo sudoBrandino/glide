@@ -100,12 +100,13 @@ Any decrypt failure is fatal: close the connection.
 | `0x30` | Ping | `u64 client_time_us` |
 | `0x50` | Clipboard | clipboard snapshot, see §5 (only after the host sent `ClipboardCaps`) |
 | `0x62` | AudioEnable | `u8 enabled` — see §3.2 |
+| `0x70`–`0x79` | File transfer | see §6 (only after the host sent `FileCaps`) |
 | `0x80` | LatencyEnable | `u8 flags` — see §3.4 |
 | `0x82` | LatencyReport | viewer latency breakdown — see §3.4 |
 
 `codec_caps` bits (despite the name, a general capability mask): bits 0–7 are video codecs —
 `0` HEVC 4:2:0, `1` HEVC 4:4:4, `2` H.264 4:2:0; bits 8+ are non-video features — `8` clipboard
-sync (§5), `9` audio PCM, `10` audio Opus (reserved) (§3.2). Hosts ignore bits they don't know;
+sync (§5), `9` audio PCM, `10` audio Opus (reserved) (§3.2), `11` file transfer (§6). Hosts ignore bits they don't know;
 codec selection looks at bits 0–7 only.
 `mode`: `0` fast (4:2:0 only), `1` sharp (4:4:4 every frame), `2` **hybrid** (4:2:0 while the screen
 changes + a 4:4:4 refinement layer once it settles; see §3.1). Hybrid requires `codec_caps` bit 1;
@@ -131,6 +132,7 @@ the host injects exactly the HID usages it receives.
 | `0x51` | ClipboardCaps | `u32 formats`, `u32 max_bytes` — see §5 (only to clients with caps bit 8) |
 | `0x60` | AudioConfig | see §3.2 (only to clients with caps bit 9) |
 | `0x61` | AudioFrame | see §3.2 (only to clients with caps bit 9) |
+| `0x70`–`0x79` | File transfer | see §6 (only to clients with caps bit 11) |
 | `0x81` | FrameTiming | per-frame host timestamps, see §3.4 (only after `LatencyEnable`) |
 
 Rules:
@@ -390,3 +392,151 @@ Both implementations use the same guards (`ClipboardEchoGuard` in Swift, `EchoGu
 `Clipboard{seq=1, text "hi\n"}` = `50 01000000 01 01 03000000 68690a`;
 `ClipboardCaps{formats=3, max_bytes=16 MiB}` = `51 03000000 00000001`.
 Both implementations and `tools/mock_host.py --selftest` check these.
+
+
+## 6. File transfer (v1.5)
+
+Message types `0x70–0x7F` are reserved for file transfer: files and folders in both directions,
+over the existing encrypted record layer, only inside an authenticated session.
+
+### 6.1 Negotiation
+
+1. The viewer sets `codec_caps` bit **11** (`FILES`) if it supports file transfer.
+2. If (and only if) bit 11 is set and file transfer is enabled on the host, the host sends
+   `FileCaps` right after `ServerHello` (after `ClipboardCaps`, if any). The host never sends
+   `0x70–0x7F` to a viewer without bit 11.
+3. The viewer sends file messages only after it received `FileCaps`, offers files only if `flags`
+   bit 0 is set, and sends `FilePull` only if bit 1 is set.
+
+### 6.2 Messages
+
+"S" is the side sending the files, "R" the side receiving them; either peer can be either.
+
+| type | name | dir | payload |
+|----|----|----|----|
+| `0x70` | FileCaps | H→C | `u32 flags` (bit0 the host accepts files, bit1 the host can send files), `u64 max_total_bytes`, `u32 max_files` (the host's limits for what it accepts) |
+| `0x71` | FileOffer | S→R | `u32 transfer_id`, `u64 total_bytes`, `u32 count`, then `count` × (`str path`, `u64 size`, `i64 mtime_ms`) |
+| `0x72` | FileAnswer | R→S | `u32 transfer_id`, `u8 status` (0 = accept, else a decline reason, §6.5), `str detail` |
+| `0x73` | FileChunk | S→R | `u32 transfer_id`, `u32 file_index`, `u64 offset`, then 1..262144 bytes of file data (the rest of the message) |
+| `0x74` | FileEnd | S→R | `u32 transfer_id`, `u32 file_index`, 32 bytes SHA-256 of the file's content |
+| `0x75` | FileAck | R→S | `u32 transfer_id`, `u64 bytes` — chunk bytes of this transfer received and written so far |
+| `0x76` | FileCancel | either | `u32 transfer_id`, `u8 reason` (§6.5), `str detail` |
+| `0x77` | FileDone | R→S | `u32 transfer_id`, `u32 files` — every file was verified and saved |
+| `0x78` | FilePull | C→H | (none) — "send me the files on your pasteboard" (Finder copy; viewer Ctrl+Alt+Shift+V) |
+| `0x79` | FilePullResult | H→C | `u8 status` (0 = an offer follows, else a reason, e.g. 11 nothing to send), `str detail` |
+
+- `path` is the file's path relative to the transfer, `/`-separated UTF-8 (a dropped folder
+  `Photos` yields `Photos/a.jpg`, `Photos/2024/b.jpg`). Only regular files are listed: folders are
+  implied by the paths (empty folders are not transferred). Invalid UTF-8 in any `str` of these
+  messages is replaced (U+FFFD), never fatal.
+- `mtime_ms`: modification time in ms since the Unix epoch (0 = unknown). The receiver applies it
+  only if `1 ≤ mtime_ms ≤ 253402300799999` (year 9999); any other value is ignored, never an error.
+- `total_bytes` must equal the sum of the sizes.
+- **Transfer ids** are chosen by the sender: the viewer's are `1..=0x7FFFFFFF`, the host's have
+  bit 31 set. A `FileCancel` therefore always identifies the transfer unambiguously. An offer whose
+  id is outside the sender's range is refused (status 9).
+
+### 6.3 Received names (normative)
+
+Every path in an offer is untrusted. Receivers process it exactly like this (both
+implementations are checked against `docs/file-transfer-vectors.json`, generated by
+`tools/mock_host.py --file-vectors`):
+
+1. **Refuse the offer** (status 3) if a path is empty, longer than 4096 bytes, starts with `/`
+   or `\`, starts with a drive (`X:`, ASCII letter + colon), has more than 32 components, or
+   has an empty (`a//b`, trailing `/`), `.` or `..` component. Also refuse an offer in which a
+   path is both a file and a folder (case-insensitively), e.g. `x` and `x/y`.
+2. **Sanitize each component**, in this order:
+   1. replace with `_`: control characters U+0000–U+001F and U+007F; `\ : * ? " < > |`
+      (`:` also blocks NTFS alternate data streams); invisible format characters U+061C,
+      U+200B–U+200F, U+202A–U+202E, U+2060–U+2064, U+2066–U+2069, U+FEFF (bidi overrides
+      that disguise extensions, zero-width characters);
+   2. strip trailing `.` and ` ` (Windows drops them silently); if nothing is left, use `_`;
+   3. if the part before the first `.`, without trailing spaces, is a Windows device name
+      (case-insensitive ASCII: `CON PRN AUX NUL CONIN$ CONOUT$ COM0–COM9 LPT0–LPT9` and
+      `COM¹²³ LPT¹²³`), prefix `_` (`con.txt` → `_con.txt`);
+   4. if longer than 200 UTF-8 bytes, cut it to 200 bytes at a character boundary, keeping the
+      extension (from the last `.`, if not at position 0 and at most 32 bytes); strip trailing
+      `.`/` ` again. (200 leaves room for the collision suffix under the 255 limits of
+      APFS/NTFS.)
+3. **Never overwrite.** Files are saved under the receiver's download folder
+   (host: `~/Downloads/Glide`, viewer: `<Downloads>\Glide`; configurable). Each top-level folder
+   of the offer becomes a *new* folder — `Photos (2)`, `Photos (3)`… if the name is taken — so a
+   transfer never writes into an existing folder (and never through an existing symlink). A file
+   whose name is taken gets ` (2)` before its extension (`a.txt` → `a (2).txt`; dotfiles and
+   folders get it at the end). The final rename is atomic and fails instead of replacing
+   (`renamex_np(RENAME_EXCL)` / `MoveFileExW` without `REPLACE_EXISTING`).
+
+### 6.4 Transfer flow
+
+1. S sends `FileOffer` and waits for `FileAnswer`. R accepts or declines (limits, disabled,
+   busy, bad names …). A sender runs one outgoing transfer at a time (it queues further requests
+   locally); a receiver may decline a second concurrent offer with status 4.
+2. After an accept, S sends the files in offer order. For each file: `FileChunk`s with
+   contiguous offsets starting at 0 (each 1..262144 bytes, summing to the file's size), then
+   `FileEnd` with the SHA-256 — also for empty files (no chunks).
+3. R writes each file to a hidden temp file (`.glide-<id>-<index>.part`) in its final folder.
+   On `FileEnd` it checks the size and SHA-256; only then it applies `mtime`, marks the file as
+   downloaded (§6.6) and renames it into place (§6.3). A chunk for the wrong file, a gap, an
+   overlap, data beyond the declared size, or a mismatch at `FileEnd` → R sends `FileCancel`
+   (reason 9 or 8) and deletes the temp file. Files already completed stay.
+4. **Flow control.** R sends `FileAck` after writing each chunk (and after each `FileEnd`). S keeps
+   at most **1 MiB** of chunk data unacknowledged (`FILE_WINDOW`; Glide's senders use 512 KiB).
+   A receiver may cancel (reason 9) if more than 4 MiB of chunks pile up unprocessed.
+5. After the last file verifies, R sends `FileDone`. S reports success only on `FileDone`.
+6. Either side may send `FileCancel` at any time (user cancel, read/write error, the source file
+   changed while it was being read — reason 10). Both then drop the transfer; R deletes the
+   partial file. Messages for an unknown or finished transfer id are ignored (not an error).
+7. A disconnect ends all transfers; receivers delete partial files.
+
+**Priority (normative intent: files never delay video or input).** Chunks are low-priority traffic:
+
+- The host sends a chunk only while the connection's queued bytes (video backlog) are below
+  256 KiB; otherwise it waits (re-checking when a chunk leaves the queue and every few ms).
+- The viewer's sender is shared by input, control and chunks: a chunk is only written when no
+  input/control message is waiting, so an input event never waits behind more than one chunk
+  (≤ 256 KiB). Together with the ack window this bounds the file data ahead of any input event
+  or video frame to ~512 KiB.
+
+### 6.5 Status / reason codes
+
+| code | meaning |
+|----|----|
+| 0 | ok / accepted (FilePullResult: an offer follows) |
+| 1 | declined (receiving turned off) |
+| 2 | too large (total size or file count over the receiver's limit) |
+| 3 | unsafe file name (§6.3) |
+| 4 | busy (another transfer in progress) |
+| 5 | disk full |
+| 6 | I/O error |
+| 7 | cancelled by the user |
+| 8 | verification failed (size or SHA-256 mismatch) |
+| 9 | protocol error (bad id, order, offsets, flow control) |
+| 10 | a source file changed while it was being sent |
+| 11 | nothing to send (FilePull with no files on the pasteboard) |
+
+### 6.6 Receiver safety
+
+- Received files are **never opened or executed** automatically. Notifications only reveal them:
+  Finder (`activateFileViewerSelecting`) on the Mac, Explorer `/select` on Windows.
+- Files are marked as downloaded from the internet: macOS sets `com.apple.quarantine`
+  (`0081;<hex time>;Glide;`) on every file and folder it creates, so Gatekeeper checks them on
+  first open; Windows writes the Mark-of-the-Web stream `<file>:Zone.Identifier` with
+  `[ZoneTransfer] ZoneId=3` (SmartScreen, Office Protected View). On file systems without
+  streams (FAT/exFAT) the mark is skipped and logged.
+- Senders refuse symlinks (and Windows junctions) and special files (FIFOs, devices, sockets)
+  and never follow links inside folders; they skip `.DS_Store`. Both sides enforce size/count
+  limits before sending/accepting (default 8 GiB, 10 000 files).
+
+### Reference bytes
+
+All in `docs/file-transfer-vectors.json` (checked by `glide-selftest`, `cargo test` and
+`mock_host.py --selftest`), for example:
+
+```
+FileCaps   {flags 3, 8 GiB, 10000}            70 03000000 0000000002000000 10270000
+FileChunk  {id 1, file 0, offset 0, "hello"}  73 01000000 00000000 0000000000000000 68656c6c6f
+FileAck    {id 1, 5 bytes}                    75 01000000 0500000000000000
+FileCancel {id 0x80000001, 7, "user"}         76 01000080 07 0400 75736572
+FilePull                                      78
+```

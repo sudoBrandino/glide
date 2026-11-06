@@ -86,6 +86,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the details.
 | CI: Swift build + selftest, Rust tests, Windows cross-build artifact, vector check | done |
 | Clipboard sync (text + images, both directions) | done |
 | Audio (SCK system audio → PCM → WASAPI, jitter buffer) | done (§3.2) |
+| File transfer, both directions (drag & drop, Finder copy + Ctrl+Alt+Shift+V, menu) | done (§6) |
 | Viewer UX | in progress |
 | Host UX: menu-bar item, automatic display mode, auth-gated session replacement | done |
 | Security v2: PAKE + pinned host identity | next ([roadmap](docs/ROADMAP.md)) |
@@ -246,8 +247,34 @@ hooks.
 `Glide Host.app` (built by `tools/make-host-app.sh`, installed as a LaunchAgent by
 `tools/install-host.sh`) shows a menu-bar item: state icon (waiting / dialing / connected / paused /
 problem), viewer name + IP, stream mode, resolution, fps / Mbps / encode ms, and actions (Disconnect,
-Pause, Display Mode, Open Log, Copy Viewer Password, Restart, Quit Until Next Login — plain Quit
-would just be relaunched by the agent's KeepAlive).
+Pause, Send Files to Viewer…, Recent Transfers, Display Mode, Open Log, Copy Viewer Password,
+Restart, Quit Until Next Login — plain Quit would just be relaunched by the agent's KeepAlive).
+
+## File transfer
+
+Files and folders go both ways over the session's encrypted connection ([PROTOCOL.md §6](docs/PROTOCOL.md)):
+
+- **PC → Mac:** drag files or folders from Explorer onto the Glide window, or use the Glide menu's
+  *Send files to the Mac…* / *Send folder to the Mac…* (multi-select pickers). They land in
+  `~/Downloads/Glide/` on the Mac, which posts a notification ("Received 3 files", click to show
+  in Finder; the first time macOS asks to allow Glide Host's notifications) and lists them under
+  the menu bar's *Recent Transfers*.
+- **Mac → PC:** menu bar → *Send Files to Viewer…* (files and folders, multi-select), or copy
+  files in Finder (Cmd+C) and press **Ctrl+Alt+Shift+V** in the viewer (Glide menu: *Receive files
+  copied on the Mac*). They land in
+  `%USERPROFILE%\Downloads\Glide\`; a Windows notification opens the folder when clicked.
+- Progress shows as a line at the bottom of the viewer; **Ctrl+Alt+Shift+X** (or the tray menu, or
+  the Mac menu's *Cancel File Transfer*) cancels.
+- Safety: received names are sanitized (no `..`, absolute paths, drive letters, device names,
+  `:` streams, trailing dots, control or bidi characters), nothing is ever overwritten
+  (`a (2).txt`, `Photos (2)`), each file is written to a temp file and renamed only after its
+  SHA-256 verifies, files are marked as downloaded (macOS quarantine, Windows Mark-of-the-Web),
+  and nothing received is ever opened automatically. Symlinks and special files are never sent.
+- Chunks only use spare capacity: the host pauses them while video is backed up, and on the viewer
+  an input event never waits behind more than one 256 KiB chunk.
+- Settings: host.json `"files": {"enabled": true, "receive": true, "downloadDir": "~/Downloads/Glide",
+  "maxTotalBytes": 8589934592, "maxFiles": 10000}`; viewer config.json `file_transfer`,
+  `file_receive`, `download_dir`, `file_max_total_bytes`, `file_max_files`.
 
 **Display mode** (`"display"` in `~/Library/Application Support/Glide/host.json`, or the menu):
 
