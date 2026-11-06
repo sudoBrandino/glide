@@ -22,9 +22,11 @@ pub struct Args {
     clipboard: bool,
     /// Headless Win32 clipboard self-test (no connection).
     clipboard_selftest: bool,
+    /// Also sync clipboard content marked private (password managers).
+    clipboard_sync_secrets: bool,
 }
 
-const USAGE: &str = "usage: glide-client <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--bench SECONDS] [--probe]
+const USAGE: &str = "usage: glide-client <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--bench SECONDS] [--probe]
        glide-client --listen [PORT] [options...]
 
   host[:port]        Glide host (default port 7420)
@@ -35,6 +37,8 @@ const USAGE: &str = "usage: glide-client <host[:port]> [--password PW] [--mode f
                      4:4:4 refinement at rest. Default: hybrid if this PC decodes HEVC 4:4:4, else fast
   --no-ctrl-as-cmd   don't swap Ctrl<->Win (default maps Ctrl->Cmd, Win->Control)
   --no-clipboard     don't sync the clipboard (text + images) with the host
+  --clipboard-sync-secrets  also send clipboard content that password managers mark private
+                     (default: respected, not sent). Env: GLIDE_CLIPBOARD_SYNC_SECRETS=1
   --bench SECONDS    headless: connect, decode for N seconds, print one JSON line
   --probe            print decoder capabilities as JSON (no connection)
   --clipboard-selftest  exercise the Win32 clipboard path headlessly (no connection; run over SSH)
@@ -42,7 +46,7 @@ const USAGE: &str = "usage: glide-client <host[:port]> [--password PW] [--mode f
 In the viewer: F11 or Alt+Enter toggles borderless fullscreen.";
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { host: None, password: None, mode: None, ctrl_as_cmd: true, bench: None, probe: false, listen: None, clipboard: true, clipboard_selftest: false };
+    let mut a = Args { host: None, password: None, mode: None, ctrl_as_cmd: true, bench: None, probe: false, listen: None, clipboard: true, clipboard_selftest: false, clipboard_sync_secrets: false };
     let mut it = std::env::args().skip(1).peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -58,6 +62,7 @@ fn parse_args() -> Result<Args, String> {
             "--no-ctrl-as-cmd" => a.ctrl_as_cmd = false,
             "--no-clipboard" => a.clipboard = false,
             "--clipboard-selftest" => a.clipboard_selftest = true,
+            "--clipboard-sync-secrets" => a.clipboard_sync_secrets = true,
             "--bench" => {
                 let v = it.next().ok_or("--bench needs SECONDS")?;
                 a.bench = Some(v.parse::<f64>().map_err(|_| format!("bad --bench value {v}"))?);
@@ -129,6 +134,11 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    #[cfg(windows)]
+    glide::win::clipboard::set_sync_secrets(
+        args.clipboard_sync_secrets || std::env::var("GLIDE_CLIPBOARD_SYNC_SECRETS").is_ok_and(|v| v == "1"),
+    );
 
     if args.clipboard_selftest {
         #[cfg(windows)]

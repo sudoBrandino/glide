@@ -13,6 +13,9 @@ final class ClipboardSync: @unchecked Sendable {
     private let sessionId: Int
     private let sendMessage: (ClipboardData) -> Void
     private let work = DispatchQueue(label: "glide.clipboard", qos: .utility)
+    /// Also send pasteboard content marked org.nspasteboard.ConcealedType (host.json
+    /// `clipboard.syncConcealed`, default false).
+    private let syncConcealed: Bool
 
     // Main-thread state.
     private var echo = ClipboardEchoGuard()
@@ -20,8 +23,9 @@ final class ClipboardSync: @unchecked Sendable {
     private var seq: UInt32 = 0
     private var stopped = false
 
-    init(sessionId: Int, send: @escaping (ClipboardData) -> Void) {
+    init(sessionId: Int, syncConcealed: Bool = false, send: @escaping (ClipboardData) -> Void) {
         self.sessionId = sessionId
+        self.syncConcealed = syncConcealed
         self.sendMessage = send
     }
 
@@ -36,7 +40,7 @@ final class ClipboardSync: @unchecked Sendable {
             t.tolerance = 0.05
             RunLoop.main.add(t, forMode: .common)
             timer = t
-            log("sync on" + Self.accessNote())
+            log("sync on" + (syncConcealed ? " (syncing concealed items too)" : "") + Self.accessNote())
         }
     }
 
@@ -68,7 +72,7 @@ final class ClipboardSync: @unchecked Sendable {
         let marker = pb.changeCount
         guard !stopped, echo.changed(marker: marker) else { return }
         let t0 = Date()
-        let content = ClipboardPasteboard.read(pb)
+        let content = ClipboardPasteboard.read(pb, syncConcealed: syncConcealed)
         if Date().timeIntervalSince(t0) > 0.5 {
             log(String(format: "reading the pasteboard took %.1f s (privacy alert or huge content?)", Date().timeIntervalSince(t0)))
         }

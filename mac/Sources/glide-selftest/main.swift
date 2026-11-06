@@ -272,8 +272,28 @@ func pasteboardTests() {
     check(ClipboardPasteboard.read(pb) == .png(png), "empty text falls through to image")
     pb.clearContents(); pb.setString("otp", forType: .string); pb.setData(Data(), forType: ClipboardPasteboard.transientType)
     if case .skipped? = ClipboardPasteboard.read(pb) { check(true, "transient content skipped") } else { check(false, "transient content skipped") }
+    pb.clearContents(); pb.setString("hunter2", forType: .string); pb.setString("", forType: ClipboardPasteboard.concealedType)
+    if case .skipped? = ClipboardPasteboard.read(pb) { check(true, "concealed content skipped by default") } else { check(false, "concealed content skipped by default") }
+    check(ClipboardPasteboard.read(pb, syncConcealed: true) == .text("hunter2"), "concealed content sent when syncConcealed")
     pb.clearContents()
     check(ClipboardPasteboard.read(pb) == nil, "empty pasteboard -> nothing")
+
+    // Untrusted PNG: signature + IHDR checked before decoding.
+    func pngHeader(_ w: UInt32, _ h: UInt32) -> Data {
+        var d = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13]) + Data("IHDR".utf8)
+        for v in [w, h] { d += withUnsafeBytes(of: v.bigEndian) { Data($0) } }
+        return d + Data([8, 6, 0, 0, 0, 0, 0, 0, 0]) + Data(repeating: 0, count: 64)  // depth, RGBA, ..., bogus CRC + junk
+    }
+    check(ClipboardPNG.dimensions(png).map { $0.width == 4 && $0.height == 3 } == true, "IHDR dimensions of a real PNG")
+    check(ClipboardPNG.refusal(png) == nil, "real PNG accepted")
+    check(ClipboardPNG.refusal(pngHeader(100_000, 100_000))?.contains("too large") == true, "oversize IHDR (100000x100000) rejected")
+    check(ClipboardPNG.refusal(pngHeader(UInt32(Int32.max), 1))?.contains("too large") == true, "oversize IHDR width rejected")
+    check(ClipboardPNG.refusal(pngHeader(8192, 8192)) == nil && ClipboardPNG.refusal(pngHeader(8193, 8192)) != nil, "64 Mpx cap boundary")
+    check(ClipboardPNG.refusal(pngHeader(0, 5)) != nil, "empty IHDR size rejected")
+    check((try? ClipboardPasteboard.prepare(ClipboardData(seq: 9, png: pngHeader(100_000, 100_000))).get()) == nil, "prepare refuses oversize PNG")
+    check((try? ClipboardPasteboard.prepare(ClipboardData(seq: 10, png: rep.tiffRepresentation!)).get()) == nil, "prepare refuses non-PNG image data (TIFF)")
+    var badChunk = png; badChunk.replaceSubrange(12..<16, with: Data("IDAT".utf8))
+    check(ClipboardPNG.dimensions(badChunk) == nil && ClipboardPNG.dimensions(png.prefix(20)) == nil, "IHDR missing/truncated rejected")
 
     // Invalid received PNG: refused alone, text kept when present.
     check((try? ClipboardPasteboard.prepare(ClipboardData(seq: 6, png: Data([1, 2, 3]))).get()) == nil, "invalid PNG refused")
