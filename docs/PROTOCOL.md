@@ -1,14 +1,17 @@
-# Glide wire protocol — v1 (LAN prototype)
+# Glide wire protocol — v2
 
 Status: draft, implemented by `mac/` (host) and `windows/` (client).
 Everything here is normative; if code and this file disagree, fix one of them.
+Security v2 (this document's §1–2) replaced the v1 password handshake; v1 is described at the end
+of §2 as "legacy, removed".
 
 ## Conventions
 
 - All integers are **little-endian**. `f32` is IEEE-754 little-endian.
 - `str` = `u16 byte_length` + UTF-8 bytes.
-- "Host" = the Mac being controlled. "Client" = the viewer (Windows).
+- "Host" = the Mac being controlled. "Client" / "viewer" = the viewer (Windows).
 - Default TCP port: **7420**. Both sides set `TCP_NODELAY`.
+- `‖` = concatenation. `SHA-256` as in FIPS 180-4.
 
 ## 0. Connection direction
 
@@ -17,54 +20,111 @@ Either side may open the TCP connection; the protocol after connect is identical
 - **Viewer dials** (default): host listens (`glide-host`), viewer connects.
 - **Host dials** (`glide-host --connect VIEWER[:PORT]`, viewer runs `--listen`): for networks
   that only allow host→viewer connections (e.g. a locked-down admin VLAN). The host redials
-  every 2 s while disconnected.
+  every 2 s while disconnected (backing off to 60 s while the viewer keeps refusing it, see §2.5).
 
-In both cases the **viewer** sends `ClientHandshake` first.
+In both cases the **viewer** writes first and is the Noise **initiator**; the host is the
+**responder**.
 
-## 1. Handshake (plaintext)
+## 1. Handshake
 
-Client connects and sends `ClientHandshake` (54 bytes):
+### 1.1 Overview and design
+
+Each side has a long-term **static X25519 key pair** (its identity). The handshake is
+**Noise_XX_25519_ChaChaPoly_SHA256** (Noise Protocol Framework, revision 34): mutual
+authentication with both static keys, forward secrecy from ephemeral keys, and the viewer's
+static key encrypted to the host. There is no password and nothing derived from a human secret,
+so a recorded or actively intercepted handshake gives an attacker nothing to guess offline.
+
+Who may connect is decided by **key pinning** (§2.3): the host keeps the public keys of paired
+viewers; the viewer keeps the host's public key per target. Keys get pinned once, by a
+**pairing** (§2.4) that both users confirm by comparing a 6-digit code (Short Authentication
+String, SAS) bound to the handshake.
+
+Why not a PAKE: v1 mixed a password into the KDF, which hands an active impostor of either side a
+value to test guesses against offline. A PAKE (CPace/SPAKE2) fixes that but needs raw curve
+arithmetic that CryptoKit doesn't expose. Static keys + pinning + a one-time SAS pairing needs only
+X25519/ChaCha20-Poly1305/SHA-256/HMAC, available on both platforms.
+
+Implementations: Swift `mac/Sources/GlideCore/{Noise,Crypto,Channel}.swift`, Rust
+`windows/src/{noise,handshake,net}.rs`, Python reference `tools/glide_noise.py`. All three are
+hand-written from the Noise spec and checked against the official vectors (§4).
+
+### 1.2 Wire sequence
+
+```
+viewer → host   ClientPreamble (24) ‖ u16 len ‖ msg1          -> e
+host → viewer   HostPreamble (8)   [‖ u16 len ‖ msg2]         <- e, ee, s, es
+viewer → host   u16 len ‖ msg3   [‖ ClientHello record]       -> s, se
+                ---- transport records (§2) from here ----
+host ↔ viewer   auth phase (§2.4): ServerHello, or AuthResult, or pairing
+```
+
+Handshake messages are framed as `u16 length ‖ message`, length ≤ **1024** (larger = protocol
+error, close). The Noise **prologue** is the 24-byte ClientPreamble, so tampering with it breaks
+the handshake.
+
+**ClientPreamble** (24 bytes):
 
 | off | size | field |
 |----|----|----|
-| 0 | 4 | magic `"GLD1"` (ASCII) |
-| 4 | 2 | `u16` protocol version = 1 |
-| 6 | 32 | client X25519 ephemeral public key |
-| 38 | 16 | client random nonce |
+| 0 | 4 | magic `"GLD2"` |
+| 4 | 2 | `u16` max version the viewer speaks (= 2) |
+| 6 | 2 | `u16` min version it accepts (= 2) |
+| 8 | 16 | reserved, zero |
 
-Host replies with `HostHandshake` (70 bytes):
+The reserved bytes also make the viewer's first flight 58 bytes: a v1 host reads exactly 54 bytes,
+sees the wrong magic and closes at once instead of waiting for its auth timeout.
 
-| off | size | field |
+**HostPreamble** (8 bytes): `"GLD2"`, `u16 version`, `u16 status`.
+
+| status | meaning | then |
 |----|----|----|
-| 0 | 4 | magic `"GLD1"` |
-| 4 | 2 | `u16` protocol version = 1 |
-| 6 | 32 | host X25519 ephemeral public key |
-| 38 | 16 | host random nonce |
-| 54 | 16 | password salt (persistent per host) |
+| 0 | OK, `version` is the negotiated version (2) | msg2 follows |
+| 1 | no common version (`version` = host's highest) | host closes |
+| 2 | host is paused (not accepting viewers) | host closes |
+| 3 | rate limited: too many failed attempts from this address (§2.5) | host closes |
 
-If magic/version mismatch, the receiver closes the connection.
+The host decides the status after reading ClientPreamble + msg1 and **before any DH**. Status ≠ 0
+is unauthenticated; the viewer only uses it for its status text and retry timing.
 
-### Key derivation
+**Version negotiation.** The host picks the highest version in `[min, max]` it supports (only 2
+exists). The negotiated version is repeated inside msg2's encrypted payload; the viewer aborts if
+it differs from the preamble's (downgrade of the plaintext preamble is detected).
 
-```
-pw_key     = PBKDF2-HMAC-SHA256(password_utf8, salt, iterations = 100000, dkLen = 32)
-shared     = X25519(own_private, peer_public)                       // 32 bytes
-transcript = ClientHandshake (54 bytes) || HostHandshake (70 bytes) // 124 bytes
-okm        = HKDF-SHA256(ikm  = shared || pw_key,
-                         salt = SHA-256(transcript),
-                         info = "glide v1 session keys",
-                         L    = 64)
-c2s_key = okm[0..32]    // client -> host
-s2c_key = okm[32..64]   // host -> client
-```
+### 1.3 Payloads
 
-The password is never sent. A wrong password yields different keys, so the
-host's first decrypt of a client record fails and the host closes the
-connection. (Known v1 limitation: an active MITM can mount an offline
-dictionary attack against the password. v2 replaces this with SPAKE2 +
-pinned host keys.)
+- **msg1** payload: empty (it is unencrypted). A nonempty payload is a protocol error.
+- **msg2** payload (encrypted to the viewer's ephemeral, from the host):
 
-## 2. Record layer (encrypted)
+  | size | field |
+  |----|----|
+  | 2 | `u16 version` (= HostPreamble version) |
+  | 1 | `u8 flags`: bit0 = the host's pairing window is open |
+  | 32 | pairing commitment `C = SHA-256("glide-v2 pair commit" ‖ n_h)` |
+
+  `n_h` is 32 random bytes the host draws per connection. msg2 also reveals the host's static key
+  to whoever initiates (XX): it is not secret.
+- **msg3** payload (encrypted, from the viewer):
+
+  | size | field |
+  |----|----|
+  | 1 | `u8 flags`: bit0 = **pair request** (§2.4) |
+  | 32 | `n_v`: 32 random bytes |
+  | str | viewer name (≤ 255 bytes; truncated on a character boundary) — shown in the Mac's list |
+
+The viewer checks the host's static key from msg2 against its pin **before** writing msg3; on a
+mismatch it closes without sending msg3 (an impostor learns nothing about the viewer's identity).
+
+### 1.4 Keys and hash
+
+After msg3 both sides run Noise `Split()`: the first key encrypts viewer→host (`c2s`), the second
+host→viewer (`s2c`). `h` = Noise `GetHandshakeHash()` (32 bytes) after msg3. Rekeying is not used.
+
+Low-order public keys (all-zero DH output) are rejected by all implementations.
+
+## 2. Record layer and authentication
+
+### 2.1 Records
 
 After the handshake every message travels as a record:
 
@@ -73,13 +133,144 @@ After the handshake every message travels as a record:
 | 4 | `u32` ciphertext length `L` (includes 16-byte tag), `17 <= L <= 32 MiB` |
 | L | ChaCha20-Poly1305 ciphertext + tag |
 
-- Key: `c2s_key` for client→host, `s2c_key` for host→client.
-- Nonce (12 bytes): `00 00 00 00` || `u64` little-endian record counter.
-  Each direction has its own counter starting at **0**, incremented per record.
-- AAD: empty.
-- Plaintext: `u8 message_type` || payload.
+- Key: `c2s` for client→host, `s2c` for host→client (from §1.4).
+- Nonce (12 bytes): `00 00 00 00` ‖ `u64` little-endian record counter. Each direction has its own
+  counter starting at **0**, incremented per record. AAD: empty. This is exactly a Noise transport
+  `CipherState` (`EncryptWithAd("", …)`); Glide frames it with its own `u32` length and does not
+  apply Noise's 65535-byte message limit.
+- Plaintext: `u8 message_type` ‖ payload.
 
 Any decrypt failure is fatal: close the connection.
+
+### 2.2 Auth-phase messages
+
+Message types `0x08–0x0F` are reserved for the auth phase; they are only valid before
+`ServerHello`.
+
+| dir | type | name | payload |
+|----|----|----|----|
+| H→C | `0x08` | AuthResult | `u8 code` (below) |
+| H→C | `0x09` | PairReveal | 32 bytes `n_h` |
+| C→H | `0x0A` | PairConfirm | `u8 match` (1 = the user confirmed the codes match, 0 = declined) |
+
+AuthResult codes — the host closes the connection after any nonzero code:
+
+| code | meaning | viewer shows |
+|----|----|----|
+| 0 | paired: both users confirmed; the viewer pins the host key and sends ClientHello | — |
+| 1 | unknown viewer: key not paired, no pair request | "doesn't recognize this PC — Pair New Viewer…" |
+| 2 | pair request, but the host's pairing window is closed | "Not paired yet — Pair New Viewer…" |
+| 3 | pairing declined (on the Mac, or a typed code didn't match) | "declined on the Mac" |
+| 4 | pairing timed out (nobody confirmed on the Mac within 60 s) | "timed out" |
+| 5 | busy: another pairing is in progress | "busy, try again" |
+
+Reference bytes: `AuthResult{1}` = `08 01`, `PairConfirm{1}` = `0a 01`, `PairReveal` = `09` ‖ 32 bytes.
+
+### 2.3 Identities and pinning
+
+- **Host identity:** X25519 key in `~/Library/Application Support/Glide/host-key` (64 hex chars,
+  mode 0600, folder 0700), created on first start. It is a file rather than a Keychain item: the
+  host is a LaunchAgent on a usually headless Mac; a legacy-keychain item is bound to the code
+  signature, so a rebuilt binary or the CLI could raise an "allow access" prompt nobody can click,
+  and the data-protection keychain needs a provisioning-profile entitlement. Same-user code can
+  read the file — but it could also replace the app. An unreadable/corrupt key file is fatal
+  (never silently regenerated: that would look like an impersonation to every viewer).
+- **Host pin list:** `host.json` `"pairedViewers": [{"name", "key" (hex), "paired" (ISO 8601)}]`.
+  Menu: *Paired Viewers ▸ name ▸ Remove…*; CLI `glide-host --paired`, `--unpair NAME|KEY`.
+  Removing a viewer ends its session.
+- **Viewer identity:** `identity.dpapi` next to `config.json` (DPAPI `CryptProtectData`, current
+  user, extra entropy). Created on first use; an undecryptable file is an error, not replaced.
+- **Viewer pins:** `config.json` `"pinned_hosts": {target: {"key", "name", "paired"}}` where
+  `target` is `host:port` (lowercase, default port added) when dialing or `listen:PORT` in listen
+  mode. Tray *Forget host (unpair)…* or `--forget-host` removes it.
+
+Rules:
+
+1. Viewer, after msg2: if a key is pinned for the target and differs → abort before msg3
+   ("HOST KEY CHANGED"). Unpinned → msg3 with the pair request bit.
+2. Viewer pair request bit = no pin for this target, **or** the host answered AuthResult 1 earlier
+   in this process (it forgot us): then pairing runs again, still requiring the pinned host key.
+3. Host, after msg3: pair request → pairing (§2.4) if the window is open (else 2, or 5 if busy).
+   No pair request → paired key: continue (`ClientHello` → `ServerHello`); unknown key: AuthResult 1.
+4. Paired viewers pipeline `ClientHello` right after msg3. `ServerHello` (as before) means
+   accepted; there is no AuthResult 0 on this path.
+
+### 2.4 Pairing
+
+The host's **pairing window** opens for **2 minutes** from the menu (*Pair New Viewer…*) or
+`glide-host --pair`; one successful pairing closes it; only one pairing runs at a time.
+
+```
+viewer                                   host
+msg3 (pair request, n_v)  ─────────────►
+                          ◄───────────── PairReveal (n_h)
+check SHA-256("glide-v2 pair commit" ‖ n_h) == C from msg2, else abort
+both show SAS = code(h, n_v, n_h); each user confirms on their own screen
+PairConfirm (1/0)         ─────────────►
+                          ◄───────────── AuthResult 0 (after both said yes; host pins the viewer)
+pin the host key; ClientHello ─────────► ServerHello …
+```
+
+**SAS:** `d = SHA-256("glide-v2 sas" ‖ h ‖ n_v ‖ n_h)`;
+`code = (d[0] << 24 | d[1] << 16 | d[2] << 8 | d[3]) mod 1 000 000`, shown as two groups of three
+digits, `"%03u %03u"` (e.g. `973 429`).
+
+Why the commitment and nonces: with a 20-bit code, a man in the middle running one handshake with
+each side could otherwise grind its own ephemeral keys/payloads until both codes match. Here the
+host commits to `n_h` in msg2 before it sees anything the viewer contributes in msg3, the viewer's
+fresh `n_v` arrives only after the host side's msg2 is fixed, and `n_h` is revealed only after
+msg3. Whichever side the attacker completes last, the code it ends up with is uniformly random to
+it: each attempt succeeds with probability 10⁻⁶ and each failed attempt shows two different codes
+to the users. (Same structure as ZRTP's hash commitment / Bluetooth numeric comparison.)
+
+**Confirmation.** The viewer shows a dialog with the code and both key fingerprints
+(fingerprint = first 8 bytes of SHA-256(public key) in hex, `aaaa bbbb cccc dddd`) and buttons
+*Codes Match — Pair* / *Cancel*. The Mac confirms either in a menu-bar alert (same buttons) or by
+**typing** the code the PC shows (`glide-host --pair` in a terminal, or `glide-host --pair-code
+NNNNNN`); a typed code is compared by the host, so a mismatch declines (AuthResult 3).
+
+**Timeouts (pre-auth resources).**
+- Until the viewer has received a PairReveal of at most 49 bytes (record body) whose nonce opens
+  the msg2 commitment, the normal pre-auth deadline applies (5 s wall clock when dialing; the
+  listen-mode pre-auth deadline), counted as a total, not per read. Only then is the user
+  prompted; the prompt plus the host's verdict get a total of **120 s**, after which the viewer
+  closes the prompt and the connection. AuthResult after the prompt must be ≤ 18 bytes (body).
+- The host enters the pairing state only after an authenticated msg3 with the pair request bit
+  **and** an open window; it waits at most **60 s** for both confirmations (then AuthResult 4).
+  Records from an unauthenticated (not yet streaming) peer are capped at 64 KiB.
+- Cancelling the window on the Mac declines a pairing in progress.
+
+### 2.5 Rate limiting
+
+The host counts failed attempts per IPv4 address / IPv6 /64 (IPv4-mapped IPv6 as IPv4):
+handshake errors, timeouts, AuthResult 1–5, a viewer hanging up after msg2. The address is then
+refused with HostPreamble status 3 for 1 s, doubling to 60 s; a successful session clears it,
+and opening the pairing window clears all of it (the viewer being paired may have been refused a
+moment ago). When the host dials out, its redial interval backs off the same way (2 s → 60 s)
+while the viewer keeps refusing it, and opening the pairing window redials immediately.
+The viewer's listen mode keeps its own backoff and IP allowlist (`allowed_peers`, TOFU-pinned
+IP; `windows/src/peers.rs`) in front of the handshake.
+
+Rejections are logged; the host's menu shows the last one ("Rejected unknown viewer “X” (ip)",
+with a repeat count). No dialog appears for them.
+
+### 2.6 Version detection
+
+- **v1 viewer → v2 host:** the host sees `"GLD1"`, reads the rest of the 54-byte v1
+  ClientHandshake and replies 70 bytes `"GLD1"`, `u16 2`, 64 zero bytes; the v1 viewer reports
+  "unsupported protocol version 2". The host logs it and notes "Rejected a Glide v1 viewer".
+- **v2 viewer → v1 host:** the v1 host reads 54 bytes, rejects the magic and closes without
+  answering; the viewer reports that the host closed before answering and is probably still v1.
+
+### 2.7 Legacy: v1 password handshake (removed)
+
+v1 (`"GLD1"`, version 1) sent a 54-byte ClientHandshake (X25519 ephemeral + nonce) and a 70-byte
+HostHandshake (+ a per-host salt), and derived `c2s`/`s2c` with
+`HKDF-SHA256(ikm = X25519 ‖ PBKDF2-HMAC-SHA256(password, salt, 100000, 32), salt = SHA-256(transcript),
+info = "glide v1 session keys", L = 64)`. Its flaw: an active impostor of either side obtained a
+value (the peer's first record) to test password guesses against offline. It is no longer
+implemented; v2 hosts leave `salt`/`password` in host.json and v2 viewers leave `password.dpapi`
+in place (unused) so a rollback to v1 binaries still works.
 
 ## 3. Messages
 
@@ -87,7 +278,8 @@ Any decrypt failure is fatal: close the connection.
 
 | type | name | payload |
 |----|----|----|
-| `0x01` | ClientHello | `u16 version`, `u32 codec_caps`, `u16 view_w`, `u16 view_h` (physical pixels of the monitor the viewer window is on — not necessarily the primary), `u8 mode`, `u8 max_fps`, `str client_name` |
+| `0x0A` | PairConfirm | auth phase only, see §2.2 |
+| `0x01` | ClientHello | `u16 version` (= 2), `u32 codec_caps`, `u16 view_w`, `u16 view_h` (physical pixels of the monitor the viewer window is on — not necessarily the primary), `u8 mode`, `u8 max_fps`, `str client_name` |
 | `0x10` | MouseMove | `f32 x`, `f32 y` — normalized 0..1 over the host display |
 | `0x11` | MouseButton | `u8 button` (0 L, 1 R, 2 M, 3 back, 4 fwd), `u8 down` (1/0) |
 | `0x12` | MouseWheel | `f32 dx`, `f32 dy` — in wheel notches (1.0 = one notch, fractional OK). `dy > 0` = wheel pushed away from user (scroll up). `dx > 0` = scroll right |
@@ -118,7 +310,9 @@ the host injects exactly the HID usages it receives.
 
 | type | name | payload |
 |----|----|----|
-| `0x02` | ServerHello | `u16 version`, `str host_name`, then a `VideoConfig` body (below) |
+| `0x08` | AuthResult | auth phase only, see §2.2 |
+| `0x09` | PairReveal | auth phase only, see §2.2 |
+| `0x02` | ServerHello | `u16 version` (= 2), `str host_name`, then a `VideoConfig` body (below) |
 | `0x04` | SharpLayerConfig | `VideoConfig` body for the refinement layer (hybrid mode only; sent right after `ServerHello`/`VideoConfig`). Same width/height as the base layer, HEVC 4:4:4 |
 | `0x05` | DisplayInfo | `u8 preference`, `u16 mode_w`, `u16 mode_h`, `u8 hidpi` — see §3.3 |
 | `0x03` | VideoConfig | `u16 width`, `u16 height` (encoded pixels), `u8 codec` (1 HEVC, 2 H.264), `u8 chroma` (0 4:2:0, 1 4:4:4), `u8 color` (0 BT.709 limited), `f32 scale` (host backing scale, e.g. 2.0) |
@@ -134,7 +328,7 @@ the host injects exactly the HID usages it receives.
 | `0x81` | FrameTiming | per-frame host timestamps, see §3.4 (only after `LatencyEnable`) |
 
 Rules:
-- Host sends `ServerHello` immediately after it successfully decrypts `ClientHello`.
+- Host sends `ServerHello` after it accepted the viewer (§2.3) and received `ClientHello`.
 - A `VideoConfig` (or `ServerHello`) always precedes the first `VideoFrame` of a new
   configuration, and the next `VideoFrame` is a keyframe. Client must reset its decoder.
 - Keyframes carry VPS/SPS/PPS (HEVC) or SPS/PPS (H.264) in-band, Annex-B with 4-byte start codes.
@@ -294,10 +488,18 @@ read back by the viewer) is not part of the wire protocol; its layout is in `doc
 
 ## 4. Test vectors
 
-`docs/test-vectors.json` (generated by `tools/gen_vectors.py` with Python
-`cryptography`) gives fixed keys/nonces/password and the expected `c2s_key`,
-`s2c_key`, and the first encrypted record in each direction. Both
-implementations must reproduce it byte-for-byte.
+- `docs/noise-vectors.json`: the official Noise_XX_25519_ChaChaPoly_SHA256 vectors (cacophony,
+  noise-c, snow; copied verbatim). Swift (`glide-selftest`), Rust (`cargo test`) and Python
+  (`tools/glide_noise.py`) run all of them in both roles.
+- `docs/test-vectors.json`: Glide v2 transcripts — a pairing session and a pinned session — from
+  fixed static/ephemeral keys and nonces: preambles, msg1–3 and payloads, `h`, transport keys,
+  commitment, SAS, every record and the exact bytes each side writes. Generated by
+  `tools/gen_vectors.py` (Python reference); CI regenerates and compares it.
+- `docs/test-vectors-rust.json`: the same schema with other inputs, generated by the Rust
+  implementation (`GLIDE_REGEN_VECTORS=1 cargo test rust_transcript`).
+
+Swift replays both transcripts as host and as viewer byte for byte; Rust replays the Python one;
+`tools/gen_vectors.py --check docs/test-vectors-rust.json` replays the Rust one in Python.
 
 ## 5. Clipboard sync (v1.1)
 

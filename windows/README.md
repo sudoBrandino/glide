@@ -8,14 +8,15 @@ The wire protocol is defined in `../docs/PROTOCOL.md`.
 
 | path | what |
 |---|---|
-| `src/protocol.rs`, `src/crypto.rs` | Message codec, handshake, KDF, ChaCha20-Poly1305 record layer. Works on any OS and is unit-tested against `../docs/test-vectors.json`. |
+| `src/protocol.rs`, `src/crypto.rs` | Message codec and the ChaCha20-Poly1305 record layer. Works on any OS. |
+| `src/noise.rs`, `src/handshake.rs`, `src/identity.rs` | Security v2: Noise XX (checked against the official vectors in `../docs/noise-vectors.json`), the Glide preambles/payloads/pairing commitment/SAS (against `../docs/test-vectors.json` and the Rust-generated `../docs/test-vectors-rust.json`), and the viewer's key (`identity.dpapi`). |
 | `src/net.rs` | TCP (NODELAY), shared encrypted writer, receive thread, 1 Hz ping, RTT and clock offset. Includes `--listen` reverse mode. |
 | `src/audio.rs` | Audio jitter buffer (priming, drift-correcting resample, underrun/overflow handling). Platform independent, unit-tested. |
 | `src/hid.rs` | Set-1 scancode → USB HID usage table, plus the Ctrl↔Cmd / Win↔Control remap. Unit-tested. |
 | `src/config.rs`, `src/hotkeys.rs`, `src/hud.rs` | Config file (load/save/migration, CLI-vs-config precedence, per-monitor window placement), hotkey table, stats-HUD text. Pure Rust, unit-tested. |
 | `src/clipboard.rs` | Clipboard sync logic without Win32: CRLF↔LF, echo guard, DIB↔PNG (`png` crate). Unit-tested. |
 | `src/annexb.rs`, `src/bench.rs` | Annex-B access-unit splitting, and the headless benchmark driver. |
-| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain, text panels), `app` (window, input, cursor, fullscreen, hotkeys), `clipboard` (clipboard listener/apply), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`, `dpapi` (saved password), `prompt` (password dialog), `placement` (monitors), `tray`. |
+| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain, text panels), `app` (window, input, cursor, fullscreen, hotkeys), `clipboard` (clipboard listener/apply), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`, `dpapi` (identity key encryption), `prompt` (pairing dialog), `placement` (monitors), `tray`. |
 | `res/`, `build.rs` | Icon, manifest (themed controls, PerMonitorV2), pairing dialog and version info, linked into the exe: MinGW `windres` for the GNU target, `rc.exe` (via `embed-resource`) for MSVC. Regenerate the icon with `../tools/make_icon.py`. |
 | `assets/` | Small clips embedded in the exe for `--probe`. Regenerate them with `../tools/make_streams.sh --clips-only`. |
 
@@ -35,12 +36,13 @@ Shaders are compiled at runtime with `D3DCompile` from `d3dcompiler_47.dll`, whi
 
 ```
 glide-client.exe                               (uses the config file: listen on 7420 by default)
-glide-client.exe <host[:port]> [--password PW] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--no-audio] [--bench SECONDS] [--probe]
+glide-client.exe <host[:port]> [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--no-audio] [--bench SECONDS] [--probe]
 glide-client.exe --listen [PORT] [same options]
-glide-client.exe --forget-password
+glide-client.exe --forget-host [host[:port] | --listen [PORT]]   (unpair, then exit)
+glide-client.exe --identity                                         (print this viewer's key fingerprint)
 ```
 
-### Config file and saved password
+### Config file, identity and pairing
 
 Settings live in `%APPDATA%\Glide\config.json` (set `GLIDE_CONFIG_DIR` to use another folder). The file
 is created on first run and rewritten when settings change. Edit it by hand, or use the tray icon → *Open config file*.
@@ -57,8 +59,11 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   "audio": true,            // play the Mac's sound (false = --no-audio)
   "audio_muted": false,     // Ctrl+Alt+Shift+A
   "clipboard": true,        // clipboard sync with the host (false = --no-clipboard)
-  "clipboard_sync_secrets": false,
-  "allowed_peers": [],      // listen mode: IPs/CIDRs allowed to connect; [] = pin the first host that authenticates  // also send clipboard items password managers mark private (= --clipboard-sync-secrets)
+  "clipboard_sync_secrets": false, // also send clipboard items password managers mark private
+  "allowed_peers": [],      // listen mode: IPs/CIDRs allowed to connect; [] = pin the first host's IP
+  "pinned_hosts": {         // host keys pinned by pairing, per target ("host:port" or "listen:PORT")
+    "listen:7420": { "key": "5714…0c36", "name": "Mac mini", "paired": "2026-11-06T13:05:09Z" }
+  },
   "last_monitor": "\\.\DISPLAY1",
   "windows": { "\\.\DISPLAY1": { "x": 0, "y": 0, "w": 2400, "h": 1400, "maximized": false, "fullscreen": true, "mon_w": 3840, "mon_h": 2160 } }
 }
@@ -72,38 +77,35 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   - `--no-ctrl-as-cmd` / `--ctrl-as-cmd` win over `"ctrl_as_cmd"`.
   - `--no-audio` wins over `"audio"`.
   - `--no-clipboard` wins over `"clipboard"`.
-- **Password:** `--password`, then `GLIDE_PASSWORD`, then the saved password, then a password dialog.
-  - The dialog has a *Remember on this PC* box, on by default.
-  - The saved password is `password.dpapi` next to `config.json`. It is encrypted with DPAPI (`CryptProtectData`, current user), so only this Windows account on this PC can read it.
-  - The saved password is never deleted automatically, only by *Forget saved password* or `--forget-password`.
-  - **Connect mode** (the viewer dials the configured host): after two authentication failures in a row, the dialog asks for the password again. This only happens for saved or typed passwords; `--password` and `GLIDE_PASSWORD` are never re-prompted or saved.
-  - **Listen mode** never prompts. Anyone who can reach the port can cause a failed handshake, so the window shows a neutral status ("A connection attempt failed authentication — still waiting for …") and keeps listening. Use tray → *Change password…* to enter a new one.
-  - Cancel on the first dialog exits. `--forget-password`, or the tray menu, deletes the saved password.
-  - Migration: a plaintext `"password"` key in `config.json` is moved into `password.dpapi` and removed from the file on the next start. Older key names (`port`, `listen`, `connect`, `no_ctrl_as_cmd`) are also migrated.
+- **Identity and pairing (security v2, `docs/PROTOCOL.md` §1–2):** no password.
+  - The viewer's key is `identity.dpapi` next to `config.json` (DPAPI, current user: only this Windows account on this PC can use it). It is created on first run; `--identity` prints its fingerprint.
+  - First connection to a host: the Mac must be in pairing mode (Glide menu → *Pair New Viewer…*, or `glide-host --pair`). A dialog shows a 6-digit code and both key fingerprints; click *Codes Match — Pair* only if the Mac shows the same code, and confirm there too. The host key is then pinned in `pinned_hosts`.
+  - Not paired yet / Mac not in pairing mode: the window says so and keeps retrying, so opening the pairing window on the Mac is enough.
+  - A different host key than the pinned one: "HOST KEY CHANGED …", and the viewer never reveals its own key to it. If the Mac was really reset: tray → *Forget host (unpair)…*, then pair again.
+  - If the Mac removed this viewer, the next attempt asks to pair again (still requiring the pinned Mac key).
+  - Pre-auth limits: until the host has proven its pairing commitment the 5 s pre-auth deadline applies (wall clock); the pairing dialog then has 120 s in total.
+  - v1 leftovers: `password.dpapi` is left in place but not read (it is mentioned once in the log); `--password` and `GLIDE_PASSWORD` are ignored; a plaintext `"password"` key in `config.json` is removed. Older key names (`port`, `listen`, `connect`, `no_ctrl_as_cmd`) are still migrated.
 - **Window:** the window placement is remembered per monitor: the position, the size, and whether it is maximized or fullscreen.
   - At startup the window reopens on the last monitor it was on, in the same state.
   - If that monitor is gone, it uses the saved state of the monitor under the cursor, or opens centered.
   - A saved rect that no longer fits (for example after a resolution change) is clamped into the monitor's work area.
 - **Listen-mode admission control** (defense in depth; see `src/peers.rs`):
   - **Allowlist:** if `allowed_peers` is non-empty, connections from any other IP are closed right after `accept()`, before a single handshake byte is sent or read. Entries are IPs or CIDRs, for example `"192.168.50.4"` or `"192.168.50.0/24"`.
-  - **Trust on first use:** if `allowed_peers` is empty, the IP of the first peer that completes an authenticated session is pinned there (logged, and shown in the "Connected" toast). Tray → *Forget pinned host* clears the list.
+  - **Trust on first use:** if `allowed_peers` is empty, the IP of the first peer that completes an authenticated session is pinned there (logged, and shown in the "Connected" toast). Tray → *Forget host (unpair)…* clears it together with the pinned key.
   - **Backoff:** a failed handshake blocks the peer for 1 s, doubling on each further failure up to 60 s. Connections from a blocked peer are dropped without a handshake, and a successful session resets it. Peers are tracked per IPv4 address and per IPv6 /64, so a peer can't escape by rotating addresses within its /64.
   - **Global budget (unpinned only):** while nothing is pinned, more than 10 failed handshakes from all peers within 60 s refuse every unpinned peer for 60 s. Pinned or allowlisted hosts are never affected.
   - **Pre-auth timeout:** a peer that hasn't completed the handshake after 5 s is disconnected.
 
-  These are mitigations only. In protocol v1 an attacker who can see or relay a handshake can still run an offline
-  dictionary attack on the password. The real fix is the planned PAKE handshake (SPAKE2 plus pinned host keys, security v2 in `docs/ROADMAP.md`).
-- **Tray icon:** Connect / Disconnect / Reconnect, Stats overlay, Change password…, Open config file, Forget saved password, Forget pinned host, Quit.
+  These limit who may start a handshake; the host's pinned key is what authenticates it.
+- **Tray icon:** Connect / Disconnect / Reconnect, Stats overlay, Mute, Open config file, Forget host (unpair)…, Quit.
   - *Disconnect* also stops listening, so the host can't reconnect until you choose *Connect*.
   - Left-click brings the window to the front.
 
-To replace a `.cmd` launcher that sets `GLIDE_PASSWORD`, run `glide-client.exe` with no arguments (or with
-`--listen 7420`). Enter the password once in the dialog with *Remember* checked.
 
 - **The viewer survives disconnects.** The window opens right away and shows a centered status line, for example
   "Waiting for host on port 7420…".
   - In `--listen` mode it goes back to listening after every disconnect. In connect mode it retries every 2 s.
-  - While disconnected, the last picture stays on screen, dimmed, under a status line such as "Connection lost — …" or "Authentication failed — …".
+  - While disconnected, the last picture stays on screen, dimmed, under a status line such as "Connection lost — …" or "Not paired with … yet — …".
   - Held keys and buttons are released, and local keys stop being captured until the host is back.
   - A new connection resets the decoders and canvas through the normal VideoConfig/SharpLayerConfig flow.
   - Fullscreen is kept across reconnects.
@@ -115,9 +117,9 @@ To replace a `.cmd` launcher that sets `GLIDE_PASSWORD`, run `glide-client.exe` 
   - The title bar shows `view WxH`.
   - Video that matches the window, or fits within about 6% of it, is drawn 1:1 and centered, never resampled.
   - `GLIDE_VIEW=WxH` pins the reported size.
-- The password comes from `--password`, then the `GLIDE_PASSWORD` environment variable, then a prompt with echo off.
+- `--bench` pairs on the console: it prints the code and asks `[y/N]` (or `GLIDE_PAIR_CONFIRM=yes|no`).
 - `--listen [PORT]` is reverse connect. It binds `0.0.0.0:PORT` (default 7420) and accepts the host's
-  connection (`glide-host --connect PC:PORT`). The GUI viewer accepts again after each disconnect; `--bench` accepts only once. The protocol is unchanged: the viewer still sends `ClientHandshake` first.
+  connection (`glide-host --connect PC:PORT`). The GUI viewer accepts again after each disconnect; `--bench` accepts only once. The protocol is unchanged: the viewer still writes first (it is the Noise initiator).
   Use this mode when the firewall blocks PC → Mac. The Windows Firewall rule on the PC allows only
   `C:\Users\me\glide\glide-client.exe` from 192.168.50.4, so keep the exe at that path.
 - `--mode` takes one of three values:
@@ -212,10 +214,8 @@ The GUI command for the real host (run it in the interactive desktop session, e.
 C:\Users\me\glide\glide-client.exe
 ```
 
-With the default config this listens on port 7420. On first run it asks for the password once (*Remember* on).
-`GLIDE_PASSWORD` / `--password` still work for scripting.
-
-Then start the host on the Mac: `mac/.build/release/glide-host --password-file .dev/password --connect 192.168.10.212:7420`.
+With the default config this listens on port 7420. On first run, pair it: on the Mac choose Glide →
+*Pair New Viewer…* (or `glide-host --pair`), then confirm the code on both screens.
 
 ### Headless modes (these work over SSH in session 0)
 
@@ -253,15 +253,17 @@ Then start the host on the Mac: `mac/.build/release/glide-host --password-file .
     `Present()`; scan-out times need a real swap chain.
   - `GLIDE_CONFIG_DIR=dir` uses another config folder. Use it for tests, so the real `%APPDATA%\Glide` is never touched.
   - `GLIDE_TEST_ACTIONS=mode,keyframe,hud,fullscreen,keyboard,reconnect` fires those hotkey actions one at a time, every `GLIDE_TEST_ACTIONS_MS` (default 1500 ms).
-  - `GLIDE_PROMPT_AUTOFILL=pw` fills in the password dialog and presses Connect. `GLIDE_PROMPT_AUTOFILL_RETRY` is used for later prompts, `GLIDE_PROMPT_REMEMBER=1` ticks the box, and `GLIDE_PROMPT_DUMP=x.bmp` captures the dialog.
+  - `GLIDE_PAIR_CONFIRM=yes|no` answers the pairing dialog after ~0.5 s (and the `--bench` console prompt); `GLIDE_PROMPT_DUMP=x.bmp` captures the dialog first.
   - `GLIDE_NO_TRAY=1` skips the tray icon.
 
 ## Testing without the Mac host
 
 ```sh
 ../tools/make_streams.sh                       # 2560x1440 HEVC 4:2:0 / 4:4:4 / H.264 test streams in tools/streams/
-GLIDE_PASSWORD=... python3 ../tools/mock_host.py --port 7421          # listen mode (client dials in)
-GLIDE_PASSWORD=... python3 ../tools/mock_host.py --connect 192.168.10.212:7421 --once   # dial a `--listen 7421` client
+python3 ../tools/mock_host.py --port 7421 --pair 300   # listen mode (client dials in); pairing window open 5 min
+python3 ../tools/mock_host.py --connect 192.168.10.212:7421 --once   # dial a `--listen 7421` client
+# --pair-confirm yes|no|ask: the mock "Mac" answer to a pairing code (ask = type the PC's code);
+# --v1-host: behave like an old v1 host; key/paired list in tools/.mock-host-key, .mock-paired.json
 ```
 
 The mock host:
