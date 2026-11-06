@@ -74,6 +74,71 @@ func run() throws {
     check(missing.isEmpty, "keymap coverage \(missing)")
 }
 
+func policyChecks() {
+    // Mode list of the BetterDisplay 16:9 virtual display on the M3 Pro host (plus 4:3 extras).
+    var modes: [DisplayModeInfo] = []
+    for (w, h) in [(800, 600), (1024, 768), (1280, 960), (1344, 1008), (1600, 1200)] { modes.append(.init(width: w, height: h, pixelWidth: w, pixelHeight: h)) }
+    let sixteenNine = [960, 1024, 1280, 1344, 1408, 1472, 1536, 1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048, 2112, 2176, 2240, 2304,
+                       2368, 2432, 2496, 2560, 2624, 2688, 2752, 2816, 2880, 2944, 3008, 3072, 3136, 3200, 3264, 3328, 3392, 3456, 3520, 3584, 3648, 3712, 3840]
+    for w in sixteenNine {
+        let h = w * 9 / 16
+        modes.append(.init(width: w, height: h, pixelWidth: w * 2, pixelHeight: h * 2))   // HiDPI
+        if w % 128 == 0 || w == 1344 || w == 1408 || w == 1600 || w == 1664 || w == 1792 || w == 2176 || w == 2304 || w == 2432 || w == 2688 || w == 2816 || w == 2944 || w == 3200 || w == 3328 || w == 3456 || w == 3712 {
+            modes.append(.init(width: w, height: h, pixelWidth: w, pixelHeight: h))      // 1x
+        }
+    }
+    for w in [3968, 4096, 4224, 4352, 4480, 4608, 4736, 4864, 4992, 5120] { modes.append(.init(width: w, height: w * 9 / 16, pixelWidth: w, pixelHeight: w * 9 / 16)) }
+    func one(_ w: Int, _ h: Int) -> DisplayModeInfo { .init(width: w, height: h, pixelWidth: w, pixelHeight: h) }
+    func hi(_ w: Int, _ h: Int) -> DisplayModeInfo { .init(width: w, height: h, pixelWidth: w * 2, pixelHeight: h * 2) }
+    func pick(_ p: DisplayModePreference, _ w: Int, _ h: Int, current: DisplayModeInfo? = nil, k: HighDPIViewerChoice = .retina, _ m: [DisplayModeInfo]? = nil) -> DisplayModeInfo? {
+        DisplayModePolicy.choose(preference: p, viewerW: w, viewerH: h, modes: m ?? modes, current: current, highDPIChoice: k)
+    }
+    check(pick(.automatic, 2560, 1440) == one(2560, 1440), "policy: 1440p viewer -> 2560x1440 crisp (HiDPI off)")
+    check(pick(.automatic, 3840, 2160) == hi(1920, 1080), "policy: 4K viewer -> looks like 1920x1080 HiDPI (retina)")
+    check(pick(.automatic, 3840, 2160, k: .smooth) == hi(2560, 1440), "policy: 4K viewer, more-space choice -> looks like 2560x1440 HiDPI")
+    check(pick(.automatic, 1920, 1080) == one(1920, 1080), "policy: 1080p viewer -> 1920x1080 crisp")
+    check(pick(.crisp, 3840, 2160) == one(3840, 2160), "policy: crisp on 4K -> 3840x2160 1x")
+    check(pick(.retina, 2560, 1440) == hi(1280, 720), "policy: retina on 1440p -> looks like 1280x720")
+    check(pick(.smooth, 2560, 1440) == hi(1664, 936), "policy: smooth on 1440p -> looks like 1664x936 (3328px, downscaled)")
+    check(pick(.automatic, 3440, 1440) == one(2560, 1440), "policy: ultrawide 3440x1440 -> largest fitting 2560x1440")
+    check(pick(.crisp, 1920, 1200) == one(1920, 1080), "policy: 16:10 viewer -> largest fitting 1920x1080")
+    check(pick(.crisp, 1600, 1200) == one(1600, 1200), "policy: 4:3 viewer -> matching aspect 1600x1200")
+    check(pick(.crisp, 640, 480) == one(800, 600), "policy: tiny viewer -> smallest mode")
+    check(pick(.automatic, 5120, 2880) == hi(2560, 1440), "policy: 5K viewer -> retina looks like 2560x1440")
+    check(pick(.manual, 2560, 1440) == nil, "policy: manual -> no change")
+    check(pick(.automatic, 0, 0) == nil, "policy: unknown viewer size -> no change")
+    var cur = one(2560, 1440); cur.refreshRate = 60
+    check(pick(.automatic, 2560, 1440, current: cur) == cur, "policy: already matching -> current mode (no switch)")
+    let noHi = modes.filter { !$0.hiDPI }
+    check(pick(.retina, 3840, 2160, noHi) == one(3840, 2160), "policy: no HiDPI modes -> falls back to crisp")
+    let hz = [DisplayModeInfo(width: 2560, height: 1440, pixelWidth: 2560, pixelHeight: 1440, refreshRate: 60),
+              DisplayModeInfo(width: 2560, height: 1440, pixelWidth: 2560, pixelHeight: 1440, refreshRate: 120)]
+    check(pick(.crisp, 2560, 1440, hz)?.refreshRate == 120, "policy: prefers higher refresh")
+    check(pick(.crisp, 2560, 1440, current: hz[0], hz)?.refreshRate == 60, "policy: keeps current refresh when it matches")
+}
+
+func registryChecks() {
+    final class S { let id: Int; init(_ i: Int) { id = i } }
+    let r = SessionRegistry<S>(maxPending: 2)
+    let a = S(1), b = S(2), c = S(3), d = S(4)
+    check(r.admit(a), "registry: admit first")
+    check(r.current == nil, "registry: unauthenticated is not current")
+    let ra = r.authenticated(a)
+    check(ra.promoted && ra.replaced == nil && r.current === a, "registry: authenticated -> current")
+    check(r.admit(b) && r.admit(c), "registry: admit two pending")
+    check(!r.admit(d), "registry: pending cap enforced")
+    check(r.current === a, "registry: pending connections don't touch the active session")
+    r.ended(b)  // wrong password / auth timeout
+    check(r.current === a && r.pendingCount == 1, "registry: failed auth leaves active session alone")
+    let rc = r.authenticated(c)
+    check(rc.promoted && rc.replaced === a && r.current === c, "registry: new viewer replaces old only after auth")
+    check(!r.ended(a) && r.current === c, "registry: replaced session ending doesn't clear current")
+    check(!r.authenticated(d).promoted, "registry: never-admitted session can't be promoted")
+    check(r.ended(c) && r.current == nil, "registry: active session ending clears current")
+}
+
 do { try run() } catch { failures += 1; print("  FAIL threw \(error)") }
+policyChecks()
+registryChecks()
 print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)

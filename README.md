@@ -26,6 +26,33 @@ cd mac && swift build -c release --build-system native
 
 See `windows/README.md` for the viewer.
 
+## Host menu bar and display mode
+
+`Glide Host.app` (built by `tools/make-host-app.sh`, installed as a LaunchAgent by
+`tools/install-host.sh`) shows a menu-bar item: state icon (waiting / dialing / connected / paused /
+problem), viewer name + IP, stream mode, resolution, fps / Mbps / encode ms, and actions (Disconnect,
+Pause, Display Mode, Open Log, Copy Viewer Password, Restart, Quit Until Next Login — plain Quit
+would just be relaunched by the agent's KeepAlive).
+
+**Display mode** (`"display"` in `~/Library/Application Support/Glide/host.json`, or the menu):
+
+| `mode` | picks (for the viewer's monitor size) |
+|---|---|
+| `automatic` (default) | `crisp` for normal viewers; for 4K-class viewers (≥ 3200×1800) `highDPIViewer`: `retina` (default, looks like 1920×1080) or `smooth` (looks like 2560×1440, downscaled) |
+| `crisp` | non-HiDPI mode matching the viewer 1:1 (1440p viewer → 2560×1440 @1x) |
+| `retina` | HiDPI mode whose pixels match the viewer 1:1 (4K → looks like 1920×1080) |
+| `smooth` | HiDPI mode that looks like ≤ 2/3 of the viewer, downscaled to fit |
+| `manual` | never touch the display mode |
+
+Otherwise the largest mode ≤ the viewer's size (same aspect preferred) wins. Switches are applied
+with `.forSession` scope before capture starts (mid-session: one re-capture → VideoConfig +
+keyframe), and the previous mode is restored 10 s after the viewer disconnects
+(`restoreOnDisconnect`, default true). Changing the mode yourself during a session pauses automatic
+switching until the next session (and that mode is kept).
+
+Only an authenticated viewer can replace the active session; unauthenticated connections are
+capped (4) and closed after 5 s without a valid ClientHello.
+
 > Only one `glide-host` process can capture at a time; a second one's ScreenCaptureKit stream
 > is interrupted.
 
