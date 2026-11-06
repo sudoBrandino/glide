@@ -23,6 +23,12 @@ pbkdf2 = { version = "0.12.2", default-features = false, features = ["hmac"] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Clipboard images (PNG <-> DIB). Pure Rust (miniz_oxide/fdeflate), cross-compiles with MinGW.
+png = "0.18.1"
+
+[build-dependencies]
+# MSVC targets only: compiles res/glide.rc with rc.exe (the GNU target uses MinGW windres directly).
+embed-resource = "3"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "=0.62.2"
@@ -41,6 +47,8 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_HiDpi",

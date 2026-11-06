@@ -45,6 +45,13 @@ pub struct Config {
     pub ctrl_as_cmd: bool,
     /// Stats overlay (Ctrl+Alt+Shift+H).
     pub hud: bool,
+    /// Clipboard sync with the host (`--no-clipboard` overrides to off).
+    pub clipboard: bool,
+    /// Also sync clipboard items marked secret/concealed (password managers). Off by default.
+    pub clipboard_sync_secrets: bool,
+    /// Listen mode: only these IPs / CIDRs may connect (checked before any handshake byte).
+    /// Empty = trust on first use: the first host that authenticates is pinned here.
+    pub allowed_peers: Vec<String>,
     /// Monitor (device name, e.g. `\\.\DISPLAY1`) the window was last on.
     pub last_monitor: Option<String>,
     /// Per-monitor window state, keyed by monitor device name.
@@ -60,6 +67,9 @@ impl Default for Config {
             mode: None,
             ctrl_as_cmd: true,
             hud: false,
+            clipboard: true,
+            clipboard_sync_secrets: false,
+            allowed_peers: Vec::new(),
             last_monitor: None,
             windows: BTreeMap::new(),
         }
@@ -162,6 +172,9 @@ pub fn parse(text: &str) -> Loaded {
     field!(mode);
     field!(ctrl_as_cmd);
     field!(hud);
+    field!(clipboard);
+    field!(clipboard_sync_secrets);
+    field!(allowed_peers);
     field!(last_monitor);
     field!(windows);
     if c.listen_port == 0 {
@@ -430,6 +443,9 @@ mod tests {
         c.hud = true;
         c.set_mode(Mode::Sharp);
         c.host = Some("mac.local:7420".into());
+        c.clipboard = false;
+        c.clipboard_sync_secrets = true;
+        c.allowed_peers = vec!["192.168.50.4".into(), "192.168.50.0/24".into()];
         record_placement(
             &mut c,
             &MonitorDesc { key: r"\\.\DISPLAY2".into(), rect: Rect { l: 3840, t: 0, r: 6912, b: 1728 }, work: Rect { l: 3840, t: 0, r: 6912, b: 1680 } },
@@ -443,6 +459,9 @@ mod tests {
         assert!(back.legacy_password.is_none());
         assert_eq!(back.config.mode(), Some(Mode::Sharp));
         assert_eq!(back.config.windows[r"\\.\DISPLAY2"].x, 160);
+        // new keys default sensibly when missing from an older file
+        let old = parse(r#"{"version":1,"hud":true}"#).config;
+        assert!(old.clipboard && !old.clipboard_sync_secrets && old.allowed_peers.is_empty());
     }
 
     #[test]
@@ -465,7 +484,9 @@ mod tests {
 
     #[test]
     fn password_removed_even_in_current_version() {
-        let l = parse(r#"{"version":1,"listen_port":7420,"host":null,"mode":null,"ctrl_as_cmd":true,"hud":false,"last_monitor":null,"windows":{},"password":"x"}"#);
+        let mut c = serde_json::to_value(Config::default()).unwrap();
+        c["password"] = "x".into();
+        let l = parse(&c.to_string());
         assert_eq!(l.legacy_password.as_deref(), Some("x"));
         assert!(l.needs_save);
     }

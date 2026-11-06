@@ -24,11 +24,17 @@ enum Power {
 
     /// Wakes the display (as if the user touched the keyboard). Cheap; safe to call often.
     private static var lastWake: UInt64 = 0
+    /// One UserIsActive assertion, refreshed on each call (passing the previous id back updates it
+    /// instead of creating a new assertion every time).
+    private static var activityID = IOPMAssertionID(0)
+    private static let lock = NSLock()
     static func wakeDisplay() {
+        lock.lock(); defer { lock.unlock() }
         let now = DispatchTime.now().uptimeNanoseconds
         guard now - lastWake > 1_000_000_000 else { return }  // at most once a second
         lastWake = now
-        var id = IOPMAssertionID(0)
-        IOPMAssertionDeclareUserActivity("Glide remote input" as CFString, kIOPMUserActiveLocal, &id)
+        if IOPMAssertionDeclareUserActivity("Glide remote input" as CFString, kIOPMUserActiveLocal, &activityID) != kIOReturnSuccess {
+            activityID = 0
+        }
     }
 }

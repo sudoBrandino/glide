@@ -22,6 +22,10 @@ pub struct Args {
     /// Reverse-connect: listen on this port and let the host dial in.
     listen: Option<u16>,
     forget_password: bool,
+    /// Clipboard sync (GUI viewer only). None = config ("clipboard", default on); --no-clipboard.
+    clipboard: Option<bool>,
+    /// Headless Win32 clipboard self-test (no connection).
+    clipboard_selftest: bool,
 }
 
 const USAGE: &str = "usage: glide-client [host[:port] | --listen [PORT]] [options...]
@@ -37,9 +41,11 @@ const USAGE: &str = "usage: glide-client [host[:port] | --listen [PORT]] [option
                      4:4:4 refinement at rest. Default: config, else hybrid if this PC decodes
                      HEVC 4:4:4, else fast
   --no-ctrl-as-cmd   don't map Ctrl->Cmd / Win->Control (also --ctrl-as-cmd to force it on)
+  --no-clipboard     don't sync the clipboard (text + images) with the host (config: \"clipboard\")
   --forget-password  delete the saved (DPAPI-encrypted) password and exit
   --bench SECONDS    headless: connect, decode for N seconds, print one JSON line
   --probe            print decoder capabilities as JSON (no connection)
+  --clipboard-selftest  exercise the Win32 clipboard path headlessly (no connection; run over SSH)
 
 Config: %APPDATA%\\Glide\\config.json (GLIDE_CONFIG_DIR overrides the folder); the saved
 password is password.dpapi next to it (only this Windows account can decrypt it).
@@ -63,6 +69,8 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Strin
             "--no-ctrl-as-cmd" => a.ctrl_as_cmd = Some(false),
             "--ctrl-as-cmd" => a.ctrl_as_cmd = Some(true),
             "--forget-password" => a.forget_password = true,
+            "--no-clipboard" => a.clipboard = Some(false),
+            "--clipboard-selftest" => a.clipboard_selftest = true,
             "--bench" => {
                 let v = it.next().ok_or("--bench needs SECONDS")?;
                 a.bench = Some(v.parse::<f64>().map_err(|_| format!("bad --bench value {v}"))?);
@@ -174,6 +182,24 @@ fn main() -> ExitCode {
         }
     };
 
+    if args.clipboard_selftest {
+        #[cfg(windows)]
+        {
+            return match glide::win::clipboard::selftest() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("--clipboard-selftest is only available on Windows");
+            return ExitCode::from(1);
+        }
+    }
+
     if args.probe {
         #[cfg(windows)]
         {
@@ -248,6 +274,10 @@ fn main() -> ExitCode {
     {
         if glide::win::probe::hevc444_supported() {
             caps |= protocol::CAP_HEVC_444;
+        }
+        // Clipboard sync (§5) needs the viewer window; the headless bench never advertises it.
+        if args.clipboard.unwrap_or(store.config.clipboard) && args.bench.is_none() {
+            caps |= protocol::CAP_CLIPBOARD;
         }
     }
     let has444 = caps & protocol::CAP_HEVC_444 != 0;
@@ -381,7 +411,8 @@ mod tests {
         let a = p(&["--listen", "7421", "--password", "x"]).unwrap();
         assert_eq!(a.listen, Some(7421));
         assert_eq!(a.password.as_deref(), Some("x"));
-        let a = p(&["mac.local:7420", "--ctrl-as-cmd", "--forget-password"]).unwrap();
+        let a = p(&["mac.local:7420", "--ctrl-as-cmd", "--forget-password", "--no-clipboard"]).unwrap();
+        assert_eq!(a.clipboard, Some(false));
         assert_eq!(a.host.as_deref(), Some("mac.local:7420"));
         assert_eq!(a.ctrl_as_cmd, Some(true));
         assert!(a.forget_password);

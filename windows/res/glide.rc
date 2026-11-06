@@ -1,5 +1,24 @@
-// Windows resources for glide-client.exe (compiled by build.rs with windres).
-#include <windows.h>
+// Windows resources for glide-client.exe (compiled by build.rs: MinGW windres for the GNU
+// target, rc.exe via embed-resource for MSVC). Self-contained on purpose: no <windows.h>, so
+// rc.exe works without a configured SDK INCLUDE path (e.g. on CI runners).
+
+#define DS_SHELLFONT      0x48
+#define DS_MODALFRAME     0x80
+#define DS_SETFOREGROUND  0x200
+#define DS_CENTER         0x800
+#define WS_POPUP          0x80000000L
+#define WS_CAPTION        0x00C00000L
+#define WS_SYSMENU        0x00080000L
+#define WS_TABSTOP        0x00010000L
+#define WS_EX_APPWINDOW   0x00040000L
+#define SS_ICON           0x3
+#define SS_CENTERIMAGE    0x200
+#define ES_PASSWORD       0x20
+#define ES_AUTOHSCROLL    0x80
+#define IDOK              1
+#define IDCANCEL          2
+#define VOS_NT_WINDOWS32  0x40004L
+#define VFT_APP           0x1L
 
 #define IDI_GLIDE        1
 #define IDD_PASSWORD     101

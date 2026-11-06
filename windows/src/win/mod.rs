@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod bench_decoder;
+pub mod clipboard;
 pub mod console;
 pub mod cursor;
 pub mod d3d;

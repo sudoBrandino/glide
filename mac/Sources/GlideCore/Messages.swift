@@ -16,6 +16,57 @@ public struct CodecCaps: OptionSet, Sendable {
     public static let hevc420 = CodecCaps(rawValue: 1 << 0)
     public static let hevc444 = CodecCaps(rawValue: 1 << 1)
     public static let h264 = CodecCaps(rawValue: 1 << 2)
+    /// Bits 0-7: video codecs. Bits 8+: non-video features.
+    public static let codecMask = CodecCaps(rawValue: 0xFF)
+    /// Clipboard sync (PROTOCOL.md §5).
+    public static let clipboard = CodecCaps(rawValue: 1 << 8)
+}
+
+/// One clipboard snapshot (PROTOCOL.md §5): `u32 seq`, `u8 count`, count x (`u8 format`, `u32 len`, bytes).
+public struct ClipboardData: Equatable, Sendable {
+    public static let formatText: UInt8 = 1
+    public static let formatPNG: UInt8 = 2
+    /// `ClipboardCaps.formats` bits.
+    public static let capsText: UInt32 = 1 << 0
+    public static let capsPNG: UInt32 = 1 << 1
+    /// Max total item payload (CLIPBOARD_MAX).
+    public static let maxBytes = 16 * 1024 * 1024
+
+    public var seq: UInt32
+    /// UTF-8 text with LF line endings.
+    public var text: String?
+    /// A complete PNG file.
+    public var png: Data?
+
+    public init(seq: UInt32 = 0, text: String? = nil, png: Data? = nil) {
+        self.seq = seq; self.text = text; self.png = png
+    }
+
+    public var isEmpty: Bool { text == nil && png == nil }
+    /// Sum of item payload lengths (what the 16 MiB limit applies to).
+    public var payloadBytes: Int { (text?.utf8.count ?? 0) + (png?.count ?? 0) }
+
+    func write(_ w: inout ByteWriter) {
+        w.u32(seq)
+        w.u8(UInt8((text != nil ? 1 : 0) + (png != nil ? 1 : 0)))
+        if let text { let b = Data(text.utf8); w.u8(Self.formatText); w.u32(UInt32(b.count)); w.bytes(b) }
+        if let png { w.u8(Self.formatPNG); w.u32(UInt32(png.count)); w.bytes(png) }
+    }
+
+    static func read(_ r: inout ByteReader) throws -> ClipboardData {
+        var c = ClipboardData(seq: try r.u32())
+        let n = try r.u8()
+        for _ in 0..<n {
+            let fmt = try r.u8(), len = Int(try r.u32())
+            let b = try r.bytes(len)
+            switch fmt {
+            case formatText where c.text == nil: c.text = String(decoding: b, as: UTF8.self)
+            case formatPNG where c.png == nil: c.png = b
+            default: break  // unknown format or duplicate: skip
+            }
+        }
+        return c
+    }
 }
 
 public struct VideoConfig: Equatable {
@@ -54,7 +105,7 @@ public enum ClientMessage {
     case requestKeyframe
     case setMode(mode: StreamMode, bitrateKbps: UInt32, maxFps: UInt8)
     case ping(clientTimeUs: UInt64)
-    case clipboard(String)
+    case clipboard(ClipboardData)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -70,7 +121,7 @@ public enum ClientMessage {
         case .requestKeyframe: w.u8(0x20)
         case let .setMode(m, br, fps): w.u8(0x21); w.u8(m.rawValue); w.u32(br); w.u8(fps)
         case let .ping(t): w.u8(0x30); w.u64(t)
-        case let .clipboard(s): w.u8(0x50); w.str(s)
+        case let .clipboard(c): w = ByteWriter(capacity: c.payloadBytes + 32); w.u8(0x50); c.write(&w)
         }
         return w.data
     }
@@ -92,7 +143,7 @@ public enum ClientMessage {
         case 0x20: return .requestKeyframe
         case 0x21: return .setMode(mode: StreamMode(rawValue: try r.u8()) ?? .fast, bitrateKbps: try r.u32(), maxFps: try r.u8())
         case 0x30: return .ping(clientTimeUs: try r.u64())
-        case 0x50: return .clipboard(try r.str())
+        case 0x50: return .clipboard(try ClipboardData.read(&r))
         default: throw WireError.unknownMessage(t)
         }
     }
@@ -108,7 +159,9 @@ public enum HostMessage {
     case cursorPos(x: Float, y: Float, visible: Bool)
     case cursorShape(id: UInt32, w: UInt16, h: UInt16, hotX: UInt16, hotY: UInt16, bgra: Data)
     case cursorShapeRef(id: UInt32)
-    case clipboard(String)
+    case clipboard(ClipboardData)
+    /// `formats`: ClipboardData.capsText | capsPNG; `maxBytes`: largest payload the host accepts.
+    case clipboardCaps(formats: UInt32, maxBytes: UInt32)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -131,7 +184,8 @@ public enum HostMessage {
             w = ByteWriter(capacity: bgra.count + 16)
             w.u8(0x42); w.u32(id); w.u16(cw); w.u16(ch); w.u16(hx); w.u16(hy); w.bytes(bgra)
         case let .cursorShapeRef(id): w.u8(0x43); w.u32(id)
-        case let .clipboard(s): w.u8(0x50); w.str(s)
+        case let .clipboard(c): w = ByteWriter(capacity: c.payloadBytes + 32); w.u8(0x50); c.write(&w)
+        case let .clipboardCaps(f, m): w.u8(0x51); w.u32(f); w.u32(m)
         }
         return w.data
     }
@@ -159,7 +213,8 @@ public enum HostMessage {
             let id = try r.u32(), cw = try r.u16(), ch = try r.u16(), hx = try r.u16(), hy = try r.u16()
             return .cursorShape(id: id, w: cw, h: ch, hotX: hx, hotY: hy, bgra: try r.bytes(Int(cw) * Int(ch) * 4))
         case 0x43: return .cursorShapeRef(id: try r.u32())
-        case 0x50: return .clipboard(try r.str())
+        case 0x50: return .clipboard(try ClipboardData.read(&r))
+        case 0x51: return .clipboardCaps(formats: try r.u32(), maxBytes: try r.u32())
         default: throw WireError.unknownMessage(t)
         }
     }

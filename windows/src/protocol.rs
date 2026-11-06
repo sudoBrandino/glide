@@ -11,6 +11,8 @@ pub const DEFAULT_PORT: u16 = 7420;
 pub const CAP_HEVC_420: u32 = 1 << 0;
 pub const CAP_HEVC_444: u32 = 1 << 1;
 pub const CAP_H264_420: u32 = 1 << 2;
+/// Bits 8+ are non-video features. Clipboard sync (§5).
+pub const CAP_CLIPBOARD: u32 = 1 << 8;
 
 // Client -> Host message types
 pub const MSG_CLIENT_HELLO: u8 = 0x01;
@@ -34,6 +36,16 @@ pub const MSG_VIDEO_FRAME: u8 = 0x40;
 pub const MSG_CURSOR_POS: u8 = 0x41;
 pub const MSG_CURSOR_SHAPE: u8 = 0x42;
 pub const MSG_CURSOR_SHAPE_REF: u8 = 0x43;
+pub const MSG_CLIPBOARD_CAPS: u8 = 0x51;
+
+// Clipboard (§5)
+pub const CLIP_FORMAT_TEXT: u8 = 1;
+pub const CLIP_FORMAT_PNG: u8 = 2;
+/// `ClipboardCaps.formats` bits.
+pub const CLIP_CAPS_TEXT: u32 = 1 << 0;
+pub const CLIP_CAPS_PNG: u32 = 1 << 1;
+/// Max total item payload of one Clipboard message (CLIPBOARD_MAX).
+pub const CLIPBOARD_MAX_BYTES: usize = 16 << 20;
 
 pub const MOUSE_LEFT: u8 = 0;
 pub const MOUSE_RIGHT: u8 = 1;
@@ -115,6 +127,72 @@ impl VideoConfig {
     }
 }
 
+/// One clipboard snapshot (§5): `u32 seq`, `u8 count`, count × (`u8 format`, `u32 len`, bytes).
+/// All present items are alternative representations of the same content.
+#[derive(Clone, PartialEq, Default)]
+pub struct ClipboardData {
+    pub seq: u32,
+    /// UTF-8 with LF line endings.
+    pub text: Option<String>,
+    /// A complete PNG file.
+    pub png: Option<Vec<u8>>,
+}
+
+impl ClipboardData {
+    pub fn is_empty(&self) -> bool {
+        self.text.is_none() && self.png.is_none()
+    }
+    /// Sum of item payload lengths (what CLIPBOARD_MAX_BYTES applies to).
+    pub fn payload_len(&self) -> usize {
+        self.text.as_ref().map_or(0, |t| t.len()) + self.png.as_ref().map_or(0, |p| p.len())
+    }
+    /// Size/format summary for logs (never the content: it may be a password).
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(t) = &self.text {
+            parts.push(format!("text {} bytes", t.len()));
+        }
+        if let Some(p) = &self.png {
+            parts.push(format!("png {} bytes", p.len()));
+        }
+        if parts.is_empty() {
+            parts.push("empty".into());
+        }
+        format!("{} (seq {})", parts.join(" + "), self.seq)
+    }
+    fn write(&self, w: &mut Writer) {
+        w.u32(self.seq).u8(self.text.is_some() as u8 + self.png.is_some() as u8);
+        if let Some(t) = &self.text {
+            w.u8(CLIP_FORMAT_TEXT).u32(t.len() as u32).bytes(t.as_bytes());
+        }
+        if let Some(p) = &self.png {
+            w.u8(CLIP_FORMAT_PNG).u32(p.len() as u32).bytes(p);
+        }
+    }
+    fn read(r: &mut Reader) -> Result<ClipboardData, DecodeError> {
+        let mut c = ClipboardData { seq: r.u32()?, ..Default::default() };
+        let n = r.u8()?;
+        for _ in 0..n {
+            let fmt = r.u8()?;
+            let len = r.u32()? as usize;
+            let b = r.take(len)?;
+            match fmt {
+                // Invalid UTF-8 is replaced, not fatal (§5).
+                CLIP_FORMAT_TEXT if c.text.is_none() => c.text = Some(String::from_utf8_lossy(b).into_owned()),
+                CLIP_FORMAT_PNG if c.png.is_none() => c.png = Some(b.to_vec()),
+                _ => {} // unknown format or duplicate: skip
+            }
+        }
+        Ok(c)
+    }
+}
+
+impl fmt::Debug for ClipboardData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ClipboardData({})", self.describe())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientMsg {
     ClientHello {
@@ -136,7 +214,7 @@ pub enum ClientMsg {
     RequestKeyframe,
     SetMode { mode: u8, bitrate_kbps: u32, max_fps: u8 },
     Ping { client_time_us: u64 },
-    Clipboard { text: String },
+    Clipboard(ClipboardData),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,7 +229,9 @@ pub enum HostMsg {
     CursorPos { x: f32, y: f32, visible: bool },
     CursorShape { shape_id: u32, w: u16, h: u16, hot_x: u16, hot_y: u16, bgra: Vec<u8> },
     CursorShapeRef { shape_id: u32 },
-    Clipboard { text: String },
+    Clipboard(ClipboardData),
+    /// Host accepts clipboard sync (§5): `formats` = CLIP_CAPS_* bits, `max_bytes` payload limit.
+    ClipboardCaps { formats: u32, max_bytes: u32 },
     /// Unknown message type: ignored for forward compatibility.
     Unknown { msg_type: u8 },
 }
@@ -264,7 +344,7 @@ impl<'a> Reader<'a> {
     pub fn new(t: u8, data: &'a [u8]) -> Self {
         Reader { data, pos: 0, t }
     }
-    fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+    pub fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         if self.data.len() - self.pos < n {
             return Err(DecodeError::Truncated(self.t));
         }
@@ -338,7 +418,12 @@ impl ClientMsg {
             ClientMsg::RequestKeyframe => vec![MSG_REQUEST_KEYFRAME],
             ClientMsg::SetMode { mode, bitrate_kbps, max_fps } => Writer::new(MSG_SET_MODE).u8(*mode).u32(*bitrate_kbps).u8(*max_fps).finish(),
             ClientMsg::Ping { client_time_us } => Writer::new(MSG_PING).u64(*client_time_us).finish(),
-            ClientMsg::Clipboard { text } => Writer::new(MSG_CLIPBOARD).str(text).finish(),
+            ClientMsg::Clipboard(c) => {
+                let mut w = Writer::new(MSG_CLIPBOARD);
+                w.buf.reserve(c.payload_len() + 16);
+                c.write(&mut w);
+                w.finish()
+            }
         }
     }
 
@@ -365,7 +450,7 @@ impl ClientMsg {
             MSG_REQUEST_KEYFRAME => ClientMsg::RequestKeyframe,
             MSG_SET_MODE => ClientMsg::SetMode { mode: r.u8()?, bitrate_kbps: r.u32()?, max_fps: r.u8()? },
             MSG_PING => ClientMsg::Ping { client_time_us: r.u64()? },
-            MSG_CLIPBOARD => ClientMsg::Clipboard { text: r.str()? },
+            MSG_CLIPBOARD => ClientMsg::Clipboard(ClipboardData::read(&mut r)?),
             _ => return Err(DecodeError::BadLength(t)),
         })
     }
@@ -421,7 +506,8 @@ impl HostMsg {
                 HostMsg::CursorShape { shape_id, w, h, hot_x, hot_y, bgra: rest[..n].to_vec() }
             }
             MSG_CURSOR_SHAPE_REF => HostMsg::CursorShapeRef { shape_id: r.u32()? },
-            MSG_CLIPBOARD => HostMsg::Clipboard { text: r.str()? },
+            MSG_CLIPBOARD => HostMsg::Clipboard(ClipboardData::read(&mut r)?),
+            MSG_CLIPBOARD_CAPS => HostMsg::ClipboardCaps { formats: r.u32()?, max_bytes: r.u32()? },
             other => HostMsg::Unknown { msg_type: other },
         };
         Ok(msg)
@@ -468,7 +554,12 @@ impl HostMsg {
                 Writer::new(MSG_CURSOR_SHAPE).u32(*shape_id).u16(*w).u16(*h).u16(*hot_x).u16(*hot_y).bytes(bgra).finish()
             }
             HostMsg::CursorShapeRef { shape_id } => Writer::new(MSG_CURSOR_SHAPE_REF).u32(*shape_id).finish(),
-            HostMsg::Clipboard { text } => Writer::new(MSG_CLIPBOARD).str(text).finish(),
+            HostMsg::Clipboard(c) => {
+                let mut w = Writer::new(MSG_CLIPBOARD);
+                c.write(&mut w);
+                w.finish()
+            }
+            HostMsg::ClipboardCaps { formats, max_bytes } => Writer::new(MSG_CLIPBOARD_CAPS).u32(*formats).u32(*max_bytes).finish(),
             HostMsg::Unknown { msg_type } => vec![*msg_type],
         }
     }
@@ -533,7 +624,10 @@ mod tests {
             ClientMsg::RequestKeyframe,
             ClientMsg::SetMode { mode: 1, bitrate_kbps: 50000, max_fps: 120 },
             ClientMsg::Ping { client_time_us: u64::MAX - 3 },
-            ClientMsg::Clipboard { text: "héllo".into() },
+            ClientMsg::Clipboard(ClipboardData { seq: 3, text: Some("héllo\nwörld".into()), png: None }),
+            ClientMsg::Clipboard(ClipboardData { seq: 4, text: None, png: Some(vec![0x89, b'P', b'N', b'G']) }),
+            ClientMsg::Clipboard(ClipboardData { seq: u32::MAX, text: Some(String::new()), png: Some(vec![1]) }),
+            ClientMsg::Clipboard(ClipboardData::default()),
         ];
         for m in msgs {
             assert_eq!(ClientMsg::decode(&m.encode()).unwrap(), m);
@@ -616,5 +710,50 @@ mod tests {
         assert_eq!(m.encode(), vec![0x15, 0x00, 0x0C, 0xC0, 0x06]);
         assert_eq!(ClientMsg::decode(&m.encode()).unwrap(), m);
         assert!(ClientMsg::decode(&[0x15, 0x00, 0x0C, 0xC0]).is_err());
+    }
+
+    #[test]
+    fn clipboard_reference_bytes() {
+        // PROTOCOL.md §5 (also checked by glide-selftest and mock_host.py --selftest).
+        let c = ClipboardData { seq: 1, text: Some("hi\n".into()), png: None };
+        let want = crate::util::unhex("500100000001010300000068690a");
+        assert_eq!(ClientMsg::Clipboard(c.clone()).encode(), want);
+        assert_eq!(HostMsg::Clipboard(c.clone()).encode(), want);
+        assert_eq!(HostMsg::decode(want.clone()).unwrap(), HostMsg::Clipboard(c.clone()));
+        assert_eq!(ClientMsg::decode(&want).unwrap(), ClientMsg::Clipboard(c));
+        let caps = HostMsg::ClipboardCaps { formats: CLIP_CAPS_TEXT | CLIP_CAPS_PNG, max_bytes: CLIPBOARD_MAX_BYTES as u32 };
+        assert_eq!(crate::util::hex(&caps.encode()), "510300000000000001");
+        assert_eq!(HostMsg::decode(caps.encode()).unwrap(), caps);
+        assert_eq!(CAP_CLIPBOARD, 0x100);
+    }
+
+    #[test]
+    fn clipboard_decoding_rules() {
+        // Unknown format skipped, duplicate text ignored (first wins), png kept.
+        let mut raw = vec![MSG_CLIPBOARD, 2, 0, 0, 0, 4];
+        raw.extend_from_slice(&[9, 2, 0, 0, 0, 0xAA, 0xBB]);
+        raw.extend_from_slice(&[1, 2, 0, 0, 0, b'o', b'k']);
+        raw.extend_from_slice(&[1, 1, 0, 0, 0, b'x']);
+        raw.extend_from_slice(&[2, 2, 0, 0, 0, 0xFF, 0xC0]);
+        let want = ClipboardData { seq: 2, text: Some("ok".into()), png: Some(vec![0xFF, 0xC0]) };
+        assert_eq!(HostMsg::decode(raw.clone()).unwrap(), HostMsg::Clipboard(want.clone()));
+        assert_eq!(ClientMsg::decode(&raw).unwrap(), ClientMsg::Clipboard(want));
+        // Invalid UTF-8 is replaced, not an error.
+        let bad = vec![MSG_CLIPBOARD, 1, 0, 0, 0, 1, 1, 2, 0, 0, 0, 0xFF, b'A'];
+        let HostMsg::Clipboard(c) = HostMsg::decode(bad).unwrap() else { panic!() };
+        assert_eq!(c.text.as_deref(), Some("\u{FFFD}A"));
+        // Every truncation is an error; a length past the end too.
+        let enc = HostMsg::Clipboard(ClipboardData { seq: 5, text: Some("abc".into()), png: Some(vec![1, 2]) }).encode();
+        for n in 1..enc.len() {
+            assert!(HostMsg::decode(enc[..n].to_vec()).is_err(), "prefix {n}");
+        }
+        assert!(HostMsg::decode(vec![MSG_CLIPBOARD, 1, 0, 0, 0, 1, 1, 0xFF, 0xFF, 0xFF, 0xFF, 0]).is_err());
+        // Text larger than the u16 `str` limit.
+        let big = ClipboardData { seq: 1, text: Some("y".repeat(200_000)), png: None };
+        assert_eq!(big.payload_len(), 200_000);
+        assert_eq!(HostMsg::decode(HostMsg::Clipboard(big.clone()).encode()).unwrap(), HostMsg::Clipboard(big));
+        // Debug never prints content.
+        let dbg = format!("{:?}", ClipboardData { seq: 1, text: Some("hunter2".into()), png: None });
+        assert!(!dbg.contains("hunter2") && dbg.contains("text 7 bytes"));
     }
 }
