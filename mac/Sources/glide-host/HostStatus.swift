@@ -19,7 +19,7 @@ final class HostStatus: @unchecked Sendable {
         var fps: Double?, mbps: Double?, encodeMs: Double?
         /// SCK frame PTS -> capture callback, p50 ms.
         var captureMs: Double?
-        /// The viewer's latest latency report (PROTOCOL.md §3.3).
+        /// The viewer's latest latency report (PROTOCOL.md §3.4).
         var latency: LatencyReport?
         var statsAt: Date?
         /// "on", "muted" or "off"; nil when the viewer doesn't take audio (PROTOCOL.md §3.2).

@@ -38,7 +38,7 @@ pub fn run(mut conn: Connection, seconds: f64, dec: &mut dyn BenchDecoder, sharp
     });
     let _ping = conn.spawn_pinger(crate::net::PING_INTERVAL);
     let sender = conn.sender.clone();
-    // Ask for per-frame host timestamps (§3.3); hosts without it ignore this.
+    // Ask for per-frame host timestamps (§3.4); hosts without it ignore this.
     let _ = sender.send(&ClientMsg::LatencyEnable { flags: 1 });
     let mut lat = crate::latency::Tracker::new(false);
     lat.keep_all = true;

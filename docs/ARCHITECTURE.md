@@ -220,7 +220,7 @@ centered rather than resampled.
 
 Every frame is timestamped at each stage on both sides: SCK PTS, capture callback, encoder
 submit and output, enqueue, and send completion on the host, carried in a `FrameTiming` message
-(PROTOCOL.md §3.3). On the viewer: receive, decode, canvas update, `Present()`, and the vblank
+(PROTOCOL.md §3.4). On the viewer: receive, decode, canvas update, `Present()`, and the vblank
 from DXGI frame statistics. `latency::Tracker` joins the two by frame id, using the
 sliding-window min-RTT clock sync. The HUD shows p50s, the viewer reports them back to the host
 log and menu bar, and a block-code test pattern provides ground truth. See

@@ -97,10 +97,10 @@ public struct VideoConfig: Equatable {
     }
 }
 
-/// "Unknown" marker for FrameTiming / LatencyReport fields (PROTOCOL.md §3.3).
+/// "Unknown" marker for FrameTiming / LatencyReport fields (PROTOCOL.md §3.4).
 public let timingUnknown: UInt32 = .max
 
-/// `FrameTiming` (0x81, §3.3): host pipeline stamps of one VideoFrame, as µs after `captureUs`.
+/// `FrameTiming` (0x81, §3.4): host pipeline stamps of one VideoFrame, as µs after `captureUs`.
 public struct FrameTiming: Equatable, Sendable {
     public var frameId: UInt32
     public var captureUs: UInt64
@@ -130,7 +130,7 @@ public struct FrameTiming: Equatable, Sendable {
     }
 }
 
-/// `LatencyReport` (0x82, §3.3): the viewer's p50 breakdown (µs) over its last ~2 s.
+/// `LatencyReport` (0x82, §3.4): the viewer's p50 breakdown (µs) over its last ~2 s.
 public struct LatencyReport: Equatable, Sendable {
     public var samples: UInt16
     /// bit0: `totalUs` ends at scan-out (else at the Present call); bit1: ground truth valid.
@@ -166,9 +166,11 @@ public enum ClientMessage {
     case ping(clientTimeUs: UInt64)
     case clipboard(ClipboardData)
     case audioEnable(Bool)
-    /// §3.3: `flags` bit0 = send FrameTiming for every VideoFrame.
+    /// §3.4: `flags` bit0 = send FrameTiming for every VideoFrame.
     case latencyEnable(flags: UInt8)
     case latencyReport(LatencyReport)
+    /// Mac display-mode preference for this session (`DisplayModePreference.wireValue`, §3.3).
+    case setDisplayPreference(mode: UInt8)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -190,6 +192,7 @@ public enum ClientMessage {
         case let .latencyReport(r):
             w.u8(0x82); w.u16(r.samples); w.u8(r.flags)
             for v in [r.hostUs, r.networkUs, r.queueUs, r.decodeUs, r.renderUs, r.scanoutUs, r.totalUs, r.groundTruthUs] { w.u32(v) }
+        case let .setDisplayPreference(m): w.u8(0x16); w.u8(m)
         }
         return w.data
     }
@@ -218,6 +221,7 @@ public enum ClientMessage {
             let n = try r.u16(), f = try r.u8()
             return .latencyReport(LatencyReport(samples: n, flags: f, hostUs: try r.u32(), networkUs: try r.u32(), queueUs: try r.u32(), decodeUs: try r.u32(),
                                                 renderUs: try r.u32(), scanoutUs: try r.u32(), totalUs: try r.u32(), groundTruthUs: try r.u32()))
+        case 0x16: return .setDisplayPreference(mode: try r.u8())
         default: throw WireError.unknownMessage(t)
         }
     }
@@ -239,8 +243,11 @@ public enum HostMessage {
     case audioConfig(AudioConfig)
     /// `pcm`: interleaved s16le samples (codec 1).
     case audioFrame(seq: UInt32, captureTimeUs: UInt64, pcm: Data)
-    /// §3.3, only after the viewer's LatencyEnable.
+    /// §3.4, only after the viewer's LatencyEnable.
     case frameTiming(FrameTiming)
+    /// Current display preference (`DisplayModePreference.wireValue`) and mode: "looks like" size in
+    /// points, `hidpi` = Retina backing (§3.3). Sent after ServerHello and whenever it changes.
+    case displayInfo(preference: UInt8, modeW: UInt16, modeH: UInt16, hidpi: Bool)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -270,6 +277,7 @@ public enum HostMessage {
             w = ByteWriter(capacity: pcm.count + 13)
             w.u8(0x61); w.u32(seq); w.u64(t); w.bytes(pcm)
         case let .frameTiming(ft): w.u8(0x81); ft.write(&w)
+        case let .displayInfo(p, mw, mh, hi): w.u8(0x05); w.u8(p); w.u16(mw); w.u16(mh); w.u8(hi ? 1 : 0)
         }
         return w.data
     }
@@ -302,6 +310,7 @@ public enum HostMessage {
         case 0x60: return .audioConfig(try AudioConfig.read(&r))
         case 0x61: return .audioFrame(seq: try r.u32(), captureTimeUs: try r.u64(), pcm: r.rest())
         case 0x81: return .frameTiming(try FrameTiming.read(&r))
+        case 0x05: return .displayInfo(preference: try r.u8(), modeW: try r.u16(), modeH: try r.u16(), hidpi: try r.u8() != 0)
         default: throw WireError.unknownMessage(t)
         }
     }

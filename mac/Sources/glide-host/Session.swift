@@ -20,7 +20,7 @@ final class Session: @unchecked Sendable {
     private var displayAssertion: IOPMAssertionID?
     private var statsTimer: DispatchSourceTimer?
     private var clientName = "?"
-    /// The viewer asked for FrameTiming messages (PROTOCOL.md §3.3).
+    /// The viewer asked for FrameTiming messages (PROTOCOL.md §3.4).
     private let timingLock = NSLock()
     private var timingEnabledValue = false
     private var timingEnabled: Bool {
@@ -98,6 +98,7 @@ final class Session: @unchecked Sendable {
         statsTimer?.cancel()
         Power.release(displayAssertion); displayAssertion = nil
         if let o = displayObserver { NotificationCenter.default.removeObserver(o) }
+        if let o = preferenceObserver { NotificationCenter.default.removeObserver(o) }
         displayRestart?.cancel()
         cursor.stop()
         clipboard?.stop(); clipboard = nil
@@ -178,6 +179,9 @@ final class Session: @unchecked Sendable {
         case let .latencyReport(r):
             viewerLatency = r
             HostStatus.shared.viewerLatency(id: id, r)
+        case let .setDisplayPreference(m):
+            guard let p = DisplayModePreference(wire: m) else { log("session \(id): unknown display preference \(m)"); return }
+            DisplayModeController.shared.setSessionPreference(id: id, p) { [weak self] _ in self?.sendDisplayInfo() }
         case .hello: break
         }
     }
@@ -208,6 +212,8 @@ final class Session: @unchecked Sendable {
                 }
                 if self.audioOff { self.send(.audioConfig(.off)) }
                 self.audio?.arm()
+                self.helloSent = true
+                self.sendDisplayInfo()
             } else {
                 self.send(.videoConfig(cfg))
                 if let sharpCfg { self.send(.sharpLayerConfig(sharpCfg)) }
@@ -223,7 +229,7 @@ final class Session: @unchecked Sendable {
             self.frameId &+= 1
             let msg = HostMessage.videoFrame(frameId: self.frameId, captureTimeUs: f.captureUs, keyframe: f.keyframe, refresh: f.refresh, sharp: f.sharp, rects: f.rects, data: f.data)
             guard self.timingEnabled else { self.send(msg); return }
-            // §3.3: once the network stack has taken the whole record, tell the viewer when each
+            // §3.4: once the network stack has taken the whole record, tell the viewer when each
             // stage of this frame happened on the host.
             let id = self.frameId
             let flags: UInt8 = (f.keyframe ? 1 : 0) | (f.refresh ? 2 : 0) | (f.sharp ? 4 : 0) | (f.rects != nil ? 8 : 0)
@@ -300,9 +306,14 @@ final class Session: @unchecked Sendable {
     /// Re-capture when the Mac's display mode changes (resolution / HiDPI switch), so the new
     /// pixel size and backing scale take effect without restarting the host.
     private var displayObserver: NSObjectProtocol?
+    private var preferenceObserver: NSObjectProtocol?
     private var displayRestart: DispatchWorkItem?
     private func watchDisplayChanges() {
+        preferenceObserver = NotificationCenter.default.addObserver(forName: DisplayModeController.preferenceChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.sendDisplayInfo()
+        }
         displayObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.sendDisplayInfo()
             guard let self, let p = self.pipeline, !self.ended else { return }
             self.displayRestart?.cancel()
             let work = DispatchWorkItem { [weak self] in
@@ -312,6 +323,24 @@ final class Session: @unchecked Sendable {
             }
             self.displayRestart = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)  // debounce mode-switch churn
+        }
+    }
+
+    /// DisplayInfo (§3.3): current preference + mode, sent after ServerHello and whenever it changes.
+    private var helloSent = false
+    private var lastDisplayInfo: Data?
+    private func sendDisplayInfo() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let dm = DisplayModeController.shared
+            let msg = HostMessage.displayInfo(preference: dm.effectivePreference, mode: dm.currentMode())
+            self.channel.queue.async {
+                guard self.helloSent, !self.ended else { return }
+                let enc = msg.encoded
+                guard enc != self.lastDisplayInfo else { return }
+                self.lastDisplayInfo = enc
+                self.channel.send(enc)
+            }
         }
     }
 

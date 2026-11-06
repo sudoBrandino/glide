@@ -89,6 +89,8 @@ pub struct HudInfo {
     pub latency: Option<crate::latency::Summary>,
     /// Latency test mode (Ctrl+Alt+Shift+L): reading the host's test pattern.
     pub latency_test: bool,
+    /// Mac display mode + preference (DisplayInfo), e.g. "1920×1080 Retina (automatic)".
+    pub mac_display: Option<String>,
 }
 
 fn ms(v: Option<f64>) -> String {
@@ -151,6 +153,9 @@ pub fn lines(i: &HudInfo) -> Vec<String> {
     let mode = i.mode.map_or("?", |m| m.name());
     v.push(format!("mode {mode} [{layer}]   sharp {}   rects {}", i.sharp_frames, i.rect_frames));
     let mut last = format!("view {}x{}   {}", i.view.0, i.view.1, i.decoder);
+    if let Some(m) = &i.mac_display {
+        last.push_str(&format!("   mac {m}"));
+    }
     if i.decode_errors > 0 {
         last.push_str(&format!("   {} decode errors", i.decode_errors));
     }
@@ -227,6 +232,9 @@ mod tests {
         assert_eq!(l[2], "12.3 Mbps   3072x1728 HEVC 4:2:0");
         assert_eq!(l[3], "mode hybrid [4:4:4]   sharp 12   rects 340");
         assert_eq!(l[4], "view 3072x1728   hw NV12 + AYUV");
+        i.mac_display = Some("1920×1080 Retina (automatic)".into());
+        assert_eq!(lines(&i)[4], "view 3072x1728   hw NV12 + AYUV   mac 1920×1080 Retina (automatic)");
+        i.mac_display = None;
         assert_eq!(l.len(), 5);
         i.showing_sharp = false;
         i.decode_errors = 2;

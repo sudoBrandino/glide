@@ -14,7 +14,7 @@ import VideoToolbox
 //        glide-probe --pattern-only [--seconds N] [--pattern-hz HZ]   (just the latency test pattern window, no connection)
 // --pattern shows the docs/LATENCY.md block-code window (top-left of the main screen) with the host
 // clock in it every frame; the probe reads it back from its decoded frames (ground truth: pattern
-// clock -> decoded on the same Mac). The probe also asks for FrameTiming (PROTOCOL.md §3.3) and
+// clock -> decoded on the same Mac). The probe also asks for FrameTiming (PROTOCOL.md §3.4) and
 // prints the host's per-stage breakdown.
 
 var args = Array(CommandLine.arguments.dropFirst())

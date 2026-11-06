@@ -327,7 +327,8 @@ fn main() -> ExitCode {
             caps |= protocol::CAP_HEVC_444;
         }
         // Clipboard sync (§5) needs the viewer window; the headless bench never advertises it.
-        if args.clipboard.unwrap_or(store.config.clipboard) && args.bench.is_none() {
+        // The GUI viewer drops the bit from each ClientHello while sync is switched off (menu).
+        if args.bench.is_none() {
             caps |= protocol::CAP_CLIPBOARD;
         }
     }
@@ -383,6 +384,7 @@ fn main() -> ExitCode {
                 audio: audio_on,
                 audio_muted: store.config.audio_muted,
                 latency_test: args.latency_test,
+                clipboard: args.clipboard.unwrap_or(store.config.clipboard),
                 store,
             };
             return match glide::win::app::run(Connector { target, password, hello }, opts) {

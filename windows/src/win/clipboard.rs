@@ -8,7 +8,8 @@
 //!   the UI thread), and PNG -> DIB preparation of received images.
 //! - Receiver thread: `enable` on ClipboardCaps, `incoming` on Clipboard.
 //!
-//! Sync is active only while a connection is up and the host has sent ClipboardCaps.
+//! Sync is active only while a connection is up, the host has sent ClipboardCaps, and the user
+//! switch (`set_active`, menu → Clipboard sync / config "clipboard") is on.
 
 use crate::clipboard::{prepare_incoming, privacy_marker, utf16_to_wire, EchoGuard, LocalClip, Prepared, PRIVACY_FORMATS};
 use crate::net::Sender;
@@ -68,6 +69,40 @@ pub fn set_sync_secrets(on: bool) {
     SYNC_SECRETS.store(on, Ordering::Relaxed);
 }
 
+/// User switch (runtime). Off = no listener, nothing sent, incoming clipboards dropped.
+static ACTIVE: AtomicBool = AtomicBool::new(true);
+
+pub fn is_active() -> bool {
+    ACTIVE.load(Ordering::Relaxed)
+}
+
+/// UI thread: turn sync on/off at runtime. Turning it on doesn't send what was copied while it
+/// was off (only later changes are synced).
+pub fn set_active(hwnd: HWND, on: bool) {
+    if ACTIVE.swap(on, Ordering::Relaxed) == on {
+        return;
+    }
+    unsafe {
+        if on {
+            UI.with(|u| u.borrow_mut().guard.baseline(GetClipboardSequenceNumber() as u64));
+            let _ = AddClipboardFormatListener(hwnd);
+        } else {
+            let _ = RemoveClipboardFormatListener(hwnd);
+            let _ = KillTimer(Some(hwnd), READ_TIMER);
+            let _ = KillTimer(Some(hwnd), APPLY_TIMER);
+            if let Some(c) = CLIP.get() {
+                *c.pending.lock().unwrap() = None;
+            }
+        }
+    }
+    eprintln!("clipboard: sync switched {}", if on { "on" } else { "off" });
+}
+
+/// The current connection negotiated clipboard sync (the host sent ClipboardCaps).
+pub fn negotiated() -> bool {
+    CLIP.get().is_some_and(|c| c.peer.lock().unwrap().is_some())
+}
+
 #[derive(Default)]
 struct UiClip {
     guard: EchoGuard,
@@ -108,6 +143,9 @@ pub fn init(hwnd: HWND) {
     }
     // Track the sequence number from the start: only changes made during a session are sent.
     UI.with(|u| u.borrow_mut().guard.baseline(unsafe { GetClipboardSequenceNumber() } as u64));
+    if !is_active() {
+        return; // switched off (config); set_active(true) adds the listener later
+    }
     if let Err(e) = unsafe { AddClipboardFormatListener(hwnd) } {
         eprintln!("clipboard: AddClipboardFormatListener failed: {e}");
     }
@@ -140,8 +178,8 @@ pub fn disable() {
 /// Receiver thread: a Clipboard message from the host.
 pub fn incoming(data: ClipboardData) {
     let Some(c) = CLIP.get() else { return };
-    if c.peer.lock().unwrap().is_none() {
-        return; // host didn't negotiate (§5): ignore
+    if c.peer.lock().unwrap().is_none() || !is_active() {
+        return; // host didn't negotiate (§5), or the user switched sync off: ignore
     }
     let _ = c.jobs.lock().unwrap().send(Job::Incoming(data));
 }
@@ -164,6 +202,9 @@ pub fn on_timer(hwnd: HWND, id: usize) {
 /// UI thread: WM_CLIPBOARDUPDATE.
 pub fn on_clipboard_update(hwnd: HWND) {
     let Some(c) = CLIP.get() else { return };
+    if !is_active() {
+        return;
+    }
     let marker = unsafe { GetClipboardSequenceNumber() } as u64;
     if !UI.with(|u| u.borrow_mut().guard.changed(marker)) {
         return; // our own write (or nothing new)
@@ -190,6 +231,9 @@ fn retry(hwnd: HWND, timer: usize, tries: u32, what: &str) {
 
 fn read_and_send(hwnd: HWND) {
     let Some(c) = CLIP.get() else { return };
+    if !is_active() {
+        return;
+    }
     let Some((formats, max_bytes, generation)) = c.peer.lock().unwrap().as_ref().map(|p| (p.formats, p.max_bytes, p.generation))
     else {
         return;
@@ -299,6 +343,10 @@ pub fn on_app_clipboard(hwnd: HWND) {
 
 fn apply_pending(hwnd: HWND) {
     let Some(c) = CLIP.get() else { return };
+    if !is_active() {
+        *c.pending.lock().unwrap() = None; // prepared before sync was switched off
+        return;
+    }
     if c.pending.lock().unwrap().is_none() {
         return;
     }

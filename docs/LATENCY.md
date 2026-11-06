@@ -1,7 +1,7 @@
 # Latency: instrumentation, ground truth, tuning
 
 This document describes how Glide measures its end-to-end latency, what was measured offline, and
-how to run the live glass-to-glass test. The wire format is in [`PROTOCOL.md`](PROTOCOL.md) §3.3.
+how to run the live glass-to-glass test. The wire format is in [`PROTOCOL.md`](PROTOCOL.md) §3.4.
 
 ## What is measured
 
@@ -216,8 +216,8 @@ All values are p50 in ms unless noted.
 wall-clock normal RC, but it never beats normal RC with counter PTS. Keep normal RC as the
 default.
 
-- `Encoder.swift` already defaults to normal RC (`GLIDE_LL=1` opts in). The README table still
-  says "low-latency RC … (default)". That row predates the switch.
+- `Encoder.swift` already defaults to normal RC (`GLIDE_LL=1` opts in). The README table
+  said "low-latency RC … (default)"; that row predated the switch and has been corrected.
 
 **New finding: sparse frames encode about 9 ms slower.**
 

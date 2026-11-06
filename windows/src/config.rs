@@ -45,6 +45,8 @@ pub struct Config {
     pub ctrl_as_cmd: bool,
     /// Stats overlay (Ctrl+Alt+Shift+H).
     pub hud: bool,
+    /// Connection bar always shown (menu → Pin connection bar).
+    pub bar_pinned: bool,
     /// Play the Mac's audio (`--no-audio` overrides to off).
     pub audio: bool,
     /// Audio muted (Ctrl+Alt+Shift+A / tray / window menu); persists across restarts.
@@ -71,6 +73,7 @@ impl Default for Config {
             mode: None,
             ctrl_as_cmd: true,
             hud: false,
+            bar_pinned: false,
             audio: true,
             audio_muted: false,
             clipboard: true,
@@ -178,6 +181,7 @@ pub fn parse(text: &str) -> Loaded {
     field!(mode);
     field!(ctrl_as_cmd);
     field!(hud);
+    field!(bar_pinned);
     field!(audio);
     field!(audio_muted);
     field!(clipboard);
@@ -449,6 +453,7 @@ mod tests {
         assert_eq!(l.config, Config::default());
         let mut c = Config::default();
         c.hud = true;
+        c.bar_pinned = true;
         c.set_mode(Mode::Sharp);
         c.host = Some("mac.local:7420".into());
         c.clipboard = false;

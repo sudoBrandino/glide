@@ -12,9 +12,9 @@
   Clipboard it receives (--clip-save DIR keeps received PNGs). --clip-text/--clip-png push a
   clipboard to the client (--clip-every N repeats it); --clip-bounce sends each received
   clipboard straight back once, to check that the viewer does not echo it again (no ping-pong).
-- --selftest checks the clipboard codec against the PROTOCOL.md §5 reference bytes (and the §3.3
+- --selftest checks the clipboard codec against the PROTOCOL.md §5 reference bytes (and the §3.4
   latency messages + the docs/LATENCY.md block code) and exits.
-- Latency (§3.3): after the client's LatencyEnable (0x80) every VideoFrame is followed by a
+- Latency (§3.4): after the client's LatencyEnable (0x80) every VideoFrame is followed by a
   FrameTiming (0x81) with the mock's send stamps; LatencyReports (0x82) are logged.
   --latency-pattern streams a live-encoded (ffmpeg, x265 zerolatency) test pattern instead of the
   files: each frame carries the mock's clock as a block code (docs/LATENCY.md), so a viewer in
@@ -226,7 +226,7 @@ def clip_caps(formats=3, max_bytes=CLIPBOARD_MAX):
     return bytes([0x51]) + struct.pack("<II", formats, max_bytes)
 
 
-# ---------------------------------------------------------------- latency (§3.3, docs/LATENCY.md)
+# ---------------------------------------------------------------- latency (§3.4, docs/LATENCY.md)
 
 TIMING_UNKNOWN = 0xFFFFFFFF
 BLOCK_SYNC, BLOCK_CELLS, BLOCK_QUIET = 0b10110010, 56, 2
@@ -533,6 +533,9 @@ class Session:
                 log(f"{self.addr}: clipboard sync negotiated (sent ClipboardCaps)")
                 if self.args.clip_text is not None or self.args.clip_png:
                     threading.Thread(target=self.clip_push_loop, daemon=True).start()
+            # DisplayInfo (§3.3): pretend the Mac runs 1920x1080 Retina under "automatic".
+            self.display_pref = 0
+            self.send_display_info()
             self.send_cursor()
             if self.args.latency_pattern:
                 t = threading.Thread(target=self.pattern_loop, daemon=True)
@@ -748,6 +751,12 @@ class Session:
         except (OSError, EOFError):
             self.alive = False
 
+    DISPLAY_MODES = {0: (1920, 1080, 1), 1: (3840, 2160, 0), 2: (2560, 1440, 1), 3: (1920, 1080, 1), 4: (1920, 1080, 1)}
+
+    def send_display_info(self):
+        w, h, hi = self.DISPLAY_MODES.get(self.display_pref, (1920, 1080, 1))
+        self.send_msg(bytes([0x05, self.display_pref]) + struct.pack("<HHB", w, h, hi))
+
     def input_loop(self):
         names = {0x10: "MouseMove", 0x11: "MouseButton", 0x12: "MouseWheel", 0x13: "Key", 0x14: "ReleaseAll",
                  0x20: "RequestKeyframe", 0x21: "SetMode", 0x50: "Clipboard"}
@@ -777,6 +786,12 @@ class Session:
             elif t == 0x15:
                 vw, vh = struct.unpack("<HH", m[1:5])
                 log(f"{self.addr}: ViewSize {vw}x{vh}")
+            elif t == 0x16:
+                names16 = ["automatic", "crisp", "smooth", "retina", "manual"]
+                log(f"{self.addr}: SetDisplayPreference {names16[m[1]] if m[1] < 5 else m[1]}")
+                if m[1] < 5:
+                    self.display_pref = m[1]
+                    self.send_display_info()
             elif t == 0x20:
                 log(f"{self.addr}: RequestKeyframe -> restarting stream at first keyframe")
                 self.restart.set()

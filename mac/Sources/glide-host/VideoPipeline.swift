@@ -28,7 +28,7 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         let refresh: Bool
         let sharp: Bool
         let rects: [FrameRect]?
-        /// Host-clock stamps (µs) for FrameTiming (PROTOCOL.md §3.3): the capture callback ran,
+        /// Host-clock stamps (µs) for FrameTiming (PROTOCOL.md §3.4): the capture callback ran,
         /// the buffer was handed to the encoder, the encoder output arrived.
         var callbackUs: UInt64? = nil
         var submitUs: UInt64? = nil

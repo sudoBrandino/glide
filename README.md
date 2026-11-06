@@ -95,32 +95,44 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the details.
 
 Measured on an M3 Pro host with an RTX 5070 Ti viewer.
 
-**Encode time on the host:** hybrid mode, real desktop content.
+**Encode time on the host:** base layer, HEVC 4:2:0, **normal rate control (the default)**.
+Low-latency rate control is opt-in with `GLIDE_LL=1`. Offline at 2560×1440 it was about 3.5 ms
+slower and produced a softer picture (`glide-host --encode-bench`, [`docs/LATENCY.md`](docs/LATENCY.md)).
 
-| Output | Base layer (HEVC 4:2:0 low-latency) |
-|---|---|
-| 2560×1440 @ 60 Hz | ~10–12 ms |
-| 3840×2160 @ 60 Hz | ~18 ms |
+| Output | Continuous motion (≥ 20 fps) | Isolated frame after idle (≤ 5 fps), e.g. one keystroke |
+|---|---|---|
+| 2560×1440 | ~10.5 ms | ~11 ms with frame-counter PTS (default); ~20 ms with the old wall-clock PTS |
+| 3840×2160 | ~18 ms | not measured |
+
+The encoder PTS is now a frame counter at the nominal rate. With wall-clock timestamps,
+VideoToolbox's real-time mode paced itself by the gap since the previous frame, so the first
+frame after an idle period took about 9 ms longer at the same size. `GLIDE_PTS=wallclock`
+restores the old behavior for A/B tests. The 2560×1440 figures were measured offline with
+synthetic text; the live LAN run is still pending.
 
 The 4:4:4 sharp IDR costs about 25–40 ms of encoder time at 4K. It is only sent once the screen
 settles, and at most once per interval while small areas such as a clock or spinner keep changing.
 The pixel diff runs in parallel with the hardware encode.
 
-**Capture → decoded, same-Mac loopback (`glide-probe`), 2560×1440 @ 60 Hz:**
+**Capture → decoded, same-Mac loopback (`glide-probe`), 2560×1440 @ 60 Hz** (earlier
+measurements, before the PTS change):
 
 | Config | p50 / p95 |
 |---|---|
-| HEVC 4:2:0, low-latency RC, 1 frame in flight (default) | 14.8 / 21.9 ms |
-| HEVC 4:2:0, normal RC | 12.4 / 37.5 ms |
+| HEVC 4:2:0, normal RC, 1 frame in flight (default) | 12.4 / 37.5 ms |
+| HEVC 4:2:0, low-latency RC (`GLIDE_LL=1`) | 14.8 / 21.9 ms |
 | H.264 low-latency | 14.5 / 22.0 ms |
 | HEVC 4:4:4 every frame ("sharp" mode) | 27.7 / 42.5 ms |
 | any config, 2 frames in flight | +10–20 ms (queueing) |
 
-Every frame now carries a per-stage latency breakdown, which shows up in the viewer HUD, the host
-log and menu bar, and `--bench`. A block-code test pattern measures true glass-to-glass latency
-(see [`docs/LATENCY.md`](docs/LATENCY.md)). The live LAN glass-to-glass run is still pending.
-Offline, an idle-then-one-frame encode took about 20 ms because VideoToolbox paced itself by
-wall-clock PTS gaps. With frame-counter PTS it takes about 11 ms, which is now the default.
+**Latency breakdown.** Every frame carries a per-stage breakdown. It shows up in:
+
+- the viewer HUD
+- the host log and menu bar
+- `--bench`
+
+A block-code test pattern measures true glass-to-glass latency. See
+[`docs/LATENCY.md`](docs/LATENCY.md); the live LAN glass-to-glass run is still pending.
 
 ## Install and run
 

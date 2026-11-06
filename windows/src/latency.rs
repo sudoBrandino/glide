@@ -1,6 +1,6 @@
 //! Per-frame latency breakdown (docs/LATENCY.md). Platform independent.
 //!
-//! Joins, by `frame_id`, the host's `FrameTiming` stamps (§3.3: capture, capture callback,
+//! Joins, by `frame_id`, the host's `FrameTiming` stamps (§3.4: capture, capture callback,
 //! encode submit/done, enqueued, sent — host clock) with the viewer's own stamps (receive,
 //! decode start/done, canvas update, `Present()` call, and the vblank the present reached the
 //! screen at — client clock). Host times are converted with the Ping/Pong clock estimate
@@ -134,7 +134,7 @@ pub struct Tracker {
     pub keep_all: bool,
     pub all: Vec<Sample>,
     pub all_gt: Vec<GroundTruth>,
-    /// The host sent at least one FrameTiming (it implements §3.3).
+    /// The host sent at least one FrameTiming (it implements §3.4).
     pub host_timing_seen: bool,
     pub dropped: u64,
     pub window_us: u64,
@@ -176,7 +176,7 @@ impl Tracker {
 
     fn rec(&mut self, id: u32, now: u64) -> &mut Pending {
         if self.pending.len() > 4096 {
-            // Something never completes (e.g. a host without §3.3): bound the memory.
+            // Something never completes (e.g. a host without §3.4): bound the memory.
             let n = self.pending.len() as u64;
             self.pending.clear();
             self.dropped += n;
@@ -431,7 +431,7 @@ impl Tracker {
         format!("{{{}}}", parts.join(","))
     }
 
-    /// The window's p50s as a `LatencyReport` (§3.3).
+    /// The window's p50s as a `LatencyReport` (§3.4).
     pub fn report(&self) -> LatencyReport {
         let s = self.summary();
         let us = |v: Option<f64>| v.map_or(TIMING_UNKNOWN, |ms| (ms * 1000.0).round().clamp(0.0, (TIMING_UNKNOWN - 1) as f64) as u32);
