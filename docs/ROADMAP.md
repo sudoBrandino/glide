@@ -1,29 +1,19 @@
 # Roadmap
 
-## Next: Security v2 (after the current feature branches merge)
+## Security v2 (done)
 
-> **Replace the v1 password-mixed KDF with a real PAKE (CPace or SPAKE2 over X25519) plus a pinned
-> host identity.**
->
-> v1 leaks a value an attacker can guess the password against offline. Any active attacker who
-> impersonates either side gets it. This was found in the security review on 2026-11-06.
+The v1 password handshake leaked a value an active impostor could test password guesses against
+offline (security review, 2026-11-06). v2 replaces it (PROTOCOL.md §1–2):
 
-The v2 design:
+- Noise_XX_25519_ChaChaPoly_SHA256 between long-term keys (Mac: `host-key` file; PC: DPAPI).
+- Key pinning both ways; pairing confirmed with a 6-digit code on both screens (host commitment +
+  nonces against code grinding); menu-bar alert or `glide-host --pair`/`--pair-code` headless.
+- Version negotiation (`GLD2`), clear errors across v1/v2, per-address rate limiting, wall-clock
+  pre-auth deadlines.
+- A PAKE was rejected: CryptoKit has no raw curve operations.
 
-- Run a PAKE (CPace or SPAKE2 over X25519) in place of `HKDF(shared || PBKDF2(pw))`.
-- Pin a long-term host key, trusted on first use, so later sessions authenticate the host without
-  relying on the password alone.
-- Bump the protocol version, and update `docs/PROTOCOL.md`, `tools/gen_vectors.py` and the test
-  vectors together.
-
-Until v2 lands, these mitigations are in place:
-
-- The password is random and 16 characters long.
-- The PC firewall admits only the Mac's IP, and only to `glide-client.exe`.
-- The Mac dials out, so nothing listens on the Mac.
-
-Fixed (merged 2026-11-06): a connection that hasn't authenticated can no longer replace the
-active session.
+Possible follow-ups: move the host key into the Keychain once the app has a provisioning profile
+(data-protection keychain); show the pairing code on the Mac via a notification as well.
 
 ## v0 — LAN prototype (done)
 
@@ -58,8 +48,8 @@ Done:
   - The signed `Glide Host.app` keeps its privacy (TCC) grants across rebuilds.
   - `tools/make-host-app.sh` and `tools/install-host.sh` build and install it.
   - `--request-permissions`.
-  - `host.json` stores the salt, password and connect target (`--set-connect`,
-    `--set-password-file`).
+  - `host.json` stores the connect target (`--set-connect`) and, since security v2, the paired
+    viewers.
 - [x] **Power management:** no idle system sleep while hosting, no display sleep during a session,
   display wake on input, and capture retries while the display is asleep or locked.
 - [x] **ViewSize:**
@@ -93,7 +83,7 @@ In progress, on feature branches:
 
 Next:
 
-- [ ] **Security v2** (see the top of this file)
+- [x] **Security v2** (see the top of this file)
 - [ ] **Virtual display** that matches the viewer (CGVirtualDisplay), for example a 4K monitor →
   1920×1080 HiDPI at 120 Hz. This drops the BetterDisplay dependency and the need to switch modes
   with `tools/display-mode.swift`.

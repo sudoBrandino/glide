@@ -1,8 +1,9 @@
+import CryptoKit
 import Foundation
 import GlideCore
 import Network
 
-/// `glide-selftest --file-host PORT --password PW [--recv DIR] [--send PATH...] [--pull PATH...] [--seconds N]`
+/// `glide-selftest --file-host PORT [--key-file F] [--recv DIR] [--send PATH...] [--pull PATH...] [--seconds N]`
 ///
 /// A minimal host for end-to-end tests of file transfer against the real viewer, using the real
 /// GlideCore pieces (SecureChannel, FileTransferEngine with the bytesInFlight chunk gate) but no
@@ -10,6 +11,9 @@ import Network
 /// else (the viewer shows a black canvas). Listens on loopback only (use an ssh -R tunnel).
 /// Files from the viewer go to --recv (quarantined); --send pushes items after connect; --pull
 /// answers the viewer's Ctrl+Alt+Shift+V. Exits when the viewer disconnects or after --seconds.
+/// Security v2: a test host with its own key (--key-file, created if missing) that trusts every
+/// viewer: a paired viewer goes straight in, an unpaired one gets an automatically confirmed
+/// pairing (the code is printed; the viewer still has to confirm it).
 func runFileHost(_ argv: [String]) -> Never {
     var args = argv
     func take(_ f: String) -> String? {
@@ -24,9 +28,16 @@ func runFileHost(_ argv: [String]) -> Never {
         args.removeSubrange(i..<j)
         return out
     }
-    guard let first = args.first, let port = UInt16(first) else { print("usage: glide-selftest --file-host PORT --password PW [--recv DIR] [--send PATH...] [--pull PATH...]"); exit(2) }
+    guard let first = args.first, let port = UInt16(first) else { print("usage: glide-selftest --file-host PORT [--key-file F] [--recv DIR] [--send PATH...] [--pull PATH...]"); exit(2) }
     args.removeFirst()
-    let password = take("--password") ?? ProcessInfo.processInfo.environment["GLIDE_PASSWORD"] ?? ""
+    let keyFile = take("--key-file") ?? FileManager.default.temporaryDirectory.appendingPathComponent("glide-file-host.key").path
+    let identity: Curve25519.KeyAgreement.PrivateKey
+    if let h = try? String(contentsOfFile: keyFile, encoding: .utf8), let raw = Data(hex: h.trimmingCharacters(in: .whitespacesAndNewlines)),
+       let k = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: raw) { identity = k }
+    else {
+        identity = Curve25519.KeyAgreement.PrivateKey()
+        FileManager.default.createFile(atPath: keyFile, contents: Data(identity.rawRepresentation.hex.utf8), attributes: [.posixPermissions: 0o600])
+    }
     let recv = URL(fileURLWithPath: take("--recv") ?? FileManager.default.temporaryDirectory.appendingPathComponent("glide-file-host").path)
     let seconds = Double(take("--seconds") ?? "120") ?? 120
     let sendItems = takeList("--send"), pullItems = takeList("--pull")
@@ -61,14 +72,21 @@ func runFileHost(_ argv: [String]) -> Never {
             }
         }
         var authed = false
+        var pairing = false
         var minOwd = Int64.max
         ch.onMessage = { d in
             guard let m = try? ClientMessage.decode(d) else { say("bad message \(d.prefix(1).hex)"); return }
             if !authed {
-                guard case let .hello(_, caps, _, _, _, _, name) = m else { ch.close(); return }
+                if pairing, case let .pairConfirm(ok) = m {
+                    pairing = false
+                    say("pairing: viewer \(ok ? "confirmed" : "declined")")
+                    if ok { ch.send(HostMessage.authResult(.ok).encoded) } else { ch.close() }
+                    return
+                }
+                guard !pairing, case let .hello(_, caps, _, _, _, _, name) = m else { ch.close(); return }
                 authed = true
                 say("viewer '\(name)' authenticated, caps \(String(caps.rawValue, radix: 16)), files \(caps.contains(.files))")
-                ch.send(HostMessage.serverHello(version: Handshake.version, hostName: "glide-selftest file host",
+                ch.send(HostMessage.serverHello(version: GlideHandshake.version, hostName: "glide-selftest file host",
                                                 config: VideoConfig(width: 1280, height: 720, codec: .hevc, chroma: .yuv420, scale: 1)).encoded)
                 guard caps.contains(.files) else { return }
                 ch.send(HostMessage.file(.caps(flags: 3, maxTotalBytes: 8 << 30, maxFiles: 10000)).encoded)
@@ -106,15 +124,25 @@ func runFileHost(_ argv: [String]) -> Never {
         }
         conn.stateUpdateHandler = { st in
             if case .ready = st {
-                ch.acceptHandshake(password: password, salt: Handshake.randomBytes(16)) { err in
-                    if let err { say("handshake failed: \(err)"); ch.close(); return }
+                ch.acceptHandshake(identity: identity, admission: { (GlideHandshake.statusOK, GlideHandshake.hostFlagPairingOpen) }) { res in
+                    guard case let .success(acc) = res else {
+                        if case let .failure(e) = res { say("handshake failed: \(e)") }
+                        ch.close(); return
+                    }
+                    say("viewer key \(GlideHandshake.fingerprint(acc.viewerKey))\(acc.info.pairRequest ? " asks to pair" : "")")
                     ch.startReceiving()
+                    if acc.info.pairRequest {
+                        pairing = true
+                        let code = GlideHandshake.sasCode(handshakeHash: acc.handshakeHash, viewerNonce: acc.info.nonce, hostNonce: acc.hostNonce)
+                        say("pairing: code \(GlideHandshake.sasText(code)) (auto-confirmed on this test host)")
+                        ch.send(HostMessage.pairReveal(nonce: acc.hostNonce).encoded)
+                    }
                 }
             }
         }
         conn.start(queue: ch.queue)
     }
-    listener.stateUpdateHandler = { st in if case .ready = st { say("file host listening on 127.0.0.1:\(port), saving to \(recv.path)") } }
+    listener.stateUpdateHandler = { st in if case .ready = st { say("file host listening on 127.0.0.1:\(port) (key \(GlideHandshake.fingerprint(identity.publicKey.rawRepresentation))), saving to \(recv.path)") } }
     listener.start(queue: .main)
     DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { say("time limit"); exit(0) }
     dispatchMain()

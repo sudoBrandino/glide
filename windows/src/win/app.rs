@@ -5,8 +5,8 @@
 //! channel and are presented as soon as they decode.
 //!
 //! UX layer: local hotkeys (`hotkeys`), a stats HUD and toasts drawn by the renderer, persisted
-//! preferences / per-monitor window placement (`config::Store`), password re-prompt on auth
-//! failure (`prompt`), and a tray icon (`tray`).
+//! preferences / per-monitor window placement (`config::Store`), the pairing dialog (`prompt`,
+//! security v2: key pinning + a 6-digit code confirmed on both screens), and a tray icon (`tray`).
 
 use super::clipboard;
 use super::files;
@@ -14,17 +14,19 @@ use super::audio::Audio;
 use super::cursor::{create_cursor, destroy_cursor, scale_image, CursorImage};
 use super::d3d::Gpu;
 use super::decoder::Decoder;
+use super::prompt::PairText;
 use super::render::{Readback, Renderer};
 use super::scanout::ScanoutClock;
-use super::{connbar as cbar, dpapi, menu, placement, prompt, tray};
+use super::{connbar as cbar, menu, placement, prompt, tray};
 use crate::menu_model::{self, Cmd};
 use crate::config::{self, Store};
 use crate::hid;
 use crate::hotkeys::{self, Action};
 use crate::blockcode;
 use crate::hud;
+use crate::identity::Identity;
 use crate::latency::Tracker;
-use crate::net::{ClockSync, ConnectError, Connection, NetEvent, Sender};
+use crate::net::{Auth, ClockSync, ConnectError, Connection, NetEvent, PairPrompt, PairingUi, Sender};
 use crate::peers;
 use crate::protocol::{self, ClientMsg, HostMsg, Mode, VideoConfig, FRAME_FLAG_KEYFRAME, FRAME_FLAG_SHARP};
 use crate::util::{letterbox, now_us, present_rect};
@@ -50,7 +52,6 @@ pub struct Options {
     pub has444: bool,
     /// Persisted preferences (HUD, mode, window placement).
     pub store: Store,
-    pub password_source: PasswordSource,
     /// Play the host's audio (§3.2); false with --no-audio / config "audio": false.
     pub audio: bool,
     /// Start muted (config "audio_muted").
@@ -60,16 +61,6 @@ pub struct Options {
     /// Clipboard sync switch at startup (config "clipboard" / --no-clipboard); toggled at runtime
     /// from the menu. ClientHello advertises clipboard support only while it is on.
     pub clipboard: bool,
-}
-
-/// Where the session password came from. Only saved/prompted passwords are re-prompted for
-/// when the host rejects them (CLI/env passwords are the caller's business).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PasswordSource {
-    Cli,
-    Env,
-    Saved,
-    Prompted,
 }
 
 /// How the viewer reaches the host. The session thread retries forever.
@@ -82,7 +73,10 @@ pub enum Target {
 
 pub struct Connector {
     pub target: Target,
-    pub password: String,
+    /// This viewer's static key (identity.dpapi).
+    pub identity: Identity,
+    /// Pin-store key of the target (`config::pin_target`).
+    pub pin_target: String,
     pub hello: ClientMsg,
 }
 
@@ -92,7 +86,8 @@ const WM_APP_CONNECTED: u32 = WM_APP + 4;
 const WM_APP_DISCONNECTED: u32 = WM_APP + 5;
 /// wParam = `hotkeys::Action as u8`.
 const WM_APP_HOTKEY: u32 = WM_APP + 6;
-const WM_APP_AUTH_FAILED: u32 = WM_APP + 7;
+/// lParam = Box<PairRequest> (session thread → UI thread: show the pairing dialog).
+const WM_APP_PAIR: u32 = WM_APP + 7;
 /// Tray icon callback (see `tray`).
 pub(super) const WM_APP_TRAY: u32 = WM_APP + 8;
 const TITLE_TIMER: usize = 1;
@@ -145,7 +140,8 @@ struct Shared {
     /// Current stream mode (`Mode as u8`); changed by Ctrl+Alt+Shift+M, used for (re)connects.
     mode: AtomicU8,
     has444: bool,
-    password: Mutex<String>,
+    /// Ask the host to pair again even though a key is pinned (it said it doesn't know us).
+    repair: AtomicBool,
     /// Ctrl+Alt+Shift+D: the current connection was dropped on purpose; reconnect immediately.
     reconnect: AtomicBool,
     /// Tray "Disconnect": stay disconnected (and stop listening) until "Connect".
@@ -156,6 +152,10 @@ struct Shared {
     listening: bool,
     /// Set by the session thread when trust-on-first-use pinned the host's IP (shown on connect).
     just_pinned: Mutex<Option<String>>,
+    /// Set by the session thread when this connection paired (toast on connect).
+    just_paired: Mutex<Option<String>>,
+    /// Pin-store key of the target (`config::pin_target`).
+    pin_target: String,
     /// Zero-sized until the first connection.
     config: Mutex<VideoConfig>,
     /// Current connection's writer; None while disconnected.
@@ -195,7 +195,6 @@ struct UiCtx {
     render_tx: Mutex<mpsc::Sender<RenderCmd>>,
     shared: Arc<Shared>,
     store: Mutex<Store>,
-    password_source: Mutex<PasswordSource>,
 }
 
 static UI: OnceLock<UiCtx> = OnceLock::new();
@@ -240,9 +239,6 @@ struct UiState {
     last_hud: Vec<String>,
     /// Last normal (not maximized / fullscreen / minimized) outer window rect.
     normal_rect: Option<RECT>,
-    /// Password dialog currently open / dismissed with Cancel (stop re-prompting).
-    prompt_open: bool,
-    prompt_declined: bool,
     test_actions: Vec<TestStep>,
     /// Mouse buttons whose down went to the connection bar (their ups aren't forwarded either).
     bar_buttons: u8,
@@ -1295,7 +1291,6 @@ fn do_action(hwnd: HWND, a: Action) {
             update_title(hwnd);
         }
         Action::Reconnect => {
-            STATE.with(|s| s.borrow_mut().prompt_declined = false);
             sh.paused.store(false, Ordering::Relaxed);
             let cur = sh.sender.lock().unwrap().clone();
             match cur {
@@ -1461,7 +1456,6 @@ fn set_paused(hwnd: HWND, paused: bool) {
         }
         toast("Disconnected");
     } else {
-        STATE.with(|s| s.borrow_mut().prompt_declined = false);
         toast("Connecting…");
     }
     update_title(hwnd);
@@ -1509,61 +1503,116 @@ fn track_normal_rect(hwnd: HWND) {
     }
 }
 
-/// Connect mode only: authentication against the configured host failed twice in a row. Ask
-/// for the password (only if it was saved/typed; CLI/env passwords are the caller's business).
-/// Listen mode never prompts: any inbound peer can cause an auth failure there.
-fn on_auth_failed(hwnd: HWND) {
-    if ui().shared.listening {
-        return;
-    }
-    let src = *ui().password_source.lock().unwrap();
-    if !matches!(src, PasswordSource::Saved | PasswordSource::Prompted) {
-        return;
-    }
-    if STATE.with(|s| s.borrow().prompt_declined) {
-        return;
-    }
-    let host = ui().shared.host_name.lock().unwrap().clone();
-    let msg = format!("Couldn't sign in to {host} (two attempts in a row). If the session password changed, enter it here:");
-    ask_new_password(hwnd, &msg, src == PasswordSource::Saved);
+/// Session thread → UI thread: show the pairing dialog, answer on `reply`.
+struct PairRequest {
+    prompt: PairPrompt,
+    cancel: Arc<AtomicBool>,
+    reply: mpsc::Sender<bool>,
 }
 
-/// Tray "Change password…".
-fn change_password(hwnd: HWND) {
-    STATE.with(|s| s.borrow_mut().prompt_declined = false);
-    let saved = ui().store.lock().unwrap().dir.as_ref().is_some_and(|d| d.join(config::PASSWORD_FILE).exists());
-    ask_new_password(hwnd, "Enter the Glide session password (the one set on the Mac host):", saved);
+/// `PairingUi` for the GUI: the dialog runs modally on the UI thread (WM_APP_PAIR); the
+/// session thread blocks in `confirm` until it is answered or dismissed.
+struct GuiPairing {
+    hwnd: isize,
+    cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
-/// Password dialog → shared password (used from the next connection attempt). With Remember it
-/// replaces the saved password; without, the saved password is left alone (it is only ever
-/// deleted explicitly: tray "Forget saved password" / --forget-password).
-fn ask_new_password(hwnd: HWND, msg: &str, remember: bool) {
-    let busy = STATE.with(|s| std::mem::replace(&mut s.borrow_mut().prompt_open, true));
-    if busy {
-        return;
-    }
-    let res = prompt::ask_password(Some(hwnd), msg, remember);
-    STATE.with(|s| s.borrow_mut().prompt_open = false);
-    match res {
-        Ok(Some(a)) => {
-            *ui().shared.password.lock().unwrap() = a.password.clone();
-            *ui().password_source.lock().unwrap() = PasswordSource::Prompted;
-            let dir = ui().store.lock().unwrap().dir.clone();
-            if let (true, Some(dir)) = (a.remember, dir) {
-                match dpapi::store_password(&dir, &a.password) {
-                    Ok(()) => *ui().password_source.lock().unwrap() = PasswordSource::Saved,
-                    Err(e) => eprintln!("warning: cannot save password: {e}"),
-                }
-            }
-            toast("Password updated — used for the next connection");
+impl PairingUi for GuiPairing {
+    fn confirm(&self, p: &PairPrompt) -> bool {
+        let cancel = Arc::new(AtomicBool::new(false));
+        *self.cancel.lock().unwrap() = Some(cancel.clone());
+        let (tx, rx) = mpsc::channel();
+        let req = Box::into_raw(Box::new(PairRequest { prompt: p.clone(), cancel: cancel.clone(), reply: tx }));
+        let posted = unsafe { PostMessageW(Some(HWND(self.hwnd as *mut _)), WM_APP_PAIR, WPARAM(0), LPARAM(req as isize)) };
+        if posted.is_err() {
+            drop(unsafe { Box::from_raw(req) });
+            return false;
         }
-        Ok(None) => STATE.with(|s| s.borrow_mut().prompt_declined = true),
+        loop {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(v) => return v && !cancel.load(Ordering::SeqCst),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if UI.get().is_some_and(|u| u.shared.quit.load(Ordering::Relaxed)) {
+                        cancel.store(true, Ordering::SeqCst);
+                        return false;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+    }
+
+    fn dismiss(&self) {
+        if let Some(c) = self.cancel.lock().unwrap().as_ref() {
+            c.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// WM_APP_PAIR: show the pairing dialog for the session thread's request.
+fn show_pairing(hwnd: HWND, req: PairRequest) {
+    let p = &req.prompt;
+    set_focus_state(hwnd, false); // the LL keyboard hook must not swallow the dialog's keys
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+    }
+    let text = PairText {
+        text: format!("Pair this PC with the Glide host at {}?\nThe Mac shows a code too. Only continue if both codes are the same.", p.target),
+        code: p.code.clone(),
+        detail: format!(
+            "Confirm on the Mac as well. Mac key: {}\nThis PC's key: {}\nIf the codes differ, click Cancel: something is intercepting the connection.",
+            p.host_fingerprint, p.viewer_fingerprint
+        ),
+    };
+    let ok = match prompt::ask_pairing(Some(hwnd), text, req.cancel.clone()) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
-            STATE.with(|s| s.borrow_mut().prompt_declined = true);
+            false
+        }
+    };
+    eprintln!("pairing dialog: {}", if ok { "codes match" } else { "cancelled" });
+    let _ = req.reply.send(ok);
+    if unsafe { GetForegroundWindow() } == hwnd {
+        set_focus_state(hwnd, true);
+    }
+}
+
+/// Tray "Forget host (unpair)…": after a confirmation, forget the pinned host key (and the
+/// TOFU IP pin) and drop the connection; the next connection pairs again.
+fn forget_host(hwnd: HWND) {
+    let target = ui().shared.pin_target.clone();
+    let name = ui().store.lock().unwrap().config.pinned_hosts.get(&target).map(|p| p.name.clone());
+    let Some(name) = name else {
+        toast("Not paired");
+        return;
+    };
+    let msg = format!(
+        "Forget the Mac “{name}” ({target})?\n\nThis PC will no longer trust its key. To connect again you must pair again: on the Mac choose Glide → Pair New Viewer…, then compare the code on both screens.\n\nAlso remove this PC on the Mac (Glide → Paired Viewers) if you are retiring it."
+    );
+    let w: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+    let r = unsafe { MessageBoxW(Some(hwnd), PCWSTR(w.as_ptr()), w!("Glide — Forget host"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) };
+    if r != IDYES {
+        return;
+    }
+    let had = ui().store.lock().unwrap().forget_host(&target);
+    if ui().shared.listening {
+        let mut old = Vec::new();
+        ui().store.lock().unwrap().update(|c| old = std::mem::take(&mut c.allowed_peers));
+        if !old.is_empty() {
+            eprintln!("also forgot pinned host IPs {old:?}");
         }
     }
+    eprintln!("unpaired {target}: {:?}", had.map(|p| p.key));
+    ui().shared.repair.store(false, Ordering::Relaxed);
+    if let Some(s) = ui().shared.sender.lock().unwrap().clone() {
+        ui().shared.reconnect.store(true, Ordering::Relaxed);
+        let _ = s.send(&ClientMsg::ReleaseAll);
+        s.shutdown();
+    }
+    toast(format!("Forgot “{name}” — pair again from the Mac (Pair New Viewer…)"));
 }
 
 /// Mute/unmute: stops local playback and tells the host to stop/start sending (AudioEnable).
@@ -1653,8 +1702,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
-        WM_APP_AUTH_FAILED => {
-            on_auth_failed(hwnd);
+        WM_APP_PAIR => {
+            if lparam.0 != 0 {
+                let req = *Box::from_raw(lparam.0 as *mut PairRequest);
+                show_pairing(hwnd, req);
+            }
             LRESULT(0)
         }
         WM_APP_TRAY if (lparam.0 & 0xFFFF) as u32 == windows::Win32::UI::Shell::NIN_BALLOONUSERCLICK => {
@@ -1668,7 +1720,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 audio: ui().shared.audio.as_ref().map(|a| a.muted()),
                 paused: ui().shared.paused.load(Ordering::Relaxed),
                 hud_on: STATE.with(|s| s.borrow().hud_on),
-                has_pinned: ui().shared.listening && !ui().store.lock().unwrap().config.allowed_peers.is_empty(),
+                paired: ui().store.lock().unwrap().config.pinned_hosts.get(&ui().shared.pin_target).map(|p| p.name.clone()),
                 files: files::enabled().then(files::busy),
             };
             tray::on_notify(hwnd, lparam, &st);
@@ -1687,19 +1739,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         None => toast("No config file (APPDATA not set)"),
                     }
                 }
-                Some(tray::MenuCmd::ForgetPassword) => {
-                    let dir = ui().store.lock().unwrap().dir.clone();
-                    let had = dir.map(|d| dpapi::forget_password(&d)).unwrap_or(false);
-                    toast(if had { "Saved password removed" } else { "No saved password" });
-                }
-                Some(tray::MenuCmd::ChangePassword) => change_password(hwnd),
                 Some(tray::MenuCmd::ToggleMute) => toggle_mute(hwnd),
-                Some(tray::MenuCmd::ForgetPinned) => {
-                    let mut old = Vec::new();
-                    ui().store.lock().unwrap().update(|c| old = std::mem::take(&mut c.allowed_peers));
-                    eprintln!("forgot pinned/allowed hosts {old:?}");
-                    toast("Pinned host forgotten — the next host that authenticates will be pinned");
-                }
+                Some(tray::MenuCmd::ForgetHost) => forget_host(hwnd),
                 Some(tray::MenuCmd::CancelFiles) => do_action(hwnd, Action::CancelFiles),
                 Some(tray::MenuCmd::OpenDownloads) => files::open_folder(),
                 Some(tray::MenuCmd::Quit) => {
@@ -1916,9 +1957,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             update_title(hwnd);
             let host = ui().shared.host_name.lock().unwrap().clone();
             cbar::set_label(hwnd, &host);
-            match ui().shared.just_pinned.lock().unwrap().take() {
-                Some(ip) => toast(format!("Connected to {host} · pinned host {ip}")),
-                None => toast(format!("Connected to {host}")),
+            let paired = ui().shared.just_paired.lock().unwrap().take();
+            match (paired, ui().shared.just_pinned.lock().unwrap().take()) {
+                (Some(fp), _) => toast(format!("Paired with {host} (key {fp}) — connected")),
+                (None, Some(ip)) => toast(format!("Connected to {host} · pinned host {ip}")),
+                (None, None) => toast(format!("Connected to {host}")),
             }
             LRESULT(0)
         }
@@ -2002,8 +2045,7 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
     let mut ever_connected = false;
     // Listen mode: per-IP backoff after failed handshakes.
     let mut backoff = peers::Backoff::default();
-    // Connect mode: consecutive authentication failures against the configured host.
-    let mut auth_failures = 0u32;
+    let pairing: Arc<GuiPairing> = Arc::new(GuiPairing { hwnd: hwnd_raw, cancel: Mutex::new(None) });
     loop {
         if shared.quit.load(Ordering::Relaxed) {
             return;
@@ -2043,6 +2085,15 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
         };
         set_status(&shared, &tx, hwnd_raw, Some(text));
 
+        // Trust state for this attempt: the pinned host key (if paired) and our identity.
+        let auth = Auth {
+            identity: connector.identity.clone(),
+            name: hello_name(&connector.hello),
+            target: shared.pin_target.clone(),
+            pinned: ui().store.lock().unwrap().config.pinned_key(&shared.pin_target),
+            request_pairing: shared.repair.load(Ordering::Relaxed),
+            pairing: pairing.clone(),
+        };
         let res = match &connector.target {
             Target::Listen(port) => {
                 if listener.is_none() {
@@ -2061,10 +2112,9 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
                     }
                 }
                 let hello = hello_for(&connector.hello, &shared);
-                let pw = shared.password.lock().unwrap().clone();
-                match accept_admitted(listener.as_ref().unwrap(), &pw, &hello, &shared, &mut backoff) {
+                match accept_admitted(listener.as_ref().unwrap(), &auth, &hello, &shared, &mut backoff) {
                     Ok(Some((c, ip))) => {
-                        // Trust on first use: pin the first host that authenticates.
+                        // Trust on first use: pin the first host IP that authenticates.
                         let mut pinned = false;
                         ui().store.lock().unwrap().update(|c| pinned = peers::pin_first(&mut c.allowed_peers, ip));
                         if pinned {
@@ -2078,43 +2128,39 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
                     Err(e) => Err(e),
                 }
             }
-            Target::Connect(addr) => {
-                let pw = shared.password.lock().unwrap().clone();
-                Connection::connect(addr, &pw, &hello_for(&connector.hello, &shared))
-            }
+            Target::Connect(addr) => Connection::connect(addr, &auth, &hello_for(&connector.hello, &shared)),
         };
         let conn = match res {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("connection attempt failed: {e}");
-                match &connector.target {
-                    // Inbound peers are untrusted: neutral status, never a password prompt.
-                    Target::Listen(port) => {
-                        let who = if ever_connected { host.clone() } else { format!("the host on port {port}") };
-                        let what = if e.is_auth_failure() {
-                            "A connection attempt failed authentication".to_string()
-                        } else {
-                            format!("A connection attempt failed ({})", short_error(&e.to_string()))
-                        };
-                        note = Some(format!("{what} — still waiting for {who}…"));
-                    }
-                    // We dialed the configured host: after 2 auth failures in a row, ask.
-                    Target::Connect(_) => {
-                        if e.is_auth_failure() {
-                            auth_failures += 1;
-                            note = Some("Authentication failed".into());
-                            if auth_failures >= 2 {
-                                post(hwnd_raw, WM_APP_AUTH_FAILED);
-                            }
-                        } else {
-                            auth_failures = 0;
-                            note = Some(short_error(&e.to_string()));
-                        }
-                    }
+                if e.is_unknown_viewer() {
+                    // The host no longer knows our key: ask to pair (same pinned host key) next time.
+                    shared.repair.store(true, Ordering::Relaxed);
                 }
-                let retry = match connector.target {
-                    Target::Listen(_) => Duration::from_millis(200),
-                    Target::Connect(_) => Duration::from_secs(2),
+                let label = match &connector.target {
+                    Target::Listen(port) if !ever_connected => format!("the host on port {port}"),
+                    Target::Connect(addr) if !ever_connected => addr.clone(),
+                    _ => host.clone(),
+                };
+                let msg = e.user_message(&label);
+                let rate_limited = matches!(e, ConnectError::Refused { status: crate::handshake::ST_RATE_LIMITED, .. });
+                note = match &connector.target {
+                    // Inbound peers are untrusted until their key checks out: keep listening.
+                    Target::Listen(_) => match &e {
+                        ConnectError::HostKeyChanged { .. } | ConnectError::Rejected(_) | ConnectError::PairingCancelled | ConnectError::PairingFailed(_) => {
+                            Some(msg)
+                        }
+                        _ => Some(format!("A connection attempt failed ({}) — still waiting for {label}…", short_error(&msg))),
+                    },
+                    // While rate-limited, keep showing why we got there (e.g. "not paired yet").
+                    Target::Connect(_) if rate_limited && note.is_some() => note,
+                    Target::Connect(_) => Some(msg),
+                };
+                let retry = match (&connector.target, &e) {
+                    (Target::Listen(_), _) => Duration::from_millis(200),
+                    (Target::Connect(_), ConnectError::Refused { .. }) => Duration::from_secs(5),
+                    (Target::Connect(_), _) => Duration::from_secs(2),
                 };
                 if sleep_or_quit(&shared, retry) {
                     return;
@@ -2122,8 +2168,12 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
                 continue;
             }
         };
+        if conn.paired {
+            ui().store.lock().unwrap().pin_host(&shared.pin_target, &conn.host_key, &conn.host_name);
+            shared.repair.store(false, Ordering::Relaxed);
+            *shared.just_paired.lock().unwrap() = Some(crate::handshake::fingerprint(&conn.host_key));
+        }
         ever_connected = true;
-        auth_failures = 0;
         let reason = run_connection(conn, &shared, &tx, hwnd_raw);
         match reason {
             None => return, // quitting
@@ -2144,17 +2194,25 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
     }
 }
 
+/// The viewer name sent in msg3 (= ClientHello's client_name).
+fn hello_name(hello: &ClientMsg) -> String {
+    match hello {
+        ClientMsg::ClientHello { client_name, .. } => client_name.clone(),
+        _ => "glide-viewer".into(),
+    }
+}
+
 /// Listen mode: accept the next admitted peer (allowlist + backoff + pre-auth deadline, see
 /// `peers::accept_admitted`). Ok(None) = interrupted by quit/pause.
 fn accept_admitted(
     listener: &std::net::TcpListener,
-    password: &str,
+    auth: &Auth,
     hello: &ClientMsg,
     shared: &Shared,
     backoff: &mut peers::Backoff,
 ) -> Result<Option<(Connection, std::net::IpAddr)>, ConnectError> {
     let allowed = || ui().store.lock().unwrap().config.allowed_peers.clone();
-    peers::accept_admitted(listener, password, hello, &shared.abort_accept, &allowed, backoff, crate::net::HANDSHAKE_TIMEOUT)
+    peers::accept_admitted(listener, auth, hello, &shared.abort_accept, &allowed, backoff, crate::net::HANDSHAKE_TIMEOUT)
 }
 
 /// ClientHello with the current monitor's view size / refresh (the window may have moved).
@@ -2337,12 +2395,14 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         host_name: Mutex::new(opts.host_label.clone()),
         mode: AtomicU8::new(opts.mode as u8),
         has444: opts.has444,
-        password: Mutex::new(connector.password.clone()),
+        repair: AtomicBool::new(false),
         reconnect: AtomicBool::new(false),
         paused: AtomicBool::new(false),
         abort_accept: AtomicBool::new(false),
         listening: matches!(connector.target, Target::Listen(_)),
         just_pinned: Mutex::new(None),
+        just_paired: Mutex::new(None),
+        pin_target: connector.pin_target.clone(),
         config: Mutex::new(VideoConfig { width: 0, height: 0, codec: protocol::Codec::Hevc, chroma: 0, color: 0, scale: 1.0 }),
         sender: Mutex::new(None),
         clock: Mutex::new(None),
@@ -2384,7 +2444,6 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         render_tx: Mutex::new(render_tx.clone()),
         shared: shared.clone(),
         store: Mutex::new(opts.store),
-        password_source: Mutex::new(opts.password_source),
     });
     if latency_test {
         set_latency_test(true);

@@ -4,7 +4,8 @@ import GlideCore
 import Network
 import IOKit.pwr_mgt
 
-/// One connected client: handshake, message dispatch, video + cursor streaming.
+/// One connected client: v2 handshake (Noise XX) + auth phase (pinned key or pairing, see
+/// docs/PROTOCOL.md §2), message dispatch, video + cursor streaming.
 final class Session: @unchecked Sendable {
     let id: Int
     private let channel: SecureChannel
@@ -39,29 +40,50 @@ final class Session: @unchecked Sendable {
     /// Created at auth if the viewer advertised file transfer (caps bit 11) and it's enabled.
     private var files: SessionFiles?
     var onEnd: ((Session) -> Void)?
-    /// Called (on the session queue) once the peer proved the password with a valid ClientHello,
-    /// before streaming starts. Until then the session must not affect any other session.
+    /// Called (on the session queue) once a paired viewer sent a valid ClientHello, before
+    /// streaming starts. Until then the session must not affect any other session.
     var onAuthenticated: ((Session) -> Void)?
+    /// Host is paused: answer new handshakes with status 2.
+    var isPaused: () -> Bool = { false }
     static let authTimeout: TimeInterval = 5
 
-    init(id: Int, connection: NWConnection, settings: HostSettings) {
+    /// Auth phase (docs/PROTOCOL.md §2.4).
+    private enum Phase { case handshake, pairing, awaitHello, streaming, rejected }
+    private var phase = Phase.handshake
+    /// The viewer's static key once the handshake completed.
+    private(set) var viewerKey: Data?
+    private var accepted: SecureChannel.HostAccepted?
+    private var vote = PairingVote()
+    /// Bumped whenever the pre-auth deadline is re-armed (stale timers ignore themselves).
+    private var deadlineGen = 0
+
+    /// `queue`: the queue `connection` was already started on (dialer), else a new one.
+    init(id: Int, connection: NWConnection, settings: HostSettings, queue: DispatchQueue? = nil) {
         self.id = id
         self.settings = settings
-        self.channel = SecureChannel(connection: connection, queue: DispatchQueue(label: "glide.session.\(id)", qos: .userInteractive))
+        self.channel = SecureChannel(connection: connection, queue: queue ?? DispatchQueue(label: "glide.session.\(id)", qos: .userInteractive))
         self.injector = InputInjector(displayID: settings.displayID)
     }
 
     var peer: String { "\(channel.connection.endpoint)" }
+    /// Peer IP (no port/zone) for logs, notes and the rate limiter.
+    var address: String {
+        if case let .hostPort(host, _) = channel.connection.endpoint {
+            var a = "\(host)"
+            if let pct = a.firstIndex(of: "%") { a = String(a[..<pct]) }
+            return a
+        }
+        return peer
+    }
+    /// Ended without ever streaming (handshake/auth failed): the dialer backs off.
+    var failedAuth: Bool { !authed }
 
     func start() {
         channel.connection.stateUpdateHandler = { [weak self] st in
             guard let self else { return }
             switch st {
             case .ready:
-                self.channel.acceptHandshake(password: self.settings.password, salt: self.settings.salt, passwordKey: self.settings.passwordKey) { err in
-                    if let err { log("session \(self.id): handshake failed: \(err)"); self.end(); return }
-                    self.channel.startReceiving()
-                }
+                self.runHandshake()
             case .failed(let e): log("session \(self.id): connection failed: \(e)"); self.end()
             case .cancelled: self.end()
             default: break
@@ -69,16 +91,12 @@ final class Session: @unchecked Sendable {
         }
         channel.onMessage = { [weak self] d in self?.handle(d) }
         // Outbound (dialed) connections can sit in the viewer's accept backlog for a moment: allow longer.
-        let authTimeout = Session.authTimeout * (channel.connection.state == .ready ? 2 : 1)
-        channel.queue.asyncAfter(deadline: .now() + authTimeout) { [weak self] in
-            guard let self, !self.authed, !self.ended else { return }
-            log("session \(self.id): no valid ClientHello within \(Int(authTimeout))s from \(self.peer); closing")
-            self.end()
-        }
+        armDeadline(Session.authTimeout * (channel.connection.state == .ready ? 2 : 1), what: "handshake")
         channel.onClose = { [weak self] err in
             guard let self else { return }
-            if let err, case WireError.decryptFailed = err, !self.authed {
-                log("session \(self.id): authentication failed (wrong password) from \(self.peer)")
+            if let err, !self.authed {
+                log("session \(self.id): closed during \(self.phase) from \(self.peer): \(err)")
+                if self.phase == .handshake || self.phase == .awaitHello { PairingController.shared.backoff.failed(self.address) }
             } else if let err {
                 log("session \(self.id): closed: \(err)")
             }
@@ -92,10 +110,141 @@ final class Session: @unchecked Sendable {
         }
     }
 
+    /// Closes the session if it hasn't authenticated within `seconds` (re-arming replaces it).
+    private func armDeadline(_ seconds: TimeInterval, what: String) {
+        deadlineGen += 1
+        let gen = deadlineGen
+        channel.queue.asyncAfter(deadline: .now() + seconds) { [weak self] in
+            guard let self, gen == self.deadlineGen, !self.authed, !self.ended else { return }
+            if self.phase == .pairing {
+                log("session \(self.id): pairing with \(self.peer) timed out")
+                self.reject(.timeout)
+                return
+            }
+            log("session \(self.id): no \(what) within \(Int(seconds))s from \(self.peer); closing")
+            PairingController.shared.backoff.failed(self.address)
+            self.end()
+        }
+    }
+
+    // MARK: Handshake + auth phase (docs/PROTOCOL.md §1–2)
+
+    private func runHandshake() {
+        let pc = PairingController.shared
+        let addr = address
+        channel.acceptHandshake(identity: settings.identity, admission: { [weak self] in
+            if self?.isPaused() == true { return (GlideHandshake.statusPaused, 0) }
+            if let left = pc.backoff.blocked(addr) {
+                log("session \(self?.id ?? 0): \(addr) is rate-limited (\(Int(left.rounded(.up))) s left); refusing")
+                return (GlideHandshake.statusRateLimited, 0)
+            }
+            return (GlideHandshake.statusOK, pc.window.isOpen() ? GlideHandshake.hostFlagPairingOpen : 0)
+        }) { [weak self] result in
+            guard let self, !self.ended else { return }
+            switch result {
+            case .failure(SecureChannel.HandshakeFailure.v1Viewer):
+                log("session \(self.id): rejected a Glide v1 viewer from \(self.peer) (it shows “unsupported protocol version 2”; update the viewer)")
+                HostStatus.shared.note("Rejected a Glide v1 viewer (\(addr)) — update it", warning: true)
+                self.end()
+            case .failure(SecureChannel.HandshakeFailure.refused(let st)):
+                if st != GlideHandshake.statusRateLimited { log("session \(self.id): refused \(self.peer) (status \(st))") }
+                self.end()
+            case .failure(let e):
+                // EOF right after msg2 = the viewer didn't like our key (pinned to another host key).
+                log("session \(self.id): handshake with \(self.peer) failed: \(e)")
+                pc.backoff.failed(addr)
+                self.end()
+            case .success(let acc):
+                self.accepted(acc)
+            }
+        }
+    }
+
+    private func accepted(_ acc: SecureChannel.HostAccepted) {
+        accepted = acc
+        viewerKey = acc.viewerKey
+        let name = PairedViewer.displayName(acc.info.name)
+        let fp = GlideHandshake.fingerprint(acc.viewerKey)
+        clientName = name
+        channel.maxRecordBytes = SecureChannel.preAuthMaxRecord
+        channel.startReceiving()
+        let pc = PairingController.shared
+        if acc.info.pairRequest {
+            switch pc.window.claim(id) {
+            case .closed:
+                log("session \(id): viewer “\(name)” (\(fp)) at \(address) asked to pair, but pairing isn't open")
+                HostStatus.shared.note("“\(name)” (\(address)) asked to pair — use Pair New Viewer…", warning: true)
+                reject(.pairingClosed)
+            case .busy:
+                log("session \(id): viewer “\(name)” asked to pair while another pairing is in progress")
+                reject(.busy)
+            case .granted:
+                phase = .pairing
+                let code = GlideHandshake.sasCode(handshakeHash: acc.handshakeHash, viewerNonce: acc.info.nonce, hostNonce: acc.hostNonce)
+                log("session \(id): pairing with “\(name)” (\(fp)) at \(address); code \(GlideHandshake.sasText(code))")
+                armDeadline(PairingWindow.confirmTimeout, what: "pairing confirmation")
+                send(.pairReveal(nonce: acc.hostNonce))
+                pc.ask(PendingPairing(sessionId: id, viewerName: name, viewerFingerprint: fp, address: address, code: code) { [weak self] ok in
+                    self?.channel.queue.async { self?.vote.local = ok; self?.evaluateVote() }
+                })
+            }
+        } else if TrustStore.shared.isPaired(acc.viewerKey) {
+            phase = .awaitHello
+        } else {
+            log("session \(id): rejected unknown viewer “\(name)” (\(fp)) from \(address)")
+            HostStatus.shared.note("Rejected unknown viewer “\(name)” (\(address))", warning: true)
+            reject(.unknownViewer)
+        }
+    }
+
+    private func evaluateVote() {
+        guard phase == .pairing, !ended, let acc = accepted else { return }
+        let pc = PairingController.shared
+        switch vote.outcome {
+        case .pending: return
+        case .paired:
+            TrustStore.shared.add(name: clientName, key: acc.viewerKey)
+            pc.window.release(id, paired: true)
+            pc.finished(sessionId: id, result: "paired \(clientName)")
+            HostStatus.shared.update { $0.pairingUntil = nil }
+            HostStatus.shared.note("Paired “\(clientName)”", warning: false)
+            log("session \(id): paired viewer “\(clientName)” (\(GlideHandshake.fingerprint(acc.viewerKey)))")
+            phase = .awaitHello
+            send(.authResult(.ok))
+            armDeadline(Session.authTimeout, what: "ClientHello after pairing")
+        case .declinedHere:
+            log("session \(id): pairing declined on the Mac")
+            reject(.declined)
+        case .declinedByViewer:
+            log("session \(id): pairing declined on the viewer")
+            pc.window.release(id, paired: false)
+            pc.finished(sessionId: id, result: "failed declined on the PC")
+            end()
+        }
+    }
+
+    /// Sends AuthResult(code), closes once it is flushed, and counts the failure.
+    private func reject(_ code: AuthCode) {
+        let pc = PairingController.shared
+        if phase == .pairing {
+            pc.window.release(id, paired: false)
+            pc.finished(sessionId: id, result: "failed \(code)")
+        }
+        pc.backoff.failed(address)
+        phase = .rejected  // ignore whatever else arrives (e.g. a pipelined ClientHello) until flushed
+        channel.send(HostMessage.authResult(code).encoded) { [weak self] _ in
+            self?.channel.queue.async { self?.end() }
+        }
+    }
+
     private var ended = false
     func end() {
         guard !ended else { return }
         ended = true
+        if phase == .pairing {
+            PairingController.shared.window.release(id, paired: false)
+            PairingController.shared.finished(sessionId: id, result: "failed the viewer disconnected")
+        }
         channel.close()
         statsTimer?.cancel()
         Power.release(displayAssertion); displayAssertion = nil
@@ -109,7 +258,7 @@ final class Session: @unchecked Sendable {
         inputQueue.async { self.injector.releaseAll() }
         if let p = pipeline { Task { await p.stop() } }
         pipeline = nil
-        if authed { DisplayModeController.shared.sessionEnded(id: id); HostStatus.shared.sessionEnded(id: id) }
+        if authed && !hostTestMode { DisplayModeController.shared.sessionEnded(id: id); HostStatus.shared.sessionEnded(id: id) }
         log("session \(id): ended")
         onEnd?(self)
     }
@@ -129,17 +278,40 @@ final class Session: @unchecked Sendable {
 
     private func handle(_ d: Data) {
         let msg: ClientMessage
-        do { msg = try ClientMessage.decode(d) } catch { log("session \(id): bad message: \(error)"); return }
+        do { msg = try ClientMessage.decode(d) } catch { log("session \(id): bad message: \(error)"); if !authed { end() }; return }
         if !authed {
-            guard case let .hello(version, caps, vw, vh, mode, maxFps, name) = msg else { log("session \(id): expected ClientHello"); end(); return }
+            switch (phase, msg) {
+            case (.rejected, _):
+                return
+            case (.pairing, .pairConfirm(let matched)):
+                vote.viewer = matched
+                evaluateVote()
+                return
+            case (.awaitHello, .hello):
+                break
+            default:
+                log("session \(id): unexpected \(msg) during \(phase); closing")
+                end()
+                return
+            }
+            guard case let .hello(version, caps, vw, vh, mode, maxFps, _) = msg else { return }
             authed = true
-            clientName = name
+            phase = .streaming
+            channel.maxRecordBytes = RecordCipher.maxRecord
+            PairingController.shared.backoff.succeeded(address)
+            let name = clientName
+            if hostTestMode {
+                onAuthenticated?(self)
+                log("session \(id): TEST MODE: '\(name)' (\(GlideHandshake.fingerprint(viewerKey ?? Data()))) authenticated (proto v\(version), caps \(caps.rawValue)); sending ServerHello only")
+                send(.serverHello(version: GlideHandshake.version, hostName: "glide-host test mode", config: VideoConfig(width: 640, height: 360, codec: .hevc, chroma: .yuv420, scale: 1)))
+                return
+            }
             onAuthenticated?(self)
             if ended { return }  // rejected by the server (e.g. paused)
             HostStatus.shared.sessionAuthed(id: id, name: name, endpoint: channel.connection.endpoint, viewW: Int(vw), viewH: Int(vh))
             Power.wakeDisplay()
             displayAssertion = Power.preventDisplaySleep()
-            log("session \(id): '\(name)' authenticated from \(peer) (proto v\(version), view \(vw)x\(vh), caps \(caps.rawValue), mode \(mode), fps \(maxFps))")
+            log("session \(id): '\(name)' (\(GlideHandshake.fingerprint(viewerKey ?? Data()))) authenticated from \(peer) (proto v\(version), view \(vw)x\(vh), caps \(caps.rawValue), mode \(mode), fps \(maxFps))")
             if caps.contains(.clipboard) {
                 clipboard = ClipboardSync(sessionId: id, syncConcealed: settings.clipboardSyncConcealed) { [weak self] c in self?.send(.clipboard(c)) }
             }
@@ -159,6 +331,10 @@ final class Session: @unchecked Sendable {
                     self.startStreaming(caps: caps, mode: mode, maxFps: maxFps, viewW: vw)
                 }
             }
+            return
+        }
+        if hostTestMode {  // never inject input or capture in test mode
+            if case let .ping(t) = msg { send(.pong(clientTimeUs: t, hostTimeUs: hostTimeMicros())) }
             return
         }
         switch msg {
@@ -205,7 +381,7 @@ final class Session: @unchecked Sendable {
         case let .setDisplayPreference(m):
             guard let p = DisplayModePreference(wire: m) else { log("session \(id): unknown display preference \(m)"); return }
             DisplayModeController.shared.setSessionPreference(id: id, p) { [weak self] _ in self?.sendDisplayInfo() }
-        case .hello: break
+        case .hello, .pairConfirm: break
         }
     }
 
@@ -226,7 +402,7 @@ final class Session: @unchecked Sendable {
             guard let self else { return }
             if !sentHello {
                 sentHello = true
-                self.send(.serverHello(version: Handshake.version, hostName: Host.current().localizedName ?? "Mac", config: cfg))
+                self.send(.serverHello(version: GlideHandshake.version, hostName: Host.current().localizedName ?? "Mac", config: cfg))
                 if let sharpCfg { self.send(.sharpLayerConfig(sharpCfg)) }
                 if let clip = self.clipboard {
                     // Only to viewers with caps bit 8 (PROTOCOL.md §5), and only after ServerHello.

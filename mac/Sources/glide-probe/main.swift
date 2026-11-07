@@ -1,5 +1,6 @@
 import AppKit
 import CoreMedia
+import CryptoKit
 import Foundation
 import GlideCore
 import ImageIO
@@ -9,13 +10,16 @@ import VideoToolbox
 
 // Headless test client: connects to a glide-host, decodes frames with VideoToolbox, and reports
 // throughput and end-to-end latency (exact when run on the same Mac as the host: shared clock).
-// Usage: glide-probe [host] [--port N] [--password PW|--password-file F] [--seconds N] [--mode fast|sharp]
-//                    [--animate] [--png out.png] [--pattern [--pattern-cell PT] [--pattern-kind target|draw]]
+// Usage: glide-probe [host] [--port N] [--seconds N] [--mode fast|sharp]
+//                    [--animate] [--png out.png] [--forget-host] [--pattern [--pattern-cell PT] [--pattern-kind target|draw]]
 //        glide-probe --pattern-only [--seconds N] [--pattern-hz HZ]   (just the latency test pattern window, no connection)
 // --pattern shows the docs/LATENCY.md block-code window (top-left of the main screen) with the host
 // clock in it every frame; the probe reads it back from its decoded frames (ground truth: pattern
 // clock -> decoded on the same Mac). The probe also asks for FrameTiming (PROTOCOL.md §3.4) and
 // prints the host's per-stage breakdown.
+// Security v2: the probe is a viewer with its own key (probe.json in the host's config folder, or
+// $GLIDE_PROBE_CONFIG); the first connection pairs (the host must be in pairing mode; the code is
+// printed here and must be confirmed on both sides; GLIDE_PAIR_CONFIRM=yes answers here).
 
 var args = Array(CommandLine.arguments.dropFirst())
 func take(_ f: String) -> String? {
@@ -26,8 +30,7 @@ func take(_ f: String) -> String? {
 func flag(_ f: String) -> Bool { if let i = args.firstIndex(of: f) { args.remove(at: i); return true }; return false }
 
 let port = UInt16(take("--port") ?? "7420")!
-var password = take("--password") ?? ProcessInfo.processInfo.environment["GLIDE_PASSWORD"] ?? ""
-if let f = take("--password-file") { password = (try! String(contentsOfFile: f, encoding: .utf8)).trimmingCharacters(in: .whitespacesAndNewlines) }
+let forgetHost = flag("--forget-host")
 let seconds = Double(take("--seconds") ?? "8")!
 let modeArg = take("--mode")
 let mode: StreamMode = modeArg == "sharp" ? .sharp : modeArg == "hybrid" ? .hybrid : .fast
@@ -281,6 +284,32 @@ if animate {
     Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in if Date().timeIntervalSince(animStart) < animateFor { v.phase += 0.05; v.needsDisplay = true } else if w.isVisible { w.orderOut(nil) } }
 }
 
+// MARK: Identity + pins (probe.json)
+
+struct ProbeConfig: Codable {
+    var key: String
+    var pins: [String: String] = [:]
+    static var url: URL {
+        if let p = ProcessInfo.processInfo.environment["GLIDE_PROBE_CONFIG"], !p.isEmpty { return URL(fileURLWithPath: p) }
+        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Glide/probe.json")
+    }
+    static func load() -> ProbeConfig {
+        if let d = try? Data(contentsOf: url), let c = try? JSONDecoder().decode(ProbeConfig.self, from: d), Data(hex: c.key)?.count == 32 { return c }
+        let c = ProbeConfig(key: Curve25519.KeyAgreement.PrivateKey().rawRepresentation.hex)
+        c.save()
+        return c
+    }
+    func save() {
+        try? FileManager.default.createDirectory(at: ProbeConfig.url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        FileManager.default.createFile(atPath: ProbeConfig.url.path, contents: try! JSONEncoder().encode(self), attributes: [.posixPermissions: 0o600])
+    }
+}
+var probeConfig = ProbeConfig.load()
+let probeKey = try! Curve25519.KeyAgreement.PrivateKey(rawRepresentation: Data(hex: probeConfig.key)!)
+let pinTarget = listenModeFlagPeek() ? "listen:\(port)" : "\(host):\(port)"
+func listenModeFlagPeek() -> Bool { CommandLine.arguments.contains("--listen") }
+if forgetHost { probeConfig.pins[pinTarget] = nil; probeConfig.save(); print("forgot the host key pinned for \(pinTarget)"); exit(0) }
+
 // MARK: Connection
 
 let decoder = Decoder()
@@ -329,6 +358,8 @@ ch.onMessage = { d in
         guard let m = try? HostMessage.decode(d) else { print("bad host message"); return }
         let now = hostTimeMicros()
         switch m {
+        case .authResult(let c):
+            print("host rejected this probe: \(c) (pair it: glide-host --pair, then run the probe again)"); exit(1)
         case let .serverHello(_, name, cfg):
             lock.lock(); stats.hostName = name; stats.config = cfg; lock.unlock()
             decoder.reset(codec: cfg.codec)
@@ -377,20 +408,54 @@ ch.onMessage = { d in
         }
     }
     ch.onClose = { err in finish("closed: \(err.map { "\($0)" } ?? "eof")") }
+    func sendHello() {
+        started = Date()
+        ch.send(ClientMessage.hello(version: GlideHandshake.version, caps: capsArg, viewW: viewW, viewH: viewW * 9 / 16, mode: mode, maxFps: 60, name: "glide-probe").encoded)
+        ch.send(ClientMessage.latencyEnable(flags: 1).encoded)
+        let pt = DispatchSource.makeTimerSource(queue: q)
+        pt.schedule(deadline: .now(), repeating: 0.25)
+        pt.setEventHandler { ch.send(ClientMessage.ping(clientTimeUs: hostTimeMicros()).encoded) }
+        pt.resume()
+        pingTimer = pt
+    }
     conn.stateUpdateHandler = { st in
         switch st {
         case .ready:
-            ch.performHandshake(password: password) { err in
-                if let err { print("handshake failed: \(err)"); exit(1) }
+            let pinned = probeConfig.pins[pinTarget].flatMap { Data(hex: $0) }
+            ch.performHandshake(identity: probeKey, name: "glide-probe", pinned: pinned) { res in
+                guard case .success(let vc) = res else {
+                    if case .failure(let e) = res { print("handshake failed: \(e)") }
+                    exit(1)
+                }
+                guard vc.pairing else { ch.startReceiving(); sendHello(); return }
+                // Pairing (docs/PROTOCOL.md §2.4): PairReveal -> code -> PairConfirm -> AuthResult.
+                print("pairing with \(pinTarget) (host key \(GlideHandshake.fingerprint(vc.hostKey)), pairing window \(vc.hostInfo.pairingOpen ? "open" : "closed"))")
+                let normal = ch.onMessage
+                ch.onMessage = { d in
+                    switch try? HostMessage.decode(d) {
+                    case .pairReveal(let nH)?:
+                        guard GlideHandshake.commitment(nH) == vc.hostInfo.commitment else { print("pairing: commitment mismatch"); exit(1) }
+                        let code = GlideHandshake.sasCode(handshakeHash: vc.handshakeHash, viewerNonce: vc.viewerNonce, hostNonce: nH)
+                        print("PAIRING CODE \(GlideHandshake.sasText(code)) — confirm on the Mac too")
+                        DispatchQueue.global().async {
+                            var ok: Bool
+                            if let v = ProcessInfo.processInfo.environment["GLIDE_PAIR_CONFIRM"] { ok = ["1", "y", "yes"].contains(v.lowercased()) }
+                            else { print("Does the Mac show the same code? [y/N] ", terminator: ""); fflush(stdout); ok = ["y", "yes"].contains((readLine() ?? "").lowercased()) }
+                            ch.send(ClientMessage.pairConfirm(ok).encoded)
+                            if !ok { print("pairing declined"); exit(1) }
+                        }
+                    case .authResult(let c)?:
+                        guard c == .ok else { print("host: \(c)"); exit(1) }
+                        probeConfig.pins[pinTarget] = vc.hostKey.hex
+                        probeConfig.save()
+                        print("paired; pinned host key for \(pinTarget)")
+                        ch.onMessage = normal
+                        sendHello()
+                    default:
+                        print("unexpected message during pairing"); exit(1)
+                    }
+                }
                 ch.startReceiving()
-                started = Date()
-                ch.send(ClientMessage.hello(version: 1, caps: capsArg, viewW: viewW, viewH: viewW * 9 / 16, mode: mode, maxFps: 60, name: "glide-probe").encoded)
-                ch.send(ClientMessage.latencyEnable(flags: 1).encoded)
-                let pt = DispatchSource.makeTimerSource(queue: q)
-                pt.schedule(deadline: .now(), repeating: 0.25)
-                pt.setEventHandler { ch.send(ClientMessage.ping(clientTimeUs: hostTimeMicros()).encoded) }
-                pt.resume()
-                pingTimer = pt
             }
         case .failed(let e): print("connect failed: \(e)"); exit(1)
         default: break

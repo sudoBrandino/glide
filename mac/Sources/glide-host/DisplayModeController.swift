@@ -3,7 +3,7 @@ import CoreGraphics
 import GlideCore
 
 /// Display settings persisted in host.json under "display". Stored as strings and parsed leniently:
-/// a typo must never make host.json undecodable (that would regenerate the salt/password).
+/// a typo must never make host.json undecodable (HostConfig.load would then fall back to defaults).
 struct DisplaySettings: Codable, Equatable {
     /// automatic | crisp | smooth | retina | manual (default automatic)
     var mode: String?

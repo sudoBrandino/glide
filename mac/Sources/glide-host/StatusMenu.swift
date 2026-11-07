@@ -7,6 +7,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     struct Actions {
         var disconnect: () -> Void = {}
         var setPaused: (Bool) -> Void = { _ in }
+        var openPairing: () -> Void = {}
+        var cancelPairing: () -> Void = {}
+        var removeViewer: (PairedViewer) -> Void = { _ in }
         /// Send files to the connected viewer; false if it can't take files.
         var sendFiles: ([URL]) -> Bool = { _ in false }
         var cancelFiles: () -> Void = {}
@@ -15,7 +18,6 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     let menu = NSMenu()
     private var statusItem: NSStatusItem?
     private let actions: Actions
-    private let password: String
     private let displayID: CGDirectDisplayID
     private var refreshTimer: Timer?
     private var menuOpen = false
@@ -31,9 +33,14 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private let latencyItem = NSMenuItem()
     private let detailItem = NSMenuItem()
     private let warningItem = NSMenuItem()
+    /// Last security event (rejected viewer, paired, v1 viewer).
+    private let noteItem = NSMenuItem()
     // Actions
     private let disconnectItem = NSMenuItem(title: "Disconnect Viewer", action: #selector(disconnect), keyEquivalent: "")
     private let pauseItem = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: "")
+    private let pairItem = NSMenuItem(title: "Pair New Viewer…", action: #selector(togglePairing), keyEquivalent: "")
+    private let viewersItem = NSMenuItem(title: "Paired Viewers", action: nil, keyEquivalent: "")
+    private let viewersMenu = NSMenu()
     private let displayItem = NSMenuItem(title: "Display Mode", action: nil, keyEquivalent: "")
     private let displayMenu = NSMenu()
     private var prefItems: [DisplayModePreference: NSMenuItem] = [:]
@@ -51,9 +58,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     /// Where received files go (host.json files.downloadDir).
     var downloadDir: URL?
 
-    init(actions: Actions, password: String, displayID: CGDirectDisplayID, showStatusItem: Bool = true) {
+    init(actions: Actions, displayID: CGDirectDisplayID, showStatusItem: Bool = true) {
         self.actions = actions
-        self.password = password
         self.displayID = displayID
         let env = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"]
         launchdLabel = (env?.isEmpty == false && env != "0") ? env : nil
@@ -74,13 +80,18 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private func buildMenu() {
         menu.autoenablesItems = false
         menu.delegate = self
-        for i in [headerItem, viewerItem, streamItem, resolutionItem, statsItem, latencyItem, detailItem, warningItem] {
+        for i in [headerItem, viewerItem, streamItem, resolutionItem, statsItem, latencyItem, detailItem, warningItem, noteItem] {
             i.isEnabled = false
             menu.addItem(i)
         }
         menu.addItem(.separator())
         for i in [disconnectItem, pauseItem] { i.target = self; menu.addItem(i) }
         menu.addItem(.separator())
+        pairItem.target = self
+        menu.addItem(pairItem)
+        viewersMenu.autoenablesItems = false
+        viewersItem.submenu = viewersMenu
+        menu.addItem(viewersItem)
         for i in [sendFilesItem, cancelFilesItem] { i.target = self }
         fileProgressItem.isEnabled = false
         recentMenu.autoenablesItems = false
@@ -124,7 +135,6 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
         add("Open Log", #selector(openLog))
-        add("Copy Viewer Password", #selector(copyPassword))
         menu.addItem(.separator())
         if launchdLabel != nil {
             add("Restart Glide Host", #selector(restart))
@@ -196,6 +206,27 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         warningItem.title = "⚠︎ Missing permission: " + warnings.joined(separator: ", ")
         warningItem.isHidden = warnings.isEmpty
 
+        if let n = s.note {
+            let t = DateFormatter.localizedString(from: n.at, dateStyle: .none, timeStyle: .short)
+            noteItem.title = (n.warning ? "⚠︎ " : "") + n.text + (n.count > 1 ? " (×\(n.count))" : "") + " · \(t)"
+            noteItem.isHidden = false
+        } else { noteItem.isHidden = true }
+
+        // Pairing
+        if let who = s.pairingWith {
+            pairItem.title = "Pairing with “\(who)” — compare the code…"
+            pairItem.isEnabled = false
+        } else if let until = s.pairingUntil, until > Date() {
+            let left = Int(until.timeIntervalSinceNow.rounded(.up))
+            pairItem.title = String(format: "Pairing Open — %d:%02d left (Cancel)", left / 60, left % 60)
+            pairItem.isEnabled = true
+        } else {
+            pairItem.title = "Pair New Viewer…"
+            pairItem.isEnabled = true
+        }
+        viewersItem.title = "Paired Viewers (\(s.pairedViewers.count))"
+        rebuildViewers(s.pairedViewers, hostFingerprint: s.hostFingerprint)
+
         disconnectItem.isEnabled = s.viewer != nil
         refreshFiles(s)
         pauseItem.title = s.paused ? (s.dialTarget != nil ? "Resume Dialing" : "Resume") : (s.dialTarget != nil ? "Pause Dialing" : "Pause (Refuse Connections)")
@@ -220,6 +251,40 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         displayActionItem.title = action ?? ""
         displayActionItem.isHidden = action == nil
         displayItem.title = "Display Mode: \(Self.prefTitle(st.preference))"
+    }
+
+    private var shownViewers: [PairedViewer]?
+    private var shownFingerprint: String?
+
+    private func rebuildViewers(_ list: [PairedViewer], hostFingerprint: String?) {
+        guard list != shownViewers || hostFingerprint != shownFingerprint else { return }
+        shownViewers = list
+        shownFingerprint = hostFingerprint
+        viewersMenu.removeAllItems()
+        if list.isEmpty {
+            let i = NSMenuItem(title: "None — use Pair New Viewer…", action: nil, keyEquivalent: "")
+            i.isEnabled = false
+            viewersMenu.addItem(i)
+        }
+        for v in list {
+            let day = v.paired.prefix(10)
+            let item = NSMenuItem(title: "\(v.name) — paired \(day)", action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            sub.autoenablesItems = false
+            let info = NSMenuItem(title: "Key \(v.fingerprint)", action: nil, keyEquivalent: "")
+            info.isEnabled = false
+            sub.addItem(info)
+            let rm = NSMenuItem(title: "Remove…", action: #selector(removeViewer(_:)), keyEquivalent: "")
+            rm.target = self
+            rm.representedObject = v.key
+            sub.addItem(rm)
+            item.submenu = sub
+            viewersMenu.addItem(item)
+        }
+        viewersMenu.addItem(.separator())
+        let me = NSMenuItem(title: "This Mac's key: \(hostFingerprint ?? "?")", action: nil, keyEquivalent: "")
+        me.isEnabled = false
+        viewersMenu.addItem(me)
     }
 
     private func refreshFiles(_ s: HostStatus.Snapshot) {
@@ -385,13 +450,24 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/glide-host.log")
     }
 
-    @objc private func copyPassword() {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(password, forType: .string)
-        // Ask clipboard managers / sync not to keep it (nspasteboard.org convention).
-        pb.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
-        log("menu: viewer password copied to the clipboard")
+    @objc private func togglePairing() {
+        let s = HostStatus.shared.snapshot
+        if let until = s.pairingUntil, until > Date() { actions.cancelPairing() } else { actions.openPairing() }
+        refresh()
+    }
+
+    @objc private func removeViewer(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String,
+              let v = HostStatus.shared.snapshot.pairedViewers.first(where: { $0.key == key }) else { return }
+        let a = NSAlert()
+        a.messageText = "Remove “\(v.name)”?"
+        a.informativeText = "This viewer will no longer be able to connect until it is paired again (Pair New Viewer…). If it is connected now, it is disconnected.\n\nKey \(v.fingerprint), paired \(v.paired)"
+        a.addButton(withTitle: "Remove")
+        a.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        actions.removeViewer(v)
+        refresh()
     }
 
     @objc private func restart() {

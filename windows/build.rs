@@ -1,4 +1,4 @@
-//! Embeds the Windows resources (icon, manifest, password dialog, version info) into
+//! Embeds the Windows resources (icon, manifest, pairing dialog, version info) into
 //! glide-client.exe.
 //! - windows-gnu: MinGW `windres` (`WINDRES` overrides; `<arch>-w64-mingw32-windres` when cross-compiling).
 //! - windows-msvc: `rc.exe` from the Windows SDK via the `embed-resource` crate.

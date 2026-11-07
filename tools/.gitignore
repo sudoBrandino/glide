@@ -1,2 +1,4 @@
 streams/
 __pycache__/
+.mock-host-key
+.mock-paired.json

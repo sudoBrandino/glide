@@ -1,18 +1,19 @@
 //! glide-client: Glide remote desktop viewer.
 //!
-//! Usage: glide-client [host[:port] | --listen [PORT]] [--password PW] [--mode fast|sharp|hybrid]
-//!                     [--no-ctrl-as-cmd] [--bench SECONDS] [--probe] [--forget-password]
+//! Usage: glide-client [host[:port] | --listen [PORT]] [--mode fast|sharp|hybrid]
+//!                     [--no-ctrl-as-cmd] [--bench SECONDS] [--probe] [--forget-host] [--identity]
 //! With no target, the viewer uses %APPDATA%\Glide\config.json (default: listen on 7420).
+//! Security v2: no passwords; the viewer pairs with the host once (docs/PROTOCOL.md §2).
 
 use glide::config::{self, Store, TargetSpec};
-use glide::net::Connection;
+use glide::net::{Auth, Connection, PairPrompt, PairingUi};
 use glide::protocol::{self, ClientMsg, Mode};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Args {
     host: Option<String>,
-    password: Option<String>,
     /// None = config, else automatic (hybrid if this machine decodes HEVC 4:4:4, else fast).
     mode: Option<Mode>,
     /// None = config (default on).
@@ -23,7 +24,10 @@ pub struct Args {
     probe: bool,
     /// Reverse-connect: listen on this port and let the host dial in.
     listen: Option<u16>,
-    forget_password: bool,
+    /// Remove the pinned host key for the target (unpair) and exit.
+    forget_host: bool,
+    /// Print this viewer's key fingerprint and exit.
+    identity: bool,
     /// Clipboard sync (GUI viewer only). None = config ("clipboard", default on); --no-clipboard.
     clipboard: Option<bool>,
     /// Headless Win32 clipboard self-test (no connection).
@@ -43,14 +47,14 @@ const USAGE: &str = "usage: glide-client [host[:port] | --listen [PORT]] [option
   host[:port]        dial a Glide host (default port 7420)
   --listen [PORT]    reverse connect: listen on 0.0.0.0:PORT (default 7420) and let the host
                      dial in (glide-host --connect); same protocol
-  --password PW      session password (else env GLIDE_PASSWORD, else the saved password, else a
-                     password dialog with a \"Remember\" option)
   --mode M           fast = 4:2:0 only; sharp = 4:4:4 every frame; hybrid = 4:2:0 while moving +
                      4:4:4 refinement at rest. Default: config, else hybrid if this PC decodes
                      HEVC 4:4:4, else fast
   --no-ctrl-as-cmd   don't map Ctrl->Cmd / Win->Control (also --ctrl-as-cmd to force it on)
   --no-clipboard     don't sync the clipboard (text + images) with the host (config: \"clipboard\")
-  --forget-password  delete the saved (DPAPI-encrypted) password and exit
+  --forget-host      unpair: forget the host key pinned for the target, then exit (the next
+                     connection pairs again; the Mac must be in \"Pair New Viewer…\" mode)
+  --identity         print this viewer's key fingerprint (shown on the Mac while pairing) and exit
   --no-audio         don't stream the Mac's sound (config \"audio\"; Ctrl+Alt+Shift+A mutes)
   --audio-selftest [SECONDS]
                      headless: open the default output device and run the audio path on
@@ -65,8 +69,10 @@ const USAGE: &str = "usage: glide-client [host[:port] | --listen [PORT]] [option
                      report true glass-to-glass latency (Ctrl+Alt+Shift+L toggles; docs/LATENCY.md)
   --clipboard-selftest  exercise the Win32 clipboard path headlessly (no connection; run over SSH)
 
-Config: %APPDATA%\\Glide\\config.json (GLIDE_CONFIG_DIR overrides the folder); the saved
-password is password.dpapi next to it (only this Windows account can decrypt it).
+Config: %APPDATA%\\Glide\\config.json (GLIDE_CONFIG_DIR overrides the folder). Pairing: the
+first connection to a host shows a 6-digit code on both screens; confirm on both if they match.
+The viewer's key is identity.dpapi next to the config (only this Windows account can use it).
+GLIDE_PAIR_CONFIRM=yes|no answers the pairing prompt non-interactively (tests, --bench).
 
 Viewer hotkeys (handled locally, never sent to the Mac; F11 / Alt+Enter also toggle fullscreen):";
 
@@ -79,14 +85,19 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Strin
     let mut it = args.into_iter().peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--password" => a.password = Some(it.next().ok_or("--password needs a value")?),
+            "--password" => {
+                // v1 option: accepted (old launchers) but ignored.
+                let _ = it.next();
+                eprintln!("note: --password is ignored: Glide v2 pairs keys instead of using a password");
+            }
             "--mode" => {
                 let v = it.next().unwrap_or_default();
                 a.mode = Some(config::mode_from_str(&v).ok_or("--mode must be fast, sharp or hybrid")?);
             }
             "--no-ctrl-as-cmd" => a.ctrl_as_cmd = Some(false),
             "--ctrl-as-cmd" => a.ctrl_as_cmd = Some(true),
-            "--forget-password" => a.forget_password = true,
+            "--forget-host" => a.forget_host = true,
+            "--identity" => a.identity = true,
             "--no-clipboard" => a.clipboard = Some(false),
             "--clipboard-selftest" => a.clipboard_selftest = true,
             "--clipboard-sync-secrets" => a.clipboard_sync_secrets = true,
@@ -125,70 +136,24 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Strin
     Ok(a)
 }
 
-#[cfg(windows)]
-type PasswordSource = glide::win::app::PasswordSource;
-#[cfg(not(windows))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-enum PasswordSource {
-    Cli,
-    Env,
-    Saved,
-    Prompted,
-}
+/// Console pairing prompt (headless --bench, non-Windows). GLIDE_PAIR_CONFIRM=yes|no answers it.
+struct ConsolePairing;
 
-/// CLI, then GLIDE_PASSWORD, then the DPAPI-saved password. None = must ask.
-fn known_password(a: &Args, dir: Option<&std::path::Path>) -> Option<(String, PasswordSource)> {
-    if let Some(p) = &a.password {
-        return Some((p.clone(), PasswordSource::Cli));
-    }
-    if let Ok(p) = std::env::var("GLIDE_PASSWORD") {
-        if !p.is_empty() {
-            return Some((p, PasswordSource::Env));
+impl PairingUi for ConsolePairing {
+    fn confirm(&self, p: &PairPrompt) -> bool {
+        eprintln!("PAIRING with {} — code {}  (host key {}, this viewer {})", p.target, p.code, p.host_fingerprint, p.viewer_fingerprint);
+        if let Ok(v) = std::env::var("GLIDE_PAIR_CONFIRM") {
+            let yes = matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "y" | "yes");
+            eprintln!("GLIDE_PAIR_CONFIRM={v}: {}", if yes { "codes match" } else { "declined" });
+            return yes;
         }
+        use std::io::Write;
+        eprint!("Does the Mac show the same code? Confirm it there too. [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut s = String::new();
+        let _ = std::io::stdin().read_line(&mut s);
+        matches!(s.trim().to_ascii_lowercase().as_str(), "y" | "yes")
     }
-    #[cfg(windows)]
-    if let Some(p) = dir.and_then(glide::win::dpapi::load_password) {
-        return Some((p, PasswordSource::Saved));
-    }
-    let _ = dir;
-    None
-}
-
-/// GUI: the password dialog (optionally saving it). Some(None) = user cancelled.
-#[cfg(windows)]
-fn dialog_password(dir: Option<&std::path::Path>, target: &str) -> Option<Option<(String, PasswordSource)>> {
-    let msg = format!("Enter the password for the Glide host ({target}).");
-    match glide::win::prompt::ask_password(None, &msg, true) {
-        Ok(Some(a)) => {
-            let mut src = PasswordSource::Prompted;
-            if a.remember {
-                match dir.map(|d| glide::win::dpapi::store_password(d, &a.password)) {
-                    Some(Ok(())) => src = PasswordSource::Saved,
-                    Some(Err(e)) => eprintln!("warning: cannot save password: {e}"),
-                    None => eprintln!("warning: no config folder; password not saved"),
-                }
-            }
-            Some(Some((a.password, src)))
-        }
-        Ok(None) => Some(None),
-        Err(e) => {
-            eprintln!("{e}; falling back to the console");
-            None
-        }
-    }
-}
-
-fn prompt_password() -> String {
-    use std::io::Write;
-    eprint!("Password: ");
-    let _ = std::io::stderr().flush();
-    #[cfg(windows)]
-    let _echo = glide::win::console::EchoOff::new();
-    let mut s = String::new();
-    let _ = std::io::stdin().read_line(&mut s);
-    eprintln!();
-    s.trim_end_matches(['\r', '\n']).to_string()
 }
 
 fn client_name() -> String {
@@ -260,8 +225,8 @@ fn main() -> ExitCode {
         }
     }
 
-    // Persistent settings (+ migration of a legacy plaintext password into DPAPI).
-    let (mut store, legacy_pw, warnings) = Store::open(config::config_dir());
+    // Persistent settings.
+    let (mut store, warnings) = Store::open(config::config_dir());
     for w in &warnings {
         eprintln!("warning: {w}");
     }
@@ -270,53 +235,46 @@ fn main() -> ExitCode {
     if store.config.clipboard_sync_secrets {
         glide::win::clipboard::set_sync_secrets(true);
     }
-    if let Some(pw) = legacy_pw {
-        #[cfg(windows)]
-        match cfg_dir.as_deref().map(|d| glide::win::dpapi::store_password(d, &pw)) {
-            Some(Ok(())) => eprintln!("moved the plaintext password from config.json into password.dpapi (encrypted)"),
-            Some(Err(e)) => eprintln!("warning: cannot encrypt the config password ({e}); it was removed from config.json"),
-            None => {}
-        }
-        let _ = pw;
-        if let Err(e) = store.save() {
-            eprintln!("warning: cannot write config: {e}");
-        }
+    // v1 leftovers: left in place (a rollback to v1 still finds them) but no longer used.
+    if cfg_dir.as_deref().is_some_and(|d| d.join(config::LEGACY_PASSWORD_FILE).exists()) {
+        eprintln!("note: {} (v1 saved password) is no longer used; Glide v2 pairs keys. It is left in place for a rollback", config::LEGACY_PASSWORD_FILE);
     }
-    if args.forget_password {
-        #[cfg(windows)]
-        let had = cfg_dir.as_deref().map(glide::win::dpapi::forget_password).unwrap_or(false);
-        #[cfg(not(windows))]
-        let had = false;
-        eprintln!("{}", if had { "saved password removed" } else { "no saved password" });
-        return ExitCode::SUCCESS;
+    if std::env::var_os("GLIDE_PASSWORD").is_some() {
+        eprintln!("note: GLIDE_PASSWORD is ignored: Glide v2 pairs keys instead of using a password");
     }
 
     let target = config::resolve_target(args.host.as_deref(), args.listen, &store.config);
+    let pin_target = config::pin_target(&target);
+    if args.forget_host {
+        match store.forget_host(&pin_target) {
+            Some(p) => eprintln!("forgot host key {} for {pin_target} ({})", p.key, p.name),
+            None => eprintln!("no host key pinned for {pin_target}"),
+        }
+        return ExitCode::SUCCESS;
+    }
+    let identity = match glide::identity::load_or_create(cfg_dir.as_deref()) {
+        Ok((id, how)) => {
+            match how {
+                glide::identity::Loaded::Created => eprintln!("created this viewer's key ({})", id.fingerprint()),
+                glide::identity::Loaded::Ephemeral => eprintln!("warning: no config folder; using a temporary key (pairing won't be remembered)"),
+                glide::identity::Loaded::Existing => {}
+            }
+            id
+        }
+        Err(e) => {
+            eprintln!("error: {e}\n(move the file away to create a new key; the viewer must then be paired again)");
+            return ExitCode::from(1);
+        }
+    };
+    if args.identity {
+        println!("{}", identity.fingerprint());
+        return ExitCode::SUCCESS;
+    }
     let host = match &target {
         TargetSpec::Connect(h) => h.clone(),
         TargetSpec::Listen(p) => format!("listen:{p}"),
     };
-    let target_desc = match &target {
-        TargetSpec::Connect(h) => h.clone(),
-        TargetSpec::Listen(p) => format!("waiting on port {p}"),
-    };
     let ctrl_as_cmd = args.ctrl_as_cmd.unwrap_or(store.config.ctrl_as_cmd);
-
-    let (password, password_source) = match known_password(&args, cfg_dir.as_deref()) {
-        Some(p) => p,
-        None => {
-            #[cfg(windows)]
-            let from_dialog = if args.bench.is_none() { dialog_password(cfg_dir.as_deref(), &target_desc) } else { None };
-            #[cfg(not(windows))]
-            let from_dialog: Option<Option<(String, PasswordSource)>> = None;
-            let _ = &target_desc;
-            match from_dialog {
-                Some(Some(p)) => p,
-                Some(None) => return ExitCode::SUCCESS, // cancelled
-                None => (prompt_password(), PasswordSource::Prompted),
-            }
-        }
-    };
 
     // Capabilities: HEVC 4:2:0 + H.264 always; HEVC 4:4:4 only if this machine can decode it.
     #[allow(unused_mut)]
@@ -384,14 +342,13 @@ fn main() -> ExitCode {
                 mode,
                 host_label: host,
                 has444,
-                password_source,
                 audio: audio_on,
                 audio_muted: store.config.audio_muted,
                 latency_test: args.latency_test,
                 clipboard: args.clipboard.unwrap_or(store.config.clipboard),
                 store,
             };
-            return match glide::win::app::run(Connector { target, password, hello }, opts) {
+            return match glide::win::app::run(Connector { target, identity, pin_target, hello }, opts) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -406,16 +363,24 @@ fn main() -> ExitCode {
         }
     }
 
-    // Bench: one-shot connection.
-    let _ = (ctrl_as_cmd, password_source, &mut store);
+    // Bench: one-shot connection (pairing on the console if needed).
+    let _ = ctrl_as_cmd;
+    let auth = Auth {
+        identity,
+        name: client_name(),
+        target: pin_target.clone(),
+        pinned: store.config.pinned_key(&pin_target),
+        request_pairing: false,
+        pairing: Arc::new(ConsolePairing),
+    };
     let res = match &target {
-        TargetSpec::Listen(port) => Connection::listen(*port, &password, &hello),
-        TargetSpec::Connect(h) => Connection::connect(h, &password, &hello),
+        TargetSpec::Listen(port) => Connection::listen(*port, &auth, &hello),
+        TargetSpec::Connect(h) => Connection::connect(h, &auth, &hello),
     };
     let conn = match res {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error: connect to {host}: {e}");
+            eprintln!("error: connect to {host}: {}", e.user_message(&host));
             if let Some(secs) = args.bench {
                 println!(
                     "{{\"host\":{},\"seconds\":{secs},\"frames\":0,\"errors\":[{}]}}",
@@ -426,6 +391,9 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if conn.paired {
+        store.pin_host(&pin_target, &conn.host_key, &conn.host_name);
+    }
     eprintln!(
         "connected to {} ({}x{} {} {}, scale {}), caps={:#05b}, mode={}",
         conn.host_name,
@@ -480,16 +448,16 @@ mod tests {
         assert_eq!(a.mode, Some(Mode::Sharp));
         assert_eq!(a.ctrl_as_cmd, Some(false));
         let a = p(&["--listen", "7421", "--password", "x"]).unwrap();
-        assert_eq!(a.listen, Some(7421));
-        assert_eq!(a.password.as_deref(), Some("x"));
-        let a = p(&["mac.local:7420", "--ctrl-as-cmd", "--forget-password", "--no-clipboard", "--no-audio"]).unwrap();
+        assert_eq!(a.listen, Some(7421), "v1 --password is accepted and ignored");
+        assert!(p(&["--identity"]).unwrap().identity);
+        let a = p(&["mac.local:7420", "--ctrl-as-cmd", "--forget-host", "--no-clipboard", "--no-audio"]).unwrap();
         assert_eq!(a.clipboard, Some(false));
         assert_eq!(a.audio, Some(false));
         assert_eq!(p(&["--audio-selftest"]).unwrap().audio_selftest, Some(3.0));
         assert_eq!(p(&["--audio-selftest", "5"]).unwrap().audio_selftest, Some(5.0));
         assert_eq!(a.host.as_deref(), Some("mac.local:7420"));
         assert_eq!(a.ctrl_as_cmd, Some(true));
-        assert!(a.forget_password);
+        assert!(a.forget_host);
         assert!(p(&["--mode", "ultra"]).is_err());
         assert!(p(&["a", "b"]).is_err());
         assert!(p(&["--nope"]).is_err());
@@ -510,9 +478,4 @@ mod tests {
         assert!(a.ctrl_as_cmd.unwrap_or(c.ctrl_as_cmd));
     }
 
-    #[test]
-    fn password_precedence() {
-        let a = p(&["--password", "cli"]).unwrap();
-        assert_eq!(known_password(&a, None).map(|x| x.1), Some(PasswordSource::Cli));
-    }
 }

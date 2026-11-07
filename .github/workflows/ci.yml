@@ -30,8 +30,10 @@ jobs:
       - run: pip install cryptography
       - name: Regenerate and compare
         run: |
+          python3 tools/glide_noise.py                                # official Noise vectors
           python3 tools/gen_vectors.py "$RUNNER_TEMP/v.json"
           cmp "$RUNNER_TEMP/v.json" docs/test-vectors.json
+          python3 tools/gen_vectors.py --check docs/test-vectors-rust.json  # Rust transcript, replayed in Python
 
   # Swift host: release build + protocol self-test against docs/test-vectors.json.
   mac:
@@ -71,7 +73,7 @@ jobs:
           swiftc -O tools/display-mode.swift -o "$RUNNER_TEMP/glide-display-mode"
           swiftc -O tools/compare.swift -o "$RUNNER_TEMP/glide-compare"
           for f in tools/*.sh; do bash -n "$f"; done
-          python3 -m py_compile tools/mock_host.py tools/gen_vectors.py
+          python3 -m py_compile tools/mock_host.py tools/gen_vectors.py tools/glide_noise.py
 
   # Rust viewer: platform-independent unit tests on Linux, plus the MinGW cross-build of the exe.
   rust:

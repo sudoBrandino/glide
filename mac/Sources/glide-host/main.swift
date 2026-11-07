@@ -1,13 +1,13 @@
 import AppKit
+import CryptoKit
 import Foundation
 import GlideCore
 import Network
 
 struct HostSettings {
     var port: UInt16 = 7420
-    var password: String
-    var salt: Data
-    var passwordKey: Data
+    /// This Mac's static key (host-key, see HostIdentity).
+    var identity: Curve25519.KeyAgreement.PrivateKey
     var displayID: CGDirectDisplayID = CGMainDisplayID()
     var fps = 60
     var bitrateKbps = 0
@@ -25,9 +25,11 @@ struct ClipboardSettings: Codable {
     var syncConcealed: Bool?
 }
 
-/// Persistent host identity: password salt (and a generated password if none supplied).
+/// host.json (`~/Library/Application Support/Glide`, or $GLIDE_HOST_CONFIG_DIR).
 struct HostConfig: Codable {
-    var salt: String
+    /// v1 leftovers: no longer used (security v2 pairs keys), but kept untouched in the file so a
+    /// rollback to the v1 host still finds its password.
+    var salt: String?
     var password: String?
     /// Default `--connect` target (viewer running `--listen`), used when no CLI flag is given.
     var connect: String?
@@ -35,35 +37,61 @@ struct HostConfig: Codable {
     var display: DisplaySettings? = nil
     /// Clipboard sync options (ClipboardSync.swift).
     var clipboard: ClipboardSettings? = nil
+    /// Viewers allowed to connect (security v2 pairing).
+    var pairedViewers: [PairedViewer]? = nil
     /// File transfer options (HostFiles.swift).
     var files: FileSettings? = nil
 
-    static var url: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Glide", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        return dir.appendingPathComponent("host.json")
+    static var dir: URL {
+        let base: URL
+        if let d = ProcessInfo.processInfo.environment["GLIDE_HOST_CONFIG_DIR"], !d.isEmpty {
+            base = URL(fileURLWithPath: d, isDirectory: true)
+        } else {
+            base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Glide", isDirectory: true)
+        }
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        return base
     }
 
+    static var url: URL { dir.appendingPathComponent("host.json") }
+
+    /// Never overwrites an existing file it can't decode (that would drop the paired viewers);
+    /// uses defaults in memory instead.
     static func load() -> HostConfig {
-        if let d = try? Data(contentsOf: url), let c = try? JSONDecoder().decode(HostConfig.self, from: d) { return c }
-        let c = HostConfig(salt: Handshake.randomBytes(16).hex, password: nil, connect: nil)
-        c.save()
-        return c
+        guard let d = try? Data(contentsOf: url) else {
+            let c = HostConfig()
+            c.save()
+            return c
+        }
+        do { return try JSONDecoder().decode(HostConfig.self, from: d) } catch {
+            log("config: \(url.path) is not valid (\(error)); using defaults without saving — fix the file")
+            return HostConfig()
+        }
     }
 
     func save() {
-        let d = try! JSONEncoder().encode(self)
-        FileManager.default.createFile(atPath: HostConfig.url.path, contents: d, attributes: [.posixPermissions: 0o600])
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let d = try! enc.encode(self)
+        let tmp = HostConfig.url.appendingPathExtension("tmp")
+        FileManager.default.createFile(atPath: tmp.path, contents: d, attributes: [.posixPermissions: 0o600])
+        rename(tmp.path, HostConfig.url.path)
     }
 }
 
 func usage() -> Never {
     print("""
-    usage: glide-host [--port N] [--password PW | --password-file PATH] [--fps N] [--bitrate-kbps N]
-                      [--max-width PX] [--display ID] [--connect HOST[:PORT]]
-           glide-host --request-permissions     (prompt for Screen Recording + Accessibility, wait, exit)
+    usage: glide-host [--port N] [--fps N] [--bitrate-kbps N] [--max-width PX] [--display ID]
+                      [--connect HOST[:PORT]]
+           glide-host --pair                (open the 2-minute pairing window of the running host;
+                                             in a terminal, wait for the viewer and type its code)
+           glide-host --pair-code NNNNNN    (confirm the viewer that is waiting to pair, if the code
+                                             matches what the PC shows; else decline it)
+           glide-host --paired              (list paired viewers)
+           glide-host --unpair NAME|KEY     (remove a paired viewer: name, key or fingerprint prefix)
+           glide-host --identity            (print this Mac's key fingerprint)
+           glide-host --request-permissions (prompt for Screen Recording + Accessibility, wait, exit)
            glide-host --set-connect HOST[:PORT] (save the default dial-out target in host.json)
-           glide-host --set-password-file PATH  (save the password in host.json)
            glide-host --selftest-ui [--out DIR] (print the status menu per state + display-mode picks; no capture)
            glide-host --encode-bench [SECONDS]  (offline VideoToolbox encode timing, normal vs low-latency RC,
                                                 synthetic 2560x1440 desktop content; no capture, no network)
@@ -71,8 +99,9 @@ func usage() -> Never {
       GLIDE_SCK_QUEUE_DEPTH=N (default 5), GLIDE_SCK_INTERVAL=native|fps (minimumFrameInterval)
       --connect: dial out to a client running `glide-client --listen` (reconnects automatically)
                  instead of listening. Use when the network only allows Mac -> viewer connections.
-      Password resolution: --password, --password-file, $GLIDE_PASSWORD, saved password in
-      ~/Library/Application Support/Glide/host.json (generated on first run).
+      Security v2: no password. A viewer pairs once (6-digit code confirmed on both screens) and
+      is then recognized by its key. Config: ~/Library/Application Support/Glide (host.json,
+      host-key; $GLIDE_HOST_CONFIG_DIR overrides).
     """)
     exit(2)
 }
@@ -108,28 +137,29 @@ if args.contains("--request-permissions") {
     exit(0)
 }
 
+// Pairing / identity commands talk to the running host over its control socket.
+if args.contains("--pair") || args.contains("--paired") || args.contains("--unpair") || args.contains("--pair-code") || args.contains("--identity") {
+    runTrustCommand(&args)  // exits
+}
+for legacy in ["--password", "--password-file", "--set-password-file"] where args.contains(legacy) {
+    _ = takeValue(legacy)
+    print("note: \(legacy) is ignored: Glide v2 pairs viewers instead of using a password (glide-host --pair)")
+}
+
 var config = HostConfig.load()
 if let v = takeValue("--set-connect") { config.connect = v; config.save(); print("saved connect target \(v)"); exit(0) }
-if let f = takeValue("--set-password-file") {
-    guard let pw = try? String(contentsOfFile: f, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !pw.isEmpty else { print("can't read \(f)"); exit(2) }
-    config.password = pw; config.save(); print("saved password to \(HostConfig.url.path)"); exit(0)
+if config.password != nil || config.salt != nil || ProcessInfo.processInfo.environment["GLIDE_PASSWORD"] != nil {
+    log("config: the v1 password (host.json salt/password, $GLIDE_PASSWORD) is no longer used — viewers pair with this Mac instead; host.json keeps it for a rollback to v1")
 }
-var password: String
-if let p = takeValue("--password") { password = p }
-else if let f = takeValue("--password-file") { password = (try? String(contentsOfFile: f, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
-else if let p = ProcessInfo.processInfo.environment["GLIDE_PASSWORD"] { password = p }
-else if let p = config.password { password = p }
-else {
-    let alphabet = Array("abcdefghjkmnpqrstuvwxyz23456789")
-    password = String((0..<12).map { _ in alphabet[Int.random(in: 0..<alphabet.count)] })
-    config.password = password
-    config.save()
-    print("Generated password: \(password)  (saved to \(HostConfig.url.path))")
-}
-guard !password.isEmpty else { print("empty password"); exit(2) }
-let salt = Data(hex: config.salt)!
+let identity: Curve25519.KeyAgreement.PrivateKey
+do { identity = try HostIdentity.loadOrCreate() } catch { log("identity: \(error.localizedDescription)"); exit(1) }
+let hostFingerprint = GlideHandshake.fingerprint(identity.publicKey.rawRepresentation)
+log("identity: this Mac's key is \(hostFingerprint)")
+TrustStore.shared.load(config)
+HostStatus.shared.update { $0.hostFingerprint = hostFingerprint }
+log("pairing: \(TrustStore.shared.list.count) paired viewer(s)\(TrustStore.shared.list.isEmpty ? " — open Glide → Pair New Viewer… (or glide-host --pair) to add one" : "")")
 
-var settings = HostSettings(password: password, salt: salt, passwordKey: Handshake.passwordKey(password, salt: salt))
+var settings = HostSettings(identity: identity)
 if let v = takeValue("--port"), let n = UInt16(v) { settings.port = n }
 settings.clipboardSyncConcealed = config.clipboard?.syncConcealed ?? false
 settings.files = HostFileConfig(config.files)
@@ -141,12 +171,19 @@ if let v = takeValue("--display"), let n = UInt32(v) { settings.displayID = n }
 let connectTarget = takeValue("--connect") ?? config.connect
 guard args.isEmpty else { print("unknown arguments: \(args)"); usage() }
 
+/// GLIDE_HOST_TEST_MODE=1: protocol-only test instance (used with $GLIDE_HOST_CONFIG_DIR and
+/// another --port to exercise handshake/pairing against the real viewer without disturbing a
+/// running host): no capture, no display-mode changes, no power assertions, no status item, no
+/// alerts; an authenticated viewer gets a ServerHello and nothing else.
+let hostTestMode = ProcessInfo.processInfo.environment["GLIDE_HOST_TEST_MODE"] == "1"
+if hostTestMode { log("TEST MODE: protocol only (no capture, no display changes, no UI)") }
+
 // Permissions
-if !CGPreflightScreenCaptureAccess() {
+if hostTestMode {} else if !CGPreflightScreenCaptureAccess() {
     log("Screen Recording permission missing — requesting (grant it in System Settings, then restart glide-host)")
     CGRequestScreenCaptureAccess()
 }
-if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary) {
+if !hostTestMode && !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary) {
     log("Accessibility permission missing — remote input will not work until granted")
 }
 
@@ -163,6 +200,9 @@ final class Server: @unchecked Sendable {
     private var paused = false
     private var dialTarget: (host: String, port: UInt16)?
     private var dialLoopActive = false
+    /// Dial mode: consecutive sessions that ended without authenticating (backoff 2 s → 60 s).
+    private var dialFailures = 0
+    private var pendingRedial: DispatchWorkItem?
 
     init(settings: HostSettings) throws {
         self.settings = settings
@@ -175,13 +215,13 @@ final class Server: @unchecked Sendable {
         dialTarget = (host, port)
         if paused { dialLoopActive = false; lock.unlock(); return }
         dialLoopActive = true
+        let queue = DispatchQueue(label: "glide.session.\(nextId)", qos: .userInteractive)
         lock.unlock()
         HostStatus.shared.update { $0.dialTarget = "\(host):\(port)"; $0.dialDetail = "connecting" }
         let conn = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: SecureChannel.tcpParameters())
-        log("dialer: connecting to \(host):\(port)")
-        let redial = { [weak self] in
-            DispatchQueue.global().asyncAfter(deadline: .now() + 2) { self?.dial(host: host, port: port) }
-        }
+        lock.lock(); let quiet = dialFailures > 2; lock.unlock()
+        if !quiet { log("dialer: connecting to \(host):\(port)") }
+        let redial = { [weak self] in self?.scheduleRedial(host: host, port: port) }
         var sessionStarted = false
         conn.stateUpdateHandler = { [weak self] st in
             guard let self else { return }
@@ -189,7 +229,13 @@ final class Server: @unchecked Sendable {
             case .ready where !sessionStarted:
                 sessionStarted = true
                 // Hand the live connection to a Session (it re-installs its own state handler).
-                self.adopt(conn, onEnd: redial)
+                self.adopt(conn, queue: queue) { [weak self] s in
+                    guard let self else { return }
+                    self.lock.lock()
+                    self.dialFailures = s.failedAuth ? self.dialFailures + 1 : 0
+                    self.lock.unlock()
+                    redial()
+                }
             case .waiting(let e):
                 log("dialer: waiting (\(e)); retrying"); conn.cancel()
                 HostStatus.shared.update { $0.dialDetail = "\(e)" }
@@ -201,18 +247,59 @@ final class Server: @unchecked Sendable {
             default: break
             }
         }
-        conn.start(queue: DispatchQueue(label: "glide.dialer"))
+        conn.start(queue: queue)
     }
 
-    private func adopt(_ conn: NWConnection, onEnd extra: (() -> Void)? = nil) {
+    /// Redial after 2 s, or longer after repeated failed handshakes (2 s doubling to 60 s), so an
+    /// unpaired/impostor viewer isn't hammered. `kickDialer()` (pairing window opened) cuts it short.
+    private func scheduleRedial(host: String, port: UInt16) {
+        lock.lock()
+        let n = dialFailures
+        let delay = n <= 1 ? 2.0 : min(2.0 * pow(2, Double(min(n - 1, 5))), 60)
+        var work: DispatchWorkItem!
+        work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.lock.lock(); if self.pendingRedial === work { self.pendingRedial = nil }; self.lock.unlock()
+            self.dial(host: host, port: port)
+        }
+        pendingRedial = work
+        lock.unlock()
+        if n > 1 { HostStatus.shared.update { $0.dialDetail = "viewer not accepted — retrying in \(Int(delay)) s" } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// The pairing window opened: forget the dial backoff and redial now if we're waiting.
+    func kickDialer() {
+        lock.lock()
+        dialFailures = 0
+        let w = pendingRedial
+        pendingRedial = nil
+        let target = dialTarget
+        lock.unlock()
+        guard let w, !w.isCancelled, let target else { return }
+        w.cancel()  // a cancelled work item never runs: dial directly instead
+        log("dialer: pairing window opened; redialing now")
+        DispatchQueue.global().async { self.dial(host: target.host, port: target.port) }
+    }
+
+    /// Paired viewers were removed: end their sessions.
+    func endSessions(of keys: [Data]) {
+        for s in sessions.all where s.viewerKey.map(keys.contains) == true {
+            log("server: ending session \(s.id) (viewer unpaired)")
+            s.end()
+        }
+    }
+
+    private func adopt(_ conn: NWConnection, queue: DispatchQueue? = nil, onEnd extra: ((Session) -> Void)? = nil) {
         lock.lock()
         let id = nextId; nextId += 1
-        let isPaused = paused
         lock.unlock()
-        let s = Session(id: id, connection: conn, settings: settings)
-        guard !isPaused else {
-            log("server: refusing connection from \(conn.endpoint) (paused)")
-            conn.cancel(); extra?(); return
+        let s = Session(id: id, connection: conn, settings: settings, queue: queue)
+        // A paused host still answers the handshake preamble (status 2) so the viewer can say why.
+        s.isPaused = { [weak self] in
+            guard let self else { return true }
+            self.lock.lock(); defer { self.lock.unlock() }
+            return self.paused
         }
         var source = "\(conn.endpoint)"
         if case let .hostPort(host, _) = conn.endpoint { source = "\(host)" }
@@ -231,7 +318,7 @@ final class Server: @unchecked Sendable {
         }
         s.onEnd = { [weak self] ended in
             self?.sessions.ended(ended)
-            extra?()
+            extra?(ended)
         }
         s.start()
     }
@@ -270,16 +357,28 @@ final class Server: @unchecked Sendable {
 }
 
 let app = NSApplication.shared
-let sleepAssertion = Power.preventSystemSleep()
-log(sleepAssertion != nil ? "power: preventing idle system sleep while the host runs" : "power: could not create sleep assertion")
+let sleepAssertion = hostTestMode ? nil : Power.preventSystemSleep()
+if !hostTestMode { log(sleepAssertion != nil ? "power: preventing idle system sleep while the host runs" : "power: could not create sleep assertion") }
 app.setActivationPolicy(.accessory)  // LSUIElement: menu-bar status item only
 let server = try Server(settings: settings)
-DisplayModeController.shared.start(displayID: settings.displayID)
-HostNotifier.shared.setUp()
+if !hostTestMode { DisplayModeController.shared.start(displayID: settings.displayID) }
+let pairing = PairingController.shared
+pairing.showAlerts = !hostTestMode
+pairing.onOpen = { server.kickDialer() }
+pairing.onRemove = { gone in server.endSessions(of: gone.compactMap(\.keyData)) }
+pairing.startControlSocket()
 let statusMenu = StatusMenu(actions: .init(disconnect: { server.disconnect() }, setPaused: { server.setPaused($0) },
+                                           openPairing: { pairing.openWindow(source: "menu") },
+                                           cancelPairing: { pairing.cancelWindow(source: "menu") },
+                                           removeViewer: { v in
+                                               let gone = TrustStore.shared.remove(matching: v.key)
+                                               for g in gone { log("pairing: removed viewer “\(g.name)” (\(g.fingerprint)) via menu") }
+                                               server.endSessions(of: gone.compactMap(\.keyData))
+                                           },
                                            sendFiles: { server.current?.sendFiles($0) ?? false },
                                            cancelFiles: { server.current?.cancelFiles() }),
-                            password: password, displayID: settings.displayID)
+                            displayID: settings.displayID, showStatusItem: !hostTestMode)
+HostNotifier.shared.setUp()
 statusMenu.downloadDir = settings.files.downloadDir
 log("files: transfer \(settings.files.enabled ? "on" : "off"), receiving \(settings.files.receive ? "on" : "off") into \(settings.files.downloadDir.path)")
 if let target = connectTarget {
@@ -288,5 +387,6 @@ if let target = connectTarget {
 } else {
     server.start()
 }
-signal(SIGINT) { _ in exit(0) }
+signal(SIGINT) { _ in unlink(PairingController.socketPath); exit(0) }
+signal(SIGTERM) { _ in unlink(PairingController.socketPath); exit(0) }
 app.run()

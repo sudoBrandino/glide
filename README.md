@@ -36,7 +36,7 @@ layer, so text is pixel-exact at rest and motion stays fast.
  CursorMonitor ─► cursor shape / position ──────────────────────┤      ├─► MF decoder #2 (sharp)─┘   swap chain
                                                                 ▼      │
                                           ChaCha20-Poly1305 records over TCP :7420
-                                          (X25519 + password KDF handshake)
+                                          (Noise XX handshake, pinned keys)
                                                                 ▲      │
  CGEvent injector ◄── keys (USB HID) / mouse / wheel ───────────┘      └── raw input, Ctrl→Cmd remap, ViewSize
 ```
@@ -89,7 +89,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the details.
 | File transfer, both directions (drag & drop, Finder copy + Ctrl+Alt+Shift+V, menu) | done (§6) |
 | Viewer UX | in progress |
 | Host UX: menu-bar item, automatic display mode, auth-gated session replacement | done |
-| Security v2: PAKE + pinned host identity | next ([roadmap](docs/ROADMAP.md)) |
+| Security v2: Noise XX, key pinning, pairing with a code confirmed on both screens | done (PROTOCOL.md §1–2) |
 | Virtual display, UDP transport, multi-monitor, relay for WAN | planned |
 
 ## Performance
@@ -176,19 +176,20 @@ only takes effect after the host restarts. The LaunchAgent restarts it on its ow
 
 | key | meaning |
 |---|---|
-| `salt` | Per-host password salt, generated on first run |
-| `password` | Session password. If no password is configured anywhere, a random one is generated, printed once and saved here |
+| `pairedViewers` | Viewers allowed to connect: `name`, public `key`, `paired` date (see Pairing below) |
+| `salt`, `password` | v1 leftovers: no longer used (kept so a rollback to v1 still works) |
 | `connect` | Default dial-out target (`HOST[:PORT]`). If it is set, the host dials the viewer instead of listening |
 | `clipboard` | `{"syncConcealed": false}`. `true` also syncs password-manager (concealed) pasteboard items to the viewer |
 
 ```sh
 H=~/Applications/Glide\ Host.app/Contents/MacOS/glide-host
-"$H" --set-password-file /path/to/password   # store the password (use a long random one)
 "$H" --set-connect 192.168.10.212:7420          # make the host dial this viewer by default
+"$H" --pair                                  # open the 2-minute pairing window (see Pairing)
+"$H" --paired                                # list paired viewers;  --unpair NAME|KEY removes one
+"$H" --identity                              # this Mac's key fingerprint
 ```
 
-The password is resolved in this order: `--password`, then `--password-file`, then
-`$GLIDE_PASSWORD`, then `host.json`. Other flags:
+The host's key is `host-key` in the same folder (0600; created on first start). Other flags:
 
 - `--port N` (default 7420)
 - `--connect HOST[:PORT]`
@@ -202,10 +203,13 @@ The password is resolved in this order: `--password`, then `--password-file`, th
 ```sh
 cd mac && swift build -c release --build-system native   # native backend: needed with CLT-only setups
 .build/release/glide-selftest ../docs/test-vectors.json  # protocol self-test
-.build/release/glide-host --password-file ../.dev/password                      # listen
-.build/release/glide-host --password-file ../.dev/password --connect 192.168.10.212  # dial out
-# Local end-to-end check on the same Mac (exact latency); opens a small test window
-.build/release/glide-probe 127.0.0.1 --password-file ../.dev/password --seconds 8 --animate --png /tmp/frame.png
+.build/release/glide-host                              # listen
+.build/release/glide-host --connect 192.168.10.212        # dial out
+# Local end-to-end check on the same Mac (exact latency); opens a small test window.
+# The probe pairs on first use (glide-host --pair, then confirm the printed code).
+.build/release/glide-probe 127.0.0.1 --seconds 8 --animate --png /tmp/frame.png
+# Protocol-only test instance (no capture/display changes/UI): GLIDE_HOST_TEST_MODE=1
+# GLIDE_HOST_CONFIG_DIR=/tmp/x GLIDE_HOST_CONTROL_SOCKET=/tmp/x.sock glide-host --port 7522
 ```
 
 Stop the LaunchAgent before you run a host from the shell (see Troubleshooting).
@@ -228,7 +232,6 @@ The exe is self-contained: it uses static CRT and needs only system DLLs. Run it
 interactive desktop session:
 
 ```bat
-set GLIDE_PASSWORD=...
 glide-client.exe --listen 7420        :: host dials in (glide-host --connect PC:7420)
 glide-client.exe 192.168.50.4            :: or: viewer dials the host
 ```
@@ -247,8 +250,10 @@ hooks.
 `Glide Host.app` (built by `tools/make-host-app.sh`, installed as a LaunchAgent by
 `tools/install-host.sh`) shows a menu-bar item: state icon (waiting / dialing / connected / paused /
 problem), viewer name + IP, stream mode, resolution, fps / Mbps / encode ms, and actions (Disconnect,
-Pause, Send Files to Viewer…, Recent Transfers, Display Mode, Open Log, Copy Viewer Password,
-Restart, Quit Until Next Login — plain Quit would just be relaunched by the agent's KeepAlive).
+Pause, Send Files to Viewer…, Recent Transfers, Pair New Viewer…, Paired Viewers ▸ name ▸ Remove…,
+Display Mode, Open Log, Restart, Quit Until Next Login — plain Quit would just be relaunched by the
+agent's KeepAlive). The last security event ("Rejected unknown viewer …", "Paired …") is shown as an
+info row.
 
 ## File transfer
 
@@ -321,21 +326,33 @@ Nothing listens on the Mac, and the PC accepts the connection only from the Mac.
 
 ## Security
 
-- **Handshake:** ephemeral X25519, keys derived with HKDF from the shared secret and a
-  PBKDF2-hashed password (100k iterations, per-host salt).
-- **Record layer:** ChaCha20-Poly1305 with per-direction keys and counters. Any failure to decrypt
-  closes the connection. The password itself is never sent.
+Security v2 ([`docs/PROTOCOL.md`](docs/PROTOCOL.md) §1–2):
 
-**Known v1 limitation:** the password is mixed into the KDF, but there is no real PAKE and no
-host identity. An active attacker who impersonates either side gets a value they can check
-password guesses against offline.
+- **Handshake:** Noise_XX_25519_ChaChaPoly_SHA256. Each side has a long-term key: the Mac's in
+  `~/Library/Application Support/Glide/host-key`, the PC's DPAPI-encrypted in `identity.dpapi`.
+  No password exists, so there is nothing to guess offline.
+- **Pinning:** the Mac only accepts viewers in its paired list; the viewer only accepts the Mac key
+  it paired with ("HOST KEY CHANGED" otherwise, and it aborts before revealing its own key).
+- **Record layer:** ChaCha20-Poly1305 with the Noise transport keys and per-direction counters.
+  Any failure to decrypt closes the connection.
+- **Rate limiting:** failed attempts back off per address (1 s → 60 s); pre-auth records are capped.
 
-Until Security v2 replaces this with CPace or SPAKE2 plus a pinned host key (see the
-[roadmap](docs/ROADMAP.md)), mitigate it:
+### Pairing (once per viewer)
 
-- Use a long random password, for example 16 characters.
-- Keep Glide on a trusted LAN. Don't expose it to the internet.
-- Prefer the host-dials setup with a firewall rule that admits only the Mac.
+1. On the Mac: Glide menu → **Pair New Viewer…** (opens a 2-minute window), or headless:
+   `glide-host --pair` in a terminal.
+2. Start/reconnect the viewer. It shows a 6-digit code; the Mac shows the same code in an alert
+   (or the terminal asks you to type the code shown on the PC).
+3. Confirm on **both** sides only if the codes match. The keys are then pinned; later connections
+   need no interaction.
+
+Without a screen on the Mac: `glide-host --pair` (non-interactive) then, once the PC shows the
+code, `glide-host --pair-code NNNNNN` — the host checks the typed code itself.
+To unpair: viewer tray → *Forget host (unpair)…*; Mac menu → *Paired Viewers ▸ name ▸ Remove…*
+(or `glide-host --unpair NAME`).
+
+Keep Glide on a trusted LAN and prefer the host-dials setup with a firewall rule that admits only
+the Mac.
 
 ## Troubleshooting
 
@@ -375,8 +392,12 @@ Until Security v2 replaces this with CPace or SPAKE2 plus a pinned host key (see
 
   You can wrap these in a small `glide-res crisp|smooth|retina` script. The host notices the mode
   change and re-captures on its own.
-- **Viewer says "Authentication failed".** The password differs between the two sides. Check the
-  password resolution order above: a `GLIDE_PASSWORD` environment variable overrides `host.json`.
+- **Viewer says "Not paired" / "doesn't recognize this PC".** Pair it (Security → Pairing).
+- **Viewer says "HOST KEY CHANGED".** The Mac presented a different key than the one paired. If you
+  reset the host (deleted `host-key`), unpair on the viewer (tray → *Forget host*) and pair again;
+  otherwise treat it as an impersonation attempt.
+- **Viewer says the host "is probably still running Glide v1"** (or a v1 viewer says
+  "unsupported protocol version 2"): update the other side.
 - **No hybrid or sharp mode.** The viewer advertises HEVC 4:4:4 only if its embedded 4:4:4 test
   clip decodes on the GPU at startup. Run `glide-client.exe --probe` to see why it doesn't.
 

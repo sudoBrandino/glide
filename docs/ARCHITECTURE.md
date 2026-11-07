@@ -13,7 +13,8 @@ capture ─► diff ─► encode ─► record layer ─► TCP ─► record l
 
 | Side | Module | Role |
 |---|---|---|
-| Host | `mac/Sources/GlideCore` | Byte codec, message types, X25519/HKDF/ChaCha20-Poly1305 handshake and records, HID keymap. It is shared by `glide-host`, `glide-probe` and `glide-selftest`. |
+| Host | `mac/Sources/GlideCore` | Byte codec, message types, Noise XX handshake (`Noise.swift`, `Crypto.swift`), records (`Channel.swift`), pairing logic and rate limiter (`Pairing.swift`), control socket, HID keymap. It is shared by `glide-host`, `glide-probe` and `glide-selftest`. |
+| Host | `glide-host/Trust.swift`, `TrustCLI.swift` | Host key file, paired-viewer list, pairing window + code confirmation (menu-bar alert, `glide-host --pair` over the control socket). |
 | Host | `glide-host/main.swift` | CLI and `host.json` config, permission checks, the listener or dialer, power assertions. |
 | Host | `glide-host/Session.swift` | One viewer connection: authentication, message dispatch, starting capture with retries, re-capture on display-mode changes and `ViewSize`, stats. |
 | Host | `glide-host/VideoPipeline.swift` | ScreenCaptureKit streams, frame scheduling, change tracking, the hybrid sharp layer. |
@@ -238,10 +239,13 @@ ciphertext, with per-direction keys and counters. The details are in PROTOCOL.md
   counter.
 - **Backpressure:** the host tracks bytes in flight per connection for backpressure.
 
-**v1 security limitation:** the session keys mix a PBKDF2 password key into HKDF, but there is no
-PAKE. An active impersonator of either side obtains a value they can check password guesses
-against offline. Security v2 replaces this with a PAKE (CPace or SPAKE2 over X25519) plus a pinned
-host identity. See [ROADMAP.md](ROADMAP.md).
+**Security v2:** a Noise_XX_25519_ChaChaPoly_SHA256 handshake between long-term keys, key pinning
+on both sides, and a one-time pairing confirmed by a 6-digit code on both screens (with a host
+commitment so a man in the middle can't grind matching codes). The host decides after msg3:
+paired key → session, pair request in an open window → pairing, otherwise AuthResult and a
+rate-limit strike. A session is "authenticated" for `SessionRegistry` only once a paired viewer's
+ClientHello arrives, so pairing and rejected attempts never touch the active session. Details and
+rationale: PROTOCOL.md §1–2.
 
 ## File transfer
 
@@ -264,11 +268,14 @@ built to only use spare capacity:
 
 ## Testing
 
-- **Reference vectors:** `tools/gen_vectors.py` is an independent Python reference for the
-  handshake and the first records. It writes `docs/test-vectors.json`.
-  - Swift checks the vectors with `glide-selftest`.
-  - Rust checks them in `cargo test` (`crypto.rs`, `protocol.rs`).
-  - CI regenerates the file and fails if it changes.
+- **Reference vectors:** three hand-written Noise implementations (Swift, Rust, Python
+  `tools/glide_noise.py`) all run the official Noise vectors (`docs/noise-vectors.json`).
+  `tools/gen_vectors.py` writes the Python reference transcripts (`docs/test-vectors.json`), the
+  Rust tests write `docs/test-vectors-rust.json`; Swift replays both as host and viewer, Rust
+  replays the Python one, Python (`--check`) replays the Rust one. CI regenerates and compares.
+- **Host protocol without capture:** `GLIDE_HOST_TEST_MODE=1 glide-host --port N` with a scratch
+  `GLIDE_HOST_CONFIG_DIR` runs handshake, pairing and the control socket but never captures,
+  injects input or changes the display — for testing against the real viewer next to a live host.
 - **End-to-end on the Mac:** `glide-probe` is a Mac-side client that uses VideoToolbox decode. It
   measures exact capture → decoded latency on loopback, can animate a test window, and dumps PNGs.
   `tools/compare.swift` builds per-tile error heatmaps from a Mac screenshot and a viewer frame dump.

@@ -350,7 +350,7 @@ This needs the live host stopped, because it runs a second session. Instead of t
 run on the Mac:
 
 ```sh
-glide-probe 127.0.0.1 --password-file … --seconds 20 --pattern
+glide-probe 127.0.0.1 --seconds 20 --pattern
 ```
 
 It prints:

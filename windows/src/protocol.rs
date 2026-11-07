@@ -1,10 +1,10 @@
-//! Glide v1 message encoding/decoding (docs/PROTOCOL.md §3). Platform independent.
+//! Glide message encoding/decoding (docs/PROTOCOL.md §2.4 auth phase, §3). Platform independent.
 //!
 //! A message plaintext is `u8 message_type || payload`, all integers little-endian.
 
 use std::fmt;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const DEFAULT_PORT: u16 = 7420;
 
 // codec_caps bits
@@ -35,6 +35,8 @@ pub const MSG_SET_MODE: u8 = 0x21;
 pub const MSG_PING: u8 = 0x30;
 pub const MSG_CLIPBOARD: u8 = 0x50;
 pub const MSG_AUDIO_ENABLE: u8 = 0x62;
+/// Pairing: the user confirmed (1) / rejected (0) the code (§2.4). 0x08–0x0F: auth phase.
+pub const MSG_PAIR_CONFIRM: u8 = 0x0A;
 /// Latency instrumentation (§3.4), client -> host.
 pub const MSG_LATENCY_ENABLE: u8 = 0x80;
 pub const MSG_LATENCY_REPORT: u8 = 0x82;
@@ -43,6 +45,18 @@ pub const MSG_LATENCY_REPORT: u8 = 0x82;
 pub const MSG_SERVER_HELLO: u8 = 0x02;
 pub const MSG_VIDEO_CONFIG: u8 = 0x03;
 pub const MSG_SHARP_LAYER_CONFIG: u8 = 0x04;
+/// Auth phase (§2.4): `u8 code` (AUTH_*).
+pub const MSG_AUTH_RESULT: u8 = 0x08;
+/// Pairing: the host's 32-byte pairing nonce (opens the commitment from msg2).
+pub const MSG_PAIR_REVEAL: u8 = 0x09;
+
+// AuthResult codes (§2.4)
+pub const AUTH_OK: u8 = 0;
+pub const AUTH_UNKNOWN_VIEWER: u8 = 1;
+pub const AUTH_PAIRING_CLOSED: u8 = 2;
+pub const AUTH_DECLINED: u8 = 3;
+pub const AUTH_TIMEOUT: u8 = 4;
+pub const AUTH_BUSY: u8 = 5;
 /// Host → viewer: current display preference + mode (v1.3).
 pub const MSG_DISPLAY_INFO: u8 = 0x05;
 
@@ -463,6 +477,8 @@ pub enum ClientMsg {
     Clipboard(ClipboardData),
     /// Start (true) / stop (false, muted) audio.
     AudioEnable { enabled: bool },
+    /// Pairing: the user compared the codes (§2.4).
+    PairConfirm { matched: bool },
     /// File transfer (§6).
     File(FileMsg),
     /// Ask the host for `FrameTiming` messages (§3.4). `flags` bit0 = enabled.
@@ -474,6 +490,10 @@ pub enum ClientMsg {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostMsg {
+    /// Auth phase result (§2.4); nonzero = rejected, the host closes the connection.
+    AuthResult { code: u8 },
+    /// Pairing: the host's nonce n_h (§2.4).
+    PairReveal { nonce: [u8; 32] },
     ServerHello { version: u16, host_name: String, config: VideoConfig },
     VideoConfig(VideoConfig),
     Pong { client_time_us: u64, host_time_us: u64 },
@@ -697,6 +717,7 @@ impl ClientMsg {
                 w.finish()
             }
             ClientMsg::AudioEnable { enabled } => Writer::new(MSG_AUDIO_ENABLE).u8(*enabled as u8).finish(),
+            ClientMsg::PairConfirm { matched } => Writer::new(MSG_PAIR_CONFIRM).u8(*matched as u8).finish(),
             ClientMsg::File(m) => m.encode(),
             ClientMsg::LatencyEnable { flags } => Writer::new(MSG_LATENCY_ENABLE).u8(*flags).finish(),
             ClientMsg::LatencyReport(r) => Writer::new(MSG_LATENCY_REPORT)
@@ -740,6 +761,7 @@ impl ClientMsg {
             MSG_PING => ClientMsg::Ping { client_time_us: r.u64()? },
             MSG_CLIPBOARD => ClientMsg::Clipboard(ClipboardData::read(&mut r)?),
             MSG_AUDIO_ENABLE => ClientMsg::AudioEnable { enabled: r.u8()? != 0 },
+            MSG_PAIR_CONFIRM => ClientMsg::PairConfirm { matched: r.u8()? != 0 },
             t if FileMsg::is_file_type(t) => ClientMsg::File(FileMsg::read(t, &mut r)?),
             MSG_LATENCY_ENABLE => ClientMsg::LatencyEnable { flags: r.u8()? },
             MSG_LATENCY_REPORT => ClientMsg::LatencyReport(LatencyReport {
@@ -767,6 +789,14 @@ impl HostMsg {
         let t = *buf.first().ok_or(DecodeError::Empty)?;
         let mut r = Reader::new(t, &buf[1..]);
         let msg = match t {
+            MSG_AUTH_RESULT => HostMsg::AuthResult { code: r.u8()? },
+            MSG_PAIR_REVEAL => {
+                let rest = r.rest();
+                if rest.len() < 32 {
+                    return Err(DecodeError::BadLength(t));
+                }
+                HostMsg::PairReveal { nonce: rest[..32].try_into().unwrap() }
+            }
             MSG_SERVER_HELLO => {
                 let version = r.u16()?;
                 let host_name = r.str()?;
@@ -852,6 +882,12 @@ impl HostMsg {
     /// Encode (used by tests and the Rust-side loopback tooling).
     pub fn encode(&self) -> Vec<u8> {
         match self {
+            HostMsg::AuthResult { code } => vec![MSG_AUTH_RESULT, *code],
+            HostMsg::PairReveal { nonce } => {
+                let mut v = vec![MSG_PAIR_REVEAL];
+                v.extend_from_slice(nonce);
+                v
+            }
             HostMsg::ServerHello { version, host_name, config } => {
                 let mut w = Writer::new(MSG_SERVER_HELLO);
                 w.u16(*version).str(host_name);
@@ -960,6 +996,18 @@ mod tests {
             }
         );
         assert_eq!(m.encode(), pt);
+    }
+
+    #[test]
+    fn auth_phase_messages() {
+        assert_eq!(HostMsg::AuthResult { code: AUTH_UNKNOWN_VIEWER }.encode(), vec![0x08, 0x01]);
+        assert_eq!(HostMsg::decode(vec![0x08, 0x03]).unwrap(), HostMsg::AuthResult { code: AUTH_DECLINED });
+        let r = HostMsg::PairReveal { nonce: [9; 32] };
+        assert_eq!(r.encode().len(), 33);
+        assert_eq!(HostMsg::decode(r.encode()).unwrap(), r);
+        assert!(HostMsg::decode(vec![0x09, 1, 2]).is_err());
+        assert_eq!(ClientMsg::PairConfirm { matched: true }.encode(), vec![0x0A, 0x01]);
+        assert_eq!(ClientMsg::decode(&[0x0A, 0x00]).unwrap(), ClientMsg::PairConfirm { matched: false });
     }
 
     #[test]
