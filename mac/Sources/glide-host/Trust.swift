@@ -286,9 +286,13 @@ final class PairingController: NSObject, @unchecked Sendable {
         case "identity":
             c.send("identity \(HostStatus.shared.snapshot.hostFingerprint ?? "?")")
         default:
-            c.send("error unknown command")
+            // Instance coordination (Instance.swift): instance / show-setup / handoff / quit.
+            if let reply = instanceCommand?(line) { c.send(reply) } else { c.send("error unknown command") }
         }
     }
+
+    /// Handles the instance commands; nil = unknown.
+    var instanceCommand: ((String) -> String?)?
 
     /// Called (main queue) after viewers were removed, so their sessions can be ended.
     var onRemove: (([PairedViewer]) -> Void)?

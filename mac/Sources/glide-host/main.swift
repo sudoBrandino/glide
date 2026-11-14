@@ -30,8 +30,11 @@ struct HostConfig: Codable {
     /// rollback to the v1 host still finds its password.
     var salt: String?
     var password: String?
-    /// Default `--connect` target (viewer running `--listen`), used when no CLI flag is given.
+    /// The PC to dial (`--connect` overrides). The host listens as well unless `listen` is false.
     var connect: String?
+    /// false: don't listen while a PC address is set (nothing on this Mac accepts connections;
+    /// THREAT_MODEL.md "Dial-out mode"). Default true.
+    var listen: Bool? = nil
     /// Display-mode policy (DisplayModeController.swift).
     var display: DisplaySettings? = nil
     /// Clipboard sync options (ClipboardSync.swift).
@@ -42,6 +45,8 @@ struct HostConfig: Codable {
     var files: FileSettings? = nil
     /// Optional virtual display sized to the viewer (VirtualDisplay.swift, docs/VIRTUAL_DISPLAY.md).
     var virtualDisplay: VirtualDisplayConfig? = nil
+    /// The version whose setup window was last finished (Setup.swift); nil = never.
+    var setupVersion: String? = nil
 
     static var dir: URL {
         let base: URL
@@ -83,7 +88,7 @@ struct HostConfig: Codable {
 func usage() -> Never {
     print("""
     usage: glide-host [--port N] [--fps N] [--bitrate-kbps N] [--max-width PX] [--display ID]
-                      [--connect HOST[:PORT]]
+                      [--connect HOST[:PORT]] [--no-listen]
            glide-host --pair                (open the 2-minute pairing window of the running host;
                                              in a terminal, wait for the viewer and type its code)
            glide-host --pair-code NNNNNN    (confirm the viewer that is waiting to pair, if the code
@@ -96,7 +101,9 @@ func usage() -> Never {
            glide-host --permission-status   (print whether both are granted, without prompting; run it
                                              with `open -W -a "Glide Host" --stdout F --args …` so
                                              the answer is about Glide Host, not the terminal)
-           glide-host --set-connect HOST[:PORT] (save the default dial-out target in host.json)
+           glide-host --set-connect HOST[:PORT] (save the PC's address: the host dials it as well as listening)
+           glide-host --login-item on|off|status (start this app at login, like the setup window's button)
+           glide-host --setup-preview OUT.png [--installer] (render the setup window to a PNG; no server)
            glide-host --selftest-ui [--out DIR] (print the status menu per state + display-mode picks; no capture)
            glide-host --encode-bench [SECONDS]  (offline VideoToolbox encode timing, normal vs low-latency RC,
                                                 synthetic 2560x1440 desktop content; no capture, no network)
@@ -108,8 +115,8 @@ func usage() -> Never {
            glide-host --list-display-modes [ID] (print a display's current and usable modes; read-only)
       Latency tuning (env, see docs/LATENCY.md): GLIDE_FPS=N (like --fps), GLIDE_LL=1 (low-latency RC),
       GLIDE_SCK_QUEUE_DEPTH=N (default 5), GLIDE_SCK_INTERVAL=native|fps (minimumFrameInterval)
-      --connect: dial out to a client running `glide-client --listen` (reconnects automatically)
-                 instead of listening. Use when the network only allows Mac -> viewer connections.
+      --connect: also dial out to the viewer's PC (reconnects automatically). The host always
+                 listens too, so whichever direction the network allows connects.
       Security v2: no password. A viewer pairs once (6-digit code confirmed on both screens) and
       is then recognized by its key. Config: ~/Library/Application Support/Glide (host.json,
       host-key; $GLIDE_HOST_CONFIG_DIR overrides).
@@ -151,6 +158,18 @@ if args.contains("--permission-status") {
     print("screen-recording=\(CGPreflightScreenCaptureAccess() ? "granted" : "missing") accessibility=\(AXIsProcessTrusted() ? "granted" : "missing")")
     exit(0)
 }
+if let v = takeValue("--login-item") {  // the setup window's Start at Login, for scripts/uninstall
+    do {
+        switch v {
+        case "on": try Instance.enableLoginItem()
+        case "off": try Instance.disableLoginItem()
+        case "status": break
+        default: usage()
+        }
+        print("login-item=\(Instance.loginItem)")
+        exit(0)
+    } catch { print("error: \(error.localizedDescription)"); exit(1) }
+}
 if args.contains("--request-permissions") {
     // Run from the app bundle so macOS attributes the grants to Glide Host itself.
     let screen0 = CGPreflightScreenCaptureAccess(), ax0 = AXIsProcessTrusted()
@@ -176,8 +195,20 @@ for legacy in ["--password", "--password-file", "--set-password-file"] where arg
     print("note: \(legacy) is ignored: Glide v2 pairs viewers instead of using a password (glide-host --pair)")
 }
 
+if let out = takeValue("--setup-preview") {  // offscreen render; never listens or captures
+    let installer = args.contains("--installer")
+    _ = NSApplication.shared
+    let m = SetupModel(installer: installer ? ("0.2.0", "/Users/you/Applications/Glide Host.app") : nil, actions: .init())
+    m.refresh()
+    Thread.sleep(forTimeInterval: 0.5)  // the Screen Recording check runs in a child process
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    print(SetupWindowController.renderPreview(m, to: out, dark: args.contains("--dark")) ? "wrote \(out)" : "render failed")
+    exit(0)
+}
+
 var config = HostConfig.load()
 if let v = takeValue("--set-connect") { config.connect = v; config.save(); print("saved connect target \(v)"); exit(0) }
+Instance.redirectLogIfNeeded()
 log("starting \(GlideVersion.banner("glide-host")) (pid \(getpid()))")
 if config.password != nil || config.salt != nil || ProcessInfo.processInfo.environment["GLIDE_PASSWORD"] != nil {
     log("config: the v1 password (host.json salt/password, $GLIDE_PASSWORD) is no longer used — viewers pair with this Mac instead; host.json keeps it for a rollback to v1")
@@ -200,6 +231,8 @@ if let v = takeValue("--bitrate-kbps"), let n = Int(v) { settings.bitrateKbps = 
 if let v = takeValue("--max-width"), let n = Int(v) { settings.maxWidth = n }
 if let v = takeValue("--display"), let n = UInt32(v) { ActiveDisplay.pinned = n }
 let connectTarget = takeValue("--connect") ?? config.connect
+let noListen = args.contains("--no-listen") || config.listen == false
+args.removeAll { $0 == "--no-listen" }
 guard args.isEmpty else { print("unknown arguments: \(args)"); usage() }
 
 /// GLIDE_HOST_TEST_MODE=1: protocol-only test instance (used with $GLIDE_HOST_CONFIG_DIR and
@@ -209,12 +242,33 @@ guard args.isEmpty else { print("unknown arguments: \(args)"); usage() }
 let hostTestMode = ProcessInfo.processInfo.environment["GLIDE_HOST_TEST_MODE"] == "1"
 if hostTestMode { log("TEST MODE: protocol only (no capture, no display changes, no UI)") }
 
-// Permissions
-if hostTestMode {} else if !CGPreflightScreenCaptureAccess() {
+// One host per user (Instance.swift). Only for the app bundle: a bare binary from `swift build`
+// or a test instance with its own config folder keeps the old behaviour.
+let role: Instance.Role = (Instance.isAppBundle && !hostTestMode) ? Instance.resolveRole() : .primary
+switch role {
+case .primary: break
+case .defer_:
+    log("instance: Glide Host is already running; showing its setup window")
+    Instance.send("show-setup")
+    exit(0)
+case let .installer(version, path):
+    // A new download (or another copy) while a host runs: only offer to replace it.
+    log("instance: Glide Host \(version ?? "(older)") is running from \(path ?? "?"); opening the installer")
+    let app = NSApplication.shared
+    let ctl = SetupWindowController(model: SetupModel(installer: (version, path), actions: .init()))
+    SetupWindowController.shared = ctl
+    ctl.show()
+    app.run()
+    exit(0)
+}
+let showSetupAtLaunch = Instance.isAppBundle && !hostTestMode && SetupModel.shouldShowAtLaunch()
+
+// Permissions (the setup window asks for them itself, with explanations)
+if hostTestMode || showSetupAtLaunch {} else if !CGPreflightScreenCaptureAccess() {
     log("Screen Recording permission missing — requesting (grant it in System Settings, then restart glide-host)")
     CGRequestScreenCaptureAccess()
 }
-if !hostTestMode && !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary) {
+if !hostTestMode && !showSetupAtLaunch && !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary) {
     log("Accessibility permission missing — remote input will not work until granted")
 }
 
@@ -240,25 +294,75 @@ final class Server: @unchecked Sendable {
         listener = try NWListener(using: SecureChannel.tcpParameters(), on: NWEndpoint.Port(rawValue: settings.port)!)
     }
 
-    /// Outbound mode: keep a connection to `host:port` alive, redialing after it drops.
+    /// Last dial error logged, so an unreachable PC doesn't log the same line every 2 s.
+    private var lastDialError: String?
+    /// Bumped by `setDialTarget`, so a redial scheduled for an old target does nothing.
+    private var dialGeneration = 0
+
+    /// Change the PC to dial at runtime (setup window): nil stops dialing. The listener keeps
+    /// running either way, so whichever direction the network allows connects.
+    func setDialTarget(_ target: String?) {
+        lock.lock()
+        dialGeneration += 1
+        pendingRedial?.cancel(); pendingRedial = nil
+        dialFailures = 0
+        lastDialError = nil
+        dialLoopActive = false
+        dialTarget = target.flatMap(Self.parseTarget)
+        let t = dialTarget
+        lock.unlock()
+        HostStatus.shared.update { $0.dialTarget = t.map { "\($0.host):\($0.port)" }; $0.dialDetail = nil }
+        if let t { dial(host: t.host, port: t.port) } else { log("dialer: off") }
+    }
+
+    /// "host", "host:port" or "[v6]:port" → (host, port); nil for an empty string.
+    static func parseTarget(_ s: String) -> (host: String, port: UInt16)? {
+        let s = s.trimmingCharacters(in: .whitespaces)
+        guard !s.isEmpty else { return nil }
+        if s.hasPrefix("["), let close = s.firstIndex(of: "]") {
+            let host = String(s[s.index(after: s.startIndex)..<close])
+            let rest = s[s.index(after: close)...]
+            return (host, rest.hasPrefix(":") ? UInt16(rest.dropFirst()) ?? 7420 : 7420)
+        }
+        let parts = s.split(separator: ":")
+        if parts.count == 2 { return (String(parts[0]), UInt16(parts[1]) ?? 7420) }
+        return (s, 7420)  // a bare name, or an IPv6 address without brackets
+    }
+
+    /// Keep a connection to `host:port` alive, redialing after it drops. Idle while another
+    /// session (a viewer that dialed in) is active, so there is only ever one.
     func dial(host: String, port: UInt16) {
         lock.lock()
-        dialTarget = (host, port)
+        guard let t = dialTarget, t.host == host, t.port == port else { lock.unlock(); return }
         if paused { dialLoopActive = false; lock.unlock(); return }
         dialLoopActive = true
+        let generation = dialGeneration
         let queue = DispatchQueue(label: "glide.session.\(nextId)", qos: .userInteractive)
         lock.unlock()
-        HostStatus.shared.update { $0.dialTarget = "\(host):\(port)"; $0.dialDetail = "connecting" }
+        if sessions.current != nil {
+            scheduleRedial(host: host, port: port, generation: generation, idle: true)
+            return
+        }
+        HostStatus.shared.update { $0.dialTarget = "\(host):\(port)"; if $0.dialDetail == nil { $0.dialDetail = "connecting" } }
         let conn = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: SecureChannel.tcpParameters())
-        lock.lock(); let quiet = dialFailures > 2; lock.unlock()
+        lock.lock(); let quiet = dialFailures > 2 || lastDialError != nil; lock.unlock()
         if !quiet { log("dialer: connecting to \(host):\(port)") }
-        let redial = { [weak self] in self?.scheduleRedial(host: host, port: port) }
+        let redial = { [weak self] in self?.scheduleRedial(host: host, port: port, generation: generation) }
         var sessionStarted = false
+        let failed = { [weak self] (e: NWError) in
+            guard let self else { return }
+            let text = "\(e)"
+            self.lock.lock(); let repeated = self.lastDialError == text; self.lastDialError = text; self.lock.unlock()
+            if !repeated { log("dialer: \(host):\(port) not reachable (\(text)); retrying every 2 s") }
+            HostStatus.shared.update { $0.dialDetail = Self.dialErrorText(e) }
+            redial()
+        }
         conn.stateUpdateHandler = { [weak self] st in
             guard let self else { return }
             switch st {
             case .ready where !sessionStarted:
                 sessionStarted = true
+                self.lock.lock(); self.lastDialError = nil; self.lock.unlock()
                 // Hand the live connection to a Session (it re-installs its own state handler).
                 self.adopt(conn, queue: queue) { [weak self] s in
                     guard let self else { return }
@@ -268,30 +372,45 @@ final class Server: @unchecked Sendable {
                     redial()
                 }
             case .waiting(let e):
-                log("dialer: waiting (\(e)); retrying"); conn.cancel()
-                HostStatus.shared.update { $0.dialDetail = "\(e)" }
-                redial()
+                conn.cancel()
+                failed(e)
             case .failed(let e) where !sessionStarted:
-                log("dialer: failed (\(e)); retrying")
-                HostStatus.shared.update { $0.dialDetail = "\(e)" }
-                redial()
+                failed(e)
             default: break
             }
         }
         conn.start(queue: queue)
     }
 
+    /// Short, plain text for the menu and the setup window.
+    static func dialErrorText(_ e: NWError) -> String {
+        if case let .posix(code) = e {
+            switch code {
+            case .ECONNREFUSED: return "the PC answers, but Glide isn't waiting for this Mac there"
+            case .ETIMEDOUT, .EHOSTUNREACH, .ENETUNREACH, .EHOSTDOWN: return "no answer (a firewall or the network may block it)"
+            default: break
+            }
+        }
+        if case .dns = e { return "the name doesn't resolve" }
+        return "\(e)"
+    }
+
     /// Redial after 2 s, or longer after repeated failed handshakes (2 s doubling to 60 s), so an
     /// unpaired/impostor viewer isn't hammered. `kickDialer()` (pairing window opened) cuts it short.
-    private func scheduleRedial(host: String, port: UInt16) {
+    /// `idle`: another session is active; just check again in 2 s.
+    private func scheduleRedial(host: String, port: UInt16, generation: Int, idle: Bool = false) {
         lock.lock()
-        let n = dialFailures
+        guard generation == dialGeneration else { lock.unlock(); return }
+        let n = idle ? 0 : dialFailures
         let delay = n <= 1 ? 2.0 : min(2.0 * pow(2, Double(min(n - 1, 5))), 60)
         var work: DispatchWorkItem!
         work = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            self.lock.lock(); if self.pendingRedial === work { self.pendingRedial = nil }; self.lock.unlock()
-            self.dial(host: host, port: port)
+            self.lock.lock()
+            if self.pendingRedial === work { self.pendingRedial = nil }
+            let current = generation == self.dialGeneration
+            self.lock.unlock()
+            if current { self.dial(host: host, port: port) }
         }
         pendingRedial = work
         lock.unlock()
@@ -362,7 +481,9 @@ final class Server: @unchecked Sendable {
         lock.lock()
         paused = p
         let target = dialTarget
-        let needDial = !p && target != nil && !dialLoopActive
+        // Resuming cancels any redial scheduled before the pause and dials afresh.
+        let needDial = !p && target != nil
+        if !p { dialGeneration += 1; pendingRedial?.cancel(); pendingRedial = nil; dialLoopActive = false }
         lock.unlock()
         HostStatus.shared.update { $0.paused = p; if p { $0.dialDetail = nil } }
         log("server: \(p ? "paused" : "resumed")")
@@ -379,7 +500,13 @@ final class Server: @unchecked Sendable {
             case .ready:
                 log("server: listening on port \(self.settings.port)")
                 HostStatus.shared.update { $0.listenPort = self.settings.port }
-            case .failed(let e): log("server: listener failed: \(e)"); exit(1)
+            case .failed(let e):
+                // Port in use: another host (or app) has it. With a PC address the dialer still
+                // works; otherwise nothing could connect, so exit (launchd retries later).
+                log("server: listener failed: \(e)")
+                HostStatus.shared.update { $0.serverError = "Can't listen on port \(self.settings.port): \(e)" }
+                self.lock.lock(); let dialing = self.dialTarget != nil; self.lock.unlock()
+                if !dialing { exit(1) }
             default: break
             }
         }
@@ -414,17 +541,46 @@ let statusMenu = StatusMenu(actions: .init(disconnect: { server.disconnect() }, 
                                            },
                                            sendFiles: { server.current?.sendFiles($0) ?? false },
                                            cancelFiles: { server.current?.cancelFiles() },
-                                           selectDisplay: { server.current?.selectDisplay($0, by: .host) }),
+                                           selectDisplay: { server.current?.selectDisplay($0, by: .host) },
+                                           showSetup: { showSetup() }),
                             showStatusItem: !hostTestMode)
 HostNotifier.shared.setUp()
 statusMenu.downloadDir = settings.files.downloadDir
 log("files: transfer \(settings.files.enabled ? "on" : "off"), receiving \(settings.files.receive ? "on" : "off") into \(settings.files.downloadDir.path)")
-if let target = connectTarget {
-    let parts = target.split(separator: ":")
-    server.dial(host: String(parts[0]), port: parts.count > 1 ? UInt16(parts[1]) ?? 7420 : 7420)
-} else {
-    server.start()
+/// The setup window (Setup.swift): at launch until finished, from the menu, when the app is
+/// opened again from Finder, or when another copy asks (`show-setup`).
+func showSetup() {
+    guard !hostTestMode else { return }
+    let ctl = SetupWindowController.shared ?? SetupWindowController(model: SetupModel(installer: nil, actions: .init(
+        setDialTarget: { server.setDialTarget($0) },
+        openPairing: { pairing.openWindow(source: "setup window") },
+        cancelPairing: { pairing.cancelWindow(source: "setup window") })))
+    SetupWindowController.shared = ctl
+    ctl.show()
 }
+pairing.instanceCommand = { line in
+    Instance.handle(line, showSetup: showSetup, quit: { reason in
+        log("instance: \(reason)")
+        unlink(PairingController.socketPath)
+        restoreDisplaysBeforeExit(reason: reason)
+        exit(0)
+    })
+}
+/// Reopening the running app (Finder, Dock, `open`) shows the setup window.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        showSetup()
+        return false
+    }
+}
+let appDelegate = AppDelegate()
+app.delegate = appDelegate
+if showSetupAtLaunch { DispatchQueue.main.async { showSetup() } }
+
+// Always listen; also dial the PC when its address is known. Whichever direction the network
+// allows connects (the dialer stays idle while a viewer that dialed in is connected).
+if connectTarget == nil || !noListen { server.start() } else { log("server: not listening (listen: false); dialing only") }
+if let target = connectTarget { server.setDialTarget(target) }
 // SIGTERM (launchctl, install scripts) and SIGINT: give the Mac its display arrangement back,
 // remove the virtual display and restore the monitor's own mode before exiting (a mirror set whose
 // master vanishes is dissolved by macOS, which can leave the monitor in another mode). Handled on

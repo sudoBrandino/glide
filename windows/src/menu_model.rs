@@ -53,10 +53,12 @@ pub enum Cmd {
     ToggleNaturalScroll,
     /// Input submenu: relative mouse (pointer lock, PROTOCOL.md §3.6).
     ToggleRelativeMouse,
+    /// The setup dialog (Mac address, firewall, start at sign-in, install).
+    SetUp,
 }
 
 // New commands go at the end: ids are positions in this list.
-const ALL: [Cmd; 36] = [
+const ALL: [Cmd; 37] = [
     Cmd::ModeFast,
     Cmd::ModeHybrid,
     Cmd::ModeSharp,
@@ -93,6 +95,7 @@ const ALL: [Cmd; 36] = [
     Cmd::ToggleCtrlAsCmd,
     Cmd::ToggleNaturalScroll,
     Cmd::ToggleRelativeMouse,
+    Cmd::SetUp,
 ];
 
 /// Menu ids: 0x2000 + 16·index. Low nibble zero and below 0xF000, so the same ids work as
@@ -354,6 +357,7 @@ pub fn build(s: &MenuState) -> Vec<Item> {
             Item::Separator,
         ]);
     }
+    v.push(cmd(Cmd::SetUp, "Set &up…", false, true));
     v.push(cmd(Cmd::Settings, "S&ettings…", false, true));
     v
 }
@@ -369,6 +373,7 @@ pub fn system_items(s: &MenuState) -> Vec<Item> {
         cmd(Cmd::ToggleFullscreen, "F&ullscreen\tCtrl+Alt+Shift+F", s.fullscreen, true),
         cmd(Cmd::RefreshPicture, "Re&fresh picture\tCtrl+Alt+Shift+R", false, s.connected),
         cmd(Cmd::Reconnect, "&Reconnect\tCtrl+Alt+Shift+D", false, !s.paused),
+        cmd(Cmd::SetUp, "Set &up…", false, true),
         cmd(Cmd::Settings, "S&ettings…", false, true),
     ]
 }

@@ -15,6 +15,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         var cancelFiles: () -> Void = {}
         /// Stream display `id` (0 = default) in the current session (PROTOCOL.md §3.5).
         var selectDisplay: (UInt32) -> Void = { _ in }
+        /// The setup window (Setup.swift).
+        var showSetup: () -> Void = {}
     }
 
     let menu = NSMenu()
@@ -180,6 +182,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(virtualItem)
 
         menu.addItem(.separator())
+        add("Set Up Glide Host…", #selector(showSetup))
         add("Open Log", #selector(openLog))
         menu.addItem(withTitle: "Glide Host \(GlideVersion.display)", action: nil, keyEquivalent: "").isEnabled = false
         menu.addItem(.separator())
@@ -607,6 +610,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         actions.removeViewer(v)
         refresh()
     }
+
+    @objc private func showSetup() { actions.showSetup() }
 
     @objc private func restart() {
         log("menu: restart (launchd relaunches the host)")

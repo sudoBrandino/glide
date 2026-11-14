@@ -580,17 +580,24 @@ fn read_host_msg(opener: &mut Opener, r: &mut BufReader<TcpStream>, buf: &mut Ve
     HostMsg::decode(pt).map_err(|e| ConnectError::Protocol(format!("bad host message: {e}")))
 }
 
+/// Resolve `addr` (default port 7420) and open a TCP connection within `timeout`, before any
+/// handshake. Both mode uses a short timeout so it can turn to its listener quickly when the
+/// network blocks PC → Mac, and tells "can't reach the Mac" (Resolve / Io here) apart from
+/// handshake errors.
+pub fn tcp_connect(addr: &str, timeout: Duration) -> Result<TcpStream, ConnectError> {
+    let addr = parse_addr(addr);
+    let sa = addr
+        .to_socket_addrs()
+        .map_err(|_| ConnectError::Resolve(addr.clone()))?
+        .next()
+        .ok_or_else(|| ConnectError::Resolve(addr.clone()))?;
+    TcpStream::connect_timeout(&sa, timeout).map_err(ConnectError::Io)
+}
+
 impl Connection {
     /// Connect, handshake (pairing if needed), send `hello`, and wait for `ServerHello`.
     pub fn connect(addr: &str, auth: &Auth, hello: &ClientMsg) -> Result<Connection, ConnectError> {
-        let addr = parse_addr(addr);
-        let sa = addr
-            .to_socket_addrs()
-            .map_err(|_| ConnectError::Resolve(addr.clone()))?
-            .next()
-            .ok_or_else(|| ConnectError::Resolve(addr.clone()))?;
-        let stream = TcpStream::connect_timeout(&sa, Duration::from_secs(5)).map_err(ConnectError::Io)?;
-        Self::from_stream(stream, auth, hello)
+        Self::from_stream(tcp_connect(addr, Duration::from_secs(5))?, auth, hello)
     }
 
     /// Reverse-connect mode: listen on `0.0.0.0:port`, accept ONE TCP connection from the

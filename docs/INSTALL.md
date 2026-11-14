@@ -8,7 +8,7 @@ Glide has two parts:
 
 | Part | Runs on | Release file |
 |---|---|---|
-| **Host** (`Glide Host.app`) | The Mac you want to control: macOS 14 or later, Apple silicon | `Glide-Host-<version>-macos-arm64.zip` |
+| **Host** (`Glide Host.app`) | The Mac you want to control: macOS 14 or later, Apple silicon | `Glide-Host-<version>-macos-arm64.dmg` (or `.zip`) |
 | **Viewer** (`glide-client.exe`) | The Windows PC you control it from: Windows 10/11 x64 | `Glide-Viewer-<version>-windows-x64.zip` |
 
 The host and the viewer must be the same release, or at least speak the same protocol version.
@@ -16,7 +16,10 @@ The host and the viewer must be the same release, or at least speak the same pro
 
 **Before you start:**
 
-- Both machines must be on the same LAN. Glide has no relay, and it uses TCP port 7420 by default.
+- Glide connects the two machines directly, with no relay server, on TCP port 7420. Either side
+  may start the connection: the Mac and the viewer both listen *and* dial the other once they
+  know its address, so one allowed direction is enough (for example a Mac on a separate network
+  segment that may reach the PC, but not the other way round).
 - The PC needs a GPU that decodes HEVC in hardware, plus the "HEVC Video Extensions" from the
   Microsoft Store.
   Hybrid and sharp mode need HEVC 4:4:4 decoding, which recent NVIDIA and Intel GPUs have. On
@@ -26,44 +29,57 @@ The host and the viewer must be the same release, or at least speak the same pro
 
 ## Quick install
 
-Two installers do everything below for you, and ask before each step that needs you. Run them
-again at any time to update, re-check the permissions, change the connection or pair again.
+No Terminal needed. Both apps have a setup window that walks through everything below.
 
-**Mac**, in Terminal:
+**Mac**
+
+1. Download `Glide-Host-<version>-macos-arm64.dmg`, open it and drag **Glide Host** to
+   **Applications**.
+2. Open Glide Host from Applications. The app is signed ad hoc, not notarized, so the first time
+   macOS says it can't check it: open **System Settings → Privacy & Security**, scroll down and
+   click **Open Anyway**.
+3. The **Glide Host Setup** window opens. From top to bottom:
+   - **Start at Login**, so the Mac is reachable after a restart.
+   - **Screen Recording → Allow…**, switch on Glide Host, then **Restart Glide Host** when the
+     window offers it.
+   - **Accessibility → Allow…**, switch on Glide Host.
+   - **Connect the PC:** the window shows this Mac's address for the viewer. If your network
+     only lets the Mac reach the PC, also enter the PC's address.
+   - **Pair a Viewer…**, then connect from the PC: both screens show the same code; confirm on
+     both.
+
+The window opens again by itself while something is missing (each new build needs the two
+permissions again), and any time from the menu bar icon → **Set Up Glide Host…**. Opening a newer
+download while Glide Host runs offers to replace it, keeping the settings and pairings.
+
+**Windows**
+
+1. Download `Glide-Viewer-<version>-windows-x64.zip`, extract it and run `glide-client.exe`.
+2. The setup window offers to **install** it (into `%LOCALAPPDATA%\Glide`, with a Start menu
+   entry), asks for the **Mac's address** (with a **Test** button), and, if the Mac should be able
+   to connect to the PC, **Allow in Windows Firewall** (one administrator prompt). **Start Glide
+   when I sign in** is optional.
+3. **Connect.** The first time, the pairing window shows the code to compare with the Mac.
+
+Open the setup window again from the Glide menu or the tray icon → **Set up…**.
+
+**From a terminal instead.** The scripts do the same, and suit scripted or remote installs:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/sudoBrandino/glide/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sudoBrandino/glide/main/install.sh | bash    # Mac
+brew install --cask sudobrandino/glide/glide-host && glide-setup                            # Mac, Homebrew
 ```
-
-It downloads the latest release and checks it against `SHA256SUMS` (and its build provenance, if
-the GitHub CLI is signed in), installs the app to `~/Applications` with its LaunchAgent, removes
-an older Glide Host that would compete for the screen, walks you through Screen Recording and
-Accessibility, asks which side connects, and opens the pairing window. Options go after
-`bash -s --`, for example `… | bash -s -- --connect my-pc.local`; `--help` lists them.
-
-**Mac, with Homebrew** (from the first release after 0.2.0):
-
-```sh
-brew install --cask sudobrandino/glide/glide-host
-glide-setup        # the same guided setup, using the app Homebrew installed
-```
-
-Run `glide-setup` again after each `brew upgrade`: the upgrade stops the host, and each new build
-needs Screen Recording and Accessibility again (the app is signed ad hoc). `glide-setup` restarts
-it and asks for them. `brew uninstall --zap glide-host` removes it with its settings and pairings.
-
-**Windows**, in PowerShell (not as administrator):
 
 ```powershell
-irm https://raw.githubusercontent.com/sudoBrandino/glide/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/sudoBrandino/glide/main/install.ps1 | iex           # Windows
 ```
 
-It downloads and verifies the viewer, installs it into the folder an existing viewer already uses
-(so firewall rules keep applying; `%LOCALAPPDATA%\Glide` otherwise), asks which side connects,
-offers a firewall rule (Windows asks for administrator rights for that step only), adds Start
-menu and sign-in shortcuts and starts the viewer for pairing.
-
-Read a script before you pipe it into a shell: both are short, and they are in this repository
+`install.sh` downloads the latest release, checks it against `SHA256SUMS`, installs the app to
+`~/Applications` with a LaunchAgent, removes an older Glide Host that would compete for the
+screen, walks through the permissions, the connection and pairing; `--help` lists its options.
+With Homebrew, run `glide-setup` again after each `brew upgrade` (each build needs the permissions
+again). `install.ps1` installs the viewer where an existing one lives, offers the firewall rule and
+shortcuts. Read a script before you pipe it into a shell: both are short and in this repository
 ([`install.sh`](../install.sh), [`install.ps1`](../install.ps1)). The sections below are the same
 steps by hand.
 

@@ -47,7 +47,9 @@ NVIDIA-GPU Windows PC). It works well there and has had little testing elsewhere
 
 - **Supported:** macOS 14+ on Apple silicon as the host, Windows 10/11 x64 as the viewer.
 - **Not supported:** any other host or viewer platform, and more than one viewer at a time.
-- **LAN only.** There is no relay or NAT traversal, and the transport is TCP.
+- **LAN only.** There is no relay or NAT traversal, and the transport is TCP. Either side may
+  start the connection (both listen and dial), so one allowed direction between two network
+  segments is enough.
 - The wire protocol is at version 2 and may still change in incompatible ways. Both sides detect a
   version mismatch and say so.
 - Releases are on the [Releases page](https://github.com/sudoBrandino/glide/releases): a Mac app
@@ -187,8 +189,10 @@ A block-code test pattern measures true glass-to-glass latency. See
 
 ## Install and run
 
-To install a prebuilt release instead of building from source, run the guided installers. They
-download and verify the release, then walk through the permissions, the connection and pairing:
+To install a prebuilt release instead of building from source, download it from the
+[Releases page](https://github.com/sudoBrandino/glide/releases): on the Mac, open the `.dmg`, drag
+Glide Host to Applications and open it; on the PC, run `glide-client.exe`. Each has a setup window
+for the permissions, the connection and pairing; no Terminal needed. Terminal installers exist too:
 
 ```sh
 # Mac (Terminal); or: brew install --cask sudobrandino/glide/glide-host && glide-setup
@@ -200,7 +204,7 @@ curl -fsSL https://raw.githubusercontent.com/sudoBrandino/glide/main/install.sh 
 irm https://raw.githubusercontent.com/sudoBrandino/glide/main/install.ps1 | iex
 ```
 
-[`docs/INSTALL.md`](docs/INSTALL.md) explains what they do, and the same steps by hand.
+[`docs/INSTALL.md`](docs/INSTALL.md) has the details, and the same steps by hand.
 
 ### Requirements
 

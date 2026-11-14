@@ -76,6 +76,8 @@ pub enum Target {
     Listen(u16),
     /// Dial `host[:port]`, retrying every 2 s.
     Connect(String),
+    /// Dial `addr` and listen on 0.0.0.0:`port`, one connection at a time (`both_round`).
+    Both { addr: String, port: u16 },
 }
 
 pub struct Connector {
@@ -84,6 +86,8 @@ pub struct Connector {
     pub identity: Identity,
     /// Pin-store key of the target (`config::pin_target`).
     pub pin_target: String,
+    /// Pin-store key tried when `pin_target` has none (`config::pin_fallback`).
+    pub pin_fallback: Option<String>,
     pub hello: ClientMsg,
 }
 
@@ -171,7 +175,7 @@ struct Shared {
     paused: AtomicBool,
     /// Interrupts a pending accept (quit or pause).
     abort_accept: AtomicBool,
-    /// Listen (reverse-connect) mode: inbound peers are untrusted until authenticated.
+    /// Listen or both mode: inbound peers are untrusted until authenticated.
     listening: bool,
     /// Set by the session thread when trust-on-first-use pinned the host's IP (shown on connect).
     just_pinned: Mutex<Option<String>>,
@@ -179,6 +183,8 @@ struct Shared {
     just_paired: Mutex<Option<String>>,
     /// Pin-store key of the target (`config::pin_target`).
     pin_target: String,
+    /// Pin-store key tried when `pin_target` has none (`config::pin_fallback`).
+    pin_fallback: Option<String>,
     /// Zero-sized until the first connection.
     config: Mutex<VideoConfig>,
     /// Current connection's writer; None while disconnected.
@@ -294,6 +300,16 @@ thread_local! {
 
 fn ui() -> &'static UiCtx {
     UI.get().expect("UI context")
+}
+
+/// A copy of the live config store (setup dialog).
+pub(super) fn store_snapshot() -> Store {
+    ui().store.lock().unwrap().clone()
+}
+
+/// Change and save the live config (setup dialog).
+pub(super) fn update_store(f: impl FnOnce(&mut config::Config)) {
+    ui().store.lock().unwrap().update(f);
 }
 
 /// Messages from the UI thread go through this queue to the "glide-input" thread, so neither the
@@ -1787,6 +1803,7 @@ fn run_menu_cmd(hwnd: HWND, c: Cmd) {
             ui().store.lock().unwrap().update(|c| c.bar_pinned = pinned);
             toast(if pinned { "Connection bar pinned" } else { "Connection bar unpinned" });
         }
+        Cmd::SetUp => super::setup::from_menu(hwnd),
         Cmd::Settings => match ui().store.lock().unwrap().path() {
             Some(p) => tray::open_in_editor(&p),
             None => toast("No config file (APPDATA not set)"),
@@ -1982,7 +1999,7 @@ fn show_pairing(hwnd: HWND, req: PairRequest) {
 /// TOFU IP pin) and drop the connection; the next connection pairs again.
 fn forget_host(hwnd: HWND) {
     let target = ui().shared.pin_target.clone();
-    let name = ui().store.lock().unwrap().config.pinned_hosts.get(&target).map(|p| p.name.clone());
+    let name = ui().store.lock().unwrap().config.pin_entry(&target, ui().shared.pin_fallback.as_deref()).map(|(_, p)| p.name.clone());
     let Some(name) = name else {
         toast("Not paired");
         return;
@@ -1996,6 +2013,9 @@ fn forget_host(hwnd: HWND) {
         return;
     }
     let had = ui().store.lock().unwrap().forget_host(&target);
+    if let Some(fb) = ui().shared.pin_fallback.as_deref() {
+        let _ = ui().store.lock().unwrap().forget_host(fb);
+    }
     if ui().shared.listening {
         let mut old = Vec::new();
         ui().store.lock().unwrap().update(|c| old = std::mem::take(&mut c.allowed_peers));
@@ -2143,7 +2163,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 audio: ui().shared.audio.as_ref().map(|a| a.muted()),
                 paused: ui().shared.paused.load(Ordering::Relaxed),
                 hud_on: STATE.with(|s| s.borrow().hud_on),
-                paired: ui().store.lock().unwrap().config.pinned_hosts.get(&ui().shared.pin_target).map(|p| p.name.clone()),
+                paired: ui().store.lock().unwrap().config.pin_entry(&ui().shared.pin_target, ui().shared.pin_fallback.as_deref()).map(|(_, p)| p.name.clone()),
                 files: files::enabled().then(files::busy),
             };
             tray::on_notify(hwnd, lparam, &st);
@@ -2169,6 +2189,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 Some(tray::MenuCmd::Quit) => {
                     let _ = DestroyWindow(hwnd);
                 }
+                Some(tray::MenuCmd::SetUp) => super::setup::from_menu(hwnd),
                 None => {}
             }
             LRESULT(0)
@@ -2476,8 +2497,30 @@ fn sleep_or_quit(shared: &Shared, d: Duration) -> bool {
 }
 
 /// Connect/listen forever; run one connection at a time; survive disconnects and auth failures.
+/// Both mode: TCP connect timeout for each dial (then the listener gets its turn).
+const BOTH_DIAL_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Both mode: how long to wait for the Mac to dial in after a dial attempt found nobody.
+const BOTH_ACCEPT_WAIT: Duration = Duration::from_secs(2);
+
+/// What one round of the session loop produced.
+enum Attempt {
+    /// A connection authenticated (`inbound`: the Mac dialed this PC).
+    Connected { conn: Connection, inbound: bool },
+    /// The Mac (or something) dialed in and the handshake failed: keep listening.
+    InboundFailed(ConnectError),
+    /// Dialing the Mac got as far as a handshake (or a name lookup) and failed.
+    DialFailed(ConnectError),
+    /// Both mode: nobody answered at the address and nobody dialed in.
+    NoAnswer(ConnectError),
+    /// Interrupted (pause): go round again.
+    Again,
+    Quit,
+}
+
 fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<RenderCmd>, hwnd_raw: isize) {
     let mut listener: Option<std::net::TcpListener> = None;
+    // Both mode: why the listener isn't up (shown in the status line); retried every round.
+    let mut listen_problem: Option<String> = None;
     // Prefix shown in front of the waiting text (e.g. last error).
     let mut note: Option<String> = None;
     let mut ever_connected = false;
@@ -2515,6 +2558,13 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
                     format!("Connecting to {addr}…")
                 }
             }
+            Target::Both { addr, .. } => {
+                let label = if ever_connected { host.clone() } else { addr.clone() };
+                match &listen_problem {
+                    Some(p) => format!("Connecting to {label}… ({p})"),
+                    None => format!("Connecting to {label}… (the Mac can also connect to this PC)"),
+                }
+            }
         };
         let text = match &note {
             Some(n) if n.ends_with('…') => n.clone(), // already a complete status line
@@ -2528,11 +2578,12 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
             identity: connector.identity.clone(),
             name: hello_name(&connector.hello),
             target: shared.pin_target.clone(),
-            pinned: ui().store.lock().unwrap().config.pinned_key(&shared.pin_target),
+            pinned: ui().store.lock().unwrap().config.pinned_key_or(&shared.pin_target, shared.pin_fallback.as_deref()),
             request_pairing: shared.repair.load(Ordering::Relaxed),
             pairing: pairing.clone(),
         };
-        let res = match &connector.target {
+        let hello = hello_for(&connector.hello, &shared);
+        let attempt = match &connector.target {
             Target::Listen(port) => {
                 if listener.is_none() {
                     match std::net::TcpListener::bind(("0.0.0.0", *port)) {
@@ -2549,63 +2600,115 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
                         }
                     }
                 }
-                let hello = hello_for(&connector.hello, &shared);
-                match accept_admitted(listener.as_ref().unwrap(), &auth, &hello, &shared, &mut backoff) {
-                    Ok(Some((c, ip))) => {
-                        // Trust on first use: pin the first host IP that authenticates.
-                        let mut pinned = false;
-                        ui().store.lock().unwrap().update(|c| pinned = peers::pin_first(&mut c.allowed_peers, ip));
-                        if pinned {
-                            eprintln!("pinned host {ip} (config allowed_peers); other IPs are now refused");
-                            *shared.just_pinned.lock().unwrap() = Some(ip.to_string());
-                        }
-                        Ok(c)
-                    }
-                    Ok(None) if shared.quit.load(Ordering::Relaxed) => return,
-                    Ok(None) => continue, // paused
-                    Err(e) => Err(e),
-                }
+                accept_round(listener.as_ref().unwrap(), &auth, &hello, &shared, &mut backoff, None)
             }
-            Target::Connect(addr) => Connection::connect(addr, &auth, &hello_for(&connector.hello, &shared)),
-        };
-        let conn = match res {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("connection attempt failed: {e}");
-                if e.is_unknown_viewer() {
-                    // The host no longer knows our key: ask to pair (same pinned host key) next time.
-                    shared.repair.store(true, Ordering::Relaxed);
+            Target::Connect(addr) => match dial(addr, Duration::from_secs(5), &auth, &hello) {
+                Ok(conn) => Attempt::Connected { conn, inbound: false },
+                Err(e) => Attempt::DialFailed(e),
+            },
+            Target::Both { addr, port } => {
+                if listener.is_none() {
+                    match std::net::TcpListener::bind(("0.0.0.0", *port)) {
+                        Ok(l) => {
+                            eprintln!("listening on 0.0.0.0:{port} (the Mac may connect too)");
+                            listener = Some(l);
+                            listen_problem = None;
+                        }
+                        Err(e) => {
+                            if listen_problem.is_none() {
+                                eprintln!("cannot listen on port {port}: {e}; dialing only");
+                            }
+                            listen_problem = Some(format!("port {port} is in use, so the Mac can't connect to this PC"));
+                        }
+                    }
                 }
+                both_round(addr, listener.as_ref(), &auth, &hello, &shared, &mut backoff)
+            }
+        };
+        let (conn, inbound) = match attempt {
+            Attempt::Quit => return,
+            Attempt::Again => continue,
+            Attempt::Connected { conn, inbound } => (conn, inbound),
+            Attempt::InboundFailed(e) | Attempt::DialFailed(e) | Attempt::NoAnswer(e) if e.is_unknown_viewer() => {
+                // The host no longer knows our key: ask to pair (same pinned host key) next time.
+                eprintln!("connection attempt failed: {e}");
+                shared.repair.store(true, Ordering::Relaxed);
+                note = Some(e.user_message(&host));
+                if sleep_or_quit(&shared, Duration::from_secs(2)) {
+                    return;
+                }
+                continue;
+            }
+            Attempt::InboundFailed(e) if matches!(connector.target, Target::Both { .. }) && matches!(e, ConnectError::HostIsV1 | ConnectError::Io(_)) => {
+                // Both mode: usually a connection the Mac made while this PC was busy dialing,
+                // already given up by the Mac (closed before its preamble). Not worth a message.
+                eprintln!("inbound connection dropped: {e}");
+                continue;
+            }
+            Attempt::InboundFailed(e) => {
+                // Inbound peers are untrusted until their key checks out: keep listening.
+                eprintln!("connection attempt failed: {e}");
                 let label = match &connector.target {
                     Target::Listen(port) if !ever_connected => format!("the host on port {port}"),
-                    Target::Connect(addr) if !ever_connected => addr.clone(),
+                    _ => host.clone(),
+                };
+                let msg = e.user_message(&label);
+                note = match &e {
+                    ConnectError::HostKeyChanged { .. } | ConnectError::Rejected(_) | ConnectError::PairingCancelled | ConnectError::PairingFailed(_) => {
+                        Some(msg)
+                    }
+                    _ if matches!(connector.target, Target::Both { .. }) => Some(format!("A connection attempt failed ({})", short_error(&msg))),
+                    _ => Some(format!("A connection attempt failed ({}) — still waiting for {label}…", short_error(&msg))),
+                };
+                if sleep_or_quit(&shared, Duration::from_millis(200)) {
+                    return;
+                }
+                continue;
+            }
+            Attempt::DialFailed(e) => {
+                eprintln!("connection attempt failed: {e}");
+                let label = match &connector.target {
+                    Target::Connect(addr) | Target::Both { addr, .. } if !ever_connected => addr.clone(),
                     _ => host.clone(),
                 };
                 let msg = e.user_message(&label);
                 let rate_limited = matches!(e, ConnectError::Refused { status: crate::handshake::ST_RATE_LIMITED, .. });
-                note = match &connector.target {
-                    // Inbound peers are untrusted until their key checks out: keep listening.
-                    Target::Listen(_) => match &e {
-                        ConnectError::HostKeyChanged { .. } | ConnectError::Rejected(_) | ConnectError::PairingCancelled | ConnectError::PairingFailed(_) => {
-                            Some(msg)
-                        }
-                        _ => Some(format!("A connection attempt failed ({}) — still waiting for {label}…", short_error(&msg))),
-                    },
-                    // While rate-limited, keep showing why we got there (e.g. "not paired yet").
-                    Target::Connect(_) if rate_limited && note.is_some() => note,
-                    Target::Connect(_) => Some(msg),
-                };
-                let retry = match (&connector.target, &e) {
-                    (Target::Listen(_), _) => Duration::from_millis(200),
-                    (Target::Connect(_), ConnectError::Refused { .. }) => Duration::from_secs(5),
-                    (Target::Connect(_), _) => Duration::from_secs(2),
-                };
+                // While rate-limited, keep showing why we got there (e.g. "not paired yet").
+                if !(rate_limited && note.is_some()) {
+                    note = Some(msg);
+                }
+                let retry = if matches!(e, ConnectError::Refused { .. }) { Duration::from_secs(5) } else { Duration::from_secs(2) };
                 if sleep_or_quit(&shared, retry) {
                     return;
                 }
                 continue;
             }
+            Attempt::NoAnswer(e) => {
+                // Both mode: the round already waited for the Mac to dial in; go again at once.
+                eprintln!("no connection yet: {e}");
+                note = Some(format!("No answer from {} ({})", if ever_connected { host.clone() } else { connector.target.addr().unwrap_or_default() }, short_error(&e.to_string())));
+                continue;
+            }
         };
+        if inbound {
+            eprintln!("the Mac connected to this PC");
+        }
+        {
+            // A pin found under the listen-mode fallback key moves to the address key, so the
+            // pairing survives switching modes (and "Forget host" finds it).
+            let mut st = ui().store.lock().unwrap();
+            let fallback = shared.pin_fallback.clone();
+            if let Some(fb) = fallback.as_deref() {
+                if !conn.paired && !st.config.pinned_hosts.contains_key(&shared.pin_target) {
+                    if let Some(p) = st.config.pinned_hosts.get(fb).cloned().filter(|p| p.key_bytes() == Some(conn.host_key)) {
+                        let target = shared.pin_target.clone();
+                        st.update(|c| {
+                            c.pinned_hosts.insert(target, p);
+                        });
+                    }
+                }
+            }
+        }
         if conn.paired {
             ui().store.lock().unwrap().pin_host(&shared.pin_target, &conn.host_key, &conn.host_name);
             shared.repair.store(false, Ordering::Relaxed);
@@ -2632,25 +2735,95 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
     }
 }
 
+impl Target {
+    /// The Mac's address, if the viewer dials.
+    fn addr(&self) -> Option<String> {
+        match self {
+            Target::Connect(a) | Target::Both { addr: a, .. } => Some(a.clone()),
+            Target::Listen(_) => None,
+        }
+    }
+}
+
+/// TCP connect (within `timeout`) + handshake.
+fn dial(addr: &str, timeout: Duration, auth: &Auth, hello: &ClientMsg) -> Result<Connection, ConnectError> {
+    Connection::from_stream(crate::net::tcp_connect(addr, timeout)?, auth, hello)
+}
+
+/// Accept one admitted peer (listen mode: wait forever; both mode: up to `wait`).
+fn accept_round(
+    listener: &std::net::TcpListener,
+    auth: &Auth,
+    hello: &ClientMsg,
+    shared: &Shared,
+    backoff: &mut peers::Backoff,
+    wait: Option<Duration>,
+) -> Attempt {
+    let allowed = || ui().store.lock().unwrap().config.allowed_peers.clone();
+    match peers::accept_admitted_within(listener, auth, hello, &shared.abort_accept, &allowed, backoff, crate::net::HANDSHAKE_TIMEOUT, wait) {
+        Ok(Some((conn, ip))) => {
+            // Trust on first use: pin the first host IP that authenticates.
+            let mut pinned = false;
+            ui().store.lock().unwrap().update(|c| pinned = peers::pin_first(&mut c.allowed_peers, ip));
+            if pinned {
+                eprintln!("pinned host {ip} (config allowed_peers); other IPs are now refused");
+                *shared.just_pinned.lock().unwrap() = Some(ip.to_string());
+            }
+            Attempt::Connected { conn, inbound: true }
+        }
+        Ok(None) if shared.quit.load(Ordering::Relaxed) => Attempt::Quit,
+        Ok(None) => Attempt::Again, // paused, or `wait` ran out
+        Err(e) => Attempt::InboundFailed(e),
+    }
+}
+
+/// One round of both mode, holding at most one connection: take a Mac that dialed in while we
+/// were busy (it waits in the kernel backlog), else dial the Mac briefly, else give the Mac a
+/// couple of seconds to dial in. Whichever direction the network allows connects.
+fn both_round(
+    addr: &str,
+    listener: Option<&std::net::TcpListener>,
+    auth: &Auth,
+    hello: &ClientMsg,
+    shared: &Shared,
+    backoff: &mut peers::Backoff,
+) -> Attempt {
+    if let Some(l) = listener {
+        match accept_round(l, auth, hello, shared, backoff, Some(Duration::ZERO)) {
+            Attempt::Again if !shared.paused.load(Ordering::Relaxed) => {}
+            other => return other,
+        }
+    }
+    let no_answer = match crate::net::tcp_connect(addr, BOTH_DIAL_TIMEOUT) {
+        Ok(stream) => {
+            return match Connection::from_stream(stream, auth, hello) {
+                Ok(conn) => Attempt::Connected { conn, inbound: false },
+                Err(e) => Attempt::DialFailed(e),
+            }
+        }
+        Err(e @ ConnectError::Resolve(_)) => return Attempt::DialFailed(e),
+        Err(e) => e,
+    };
+    match listener {
+        Some(l) => match accept_round(l, auth, hello, shared, backoff, Some(BOTH_ACCEPT_WAIT)) {
+            Attempt::Again if !shared.paused.load(Ordering::Relaxed) => Attempt::NoAnswer(no_answer),
+            other => other,
+        },
+        None => {
+            if sleep_or_quit(shared, BOTH_ACCEPT_WAIT) {
+                return Attempt::Quit;
+            }
+            Attempt::NoAnswer(no_answer)
+        }
+    }
+}
+
 /// The viewer name sent in msg3 (= ClientHello's client_name).
 fn hello_name(hello: &ClientMsg) -> String {
     match hello {
         ClientMsg::ClientHello { client_name, .. } => client_name.clone(),
         _ => "glide-viewer".into(),
     }
-}
-
-/// Listen mode: accept the next admitted peer (allowlist + backoff + pre-auth deadline, see
-/// `peers::accept_admitted`). Ok(None) = interrupted by quit/pause.
-fn accept_admitted(
-    listener: &std::net::TcpListener,
-    auth: &Auth,
-    hello: &ClientMsg,
-    shared: &Shared,
-    backoff: &mut peers::Backoff,
-) -> Result<Option<(Connection, std::net::IpAddr)>, ConnectError> {
-    let allowed = || ui().store.lock().unwrap().config.allowed_peers.clone();
-    peers::accept_admitted(listener, auth, hello, &shared.abort_accept, &allowed, backoff, crate::net::HANDSHAKE_TIMEOUT)
 }
 
 /// ClientHello with the current monitor's view size / refresh (the window may have moved).
@@ -2909,7 +3082,7 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
     }
     let initial_status = match &connector.target {
         Target::Listen(port) => format!("Waiting for host on port {port}…"),
-        Target::Connect(addr) => format!("Connecting to {addr}…"),
+        Target::Connect(addr) | Target::Both { addr, .. } => format!("Connecting to {addr}…"),
     };
     let shared = Arc::new(Shared {
         host_name: Mutex::new(opts.host_label.clone()),
@@ -2919,10 +3092,11 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         reconnect: AtomicBool::new(false),
         paused: AtomicBool::new(false),
         abort_accept: AtomicBool::new(false),
-        listening: matches!(connector.target, Target::Listen(_)),
+        listening: matches!(connector.target, Target::Listen(_) | Target::Both { .. }),
         just_pinned: Mutex::new(None),
         just_paired: Mutex::new(None),
         pin_target: connector.pin_target.clone(),
+        pin_fallback: connector.pin_fallback.clone(),
         config: Mutex::new(VideoConfig { width: 0, height: 0, codec: protocol::Codec::Hevc, chroma: 0, color: 0, scale: 1.0 }),
         sender: Mutex::new(None),
         clock: Mutex::new(None),

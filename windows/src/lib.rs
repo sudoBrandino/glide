@@ -26,6 +26,7 @@ pub mod net;
 pub mod noise;
 pub mod peers;
 pub mod protocol;
+pub mod setup;
 pub mod util;
 pub mod version;
 

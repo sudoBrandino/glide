@@ -60,10 +60,19 @@ pub struct WindowState {
 #[serde(default)]
 pub struct Config {
     pub version: u32,
-    /// Port for listen (reverse-connect) mode, used when no host is configured.
+    /// Port the viewer listens on so the Mac can connect to it: listen-only mode (no `host`), and
+    /// "both" mode (`host` set and `accept_incoming`).
     pub listen_port: u16,
-    /// If set (and no CLI target is given), dial this host instead of listening.
+    /// The Mac's address. If set (and no CLI target is given), the viewer dials it, and also
+    /// listens on `listen_port` while `accept_incoming` is on (whichever direction the network
+    /// allows wins).
     pub host: Option<String>,
+    /// With `host` set: also listen on `listen_port`, so the Mac can connect to this PC when the
+    /// network blocks PC → Mac. Off = dial only (`--no-listen`).
+    pub accept_incoming: bool,
+    /// The user chose to run the viewer from this exe without installing it (setup dialog), so
+    /// starting it from there doesn't offer to install again.
+    pub portable_exe: Option<String>,
     /// "fast" | "sharp" | "hybrid"; None = automatic (hybrid if 4:4:4 decode works).
     pub mode: Option<String>,
     /// Ctrl → Command, Win → Control, Alt → Option (menu → Input; `--no-ctrl-as-cmd`).
@@ -113,6 +122,8 @@ impl Default for Config {
             version: CONFIG_VERSION,
             listen_port: DEFAULT_PORT,
             host: None,
+            accept_incoming: true,
+            portable_exe: None,
             mode: None,
             ctrl_as_cmd: true,
             natural_scrolling: false,
@@ -156,14 +167,38 @@ impl Config {
     pub fn pinned_key(&self, target: &str) -> Option<[u8; 32]> {
         self.pinned_hosts.get(target).and_then(PinnedHost::key_bytes)
     }
+    /// The pin for `target`, else the one for `fallback` (`pin_fallback`: a viewer that used to
+    /// listen keeps its pairing after the Mac's address is entered).
+    pub fn pin_entry(&self, target: &str, fallback: Option<&str>) -> Option<(&str, &PinnedHost)> {
+        let valid = |k: &str| self.pinned_hosts.get_key_value(k).filter(|(_, p)| p.key_bytes().is_some());
+        valid(target).or_else(|| fallback.and_then(valid)).map(|(k, p)| (k.as_str(), p))
+    }
+    /// `pinned_key` with the `pin_fallback` target.
+    pub fn pinned_key_or(&self, target: &str, fallback: Option<&str>) -> Option<[u8; 32]> {
+        self.pin_entry(target, fallback).and_then(|(_, p)| p.key_bytes())
+    }
+    /// Nothing set up yet: no Mac address and no paired Mac (the setup dialog opens at startup).
+    pub fn needs_setup(&self) -> bool {
+        self.host.as_deref().is_none_or(|h| h.trim().is_empty()) && self.pinned_hosts.is_empty()
+    }
 }
 
 /// Pin-store key for a connection target: "host:port" (normalized, lowercase) when dialing,
+/// also in both mode (whichever direction connects, the Mac must present that key),
 /// "listen:PORT" in listen mode (whoever dials in must present that key).
 pub fn pin_target(t: &TargetSpec) -> String {
     match t {
-        TargetSpec::Connect(h) => crate::net::parse_addr(h.trim()).to_ascii_lowercase(),
+        TargetSpec::Connect(h) | TargetSpec::Both { host: h, .. } => crate::net::parse_addr(h.trim()).to_ascii_lowercase(),
         TargetSpec::Listen(p) => format!("listen:{p}"),
+    }
+}
+
+/// Second pin-store key tried when `pin_target` has no pin: in both mode the listen-mode pin
+/// ("listen:PORT"), so a viewer paired while listening stays paired once it knows the address.
+pub fn pin_fallback(t: &TargetSpec) -> Option<String> {
+    match t {
+        TargetSpec::Both { port, .. } => Some(format!("listen:{port}")),
+        _ => None,
     }
 }
 
@@ -257,6 +292,8 @@ pub fn parse(text: &str) -> Loaded {
     }
     field!(listen_port);
     field!(host);
+    field!(accept_incoming);
+    field!(portable_exe);
     field!(mode);
     field!(ctrl_as_cmd);
     field!(natural_scrolling);
@@ -291,6 +328,9 @@ pub fn parse(text: &str) -> Loaded {
     }
     if c.host.as_deref().is_some_and(|h| h.trim().is_empty()) {
         c.host = None;
+    }
+    if c.portable_exe.as_deref().is_some_and(|h| h.trim().is_empty()) {
+        c.portable_exe = None;
     }
     if c.download_dir.as_deref().is_some_and(|h| h.trim().is_empty()) {
         c.download_dir = None;
@@ -425,21 +465,35 @@ impl Store {
 /// Where the viewer connects, after merging CLI and config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetSpec {
+    /// Listen only: the Mac must connect to this PC (no address known).
     Listen(u16),
+    /// Dial only (`--no-listen`, or config `accept_incoming: false`).
     Connect(String),
+    /// Dial `host` and listen on `port`, one connection at a time: works whichever direction
+    /// the network allows.
+    Both { host: String, port: u16 },
 }
 
-/// CLI wins: a positional host, then `--listen [PORT]`; else the config's `host`; else listen on
-/// the configured port. So `glide-client.exe` with no arguments = listen on 7420 by default.
-pub fn resolve_target(cli_host: Option<&str>, cli_listen: Option<u16>, c: &Config) -> TargetSpec {
+/// CLI wins: a positional host (both mode, listening on `--listen PORT` or the configured port;
+/// dial only with `--no-listen`), then `--listen [PORT]` alone (listen only); else the config's
+/// `host` (both mode unless `accept_incoming` is off); else listen on the configured port. So
+/// `glide-client.exe` with no arguments and no config = listen on 7420.
+pub fn resolve_target(cli_host: Option<&str>, cli_listen: Option<u16>, no_listen: bool, c: &Config) -> TargetSpec {
+    let both = |h: &str, accept: bool| {
+        if accept && !no_listen {
+            TargetSpec::Both { host: h.to_string(), port: cli_listen.unwrap_or(c.listen_port) }
+        } else {
+            TargetSpec::Connect(h.to_string())
+        }
+    };
     if let Some(h) = cli_host {
-        return TargetSpec::Connect(h.to_string());
+        return both(h, true);
     }
     if let Some(p) = cli_listen {
         return TargetSpec::Listen(p);
     }
     match c.host.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
-        Some(h) => TargetSpec::Connect(h.to_string()),
+        Some(h) => both(h, c.accept_incoming),
         None => TargetSpec::Listen(c.listen_port),
     }
 }
@@ -721,6 +775,10 @@ mod tests {
         assert_eq!(pin_target(&TargetSpec::Connect("Mac.Local".into())), "mac.local:7420");
         assert_eq!(pin_target(&TargetSpec::Connect("192.168.50.4:7421".into())), "192.168.50.4:7421");
         assert_eq!(pin_target(&TargetSpec::Listen(7420)), "listen:7420");
+        let both = TargetSpec::Both { host: "10.0.99.4".into(), port: 7420 };
+        assert_eq!(pin_target(&both), "10.0.99.4:7420");
+        assert_eq!(pin_fallback(&both).as_deref(), Some("listen:7420"));
+        assert_eq!(pin_fallback(&TargetSpec::Connect("x".into())), None);
         // timestamps
         assert_eq!(rfc3339_utc(std::time::UNIX_EPOCH), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339_utc(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_970_309)), "2026-11-06T13:05:09Z");
@@ -730,13 +788,40 @@ mod tests {
     #[test]
     fn target_precedence() {
         let mut c = Config::default();
-        assert_eq!(resolve_target(None, None, &c), TargetSpec::Listen(7420));
+        assert_eq!(resolve_target(None, None, false, &c), TargetSpec::Listen(7420));
         c.listen_port = 7500;
-        assert_eq!(resolve_target(None, None, &c), TargetSpec::Listen(7500));
+        assert_eq!(resolve_target(None, None, false, &c), TargetSpec::Listen(7500));
         c.host = Some("mac:7420".into());
-        assert_eq!(resolve_target(None, None, &c), TargetSpec::Connect("mac:7420".into()));
-        assert_eq!(resolve_target(None, Some(7421), &c), TargetSpec::Listen(7421));
-        assert_eq!(resolve_target(Some("other"), Some(7421), &c), TargetSpec::Connect("other".into()));
+        assert_eq!(resolve_target(None, None, false, &c), TargetSpec::Both { host: "mac:7420".into(), port: 7500 });
+        assert_eq!(resolve_target(None, None, true, &c), TargetSpec::Connect("mac:7420".into()));
+        c.accept_incoming = false;
+        assert_eq!(resolve_target(None, None, false, &c), TargetSpec::Connect("mac:7420".into()));
+        assert_eq!(resolve_target(None, Some(7421), false, &c), TargetSpec::Listen(7421));
+        assert_eq!(resolve_target(Some("other"), Some(7421), false, &c), TargetSpec::Both { host: "other".into(), port: 7421 });
+        assert_eq!(resolve_target(Some("other"), None, true, &c), TargetSpec::Connect("other".into()));
+    }
+
+    #[test]
+    fn pin_fallback_and_setup_state() {
+        let mut c = Config::default();
+        assert!(c.needs_setup());
+        let (a, b) = ("ab".repeat(32), "cd".repeat(32));
+        c.pinned_hosts.insert("listen:7420".into(), PinnedHost { key: a, name: "Mac".into(), paired: String::new() });
+        assert!(!c.needs_setup());
+        assert_eq!(c.pinned_key_or("10.0.99.4:7420", Some("listen:7420")), Some([0xab; 32]));
+        assert_eq!(c.pin_entry("10.0.99.4:7420", Some("listen:7420")).unwrap().0, "listen:7420");
+        assert_eq!(c.pinned_key_or("10.0.99.4:7420", None), None);
+        c.pinned_hosts.insert("10.0.99.4:7420".into(), PinnedHost { key: b, name: "Mac".into(), paired: String::new() });
+        assert_eq!(c.pinned_key_or("10.0.99.4:7420", Some("listen:7420")), Some([0xcd; 32]), "the address pin wins");
+        let mut c = Config { host: Some(" ".into()), ..Config::default() };
+        assert!(c.needs_setup());
+        c.host = Some("mac".into());
+        assert!(!c.needs_setup());
+        // new keys round-trip and default sensibly in old files
+        let l = parse(r#"{"version":1,"host":"mac"}"#);
+        assert!(l.config.accept_incoming && l.config.portable_exe.is_none());
+        let c = Config { accept_incoming: false, portable_exe: Some("C:\\x\\glide-client.exe".into()), ..Config::default() };
+        assert_eq!(parse(&to_json(&c)).config, c);
     }
 
     #[test]

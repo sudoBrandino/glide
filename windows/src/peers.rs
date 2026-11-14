@@ -175,7 +175,24 @@ pub fn accept_admitted(
     backoff: &mut Backoff,
     deadline: Duration,
 ) -> Result<Option<(Connection, IpAddr)>, ConnectError> {
+    accept_admitted_within(listener, auth, hello, abort, allowed_peers, backoff, deadline, None)
+}
+
+/// `accept_admitted`, giving up with Ok(None) when no admitted peer has connected within `wait`
+/// (both mode alternates between dialing and accepting). `Some(Duration::ZERO)` only takes a
+/// connection that is already waiting in the backlog.
+pub fn accept_admitted_within(
+    listener: &std::net::TcpListener,
+    auth: &Auth,
+    hello: &ClientMsg,
+    abort: &AtomicBool,
+    allowed_peers: &dyn Fn() -> Vec<String>,
+    backoff: &mut Backoff,
+    deadline: Duration,
+    wait: Option<Duration>,
+) -> Result<Option<(Connection, IpAddr)>, ConnectError> {
     listener.set_nonblocking(true).map_err(ConnectError::Io)?;
+    let give_up = wait.map(|w| Instant::now() + w);
     loop {
         if abort.load(Ordering::Relaxed) {
             return Ok(None);
@@ -183,6 +200,9 @@ pub fn accept_admitted(
         let (stream, peer) = match listener.accept() {
             Ok(x) => x,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if give_up.is_some_and(|t| Instant::now() >= t) {
+                    return Ok(None);
+                }
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
@@ -482,6 +502,31 @@ mod accept_tests {
         let mut allowed = Vec::new();
         assert!(pin_first(&mut allowed, ip));
         assert_eq!(allowed, vec!["127.0.0.1"]);
+    }
+
+    #[test]
+    fn bounded_accept_gives_up_and_takes_the_backlog() {
+        // Both mode: no host dialing in → Ok(None) after the wait; a host that connected while
+        // the viewer was busy dialing waits in the backlog and is taken even with a zero wait.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let abort = AtomicBool::new(false);
+        let none = || Vec::<String>::new();
+        let (host, viewer) = (Identity::generate(), Identity::generate());
+        let a = auth(&viewer, Some(host.public()), TestUi::new(true));
+        let mut b = Backoff::default();
+        let t0 = Instant::now();
+        let r = accept_admitted_within(&l, &a, &hello(), &abort, &none, &mut b, Duration::from_secs(5), Some(Duration::from_millis(150)));
+        assert!(matches!(r, Ok(None)));
+        assert!(t0.elapsed() >= Duration::from_millis(150) && t0.elapsed() < Duration::from_secs(3));
+        let mut cfg = HostCfg::new(host.clone());
+        cfg.paired = vec![viewer.public()];
+        let h = dial(addr, cfg);
+        std::thread::sleep(Duration::from_millis(100)); // the connect completes into the backlog
+        let r = accept_admitted_within(&l, &a, &hello(), &abort, &none, &mut b, Duration::from_secs(5), Some(Duration::ZERO));
+        let (conn, _) = r.unwrap().unwrap();
+        assert_eq!(conn.host_key, host.public());
+        assert!(matches!(h.join().unwrap(), Outcome::Streaming { .. }));
     }
 
     #[test]

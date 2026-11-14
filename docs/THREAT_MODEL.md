@@ -76,9 +76,13 @@ use a VPN (WireGuard, Tailscale and so on) and treat it as part of the LAN.
 
 ## Dial-out mode (host → viewer)
 
-With `glide-host --connect PC` and `glide-client --listen`, the **viewer** listens instead of
-the Mac. Nothing listens on the Mac, which suits a Mac on a locked-down network segment. The
-cryptography is the same: the viewer is still the Noise initiator, and pins still decide.
+Once the Mac knows the PC's address (setup window, `glide-host --connect PC` or `connect` in
+host.json), it dials the viewer, and a viewer that knows the Mac's address listens as well as
+dialing (`accept_incoming`, default on). Either direction then works, whichever the network allows.
+By default the Mac **keeps listening** too. To have nothing listening on the Mac (a Mac on a
+locked-down segment), set `"listen": false` in host.json or pass `--no-listen`; the viewer's
+counterpart is `"accept_incoming": false` / `--no-listen`. The cryptography is the same either
+way: the viewer is still the Noise initiator, and pins still decide.
 
 What changes is the exposure of the viewer:
 
@@ -91,7 +95,8 @@ What changes is the exposure of the viewer:
 - Recommended: set `allowed_peers` to the Mac's address and add a Windows Firewall rule that
   admits only the Mac to `glide-client.exe`.
 
-The host redials every 2 s (backing off to 60 s while it is refused). It sends nothing about
+The host redials every 2 s (backing off to 60 s while it is refused), and doesn't dial while a
+viewer that dialed in is connected. It sends nothing about
 itself beyond what any host sends to a connecting viewer.
 
 ## Untrusted input, by side

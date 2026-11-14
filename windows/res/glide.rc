@@ -14,6 +14,9 @@
 #define SS_ICON           0x3
 #define SS_CENTERIMAGE    0x200
 #define SS_CENTER         0x1
+#define ES_AUTOHSCROLL    0x80
+#define WS_BORDER         0x00800000L
+#define WS_GROUP          0x00020000L
 #define IDOK              1
 #define IDCANCEL          2
 #define VOS_NT_WINDOWS32  0x40004L
@@ -29,6 +32,20 @@
 #define IDC_PAIR_TEXT    1101
 #define IDC_PAIR_CODE    1102
 #define IDC_PAIR_DETAIL  1103
+#define IDD_SETUP        103
+#define IDC_SU_ICON      1200
+#define IDC_SU_INTRO     1201
+#define IDC_SU_ADDR      1202
+#define IDC_SU_TEST      1203
+#define IDC_SU_TEST_RESULT 1204
+#define IDC_SU_ACCEPT    1205
+#define IDC_SU_FIREWALL  1206
+#define IDC_SU_FW_STATUS 1207
+#define IDC_SU_THIS_PC   1208
+#define IDC_SU_AUTOSTART 1209
+#define IDC_SU_INSTALL   1210
+#define IDC_SU_INSTALL_NOTE 1211
+#define IDC_SU_ADDR_LABEL 1212
 
 IDI_GLIDE ICON "glide.ico"
 1 24 "glide.manifest"
@@ -47,6 +64,31 @@ BEGIN
     LTEXT           "", IDC_PAIR_DETAIL, 10, 78, 242, 44
     DEFPUSHBUTTON   "Codes Match, Pair", IDOK, 118, 128, 80, 14, WS_TABSTOP
     PUSHBUTTON      "Cancel", IDCANCEL, 202, 128, 50, 14, WS_TABSTOP
+END
+
+// Setup (win/setup.rs): Mac address + test, firewall, start at sign-in, install. Tab order is
+// the order below; texts that depend on state are set at runtime. Keep this file ASCII.
+IDD_SETUP DIALOGEX 0, 0, 300, 250
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | DS_SETFOREGROUND | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "Glide: Set up"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    CONTROL         "", IDC_SU_ICON, "Static", SS_ICON | SS_CENTERIMAGE, 10, 10, 24, 24
+    LTEXT           "Connect this PC to your Mac. Glide Host on the Mac shows its address in its setup window (menu bar icon, Set Up...).", IDC_SU_INTRO, 44, 10, 246, 26
+    LTEXT           "&Mac's address:", IDC_SU_ADDR_LABEL, 10, 42, 120, 10
+    EDITTEXT        IDC_SU_ADDR, 10, 53, 222, 14, ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP | WS_GROUP
+    PUSHBUTTON      "&Test", IDC_SU_TEST, 238, 53, 52, 14, WS_TABSTOP
+    LTEXT           "", IDC_SU_TEST_RESULT, 10, 70, 280, 26
+    AUTOCHECKBOX    "&Let the Mac connect to this PC", IDC_SU_ACCEPT, 10, 100, 170, 12, WS_TABSTOP | WS_GROUP
+    PUSHBUTTON      "&Allow in Windows Firewall", IDC_SU_FIREWALL, 182, 99, 108, 14, WS_TABSTOP
+    LTEXT           "", IDC_SU_FW_STATUS, 22, 116, 268, 26
+    LTEXT           "", IDC_SU_THIS_PC, 22, 144, 268, 26
+    AUTOCHECKBOX    "&Start Glide when I sign in", IDC_SU_AUTOSTART, 10, 176, 280, 12, WS_TABSTOP | WS_GROUP
+    AUTOCHECKBOX    "&Install Glide Viewer on this PC", IDC_SU_INSTALL, 10, 192, 280, 12, WS_TABSTOP
+    LTEXT           "", IDC_SU_INSTALL_NOTE, 22, 205, 268, 18
+    DEFPUSHBUTTON   "&Connect", IDOK, 184, 228, 52, 14, WS_TABSTOP | WS_GROUP
+    PUSHBUTTON      "Cancel", IDCANCEL, 240, 228, 50, 14, WS_TABSTOP
 END
 
 VS_VERSION_INFO VERSIONINFO
