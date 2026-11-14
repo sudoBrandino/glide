@@ -69,7 +69,9 @@ enum ActiveDisplay {
     }
 
     static func isOnline(_ id: CGDirectDisplayID) -> Bool {
-        CGDisplayIsOnline(id) != 0 && CGDisplayIsActive(id) != 0
+        // == 1, not != 0: for an ID that no longer exists (a removed virtual display) these return
+        // -1 in some processes on macOS 27, which `!= 0` would take for "online".
+        CGDisplayIsOnline(id) == 1 && CGDisplayIsActive(id) == 1
     }
 
     private static func sameHardware(_ id: CGDirectDisplayID, _ s: DisplayIdentity) -> Bool {
