@@ -205,23 +205,23 @@ mod tests {
 
     #[test]
     fn install_paths() {
-        let env = |k: &str| (k == "LOCALAPPDATA").then(|| "C:\\Users\\b\\AppData\\Local".to_string());
+        let env = |k: &str| (k == "LOCALAPPDATA").then(|| "C:\\Users\\me\\AppData\\Local".to_string());
         let dir = default_install_dir(env).unwrap();
-        assert_eq!(dir, PathBuf::from("C:\\Users\\b\\AppData\\Local").join("Glide"));
+        assert_eq!(dir, PathBuf::from("C:\\Users\\me\\AppData\\Local").join("Glide"));
         assert_eq!(default_install_dir(|_| None), None);
-        let installed = Path::new("C:\\Users\\b\\AppData\\Local\\Glide\\glide-client.exe");
-        let inst_dir = Path::new("c:\\users\\b\\appdata\\local\\glide\\");
+        let installed = Path::new("C:\\Users\\me\\AppData\\Local\\Glide\\glide-client.exe");
+        let inst_dir = Path::new("c:\\users\\me\\appdata\\local\\glide\\");
         assert!(!offer_install(installed, inst_dir, None), "already installed (case, trailing slash)");
-        assert!(!offer_install(Path::new("\\\\?\\C:\\Users\\b\\AppData\\Local\\Glide\\glide-client.exe"), inst_dir, None));
-        let dl = Path::new("C:\\Users\\b\\Downloads\\glide-client.exe");
+        assert!(!offer_install(Path::new("\\\\?\\C:\\Users\\me\\AppData\\Local\\Glide\\glide-client.exe"), inst_dir, None));
+        let dl = Path::new("C:\\Users\\me\\Downloads\\glide-client.exe");
         assert!(offer_install(dl, inst_dir, None));
         assert!(offer_install(dl, inst_dir, Some("C:\\Other\\glide-client.exe")));
-        assert!(!offer_install(dl, inst_dir, Some("c:/users/b/downloads/glide-client.exe")), "chose to run it from there");
+        assert!(!offer_install(dl, inst_dir, Some("c:/users/me/downloads/glide-client.exe")), "chose to run it from there");
     }
 
     #[test]
     fn addresses() {
-        assert_eq!(normalize_address("  10.0.99.4 ").unwrap(), "10.0.99.4");
+        assert_eq!(normalize_address("  192.168.50.4 ").unwrap(), "192.168.50.4");
         assert_eq!(normalize_address("mac.local:7421").unwrap(), "mac.local:7421");
         assert_eq!(normalize_address("fe80::1").unwrap(), "fe80::1");
         assert!(normalize_address("").is_err());

@@ -775,8 +775,8 @@ mod tests {
         assert_eq!(pin_target(&TargetSpec::Connect("Mac.Local".into())), "mac.local:7420");
         assert_eq!(pin_target(&TargetSpec::Connect("192.168.50.4:7421".into())), "192.168.50.4:7421");
         assert_eq!(pin_target(&TargetSpec::Listen(7420)), "listen:7420");
-        let both = TargetSpec::Both { host: "10.0.99.4".into(), port: 7420 };
-        assert_eq!(pin_target(&both), "10.0.99.4:7420");
+        let both = TargetSpec::Both { host: "192.168.50.4".into(), port: 7420 };
+        assert_eq!(pin_target(&both), "192.168.50.4:7420");
         assert_eq!(pin_fallback(&both).as_deref(), Some("listen:7420"));
         assert_eq!(pin_fallback(&TargetSpec::Connect("x".into())), None);
         // timestamps
@@ -808,11 +808,11 @@ mod tests {
         let (a, b) = ("ab".repeat(32), "cd".repeat(32));
         c.pinned_hosts.insert("listen:7420".into(), PinnedHost { key: a, name: "Mac".into(), paired: String::new() });
         assert!(!c.needs_setup());
-        assert_eq!(c.pinned_key_or("10.0.99.4:7420", Some("listen:7420")), Some([0xab; 32]));
-        assert_eq!(c.pin_entry("10.0.99.4:7420", Some("listen:7420")).unwrap().0, "listen:7420");
-        assert_eq!(c.pinned_key_or("10.0.99.4:7420", None), None);
-        c.pinned_hosts.insert("10.0.99.4:7420".into(), PinnedHost { key: b, name: "Mac".into(), paired: String::new() });
-        assert_eq!(c.pinned_key_or("10.0.99.4:7420", Some("listen:7420")), Some([0xcd; 32]), "the address pin wins");
+        assert_eq!(c.pinned_key_or("192.168.50.4:7420", Some("listen:7420")), Some([0xab; 32]));
+        assert_eq!(c.pin_entry("192.168.50.4:7420", Some("listen:7420")).unwrap().0, "listen:7420");
+        assert_eq!(c.pinned_key_or("192.168.50.4:7420", None), None);
+        c.pinned_hosts.insert("192.168.50.4:7420".into(), PinnedHost { key: b, name: "Mac".into(), paired: String::new() });
+        assert_eq!(c.pinned_key_or("192.168.50.4:7420", Some("listen:7420")), Some([0xcd; 32]), "the address pin wins");
         let mut c = Config { host: Some(" ".into()), ..Config::default() };
         assert!(c.needs_setup());
         c.host = Some("mac".into());
