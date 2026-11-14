@@ -24,7 +24,13 @@
   PATH... answers FilePull (Ctrl+Alt+Shift+V), --file-evil sends adversarial offers, --file-decline
   declines everything, --log-pings logs Ping queueing (input priority during uploads).
 - --selftest checks the clipboard codec against the PROTOCOL.md §5 reference bytes (and the §3.4
-  latency messages + the docs/LATENCY.md block code) and exits.
+  latency messages + the docs/LATENCY.md block code, and the §3.5 display messages + identity
+  matching against docs/display-vectors.json) and exits.
+- Multiple displays (§3.5, client caps bit 13): pretends the Mac has --displays N displays (default 2;
+  a built-in panel plus external monitors), sends DisplayList after DisplayInfo and answers
+  SelectDisplay with DisplayList + DisplayChanged (the video stream itself does not change).
+  --display-unplug-after N drops the selected external display after N s (fallback), and plugs it back
+  N s later (restored), to exercise the viewer's hot-plug handling.
 - Latency (§3.4): after the client's LatencyEnable (0x80) every VideoFrame is followed by a
   FrameTiming (0x81) with the mock's send stamps; LatencyReports (0x82) are logged.
   --latency-pattern streams a live-encoded (ffmpeg, x265 zerolatency) test pattern instead of the
@@ -403,6 +409,7 @@ def selftest():
     trunc = all(_raises(lambda n=n: clip_decode(both[:n])) for n in range(1, len(both)))
     check(trunc, "truncation rejected")
     file_selftest(check)
+    display_selftest(check)
     check(crc8(b"123456789") == 0xF4, "CRC-8/SMBUS check value")
     check("".join(map(str, block_bits(0x12345678, 1, 5))) == BLOCK_REF, "block code reference bits (docs/LATENCY.md)")
     ft = frame_timing(7, 1_000_000, 1, 1_001_500, 1_001_600, 1_009_800, 1_009_900, 1_010_100)
@@ -697,6 +704,164 @@ def file_vectors_json():
             ' "messages": [\n' + rows({"name": n, "hex": b.hex()} for n, b in file_vectors()) + "\n ],\n"
             ' "paths": [\n' + rows({"in": i, "out": o} for i, o in PATH_VECTORS) + "\n ],\n"
             ' "suffix": [\n' + rows({"name": n, "n": k, "dir": d, "out": o} for n, k, d, o in SUFFIX_VECTORS) + "\n ]\n}\n")
+
+
+# ---------------------------------------------------------------- §3.5 multiple displays
+
+CAP_DISPLAYS = 1 << 13
+DISP_MAIN, DISP_BUILTIN, DISP_HIDPI, DISP_DEFAULT = 1, 2, 4, 8
+REASON_SELECTED, REASON_UNAVAILABLE, REASON_FALLBACK, REASON_RESTORED, REASON_HOST, REASON_DEFAULT = range(6)
+DISPLAY_LIST_MAX = 32
+
+
+def display(id, name, flags=0, x=0, y=0, w=1920, h=1080, pw=None, ph=None, refresh=6000, vendor=0, model=0, serial=0):
+    """One DisplayList entry as a dict (field names as in PROTOCOL.md §3.5)."""
+    return {"id": id, "flags": flags, "x": x, "y": y, "width": w, "height": h,
+            "pixel_width": w if pw is None else pw, "pixel_height": h if ph is None else ph,
+            "refresh": refresh, "vendor": vendor, "model": model, "serial": serial, "name": name}
+
+
+def display_list(streamed, selected, displays):
+    out = bytes([0x06]) + struct.pack("<IIB", streamed, selected, len(displays))
+    for d in displays:
+        out += struct.pack("<IBiiHHHHHIII", d["id"], d["flags"], d["x"], d["y"], d["width"], d["height"],
+                           d["pixel_width"], d["pixel_height"], d["refresh"], d["vendor"], d["model"], d["serial"])
+        out += _fstr(d["name"])
+    return out
+
+
+def display_changed(display_id, reason, requested):
+    return bytes([0x07]) + struct.pack("<IBI", display_id, reason, requested)
+
+
+def select_display(display_id):
+    return bytes([0x1A]) + struct.pack("<I", display_id)
+
+
+def display_decode(m):
+    """DisplayList / DisplayChanged / SelectDisplay -> (kind, dict). Raises ValueError/struct.error."""
+    t = m[0]
+    if t == 0x1A:
+        if len(m) < 5:
+            raise ValueError("truncated SelectDisplay")
+        return "select", {"id": struct.unpack_from("<I", m, 1)[0]}
+    if t == 0x07:
+        if len(m) < 10:
+            raise ValueError("truncated DisplayChanged")
+        i, r, q = struct.unpack_from("<IBI", m, 1)
+        return "changed", {"id": i, "reason": r, "requested": q}
+    if t != 0x06:
+        raise ValueError(f"not a display message: {t:#x}")
+    streamed, selected, n = struct.unpack_from("<IIB", m, 1)
+    p, ds = 10, []
+    keys = ("id", "flags", "x", "y", "width", "height", "pixel_width", "pixel_height", "refresh", "vendor", "model", "serial")
+    for _ in range(n):
+        d = dict(zip(keys, struct.unpack_from("<IBiiHHHHHIII", m, p)))
+        p += 35
+        (nl,) = struct.unpack_from("<H", m, p)
+        if p + 2 + nl > len(m):
+            raise ValueError("truncated display name")
+        d["name"] = m[p + 2:p + 2 + nl].decode("utf-8", "replace")
+        p += 2 + nl
+        ds.append(d)
+    return "list", {"streamed": streamed, "selected": selected, "displays": ds}
+
+
+def display_match(want, displays):
+    """PROTOCOL.md §3.5 identity matching: remembered {id, vendor, model, serial, name} -> id or None."""
+    same = lambda d: (d["vendor"], d["model"], d["serial"]) == (want["vendor"], want["model"], want["serial"])
+    for d in displays:
+        if d["id"] == want["id"] and same(d):
+            return d["id"]
+    if want["serial"] != 0:
+        return next((d["id"] for d in displays if same(d)), None)
+    cands = [d for d in displays if same(d)]
+    if want["vendor"] == 0 and want["model"] == 0:
+        cands = [d for d in cands if d["name"] == want["name"]]
+    named = [d for d in cands if d["name"] == want["name"]]
+    return (named or cands or [{"id": None}])[0]["id"]
+
+
+APPLE, DELL = 0x0610, 0x10AC
+BUILTIN = display(1, "Built-in Retina Display", DISP_MAIN | DISP_BUILTIN | DISP_HIDPI | DISP_DEFAULT,
+                  0, 0, 1512, 982, 3024, 1964, 12000, APPLE, 0xA04E, 0)
+DELL_A = display(5, "DELL U2723QE", DISP_HIDPI, 1512, -300, 1920, 1080, 3840, 2160, 6000, DELL, 0x4268, 0x31324C4A)
+DELL_B = display(6, "DELL U2723QE", 0, 3432, -300, 2560, 1440, 2560, 1440, 5994, DELL, 0x4268, 0x31324C4B)
+TWIN_1 = display(7, "LG HDR 4K", 0, -1920, 0, 1920, 1080, refresh=6000, vendor=0x1E6D, model=0x7750)
+TWIN_2 = display(8, "LG HDR 4K", 0, -3840, 0, 1920, 1080, refresh=6000, vendor=0x1E6D, model=0x7750)
+VIRTUAL = display(9, "Glide Virtual Display", DISP_HIDPI, 0, 982, 1920, 1080, 3840, 2160, 6000)
+SIDECAR = display(10, "Sidecar Display", 0, 0, 2062, 1366, 1024)
+
+
+def display_vectors():
+    """The shared reference encodings (docs/display-vectors.json "messages")."""
+    return [
+        ("SelectDisplay", select_display(2)),
+        ("SelectDisplayAutomatic", select_display(0)),
+        ("DisplayChanged", display_changed(2, REASON_FALLBACK, 5)),
+        ("DisplayChangedUnavailable", display_changed(1, REASON_UNAVAILABLE, 0xDEADBEEF)),
+        ("DisplayListBuiltin", display_list(1, 0, [BUILTIN])),
+        ("DisplayList", display_list(5, 5, [BUILTIN, VIRTUAL, DELL_A, DELL_B])),
+        ("DisplayListEmpty", display_list(3, 0, [])),
+        ("DisplayListUnicode", display_list(11, 11, [display(11, "Écran 日本", DISP_MAIN | DISP_DEFAULT, -1, -2, 1, 2, 3, 4, 0, 1, 2, 3)])),
+    ]
+
+
+def ident(d, **kw):
+    w = {k: d[k] for k in ("id", "vendor", "model", "serial", "name")}
+    w.update(kw)
+    return w
+
+
+MATCH_LIST = [BUILTIN, DELL_A, DELL_B, TWIN_1, TWIN_2, VIRTUAL, SIDECAR]
+# (description, remembered identity, expected id or None) against MATCH_LIST.
+MATCH_VECTORS = [
+    ("same id and identity", ident(DELL_B), 6),
+    ("new id, same serial", ident(DELL_A, id=99), 5),
+    ("id reused by another display", ident(DELL_A, id=1), 5),
+    ("serial gone: other unit of the model is not a match", ident(DELL_A, id=5, serial=0x31324C4C), None),
+    ("built-in panel, new id", ident(BUILTIN, id=42), 1),
+    ("built-in panel, renamed (other language)", ident(BUILTIN, id=42, name="Integriertes Retina-Display"), 1),
+    ("twins without serial: same id wins", ident(TWIN_2), 8),
+    ("twins without serial, new id: first in list order", ident(TWIN_2, id=77), 7),
+    ("no EDID: matched by name", ident(VIRTUAL, id=31), 9),
+    ("no EDID: second unknown display by name", ident(SIDECAR, id=32), 10),
+    ("no EDID, name differs: none", ident(VIRTUAL, id=31, name="Other Virtual"), None),
+    ("unknown vendor/model: none", ident(DELL_A, id=12, vendor=0x4C2D, model=1, serial=0), None),
+    ("same id, different identity, no other match: none", ident(DELL_A, id=7, model=0x1111, serial=0), None),
+]
+
+
+def display_vectors_json():
+    import json
+    j = lambda v: json.dumps(v, ensure_ascii=True)
+    rows = lambda items: ",\n".join("  " + j(x) for x in items)
+    return ("{\n" + ' "comment": ' + j("Generated by tools/mock_host.py --display-vectors; checked by glide-selftest, "
+                                          "cargo test and mock_host.py --selftest (docs/PROTOCOL.md §3.5). "
+                                          "match: remembered identity -> expected id (null = no match) in match_list.") + ",\n"
+            ' "messages": [\n' + rows({"name": n, "hex": b.hex()} for n, b in display_vectors()) + "\n ],\n"
+            ' "match_list": [\n' + rows(MATCH_LIST) + "\n ],\n"
+            ' "match": [\n' + rows({"what": w, "want": i, "expect": e} for w, i, e in MATCH_VECTORS) + "\n ]\n}\n")
+
+
+def display_selftest(check):
+    vec_path = os.path.join(HERE, "../docs/display-vectors.json")
+    try:
+        disk = open(vec_path).read()
+    except OSError:
+        disk = ""
+    check(disk == display_vectors_json(), "docs/display-vectors.json is up to date (--display-vectors)")
+    for name, b in display_vectors():
+        kind, f = display_decode(b)
+        re = {"select": lambda: select_display(f["id"]),
+              "changed": lambda: display_changed(f["id"], f["reason"], f["requested"]),
+              "list": lambda: display_list(f["streamed"], f["selected"], f["displays"])}[kind]()
+        check(re == b, f"{name} decode/encode roundtrip")
+        check(all(_raises(lambda n=n: display_decode(b[:n])) for n in range(1, len(b))), f"{name} truncation rejected")
+    bad = [(w, display_match(i, MATCH_LIST), e) for w, i, e in MATCH_VECTORS if display_match(i, MATCH_LIST) != e]
+    for w, got, e in bad:
+        print(f"    match {w!r}: got {got}, want {e}")
+    check(not bad, f"{len(MATCH_VECTORS)} display identity matching vectors")
 
 
 def collect_files(paths):
@@ -1010,6 +1175,13 @@ class Session:
             # DisplayInfo (§3.3): pretend the Mac runs 1920x1080 Retina under "automatic".
             self.display_pref = 0
             self.send_display_info()
+            if caps & CAP_DISPLAYS:
+                self.mock_displays = [BUILTIN, DELL_A, DELL_B, VIRTUAL][:max(1, min(self.args.displays, 4))]
+                self.streamed, self.selected = BUILTIN["id"], 0
+                self.send_display_list()
+                log(f"{self.addr}: display selection negotiated (caps bit 13): {len(self.mock_displays)} displays")
+                if self.args.display_unplug_after > 0:
+                    threading.Thread(target=self.display_hotplug_loop, daemon=True).start()
             self.send_cursor()
             if self.args.latency_pattern:
                 t = threading.Thread(target=self.pattern_loop, daemon=True)
@@ -1492,6 +1664,46 @@ class Session:
         w, h, hi = self.DISPLAY_MODES.get(self.display_pref, (1920, 1080, 1))
         self.send_msg(bytes([0x05, self.display_pref]) + struct.pack("<HHB", w, h, hi))
 
+    def send_display_list(self):
+        with self.lock:
+            ds = list(self.mock_displays)
+        self.send_msg(display_list(self.streamed, self.selected, ds))
+
+    def on_select_display(self, did):
+        ids = [d["id"] for d in self.mock_displays]
+        if did != 0 and did not in ids:
+            log(f"{self.addr}: SelectDisplay {did}: no such display")
+            self.send_msg(display_changed(self.streamed, REASON_UNAVAILABLE, did))
+            return
+        self.selected = did
+        self.streamed = did or BUILTIN["id"]
+        name = next(d["name"] for d in self.mock_displays if d["id"] == self.streamed)
+        log(f"{self.addr}: SelectDisplay {did or 'automatic'} -> streaming {self.streamed} {name!r} (video unchanged)")
+        self.send_display_list()
+        self.send_msg(display_changed(self.streamed, REASON_SELECTED, did))
+
+    def display_hotplug_loop(self):
+        n = self.args.display_unplug_after
+        while self.alive:
+            time.sleep(n)
+            sel = next((d for d in self.mock_displays if d["id"] == self.selected and not d["flags"] & DISP_BUILTIN), None)
+            if sel is None:
+                continue
+            log(f"{self.addr}: hot-plug: unplugging {sel['name']!r} ({sel['id']})")
+            with self.lock:
+                self.mock_displays = [d for d in self.mock_displays if d is not sel]
+            self.streamed = BUILTIN["id"]
+            self.send_display_list()
+            self.send_msg(display_changed(self.streamed, REASON_FALLBACK, sel["id"]))
+            time.sleep(n)
+            back = dict(sel, id=sel["id"] + 100)  # comes back under a new id
+            log(f"{self.addr}: hot-plug: {sel['name']!r} is back as {back['id']}")
+            with self.lock:
+                self.mock_displays = sorted(self.mock_displays + [back], key=lambda d: (d["x"], d["y"], d["id"]))
+            self.selected = self.streamed = back["id"]
+            self.send_display_list()
+            self.send_msg(display_changed(self.streamed, REASON_RESTORED, back["id"]))
+
     def input_loop(self):
         names = {0x10: "MouseMove", 0x11: "MouseButton", 0x12: "MouseWheel", 0x13: "Key", 0x14: "ReleaseAll",
                  0x20: "RequestKeyframe", 0x21: "SetMode", 0x50: "Clipboard"}
@@ -1534,6 +1746,11 @@ class Session:
                 if m[1] < 5:
                     self.display_pref = m[1]
                     self.send_display_info()
+            elif t == 0x1A:
+                if len(m) >= 5 and getattr(self, "mock_displays", None):
+                    self.on_select_display(struct.unpack_from("<I", m, 1)[0])
+                else:
+                    log(f"{self.addr}: SelectDisplay ignored (no DisplayList sent)")
             elif t == 0x20:
                 log(f"{self.addr}: RequestKeyframe -> restarting stream at first keyframe")
                 self.restart.set()
@@ -1602,6 +1819,10 @@ def main():
     ap.add_argument("--selftest", action="store_true",
                     help="check the clipboard/latency/file codecs (PROTOCOL.md §5/§3.4/§6, docs/file-transfer-vectors.json) and exit")
     ap.add_argument("--file-vectors", metavar="OUT", help="write docs/file-transfer-vectors.json to OUT and exit")
+    ap.add_argument("--display-vectors", metavar="OUT", help="write docs/display-vectors.json to OUT and exit")
+    ap.add_argument("--displays", type=int, default=2, help="number of Mac displays to pretend (§3.5, caps bit 13; 1-4)")
+    ap.add_argument("--display-unplug-after", type=float, default=0, metavar="SECONDS",
+                    help="unplug the selected external display after N s, plug it back N s later (§3.5 hot-plug)")
     ap.add_argument("--no-files", action="store_true", help="don't negotiate file transfer (caps bit 11)")
     ap.add_argument("--file-recv", default=os.path.join(HERE, "../.dev/mock-recv"), help="save files from the viewer here")
     ap.add_argument("--file-send", nargs="+", metavar="PATH", help="offer these files/folders to the viewer ~2 s after connect")
@@ -1620,6 +1841,9 @@ def main():
         sys.exit(0 if selftest() else 1)
     if args.file_vectors:
         open(args.file_vectors, "w").write(file_vectors_json())
+        sys.exit(0)
+    if args.display_vectors:
+        open(args.display_vectors, "w").write(display_vectors_json())
         sys.exit(0)
 
     trust = Trust(args)

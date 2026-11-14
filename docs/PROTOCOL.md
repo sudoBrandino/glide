@@ -287,6 +287,7 @@ in place (unused) so a rollback to v1 binaries still works.
 | `0x14` | ReleaseAll | (none) — host releases every held key/button |
 | `0x15` | ViewSize | `u16 view_w`, `u16 view_h` — physical pixels of the monitor/area the viewer will present on (the window's current monitor in fullscreen). Sent whenever it changes (window moved to another monitor, display mode change). The host re-captures so the encoded width ≤ `view_w` and follows with `VideoConfig` + keyframe |
 | `0x16` | SetDisplayPreference | `u8 mode` — Mac display-mode preference for this session, see §3.3 |
+| `0x1A` | SelectDisplay | `u32 display_id` — which Mac display to stream (0 = the host's default), see §3.5 |
 | `0x20` | RequestKeyframe | (none) |
 | `0x21` | SetMode | `u8 mode` (0 fast, 1 sharp), `u32 bitrate_kbps` (0 = auto), `u8 max_fps` (0 = keep) |
 | `0x30` | Ping | `u64 client_time_us` |
@@ -298,7 +299,8 @@ in place (unused) so a rollback to v1 binaries still works.
 
 `codec_caps` bits (despite the name, a general capability mask): bits 0–7 are video codecs —
 `0` HEVC 4:2:0, `1` HEVC 4:4:4, `2` H.264 4:2:0; bits 8+ are non-video features — `8` clipboard
-sync (§5), `9` audio PCM, `10` audio Opus (reserved) (§3.2), `11` file transfer (§6). Hosts ignore bits they don't know;
+sync (§5), `9` audio PCM, `10` audio Opus (reserved) (§3.2), `11` file transfer (§6), `13` display selection (§3.5).
+Hosts ignore bits they don't know;
 codec selection looks at bits 0–7 only.
 `mode`: `0` fast (4:2:0 only), `1` sharp (4:4:4 every frame), `2` **hybrid** (4:2:0 while the screen
 changes + a 4:4:4 refinement layer once it settles; see §3.1). Hybrid requires `codec_caps` bit 1;
@@ -316,6 +318,8 @@ the host injects exactly the HID usages it receives.
 | `0x02` | ServerHello | `u16 version` (= 2), `str host_name`, then a `VideoConfig` body (below) |
 | `0x04` | SharpLayerConfig | `VideoConfig` body for the refinement layer (hybrid mode only; sent right after `ServerHello`/`VideoConfig`). Same width/height as the base layer, HEVC 4:4:4 |
 | `0x05` | DisplayInfo | `u8 preference`, `u16 mode_w`, `u16 mode_h`, `u8 hidpi` — see §3.3 |
+| `0x06` | DisplayList | the Mac's displays and which one is streamed — see §3.5 (only to clients with caps bit 13) |
+| `0x07` | DisplayChanged | `u32 display_id`, `u8 reason`, `u32 requested_id` — see §3.5 (only to clients with caps bit 13) |
 | `0x03` | VideoConfig | `u16 width`, `u16 height` (encoded pixels), `u8 codec` (1 HEVC, 2 H.264), `u8 chroma` (0 4:2:0, 1 4:4:4), `u8 color` (0 BT.709 limited), `f32 scale` (host backing scale, e.g. 2.0) |
 | `0x31` | Pong | `u64 client_time_us` (echoed), `u64 host_time_us` |
 | `0x40` | VideoFrame | `u32 frame_id`, `u64 capture_time_us` (host monotonic), `u8 flags`, [rects], then Annex-B elementary stream bytes. Flags: bit0 keyframe; bit1 refresh (re-encode of unchanged content for quality — `capture_time_us` is the original capture, so exclude from latency stats); bit2 **sharp layer** (decode with the refinement-layer decoder, see §3.1); bit3 **has rects**: the payload starts with `u16 n` then `n` × (`u16 x, y, w, h`) in encoded pixels, before the Annex-B bytes |
@@ -488,6 +492,102 @@ LatencyReport {120 samples, flags 1, host 11000, network 1200, queue 300, decode
 The glass-to-glass test pattern (a block code of the host clock drawn on the host screen and
 read back by the viewer) is not part of the wire protocol; its layout is in `docs/LATENCY.md`.
 
+## 3.5 Multiple displays (v1.6)
+
+A Mac can have several displays (built-in panel, external monitors, virtual displays). The host
+streams exactly one of them; the viewer can see the list and pick which one. Message types
+`0x06–0x07` (H→C) and `0x1A–0x1C` (C→H) are reserved for this; `0x1B–0x1C` are unused.
+
+**Capability.** ClientHello `codec_caps` bit **13** = `DISPLAYS`. A host sends `0x06`/`0x07` only
+to viewers that set it, so an old viewer never sees them; an old host ignores the bit and logs and
+drops `0x1A`. A viewer sends `SelectDisplay` only after it received a `DisplayList`.
+
+| dir | type | name | payload |
+|----|----|----|----|
+| H→C | `0x06` | DisplayList | `u32 streamed_id`, `u32 selected_id`, `u8 count`, then `count` × display (below) |
+| H→C | `0x07` | DisplayChanged | `u32 display_id`, `u8 reason`, `u32 requested_id` |
+| C→H | `0x1A` | SelectDisplay | `u32 display_id` |
+
+Display entry (35 bytes + name):
+
+| size | field |
+|----|----|
+| 4 | `u32 id` — the macOS `CGDirectDisplayID`. **Volatile**: valid for this connection only |
+| 1 | `u8 flags` — bit0 main display, bit1 built-in panel, bit2 HiDPI (current mode has Retina backing), bit3 default (what `SelectDisplay(0)` streams); other bits zero |
+| 4 + 4 | `i32 x`, `i32 y` — top-left corner in global points (the main display's top-left is 0,0; y grows downwards) |
+| 2 + 2 | `u16 width`, `u16 height` — current mode, points ("looks like") |
+| 2 + 2 | `u16 pixel_width`, `u16 pixel_height` — current mode, backing pixels |
+| 2 | `u16 refresh` — refresh rate in 1/100 Hz (5994 = 59.94 Hz), 0 = unknown |
+| 4 + 4 + 4 | `u32 vendor`, `u32 model`, `u32 serial` — EDID identity (`CGDisplayVendorNumber`/`ModelNumber`/`SerialNumber`), 0 = unknown |
+| 2 + n | `str name` — the display's localized name (`NSScreen.localizedName`), e.g. `Built-in Retina Display` |
+
+`DisplayChanged.reason`:
+
+| value | meaning |
+|----|----|
+| 0 | selected — the viewer's `SelectDisplay` was applied |
+| 1 | unavailable — `requested_id` is not a display the host can stream; nothing changed |
+| 2 | fallback — the selected display went away (unplugged, lid closed, asleep); streaming the default |
+| 3 | restored — the selected display came back; streaming it again |
+| 4 | host — someone on the Mac picked the display (menu bar) |
+| 5 | default — no display is selected and the host's default changed (e.g. a new main display) |
+
+Rules:
+- **Default display.** Without a selection the host streams its default: its configured display
+  (`glide-host --display ID`) while that is online, otherwise the current main display. It
+  re-resolves on every capture start, never caching an ID.
+- **List.** The host sends `DisplayList` once after `ServerHello` (after `DisplayInfo`) and again
+  whenever its content changes: a display appears or goes away, a mode/arrangement changes, or the
+  streamed display changes. It lists the online, non-mirrored displays (at most 32) ordered by `x`,
+  then `y`, then `id` (left to right), so "next display" is the one to the right. `streamed_id` is
+  the display being captured; `selected_id` is the session's selection (0 = none, following the
+  default). `streamed_id` may be missing from the list (e.g. the only display is asleep); viewers
+  must cope.
+- **Selecting.** `SelectDisplay(id)` selects display `id` for the rest of the session (0 clears the
+  selection). The host does not persist it. If `id` is not in its current list the host answers
+  `DisplayChanged(streamed, 1, id)` and changes nothing. Otherwise it re-captures that display
+  (`VideoConfig` + keyframe as usual), moves input mapping to it (`MouseMove` etc. are normalized
+  over the streamed display), applies its display-mode policy (§3.3) to the new display and gives
+  the previous display its pre-session mode back. Selecting the display already streamed answers
+  `DisplayChanged(id, 0, id)` without re-capturing.
+- **Order after a switch:** `VideoConfig` (+ `SharpLayerConfig`), `DisplayList`, `DisplayChanged`,
+  `DisplayInfo` (now describing the new display), then the keyframe. A viewer can therefore name
+  the new display from the list it just received.
+- **Hot-plug.** When the selected display goes away the host falls back to the default display
+  and sends `DisplayChanged(default, 2, selected)`. It keeps the selection's identity (vendor,
+  model, serial, name) for the rest of the session: when a display with that identity comes back
+  (possibly under a new id) it switches back and sends `DisplayChanged(id, 3, id)`. Without a
+  selection, a change of the default display is reported as reason 5.
+- **Identity.** Display ids can change across reconnects, reboots and re-plugs. A viewer that wants
+  to remember a choice stores the display's identity and, after the first `DisplayList` of a new
+  connection, maps it back with the matching rule below; if it matches a display other than the
+  streamed one it sends `SelectDisplay`. If nothing matches it leaves the default alone.
+
+**Identity matching (normative; both sides use it, checked by the vectors).** Given a remembered
+`(id, vendor, model, serial, name)` and the current list, the match is:
+
+1. the entry with the same `id` **and** the same `vendor`, `model`, `serial`, if any; else
+2. if the remembered `serial` ≠ 0: the first entry with the same `vendor`, `model` and `serial`;
+   else none (a different unit of the same model is not the same display); else
+3. (remembered `serial` = 0) the entries with the same `vendor` and `model` and `serial` = 0 —
+   when `vendor` and `model` are both 0, only those whose `name` is also equal — preferring the
+   first whose `name` is equal, else the first; else none.
+
+"First" is in list order. Names are compared exactly (UTF-8 bytes).
+
+Reference encodings (`docs/display-vectors.json`, generated by `tools/mock_host.py
+--display-vectors`; checked by `glide-selftest`, `cargo test` and `mock_host.py --selftest`):
+
+```
+SelectDisplay {id 2}                    1a 02000000
+SelectDisplay {automatic}               1a 00000000
+DisplayChanged {id 2, fallback, req 5}  07 02000000 02 05000000
+DisplayList {streamed 1, selected 0, [id 1 "Built-in Retina Display" main|builtin|hidpi|default,
+             0,0 1512x982 pt 3024x1964 px 120 Hz, 0610/a04e/0]}
+  06 01000000 00000000 01 01000000 0f 00000000 00000000 e805 d603 d00b ac07 e02e
+     10060000 4ea00000 00000000 1700 4275696c742d696e20526574696e6120446973706c6179
+```
+
 ## 4. Test vectors
 
 - `docs/noise-vectors.json`: the official Noise_XX_25519_ChaChaPoly_SHA256 vectors (cacophony,
@@ -499,6 +599,8 @@ read back by the viewer) is not part of the wire protocol; its layout is in `doc
   `tools/gen_vectors.py` (Python reference); CI regenerates and compares it.
 - `docs/test-vectors-rust.json`: the same schema with other inputs, generated by the Rust
   implementation (`GLIDE_REGEN_VECTORS=1 cargo test rust_transcript`).
+- `docs/display-vectors.json`: §3.5 message encodings and identity-matching cases, generated by
+  `tools/mock_host.py --display-vectors`; CI regenerates and compares it.
 
 Swift replays both transcripts as host and as viewer byte for byte; Rust replays the Python one;
 `tools/gen_vectors.py --check docs/test-vectors-rust.json` replays the Rust one in Python.
