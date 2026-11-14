@@ -1,8 +1,36 @@
+# Build output
 .build/
-*.xcodeproj
 .swiftpm/
+*.xcodeproj
+xcuserdata/
+DerivedData/
 windows/target/
-.DS_Store
-*.app
 dist/
+*.app
+*.dSYM/
+__pycache__/
+*.pyc
+
+# Private per-developer files: local config, credentials, signing material
 .dev/
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.cer
+*.mobileprovision
+*.provisionprofile
+*.dpapi
+host-key
+host.json
+
+# Editors, OS, tools
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+.remember/
+.claude/
+*.log

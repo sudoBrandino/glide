@@ -27,7 +27,7 @@ The wire protocol is defined in `../docs/PROTOCOL.md`.
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"   # or ~/.cargo/bin
 cargo test                                                    # native unit tests, including the test vectors
 cargo build --release --target x86_64-pc-windows-gnu          # needs x86_64-w64-mingw32-gcc (Homebrew mingw-w64)
-scp target/x86_64-pc-windows-gnu/release/glide-client.exe my-pc:C:/Users/me/glide/glide-client.exe
+scp target/x86_64-pc-windows-gnu/release/glide-client.exe <pc>:glide/glide-client.exe      # or ../tools/deploy-viewer.sh
 ```
 
 `.cargo/config.toml` sets the MinGW linker and `+crt-static`. The exe needs only system DLLs.
@@ -96,7 +96,7 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   - If that monitor is gone, it uses the saved state of the monitor under the cursor, or opens centered.
   - A saved rect that no longer fits (for example after a resolution change) is clamped into the monitor's work area.
 - **Listen-mode admission control** (defense in depth; see `src/peers.rs`):
-  - **Allowlist:** if `allowed_peers` is non-empty, connections from any other IP are closed right after `accept()`, before a single handshake byte is sent or read. Entries are IPs or CIDRs, for example `"192.168.50.4"` or `"192.168.50.0/24"`.
+  - **Allowlist:** if `allowed_peers` is non-empty, connections from any other IP are closed right after `accept()`, before a single handshake byte is sent or read. Entries are IPs or CIDRs, for example `"192.168.1.50"` or `"192.168.1.0/24"`.
   - **Trust on first use:** if `allowed_peers` is empty, the IP of the first peer that completes an authenticated session is pinned there (logged, and shown in the "Connected" toast). Tray → *Forget host (unpair)…* clears it together with the pinned key.
   - **Backoff:** a failed handshake blocks the peer for 1 s, doubling on each further failure up to 60 s. Connections from a blocked peer are dropped without a handshake, and a successful session resets it. Peers are tracked per IPv4 address and per IPv6 /64, so a peer can't escape by rotating addresses within its /64.
   - **Global budget (unpinned only):** while nothing is pinned, more than 10 failed handshakes from all peers within 60 s refuse every unpinned peer for 60 s. Pinned or allowlisted hosts are never affected.
@@ -126,8 +126,9 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
 - `--bench` pairs on the console: it prints the code and asks `[y/N]` (or `GLIDE_PAIR_CONFIRM=yes|no`).
 - `--listen [PORT]` is reverse connect. It binds `0.0.0.0:PORT` (default 7420) and accepts the host's
   connection (`glide-host --connect PC:PORT`). The GUI viewer accepts again after each disconnect; `--bench` accepts only once. The protocol is unchanged: the viewer still writes first (it is the Noise initiator).
-  Use this mode when the firewall blocks PC → Mac. The Windows Firewall rule on the PC allows only
-  `C:\Users\me\glide\glide-client.exe` from 192.168.50.4, so keep the exe at that path.
+  Use this mode when the firewall blocks PC → Mac. A Windows Firewall rule on the PC can then allow
+  only the Mac's address to reach `glide-client.exe`. Such a rule is bound to the exe's path, so
+  keep the exe at that path.
 - `--mode` takes one of three values:
   - `fast`: 4:2:0 only.
   - `sharp`: 4:4:4 on every frame.
@@ -238,7 +239,7 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
 The GUI command for the real host (run it in the interactive desktop session, e.g. from a shortcut):
 
 ```
-C:\Users\me\glide\glide-client.exe
+%USERPROFILE%\glide\glide-client.exe
 ```
 
 With the default config this listens on port 7420. On first run, pair it: on the Mac choose Glide →
@@ -289,7 +290,7 @@ With the default config this listens on port 7420. On first run, pair it: on the
 ```sh
 ../tools/make_streams.sh                       # 2560x1440 HEVC 4:2:0 / 4:4:4 / H.264 test streams in tools/streams/
 python3 ../tools/mock_host.py --port 7421 --pair 300   # listen mode (client dials in); pairing window open 5 min
-python3 ../tools/mock_host.py --connect 192.168.10.212:7421 --once   # dial a `--listen 7421` client
+python3 ../tools/mock_host.py --connect 192.168.1.60:7421 --once   # dial a `--listen 7421` client
 # --pair-confirm yes|no|ask: the mock "Mac" answer to a pairing code (ask = type the PC's code);
 # --v1-host: behave like an old v1 host; key/paired list in tools/.mock-host-key, .mock-paired.json
 ```

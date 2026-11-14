@@ -2,8 +2,10 @@
 
 [![CI](https://github.com/sudoBrandino/glide/actions/workflows/ci.yml/badge.svg)](https://github.com/sudoBrandino/glide/actions/workflows/ci.yml)
 
-Glide is a remote desktop for controlling a Mac from a Windows PC, written from scratch. The goal
-is Jump Desktop-level sharpness and responsiveness on a LAN, with both ends native:
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+Glide is a remote desktop for controlling a Mac from a Windows PC, written from scratch. Both ends
+are native:
 
 - **Host (`mac/`, Swift):** ScreenCaptureKit capture, VideoToolbox hardware HEVC, and a
   ChaCha20-Poly1305 record layer over TCP. Input is injected with CGEvent, and cursor shapes are
@@ -12,9 +14,48 @@ is Jump Desktop-level sharpness and responsiveness on a LAN, with both ends nati
   swap chain, raw keyboard and mouse capture, and the host cursor shown as the native Windows
   cursor.
 
-Its main difference from generic remote desktops is **hybrid mode**. While the screen changes,
-Glide streams low-latency HEVC 4:2:0. Once the screen settles, it sends a 4:4:4 "sharp" refinement
-layer, so text is pixel-exact at rest and motion stays fast.
+## Why
+
+General-purpose remote desktops trade text sharpness for motion, or the other way round. Glide
+aims for the sharpness and responsiveness of the best commercial tools on a LAN, for one specific
+pairing: a Mac you work on, viewed from a Windows PC.
+
+Its main difference is **hybrid mode**. While the screen changes, Glide streams low-latency HEVC
+4:2:0. Once the screen settles, it sends a 4:4:4 "sharp" refinement layer, so text is pixel-exact
+at rest and motion stays fast.
+
+## Features
+
+- Hardware HEVC both ways: VideoToolbox encode on the Mac, Media Foundation / D3D11 decode on the PC.
+- Hybrid 4:2:0 + 4:4:4 mode, plus `fast` (4:2:0 only), `sharp` (4:4:4 every frame) and an H.264
+  fallback.
+- The host re-captures at the viewer monitor's size, so video is drawn 1:1 and never upscaled.
+- Keyboard (USB HID usages, Ctrl→Cmd remap), mouse, wheel, and the Mac cursor shown as the native
+  Windows cursor.
+- Clipboard sync (text and images), Mac system audio to the PC, and file transfer in both
+  directions.
+- End-to-end encrypted with a Noise XX handshake and pinned keys. There are no passwords and no
+  accounts; a viewer is paired once with a code confirmed on both screens.
+- Either side can open the connection, which helps with one-way firewalls.
+- A menu-bar host app with a LaunchAgent, and a viewer with a tray icon, HUD and hotkeys.
+- Per-stage latency instrumentation and a glass-to-glass latency test.
+
+## Project status
+
+Glide is a young project that its author uses daily on one hardware pair (Apple silicon Mac,
+NVIDIA-GPU Windows PC). It works well there and has had little testing elsewhere.
+
+- **Supported:** macOS 14+ on Apple silicon as the host, Windows 10/11 x64 as the viewer.
+- **Not supported:** any other host or viewer platform, and more than one viewer at a time.
+- **LAN only.** There is no relay or NAT traversal, and the transport is TCP.
+- The wire protocol is at version 2 and may still change in incompatible ways. Both sides detect a
+  version mismatch and say so.
+- There are no signed or notarized releases. You build the host yourself; the viewer exe is also
+  available as a CI artifact.
+
+See the feature table below and [`docs/ROADMAP.md`](docs/ROADMAP.md) for what is planned.
+
+## Documentation
 
 | | |
 |---|---|
@@ -23,6 +64,8 @@ layer, so text is pixel-exact at rest and motion stays fast.
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | What's done and what's next |
 | [`docs/LATENCY.md`](docs/LATENCY.md) | Latency breakdown, glass-to-glass test, tuning results |
 | [`windows/README.md`](windows/README.md) | Viewer reference: all flags, env vars, headless modes |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to build, test and send changes |
+| [`SECURITY.md`](SECURITY.md) | How to report a vulnerability |
 
 ## Architecture
 
@@ -69,11 +112,11 @@ flowchart LR
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the details.
 
-## Status
+## Feature status
 
 | Feature | Status |
 |---|---|
-| Protocol v1 + reference crypto vectors (Python, Swift, Rust all agree) | done |
+| Protocol + reference crypto vectors (Python, Swift, Rust all agree) | done |
 | HEVC 4:2:0 low-latency / 4:4:4 "sharp" / H.264 fallback | done |
 | **Hybrid mode**: 4:2:0 while moving, 4:4:4 at rest, pixel-diff patch rects, color-matched layers | done |
 | Latest-frame-wins scheduling, network backpressure, idle quality refresh | done |
@@ -154,9 +197,12 @@ A block-code test pattern measures true glass-to-glass latency. See
 tools/make-host-app.sh && tools/install-host.sh
 ```
 
-- `make-host-app.sh` signs the app with a stable identity, so macOS privacy grants survive
-  rebuilds. Set `GLIDE_SIGN_ID="<identity>"` to choose the identity, or `GLIDE_SIGN_ID=-` for an
-  ad-hoc signature. With an ad-hoc signature, grants may need to be renewed after each rebuild.
+- `make-host-app.sh` signs the app ad hoc by default. With an ad-hoc signature, macOS privacy
+  grants may need to be renewed after each rebuild. To keep them, sign with a stable identity:
+  set `GLIDE_SIGN_ID="<identity>"` (list yours with `security find-identity -v -p codesigning`).
+- `GLIDE_BUNDLE_ID` sets the app's bundle identifier, which is also the LaunchAgent label
+  (default `io.github.sudobrandino.glide.host`). Put your values in `.dev/build.env`, which is
+  gitignored; see [`tools/build-env.sh`](tools/build-env.sh).
 - `install-host.sh --no-start` installs without starting the app. `install-host.sh --uninstall`
   removes the app and the agent, but keeps the config.
 - The log is written to `~/Library/Logs/glide-host.log`.
@@ -170,7 +216,7 @@ input. Grant both to *Glide Host*, not to Terminal:
 
 This prompts for both permissions and waits until they are granted. A new Screen Recording grant
 only takes effect after the host restarts. The LaunchAgent restarts it on its own, or you can run
-`launchctl kickstart -k gui/$(id -u)/io.github.sudobrandino.glide.host`.
+`launchctl kickstart -k gui/$(id -u)/<bundle id>`.
 
 **Configuration** is stored in `~/Library/Application Support/Glide/host.json` (mode 0600):
 
@@ -183,7 +229,7 @@ only takes effect after the host restarts. The LaunchAgent restarts it on its ow
 
 ```sh
 H=~/Applications/Glide\ Host.app/Contents/MacOS/glide-host
-"$H" --set-connect 192.168.10.212:7420          # make the host dial this viewer by default
+"$H" --set-connect 192.168.1.60:7420         # make the host dial this viewer by default
 "$H" --pair                                  # open the 2-minute pairing window (see Pairing)
 "$H" --paired                                # list paired viewers;  --unpair NAME|KEY removes one
 "$H" --identity                              # this Mac's key fingerprint
@@ -204,7 +250,7 @@ The host's key is `host-key` in the same folder (0600; created on first start). 
 cd mac && swift build -c release --build-system native   # native backend: needed with CLT-only setups
 .build/release/glide-selftest ../docs/test-vectors.json  # protocol self-test
 .build/release/glide-host                              # listen
-.build/release/glide-host --connect 192.168.10.212        # dial out
+.build/release/glide-host --connect 192.168.1.60       # dial out
 # Local end-to-end check on the same Mac (exact latency); opens a small test window.
 # The probe pairs on first use (glide-host --pair, then confirm the printed code).
 .build/release/glide-probe 127.0.0.1 --seconds 8 --animate --png /tmp/frame.png
@@ -233,7 +279,7 @@ interactive desktop session:
 
 ```bat
 glide-client.exe --listen 7420        :: host dials in (glide-host --connect PC:7420)
-glide-client.exe 192.168.50.4            :: or: viewer dials the host
+glide-client.exe 192.168.1.50         :: or: viewer dials the host
 ```
 
 - **F11** or **Alt+Enter** toggles borderless fullscreen.
@@ -314,13 +360,12 @@ directions, and the viewer always sends the first handshake message.
 When the host dials, it redials every 2 s while it is disconnected. In listen mode the viewer
 accepts again after every disconnect.
 
-**The admin-VLAN case.** In the reference setup, the Mac (192.168.50.4) is on an admin VLAN
-(192.168.50.0/29). The UniFi zone firewall blocks Trusted → Admin, so the PC (192.168.10.212) can't reach
-the Mac, but the Mac can reach the PC. The setup is:
+**Example: a one-way firewall.** Say the Mac (192.168.1.50) is on a restricted network segment.
+The firewall lets the Mac reach the PC (192.168.1.60) but blocks the other direction. The setup is:
 
-- The host has `connect` set to `192.168.10.212:7420`.
+- The host has `connect` set to `192.168.1.60:7420`.
 - The viewer runs `--listen 7420`.
-- A Windows Firewall rule on the PC admits only 192.168.50.4 to `glide-client.exe` at a fixed path.
+- A Windows Firewall rule on the PC admits only 192.168.1.50 to `glide-client.exe` at a fixed path.
 
 Nothing listens on the Mac, and the PC accepts the connection only from the Mac.
 
@@ -358,7 +403,7 @@ the Mac.
 
 - **Only one host can capture at a time.** A second `glide-host` interrupts the first one's
   ScreenCaptureKit stream. Before you run a host from the shell, stop the agent with
-  `launchctl bootout gui/$(id -u)/io.github.sudobrandino.glide.host`. Bring it back with
+  `launchctl bootout gui/$(id -u)/<bundle id>`. Bring it back with
   `tools/install-host.sh`. Running `glide-probe` against the live host also takes over the active
   session.
 - **Black screen or "capture unavailable" in the log.** The display is asleep, locked or being
@@ -417,4 +462,14 @@ the Mac.
   - a native MSVC build and test run on Windows, with a `--probe` smoke test;
   - the vector regeneration check.
 
-Private project — all rights reserved.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the checks to run before you send a pull request.
+
+## Contributing
+
+Bug reports, fixes and ideas are welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first, and
+note the [code of conduct](CODE_OF_CONDUCT.md). Report security problems privately, as described
+in [`SECURITY.md`](SECURITY.md).
+
+## License
+
+Glide is released under the [MIT License](LICENSE).

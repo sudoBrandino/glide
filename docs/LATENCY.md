@@ -156,8 +156,7 @@ measurement that doesn't depend on it.
 
 ## Offline evidence
 
-These runs used only the mock host and offline tools. Nothing touched the live host or the
-user's desktop.
+These runs used only the mock host and offline tools, without a live capture session.
 
 ### Viewer pipeline and ground-truth reader
 
@@ -165,9 +164,8 @@ The setup:
 
 - `tools/mock_host.py --latency-pattern` ran on the Mac. It live-encodes the block-code pattern
   with x265 in `ultrafast`/`zerolatency` mode, in software, at 60 fps.
-- `glide-client.exe` (this branch) ran on the PC from `C:\Users\me\glide\dev\latency\` in
-  session 0, through `ssh -R`.
-- The PC decodes on the RTX 5070 Ti through the Media Foundation HEVC hardware decoder.
+- `glide-client.exe` ran on a Windows PC from a scratch folder in session 0, through `ssh -R`.
+- The PC decodes on an NVIDIA RTX 50-series GPU through the Media Foundation HEVC hardware decoder.
 - The SSH tunnel adds about 3 ms of RTT, so `network` here is tunnel time, not LAN time.
 - Session 0 has no swap chain, so these runs are offscreen and there is no scan-out time.
 
@@ -198,7 +196,7 @@ All values are p50 in ms unless noted.
   own `VideoEncoder`.
 - Settings: HEVC 4:2:0, 44 Mbps auto bitrate, one frame in flight, M3 Pro.
 - It never touches ScreenCaptureKit or the network.
-- It was run while the live session was idle (under 3 fps). Values are from three runs.
+- Values are from three runs.
 
 | Scenario | Normal RC: encode p50 / p95 (ms) | Low-latency RC: encode p50 / p95 (ms) |
 |---|---|---|
@@ -239,19 +237,18 @@ default.
 
 | # | Hypothesis | Offline status | How to settle it live |
 |---|---|---|---|
-| a | SCK `queueDepth` (5) and `minimumFrameInterval` (1/fps) inflate capture → callback | **Needs a live run**: only one SCK capture can run, and it is the user's. New knobs: `GLIDE_SCK_QUEUE_DEPTH=N` (1–8) and `GLIDE_SCK_INTERVAL=native` (no cap). | Compare `latency: capture->callback p50/p95` in the host log, and the HUD `enc`, at queue depth 3, 5 and 8, and with the native interval. Expectation: the callback runs right away (latest-frame-wins never blocks the queue), so depth should barely matter. The interval matters only if the display runs faster than `fps`. |
-| b | The 60 Hz virtual display adds an average of about 8.3 ms of compositor wait | Measured offline: the BetterDisplay virtual screen "RustDesktop" offers **only 60 Hz** modes (`CGDisplayCopyAllDisplayModes`), and BetterDisplay stores `refreshRates@VirtualScreen:147 = "[60]"`. The list is configurable in BetterDisplay's virtual screen settings, so 120 Hz is very likely possible, but changing it reconfigures the user's display. **Needs the user's consent and a live run.** | A change at a random time waits uniformly 0–16.7 ms (mean 8.3) for the next composite at 60 Hz, and 0–8.3 ms (mean 4.2) at 120 Hz. Measure ground truth with `--pattern-kind draw --pattern-hz 5` at 60 and at 120 Hz, with the host at `GLIDE_FPS=120` (the default 60 would throttle SCK). Expect about −4 ms on average. At 120 fps of continuous motion, a 10.5 ms encode with one frame in flight caps throughput at about 95 fps, and latest-frame-wins drops the rest. |
+| a | SCK `queueDepth` (5) and `minimumFrameInterval` (1/fps) inflate capture → callback | **Needs a live run**: only one SCK capture can run at a time. New knobs: `GLIDE_SCK_QUEUE_DEPTH=N` (1–8) and `GLIDE_SCK_INTERVAL=native` (no cap). | Compare `latency: capture->callback p50/p95` in the host log, and the HUD `enc`, at queue depth 3, 5 and 8, and with the native interval. Expectation: the callback runs right away (latest-frame-wins never blocks the queue), so depth should barely matter. The interval matters only if the display runs faster than `fps`. |
+| b | The 60 Hz virtual display adds an average of about 8.3 ms of compositor wait | Measured offline: the BetterDisplay virtual screen on the test Mac offered **only 60 Hz** modes (`CGDisplayCopyAllDisplayModes`). The refresh-rate list is configurable in BetterDisplay's virtual screen settings, so 120 Hz is likely possible. **Needs a live run.** | A change at a random time waits uniformly 0–16.7 ms (mean 8.3) for the next composite at 60 Hz, and 0–8.3 ms (mean 4.2) at 120 Hz. Measure ground truth with `--pattern-kind draw --pattern-hz 5` at 60 and at 120 Hz, with the host at `GLIDE_FPS=120` (the default 60 would throttle SCK). Expect about −4 ms on average. At 120 fps of continuous motion, a 10.5 ms encode with one frame in flight caps throughput at about 95 fps, and latest-frame-wins drops the rest. |
 | c | Encoder settings at 2560×1440 | **Measured offline** (table above): normal RC is about 10.5 ms and low-latency RC about 14 ms. Isolated frames cost about 20 ms with wall-clock PTS and about 11 ms with counter PTS, which is now the default. | Live A/B of `GLIDE_PTS=wallclock` against the default, using `--pattern-hz 2` (isolated frames). The host log's `encode p50` and the viewer `enc` should drop by about 8 ms. Optionally try `GLIDE_LL=1`. |
 | d | Viewer present path: waitable swap chain with max frame latency 1, and `ALLOW_TEARING` (`GLIDE_TEARING=1`) in fullscreen | Instrumented, but **needs a live run**: present statistics need a real swap chain on the interactive desktop. The session-0 test viewer has none. | The HUD `scan` and the report's `present_to_scanout`, in three configurations: windowed, fullscreen (F11), and fullscreen with `GLIDE_TEARING=1`. Expectations at 144 Hz (6.94 ms period): **windowed, DWM-composed**: wait for the next composition (0–6.9 ms, mean 3.5) plus one frame, so about 10 ms. **Fullscreen with independent flip**: about 3.5 ms (half a period). **With tearing**: about 0–1 ms. With G-SYNC/VRR in independent flip, expect about 0 ms. Check `refresh_hz_measured` in the report. |
 
-## Live glass-to-glass runbook (for the lead, with the user's consent)
+## Live glass-to-glass runbook
 
-All steps keep the live session usable. Every host restart drops the viewer for about 2 s, and
-the viewer reconnects on its own.
+Every host restart drops the viewer for about 2 s; the viewer reconnects on its own.
 
-### 0. Deploy (once)
+### 0. Build and install
 
-1. Merge `feat/latency` and build the host:
+1. Build and install the host:
 
    ```sh
    cd mac && swift build -c release --build-system native && .build/release/glide-selftest ../docs/test-vectors.json
@@ -260,13 +257,13 @@ the viewer reconnects on its own.
 
    `install-host.sh` restarts the LaunchAgent.
 2. Build the viewer (`cargo build --release --locked --target x86_64-pc-windows-gnu`).
-3. Deploy the viewer to the **same path** as today (`C:\Users\me\glide\glide-client.exe`) with
-   the rename trick, so the firewall rule keeps applying. The user then restarts the viewer
-   (`Glide.cmd`).
+3. Copy the viewer to the PC. Keep the same path as before (for example
+   `%USERPROFILE%\glide\glide-client.exe`; `tools/deploy-viewer.sh` does this) so an existing
+   firewall rule keeps applying, then restart the viewer.
 
 ### 1. Instrumentation sanity check (no pattern)
 
-1. The user presses **Ctrl+Alt+Shift+H** and moves a window around for about 10 s. The HUD shows
+1. Press **Ctrl+Alt+Shift+H** and moves a window around for about 10 s. The HUD shows
    `lat p50  enc …  net …  dec …  scan …  glass … ms`.
 2. On the Mac, the host log should show the viewer's report:
 
@@ -280,29 +277,29 @@ the viewer reconnects on its own.
 
 ### 2. Ground-truth pattern
 
-Run this on the Mac from the lead's shell, which is in the user's GUI session:
+Run this on the Mac from a shell in the logged-in GUI session:
 
 ```sh
-~/Development/glide/mac/.build/release/glide-probe --pattern-only --seconds 600 &   # 480×32-pt strip, top-left
+mac/.build/release/glide-probe --pattern-only --seconds 600 &   # 480×32-pt strip, top-left
 ```
 
-The pattern is a borderless, click-through window at status-bar level, below the menu bar. Tell
-the user it's there. `kill %1` removes it.
+The pattern is a borderless, click-through window at status-bar level, below the menu bar.
+`kill %1` removes it.
 
 ### 3. Measure
 
-Each run is 60 s. The user presses **Ctrl+Alt+Shift+L** to start and again to stop. The toast
-shows the report path: `C:\Users\me\AppData\Local\Temp\glide-latency-<t>.json`. Fetch it:
+Each run is 60 s. Press **Ctrl+Alt+Shift+L** to start and again to stop. The toast
+shows the report path: `%TEMP%\glide-latency-<t>.json`. Fetch it:
 
 ```sh
-ssh my-pc 'cmd /c type C:\Users\me\AppData\Local\Temp\glide-latency-<t>.json'
+ssh <pc> 'cmd /c type %TEMP%\glide-latency-<t>.json'
 ```
 
 | Run | Condition | Look at |
 |---|---|---|
 | A | Windowed viewer, default host, continuous pattern | `ground_truth.to_scanout`, `total_scanout_only`, `minus_instrumented_to_present` (expect ≈ 0 ± 1 ms for kind 1) |
 | B | Fullscreen (F11) | `present_to_scanout`: windowed vs. independent flip |
-| C | Fullscreen with tearing. The user restarts the viewer with `set GLIDE_TEARING=1` before `Glide.cmd`. | `present_to_scanout` → ~0 |
+| C | Fullscreen with tearing. Restart the viewer with `GLIDE_TEARING=1` set. | `present_to_scanout` → ~0 |
 | D | Pattern updating at 2 Hz: restart the probe with `--pattern-hz 2`. These are isolated frames, like typing. | `host_capture_to_encoded`, `ground_truth` |
 | E | Same as D, with `GLIDE_PTS=wallclock` on the host (see step 4) | Expect `encode` about 8 ms higher than D |
 | F | `--pattern-kind draw` (continuous, then `--pattern-hz 5`) | `ground_truth − instrumented` = compositor wait (hypothesis b) |
@@ -313,10 +310,10 @@ Host knobs are environment variables for the LaunchAgent:
 
 ```sh
 launchctl setenv GLIDE_PTS wallclock            # or GLIDE_SCK_QUEUE_DEPTH 3 / GLIDE_SCK_INTERVAL native / GLIDE_LL 1 / GLIDE_FPS 120
-launchctl kickstart -k gui/$(id -u)/io.github.sudobrandino.glide.host
+launchctl kickstart -k gui/$(id -u)/<bundle id>
 grep 'capture:' ~/Library/Logs/glide-host.log | tail -2   # confirms the knob ("encoder PTS = wall clock", "SCK queueDepth …")
 # … measure …
-launchctl unsetenv GLIDE_PTS && launchctl kickstart -k gui/$(id -u)/io.github.sudobrandino.glide.host
+launchctl unsetenv GLIDE_PTS && launchctl kickstart -k gui/$(id -u)/<bundle id>
 ```
 
 For hypothesis (a), compare `latency: capture->callback p50/p95` in the host log at the default,
@@ -324,9 +321,9 @@ at `GLIDE_SCK_QUEUE_DEPTH` 3 and 8, and with `GLIDE_SCK_INTERVAL=native`.
 
 ### 5. Optional: 120 Hz virtual display (hypothesis b)
 
-Only with the user's explicit OK, because it changes their display:
+This changes the Mac's display configuration:
 
-1. In BetterDisplay, open the "RustDesktop" virtual screen settings and add 120 Hz to its
+1. In BetterDisplay, open the virtual screen's settings and add 120 Hz to its
    refresh rates.
 2. Switch to 2560×1440 @ 120 Hz.
 3. Run `launchctl setenv GLIDE_FPS 120` and kickstart the host.
@@ -338,15 +335,15 @@ Only with the user's explicit OK, because it changes their display:
 ```sh
 kill %1                                          # pattern window
 launchctl unsetenv GLIDE_PTS GLIDE_LL GLIDE_FPS GLIDE_SCK_QUEUE_DEPTH GLIDE_SCK_INTERVAL
-launchctl kickstart -k gui/$(id -u)/io.github.sudobrandino.glide.host
+launchctl kickstart -k gui/$(id -u)/<bundle id>
 ```
 
-The user can turn the HUD off with Ctrl+Alt+Shift+H. Latency test mode is off unless
+Turn the HUD off with Ctrl+Alt+Shift+H. Latency test mode is off unless
 Ctrl+Alt+Shift+L is pressed.
 
 ### Mac-only cross-check (optional)
 
-This needs the live host stopped, because it runs a second session. Instead of the PC viewer,
+This needs the installed host stopped, because only one capture session can run. Instead of the PC viewer,
 run on the Mac:
 
 ```sh
@@ -357,7 +354,7 @@ It prints:
 - the host stage p50/p95 from `FrameTiming`
 - `ground truth (pattern clock -> decoded)`, exact because both ends share one clock
 
-This step kicks the user's viewer session, so get consent first.
+This disconnects any connected viewer.
 
 ## Limitations
 

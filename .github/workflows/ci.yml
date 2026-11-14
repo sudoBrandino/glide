@@ -1,13 +1,17 @@
 name: CI
 
+# Third-party actions are pinned to commit SHAs; Dependabot keeps them current
+# (.github/dependabot.yml).
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs on pull requests; let every push to main finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -23,8 +27,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - run: pip install cryptography
@@ -34,6 +40,13 @@ jobs:
           python3 tools/gen_vectors.py "$RUNNER_TEMP/v.json"
           cmp "$RUNNER_TEMP/v.json" docs/test-vectors.json
           python3 tools/gen_vectors.py --check docs/test-vectors-rust.json  # Rust transcript, replayed in Python
+      - name: No personal paths in the tree
+        # Examples and tests use placeholders such as %USERPROFILE% or C:\Users\me; see CONTRIBUTING.md.
+        run: |
+          if git grep -nIE 'C:[\\/]+Users[\\/]+[a-z0-9]+[\\/]|/Users/[a-z0-9]+/|/home/[a-z0-9]+/' -- . \
+               ':!.github/workflows/ci.yml' | grep -vE 'Users[\\/]+(me|you|runner|<)'; then
+            echo "::error::a personal path was committed; use a placeholder"; exit 1
+          fi
 
   # Swift host: release build + protocol self-test against docs/test-vectors.json.
   mac:
@@ -41,14 +54,16 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Toolchain
         run: |
           sw_vers
           xcode-select -p
           swift --version
       - name: Cache SwiftPM build
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: mac/.build
           key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mac/Package.swift', 'mac/Sources/**') }}
@@ -84,13 +99,16 @@ jobs:
       run:
         working-directory: windows
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install MinGW-w64
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-gnu
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: windows
       - name: cargo test
@@ -106,7 +124,7 @@ jobs:
           if x86_64-w64-mingw32-objdump -p "$EXE" | grep -iE 'DLL Name: (libgcc|libwinpthread|libstdc)'; then
             echo "::error::exe links MinGW runtime DLLs"; exit 1
           fi
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: glide-client-windows-x64
           path: windows/target/x86_64-pc-windows-gnu/release/glide-client.exe
@@ -124,9 +142,13 @@ jobs:
         working-directory: windows
         shell: bash
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: windows
       - name: cargo test

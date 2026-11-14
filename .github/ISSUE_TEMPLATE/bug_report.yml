@@ -1,0 +1,84 @@
+name: Bug report
+description: Something in Glide doesn't work as it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Security problems do not belong here**: report them privately, as described in [SECURITY.md](https://github.com/sudoBrandino/glide/blob/main/SECURITY.md).
+        Before you paste logs, remove anything you don't want public, such as IP addresses, host names and user names.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start the host with ...
+        2. Connect the viewer with ...
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: side
+    attributes:
+      label: Where does the problem show
+      options:
+        - Host (Mac)
+        - Viewer (Windows)
+        - Both, or not sure
+    validations:
+      required: true
+  - type: input
+    id: host-version
+    attributes:
+      label: Host version
+      description: The git commit you built, or the version shown in Finder's Get Info for Glide Host.app.
+      placeholder: "commit a28cbc3"
+    validations:
+      required: true
+  - type: input
+    id: viewer-version
+    attributes:
+      label: Viewer version
+      description: The git commit you built, or the CI run the exe came from.
+      placeholder: "commit a28cbc3"
+    validations:
+      required: true
+  - type: input
+    id: mac
+    attributes:
+      label: Mac and macOS version
+      placeholder: "MacBook Pro M3 Pro, macOS 15.2"
+    validations:
+      required: true
+  - type: input
+    id: pc
+    attributes:
+      label: Windows version and GPU
+      placeholder: "Windows 11 24H2, RTX 4070, driver 566.36"
+    validations:
+      required: true
+  - type: input
+    id: mode
+    attributes:
+      label: Connection and stream mode
+      description: Who dials (viewer dials, or host dials with --connect / --listen), and the mode (hybrid, fast, sharp).
+      placeholder: "viewer dials, hybrid"
+  - type: textarea
+    id: probe
+    attributes:
+      label: Viewer probe output
+      description: For decode or display problems, the output of `glide-client.exe --probe`.
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The relevant part of `~/Library/Logs/glide-host.log` on the Mac, and the viewer's log or console output.
+      render: text

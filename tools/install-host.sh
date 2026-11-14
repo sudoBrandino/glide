@@ -4,10 +4,13 @@
 #   install-host.sh            install/update app + agent, (re)start it
 #   install-host.sh --no-start install/update only
 #   install-host.sh --uninstall
+# The LaunchAgent label is the app's bundle identifier (GLIDE_BUNDLE_ID, see tools/build-env.sh).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$HOME/Applications/Glide Host.app"
-LABEL="io.github.sudobrandino.glide.host"
+# shellcheck source=tools/build-env.sh
+source "$ROOT/tools/build-env.sh"
+LABEL="$GLIDE_BUNDLE_ID"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 
@@ -16,6 +19,15 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   rm -f "$PLIST"; rm -rf "$APP"
   echo "uninstalled (config kept in ~/Library/Application Support/Glide)"; exit 0
 fi
+
+# Only one host can capture at a time. Refuse to add a second agent under a different label
+# (for example after changing GLIDE_BUNDLE_ID); uninstall the old one first.
+for other in "$HOME/Library/LaunchAgents/"*.glide.host.plist; do
+  [[ -e "$other" && "$other" != "$PLIST" ]] || continue
+  echo "another Glide Host agent is installed: $other"
+  echo "set GLIDE_BUNDLE_ID=$(basename "$other" .plist) to update it, or uninstall it first"
+  exit 1
+done
 
 mkdir -p "$HOME/Applications" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true

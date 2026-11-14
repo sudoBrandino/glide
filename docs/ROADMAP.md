@@ -36,7 +36,7 @@ Possible follow-ups: move the host key into the Keychain once the app has a prov
 Done:
 
 - [x] **Dial-out mode:** `glide-host --connect` with auto-redial, and `glide-client --listen`.
-  This is for networks that only allow host → viewer connections, such as the admin VLAN.
+  This is for networks that only allow host → viewer connections, such as a locked-down network segment.
 - [x] **Hybrid sharpness:**
   - 4:2:0 low-latency while the screen moves, a standalone 4:4:4 IDR once it settles.
   - The viewer runs a second decoder, and both layers feed an RGB canvas.
@@ -98,7 +98,7 @@ Next:
 
 ## v2 — beyond the LAN
 
-- [ ] A self-hosted rendezvous or relay server, for example on the home server, for NAT traversal
+- [ ] A self-hosted rendezvous or relay server for NAT traversal
 
 ## Known issues
 
@@ -108,7 +108,3 @@ Next:
   first. Stop the LaunchAgent before you run a host from the shell.
 - `swift build` with the default build backend fails on a Command Line Tools-only setup. Use
   `--build-system native` there. It works with Xcode, which is what CI uses.
-- **Network:**
-  - The Mac is on the admin VLAN (192.168.50.0/29). Trusted → Admin is blocked by the UniFi zone
-    firewall, so the Mac dials the viewer (`--connect`, or `connect` in `host.json`).
-  - The PC has a Windows Firewall rule that allows only 192.168.50.4 → `glide-client.exe`.

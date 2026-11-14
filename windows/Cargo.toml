@@ -3,6 +3,8 @@ name = "glide-client"
 version = "0.1.0"
 edition = "2021"
 description = "Glide remote desktop viewer (Windows client)"
+license = "MIT"
+repository = "https://github.com/sudoBrandino/glide"
 publish = false
 build = "build.rs"
 

@@ -15,7 +15,7 @@ func runTrustCommand(_ args: inout [String]) -> Never {
     func notRunning() -> Never {
         print("""
         Glide Host isn't running (no control socket at \(path)).
-        Start it (it runs as a LaunchAgent: launchctl kickstart gui/$(id -u)/io.github.sudobrandino.glide.host),
+        Start it (it runs as a LaunchAgent; tools/install-host.sh installs and starts it),
         or use the Glide menu-bar item → Pair New Viewer….
         """)
         exit(1)

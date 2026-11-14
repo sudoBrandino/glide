@@ -1,10 +1,13 @@
 #!/bin/bash
 # Builds and signs "Glide Host.app" (menu-bar-less agent app wrapping glide-host).
 # Signing with a stable identity keeps macOS privacy grants (Screen Recording, Accessibility)
-# valid across rebuilds. Override with GLIDE_SIGN_ID="<identity or hash>" or GLIDE_SIGN_ID=- (ad hoc).
+# valid across rebuilds: set GLIDE_SIGN_ID="<identity or hash>". The default is ad hoc ("-").
+# GLIDE_BUNDLE_ID sets the bundle identifier. See tools/build-env.sh (.dev/build.env).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SIGN_ID="${GLIDE_SIGN_ID:-Apple Development: you@example.com (TEAMID1234)}"
+# shellcheck source=tools/build-env.sh
+source "$ROOT/tools/build-env.sh"
+SIGN_ID="$GLIDE_SIGN_ID"
 OUT="$ROOT/dist/Glide Host.app"
 VERSION="0.1.$(date +%Y%m%d%H%M)"
 
@@ -17,7 +20,7 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleIdentifier</key><string>io.github.sudobrandino.glide.host</string>
+  <key>CFBundleIdentifier</key><string>$GLIDE_BUNDLE_ID</string>
   <key>CFBundleName</key><string>Glide Host</string>
   <key>CFBundleDisplayName</key><string>Glide Host</string>
   <key>CFBundleExecutable</key><string>glide-host</string>
@@ -30,7 +33,7 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
-codesign --force --timestamp=none --sign "$SIGN_ID" --identifier io.github.sudobrandino.glide.host "$OUT"
+codesign --force --timestamp=none --sign "$SIGN_ID" --identifier "$GLIDE_BUNDLE_ID" "$OUT"
 codesign --verify --verbose=1 "$OUT" 2>&1 | tail -1
 codesign -dr - "$OUT" 2>&1 | grep designated
-echo "built $OUT ($VERSION)"
+echo "built $OUT ($VERSION, $GLIDE_BUNDLE_ID)"

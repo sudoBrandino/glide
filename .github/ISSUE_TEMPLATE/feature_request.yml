@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest something Glide should do
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [roadmap](https://github.com/sudoBrandino/glide/blob/main/docs/ROADMAP.md) first: it may already be planned.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve
+      description: Describe the situation, not only the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+  - type: checkboxes
+    id: protocol
+    attributes:
+      label: Scope
+      options:
+        - label: This would need a change to the wire protocol (docs/PROTOCOL.md)
+        - label: I would like to work on this myself

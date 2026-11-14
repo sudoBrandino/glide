@@ -192,7 +192,7 @@ func clipboardTests() throws {
 /// NSPasteboard read/write rules on a private named pasteboard (never the user's general one).
 func pasteboardTests() {
     print("pasteboard (private):")
-    let pb = NSPasteboard(name: NSPasteboard.Name("io.github.sudobrandino.glide.selftest.\(getpid())"))
+    let pb = NSPasteboard(name: NSPasteboard.Name("glide.selftest.\(getpid())"))
     defer { pb.releaseGlobally() }
     var g = ClipboardEchoGuard()
     g.baseline(marker: pb.changeCount)
