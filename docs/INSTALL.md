@@ -24,6 +24,49 @@ The host and the viewer must be the same release, or at least speak the same pro
 - Intel Macs are not supported. The x86_64 host compiles, but Intel Macs have no hardware
   HEVC 4:4:4 encoder, and the host doesn't fall back to fast mode on its own yet.
 
+## Quick install
+
+Two installers do everything below for you, and ask before each step that needs you. Run them
+again at any time to update, re-check the permissions, change the connection or pair again.
+
+**Mac**, in Terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/sudoBrandino/glide/main/install.sh | bash
+```
+
+It downloads the latest release and checks it against `SHA256SUMS` (and its build provenance, if
+the GitHub CLI is signed in), installs the app to `~/Applications` with its LaunchAgent, removes
+an older Glide Host that would compete for the screen, walks you through Screen Recording and
+Accessibility, asks which side connects, and opens the pairing window. Options go after
+`bash -s --`, for example `… | bash -s -- --connect my-pc.local`; `--help` lists them.
+
+**Mac, with Homebrew** (from the first release after 0.2.0):
+
+```sh
+brew install --cask sudobrandino/glide/glide-host
+glide-setup        # the same guided setup, using the app Homebrew installed
+```
+
+Run `glide-setup` again after each `brew upgrade`: the upgrade stops the host, and each new build
+needs Screen Recording and Accessibility again (the app is signed ad hoc). `glide-setup` restarts
+it and asks for them. `brew uninstall --zap glide-host` removes it with its settings and pairings.
+
+**Windows**, in PowerShell (not as administrator):
+
+```powershell
+irm https://raw.githubusercontent.com/sudoBrandino/glide/main/install.ps1 | iex
+```
+
+It downloads and verifies the viewer, installs it into the folder an existing viewer already uses
+(so firewall rules keep applying; `%LOCALAPPDATA%\Glide` otherwise), asks which side connects,
+offers a firewall rule (Windows asks for administrator rights for that step only), adds Start
+menu and sign-in shortcuts and starts the viewer for pairing.
+
+Read a script before you pipe it into a shell: both are short, and they are in this repository
+([`install.sh`](../install.sh), [`install.ps1`](../install.ps1)). The sections below are the same
+steps by hand.
+
 ## Contents
 
 1. [Verify the download](#1-verify-the-download)
@@ -76,18 +119,19 @@ the LaunchAgent below expects it. Only run `xattr` on files you have verified (s
 The host runs in the background as a per-user LaunchAgent: it starts at login and restarts if it
 exits. No administrator rights are needed. Pick one of the two ways below.
 
-**Option A: from a source checkout.** If you have cloned the repository, put the release app
-where the install script looks for it, and run the script:
+**Option A: with the installer, from the zip you downloaded.** It skips the download and does
+the rest of the guided setup:
 
 ```sh
-cd glide                                            # your clone, at the release tag
-mkdir -p dist && ditto -x -k ~/Downloads/Glide-Host-0.2.0-macos-arm64.zip dist/
-xattr -dr com.apple.quarantine "dist/Glide Host.app"
-tools/install-host.sh                               # copies it to ~/Applications and starts it
+curl -fsSL https://raw.githubusercontent.com/sudoBrandino/glide/main/install.sh \
+  | bash -s -- --app ~/Downloads/Glide-Host-0.2.0-macos-arm64.zip
 ```
 
-**Option B: by hand.** This creates the same LaunchAgent as `tools/install-host.sh`. The label
-must be the app's bundle identifier, `io.github.sudobrandino.glide.host`:
+From a clone of the repository, `./install.sh --app …` does the same.
+
+**Option B: by hand.** This creates the same LaunchAgent as `install.sh`. The label must be the
+app's bundle identifier, `io.github.sudobrandino.glide.host`. `KeepAlive` restarts the host
+whenever it exits, as long as the app is still there:
 
 ```sh
 LABEL=io.github.sudobrandino.glide.host
@@ -102,7 +146,11 @@ cat > ~/Library/LaunchAgents/$LABEL.plist <<EOF
   <key>ProgramArguments</key>
   <array><string>$APP/Contents/MacOS/glide-host</string></array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>PathState</key>
+    <dict><key>$APP/Contents/MacOS/glide-host</key><true/></dict>
+  </dict>
   <key>ThrottleInterval</key><integer>5</integer>
   <key>ProcessType</key><string>Interactive</string>
   <key>LimitLoadToSessionType</key><string>Aqua</string>
@@ -268,12 +316,14 @@ Details: [VIRTUAL_DISPLAY.md](VIRTUAL_DISPLAY.md).
 
 ## 5. Update
 
+Run the installer again (`install.sh` or `install.ps1`, see [Quick install](#quick-install)), or
+`brew upgrade glide-host && glide-setup`. By hand:
+
 1. Mac: unzip the new app and clear its quarantine flag ([2.1](#21-unzip-and-clear-the-quarantine-flag)).
    Quit the old host (menu bar → **Quit Until Next Login**, which unloads the LaunchAgent),
    replace `~/Applications/Glide Host.app`, and load the agent again:
    `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.sudobrandino.glide.host.plist`
-   (or log out and back in). With a source checkout, `tools/install-host.sh` as in Option A does
-   all of this.
+   (or log out and back in).
 2. Because the app is signed ad hoc, macOS treats each release as a new app and may ignore the
    old permissions. If capture or input stops working, remove *Glide Host* from **Screen
    Recording** and **Accessibility** in System Settings (the **−** button), then repeat
@@ -285,7 +335,8 @@ Pairings and settings survive updates.
 
 ## 6. Uninstall
 
-**Mac.** With a source checkout, `tools/install-host.sh --uninstall` does the first three lines:
+**Mac.** `install.sh --uninstall` (or `glide-setup --uninstall`) does the first three lines, and
+`--purge` the rest; with Homebrew, `brew uninstall --zap glide-host`. By hand:
 
 ```sh
 launchctl bootout gui/$(id -u)/io.github.sudobrandino.glide.host
@@ -297,8 +348,11 @@ tccutil reset ScreenCapture io.github.sudobrandino.glide.host
 tccutil reset Accessibility io.github.sudobrandino.glide.host
 ```
 
-**PC.** Quit the viewer (tray → **Quit Glide**), delete its folder, and optionally delete
-`%APPDATA%\Glide` (settings, this PC's key, the pinned Mac key) and any firewall rule you added.
+**PC.** Run the installer with `-Uninstall` (add `-Purge` for the settings):
+`& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sudoBrandino/glide/main/install.ps1))) -Uninstall`.
+By hand: quit the viewer (tray → **Quit Glide**), delete its folder and its Start menu shortcut,
+and optionally delete `%APPDATA%\Glide` (settings, this PC's key, the pinned Mac key) and any
+firewall rule you added.
 
 ## 7. Troubleshooting
 

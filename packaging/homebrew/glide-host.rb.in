@@ -1,0 +1,50 @@
+# Template for the Homebrew cask. tools/release.sh cask fills in the @…@ values from a release's
+# SHA256SUMS and writes glide-host.rb; the tap (sudoBrandino/homebrew-glide) serves that file as
+# Casks/glide-host.rb. See packaging/homebrew/README.md.
+#
+# Lifecycle: `glide-setup` (install.sh inside the app) installs and starts the LaunchAgent; the
+# cask's steps run in Homebrew's sandbox, which can't. `uninstall launchctl` stops the host and
+# removes the agent on uninstall and also on upgrade (Homebrew skips only `signal` on upgrades).
+# That suits ad-hoc-signed builds: every new build needs its Screen Recording and Accessibility
+# grants again, and `glide-setup` does both. The caveat says so.
+cask "glide-host" do
+  version "@VERSION@"
+  sha256 "@SHA256@"
+
+  url "https://github.com/sudoBrandino/glide/releases/download/v#{version}/Glide-Host-#{version}-macos-@ARCH@.zip"
+  name "Glide Host"
+  desc "Host for the Glide low-latency remote desktop"
+  homepage "https://github.com/sudoBrandino/glide"
+
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  @ARCH_DEPENDS@
+  depends_on macos: :sonoma
+
+  app "Glide Host.app"
+  binary "#{appdir}/Glide Host.app/Contents/Resources/glide-setup"
+  binary "#{appdir}/Glide Host.app/Contents/MacOS/glide-host"
+
+  # The app is signed ad hoc and not notarized, so Gatekeeper refuses to start it while it carries
+  # Homebrew's quarantine flag.
+  postflight_steps do
+    run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{appdir}}/Glide Host.app"], must_succeed: false
+  end
+
+  uninstall launchctl: "io.github.sudobrandino.glide.host"
+
+  zap trash: [
+    "~/Library/Application Support/Glide",
+    "~/Library/Logs/glide-host.log",
+  ]
+
+  caveats <<~EOS
+    Run this now, and again after every upgrade:
+      glide-setup
+    It starts Glide Host at login and walks you through Screen Recording and
+    Accessibility (each new build needs them again), the connection and pairing.
+  EOS
+end

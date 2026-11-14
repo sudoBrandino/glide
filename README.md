@@ -187,8 +187,20 @@ A block-code test pattern measures true glass-to-glass latency. See
 
 ## Install and run
 
-To install a prebuilt release instead of building from source, follow
-[`docs/INSTALL.md`](docs/INSTALL.md).
+To install a prebuilt release instead of building from source, run the guided installers. They
+download and verify the release, then walk through the permissions, the connection and pairing:
+
+```sh
+# Mac (Terminal); or: brew install --cask sudobrandino/glide/glide-host && glide-setup
+curl -fsSL https://raw.githubusercontent.com/sudoBrandino/glide/main/install.sh | bash
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/sudoBrandino/glide/main/install.ps1 | iex
+```
+
+[`docs/INSTALL.md`](docs/INSTALL.md) explains what they do, and the same steps by hand.
 
 ### Requirements
 
@@ -213,8 +225,10 @@ tools/make-host-app.sh && tools/install-host.sh
 - `GLIDE_BUNDLE_ID` sets the app's bundle identifier, which is also the LaunchAgent label
   (default `io.github.sudobrandino.glide.host`). Put your values in `.dev/build.env`, which is
   gitignored; see [`tools/build-env.sh`](tools/build-env.sh).
-- `install-host.sh --no-start` installs without starting the app. `install-host.sh --uninstall`
-  removes the app and the agent, but keeps the config.
+- `install-host.sh` runs the installer (`install.sh`) unattended on the app you built.
+  `--no-start` installs without starting the app; `--uninstall` removes the app and the agent but
+  keeps the config. For the guided setup (permissions, connection, pairing), run
+  `./install.sh --app "dist/Glide Host.app"`.
 - The log is written to `~/Library/Logs/glide-host.log`.
 
 **Permissions.** The host needs **Screen Recording** to capture and **Accessibility** to inject

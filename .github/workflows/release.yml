@@ -27,6 +27,8 @@ on:
       - tools/release.sh
       - tools/version.sh
       - tools/make-host-app.sh
+      - install.sh
+      - packaging/**
       - .github/workflows/release.yml
 
 concurrency:
@@ -204,6 +206,7 @@ jobs:
         run: |
           tools/release.sh notes
           tools/release.sh sums
+          tools/release.sh cask
           ls -l out
           cat out/RELEASE_NOTES.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -223,7 +226,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          files=(out/Glide-*.zip out/SHA256SUMS)
+          files=(out/Glide-*.zip out/SHA256SUMS out/glide-host.rb)
           if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
             if [ "$state" != "true" ]; then
               echo "::error::release $TAG is already published; not touching it"; exit 1
