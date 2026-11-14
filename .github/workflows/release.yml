@@ -5,6 +5,7 @@ name: Release
 #
 # - Push a tag vX.Y.Z (must equal the VERSION file, on a commit in main): build, attest, draft.
 # - Run it by hand (workflow_dispatch) for a dry run: build only, artifacts on the run page.
+#   Pull requests that touch the release tooling get the same dry run.
 #
 # Optional repository secrets for a Developer ID signed and notarized Mac app. Without them the
 # app is signed ad hoc, as with tools/make-host-app.sh.
@@ -20,6 +21,13 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+  pull_request:
+    paths:
+      - VERSION
+      - tools/release.sh
+      - tools/version.sh
+      - tools/make-host-app.sh
+      - .github/workflows/release.yml
 
 concurrency:
   group: release-${{ github.ref }}
