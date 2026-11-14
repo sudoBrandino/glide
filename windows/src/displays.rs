@@ -49,6 +49,9 @@ impl DisplayIdentity {
     }
 }
 
+/// Display names kept for toasts about displays that went away (`DisplayState::names`).
+const MAX_REMEMBERED_NAMES: usize = 512;
+
 /// The host's displays for the current connection (from DisplayList).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DisplayState {
@@ -65,6 +68,11 @@ pub struct DisplayState {
 
 impl DisplayState {
     pub fn apply_list(&mut self, streamed: u32, selected: u32, displays: Vec<MacDisplay>) {
+        // The list is host-supplied: keep the remembered names bounded (a real Mac has a handful
+        // of displays per connection; a hostile host could send new ids forever).
+        if self.names.len() + displays.len() > MAX_REMEMBERED_NAMES {
+            self.names.clear();
+        }
         for d in &displays {
             self.names.insert(d.id, d.name.clone());
         }
@@ -111,7 +119,7 @@ pub fn label(d: &MacDisplay) -> String {
     }
     if d.refresh > 0 {
         let hz = d.refresh as f64 / 100.0;
-        if d.refresh % 100 == 0 {
+        if d.refresh.is_multiple_of(100) {
             s.push_str(&format!(" @ {hz:.0} Hz"));
         } else {
             s.push_str(&format!(" @ {hz:.2} Hz"));

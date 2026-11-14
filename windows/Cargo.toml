@@ -72,6 +72,18 @@ features = [
 
 [dev-dependencies]
 
+# CI runs `cargo clippy --all-targets -- -D warnings` for the host and the Windows target.
+# Default lint set, minus a few style judgments that would mean churn without a fix.
+[lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+# Rewrites hot pixel/sample loops to `as_chunks`; not worth the churn (and newer than many toolchains).
+chunks_exact_to_as_chunks = "allow"
+
+[lints.rust]
+# Lets toolchains older than CI's (which may not know a lint named above) build without warnings.
+unknown_lints = "allow"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

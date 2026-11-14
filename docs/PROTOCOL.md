@@ -318,6 +318,11 @@ own units, e.g. points), clamped inside the display. Viewers send the center of 
 the pointer within the drawn video rectangle, `(px + 0.5) / rect_width` (likewise for `y`),
 clamped to 0..1 when the pointer is over a letterbox bar.
 
+Input values are untrusted: a `MouseMove` or `MouseWheel` with a NaN or infinite `f32`, a
+`MouseMove` coordinate outside ±1000 or a `MouseWheel` delta outside ±10000 notches is malformed,
+and the host drops the message (it logs it; the session continues). Finite coordinates outside
+0..1 are clamped to the display.
+
 ### Host → Client
 
 | type | name | payload |
@@ -351,7 +356,10 @@ Rules:
 - Keyframes carry VPS/SPS/PPS (HEVC) or SPS/PPS (H.264) in-band, Annex-B with 4-byte start codes.
 - No B-frames; decode order == display order. Client should display every frame immediately.
 - The host only sends frames when the screen changes; long gaps are normal.
-- `CursorShape` sizes are in **host pixels**; client may scale by its own view scale.
+- `CursorShape` sizes are in **host pixels**; client may scale by its own view scale. `w` and `h`
+  are at most 256 (hosts don't send larger shapes; viewers ignore them). Viewers bound their shape
+  cache (Glide's: 1024 shapes / 64 MiB, then it starts over); a `CursorShapeRef` to a shape the
+  viewer doesn't have leaves the current cursor unchanged.
 
 ## 3.1 Hybrid mode and the viewer canvas
 
@@ -865,6 +873,8 @@ implementations are checked against `docs/file-transfer-vectors.json`, generated
       extension (from the last `.`, if not at position 0 and at most 32 bytes); strip trailing
       `.`/` ` again. (200 leaves room for the collision suffix under the 255 limits of
       APFS/NTFS.)
+   5. if step 4 cut the name, apply step 3 again: a cut can expose a device name
+      (`CON` + 197 spaces + `xyz` → `CON` → `_CON`). A component is therefore at most 201 bytes.
 3. **Never overwrite.** Files are saved under the receiver's download folder
    (host: `~/Downloads/Glide`, viewer: `<Downloads>\Glide`; configurable). Each top-level folder
    of the offer becomes a *new* folder — `Photos (2)`, `Photos (3)`… if the name is taken — so a

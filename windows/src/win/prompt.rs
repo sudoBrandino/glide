@@ -51,7 +51,8 @@ fn wide(s: &str) -> Vec<u16> {
 pub fn app_icon(size: i32) -> Option<HICON> {
     unsafe {
         let hinst = GetModuleHandleW(None).ok()?;
-        LoadImageW(Some(HINSTANCE(hinst.0)), PCWSTR(1 as *const u16), IMAGE_ICON, size, size, LR_DEFAULTCOLOR)
+        // MAKEINTRESOURCE(1): an integer resource id in a pointer, never dereferenced as memory.
+        LoadImageW(Some(HINSTANCE(hinst.0)), PCWSTR(std::ptr::without_provenance(1)), IMAGE_ICON, size, size, LR_DEFAULTCOLOR)
             .ok()
             .map(|h| HICON(h.0))
     }

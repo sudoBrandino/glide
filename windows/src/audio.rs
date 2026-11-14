@@ -175,7 +175,7 @@ impl JitterBuffer {
         self.channels
     }
     fn avail(&self) -> usize {
-        if self.channels == 0 { 0 } else { self.q.len() / self.channels }
+        self.q.len().checked_div(self.channels).unwrap_or(0)
     }
     /// Buffered audio not yet played, in ms.
     pub fn level_ms(&self) -> f64 {
@@ -205,7 +205,7 @@ impl JitterBuffer {
     /// Add one AudioFrame payload (interleaved s16le). Returns false if malformed.
     pub fn push(&mut self, seq: u32, capture_time_us: u64, pcm: &[u8]) -> bool {
         let ch = self.channels;
-        if ch == 0 || pcm.len() % (2 * ch) != 0 {
+        if ch == 0 || !pcm.len().is_multiple_of(2 * ch) {
             self.stats.malformed += 1;
             return false;
         }
@@ -221,14 +221,15 @@ impl JitterBuffer {
             return true;
         }
         if let Some(bump) = self.pending_bump.take() {
-            if self.end_ts_us.is_some_and(|end| capture_time_us > end + PAUSE_GAP_US) {
+            if self.end_ts_us.is_some_and(|end| capture_time_us > end.saturating_add(PAUSE_GAP_US)) {
                 // The host went quiet; nothing arrived late. Undo the underrun's target bump.
                 self.target -= bump;
                 self.stats.underruns -= 1;
                 self.stats.pauses += 1;
             }
         }
-        self.end_ts_us = Some(capture_time_us + n as u64 * 1_000_000 / self.rate.max(1) as u64);
+        // Host-supplied timestamp: saturate rather than overflow.
+        self.end_ts_us = Some(capture_time_us.saturating_add(n as u64 * 1_000_000 / self.rate.max(1) as u64));
         self.q.extend(pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0));
         self.markers.push_back((self.tail_abs, capture_time_us));
         self.tail_abs += n as u64;
@@ -314,16 +315,16 @@ impl JitterBuffer {
             }
             let o = &mut out[i * ch..(i + 1) * ch];
             if t == 0.0 {
-                for c in 0..ch {
-                    o[c] = self.q[idx * ch + c];
+                for (c, v) in o.iter_mut().enumerate() {
+                    *v = self.q[idx * ch + c];
                 }
             } else {
-                for c in 0..ch {
+                for (c, v) in o.iter_mut().enumerate() {
                     let p1 = self.q[idx * ch + c];
                     let p2 = self.q[(idx + 1) * ch + c];
                     let p0 = if idx == 0 { self.prev[c] } else { self.q[(idx - 1) * ch + c] };
                     let p3 = if idx + 2 < avail { self.q[(idx + 2) * ch + c] } else { p2 };
-                    o[c] = cubic(p0, p1, p2, p3, t);
+                    *v = cubic(p0, p1, p2, p3, t);
                 }
             }
             self.pos += ratio;
@@ -677,7 +678,7 @@ mod tests {
                 next_burst += 1024.0 / 48.0 * 1000.0;
             } else {
                 pending.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                while pending.first().map_or(false, |p| p.0 <= next_pull) {
+                while pending.first().is_some_and(|p| p.0 <= next_pull) {
                     let (_, d) = pending.remove(0);
                     for r in [0..342usize, 342..683, 683..1024] {
                         j.push(seq, 0, &pcm(&d[r.start * 2..r.end * 2]));

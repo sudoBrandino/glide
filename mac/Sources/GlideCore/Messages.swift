@@ -346,6 +346,19 @@ public enum ClientMessage {
         return w.data
     }
 
+    /// Largest |MouseWheel| delta accepted, in notches (PROTOCOL.md §3). Real viewers send a few.
+    public static let maxWheelNotches: Float = 10_000
+    /// Largest |MouseMove| coordinate accepted (normalized 0..1; the host clamps what is in range).
+    public static let maxMouseCoordinate: Float = 1_000
+
+    /// An input `f32` from the viewer: NaN, ±inf and absurd magnitudes are malformed (§3), so they
+    /// never reach float-to-integer conversions in input injection (which trap on them).
+    static func inputF32(_ r: inout ByteReader, limit: Float) throws -> Float {
+        let v = try r.f32()
+        guard v.isFinite, abs(v) <= limit else { throw WireError.malformed("input value \(v) out of range") }
+        return v
+    }
+
     public static func decode(_ d: Data) throws -> ClientMessage {
         var r = ByteReader(d)
         let t = try r.u8()
@@ -354,9 +367,9 @@ public enum ClientMessage {
             let v = try r.u16(), caps = CodecCaps(rawValue: try r.u32()), vw = try r.u16(), vh = try r.u16()
             let mode = StreamMode(rawValue: try r.u8()) ?? .fast
             return .hello(version: v, caps: caps, viewW: vw, viewH: vh, mode: mode, maxFps: try r.u8(), name: try r.str())
-        case 0x10: return .mouseMove(x: try r.f32(), y: try r.f32())
+        case 0x10: return .mouseMove(x: try inputF32(&r, limit: maxMouseCoordinate), y: try inputF32(&r, limit: maxMouseCoordinate))
         case 0x11: return .mouseButton(button: try r.u8(), down: try r.u8() != 0)
-        case 0x12: return .mouseWheel(dx: try r.f32(), dy: try r.f32())
+        case 0x12: return .mouseWheel(dx: try inputF32(&r, limit: maxWheelNotches), dy: try inputF32(&r, limit: maxWheelNotches))
         case 0x13: return .key(usage: try r.u16(), down: try r.u8() != 0)
         case 0x14: return .releaseAll
         case 0x15: return .viewSize(w: try r.u16(), h: try r.u16())

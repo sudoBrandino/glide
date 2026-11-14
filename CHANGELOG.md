@@ -36,10 +36,16 @@ changed for them, not how. Delete empty subsections when the release is cut.
 - Glide menu → **Input**: switch Ctrl as Command (Win as Control) on or off at runtime, and
   **Natural scrolling** (reverses the direction; config `natural_scrolling`).
 - Host: `GLIDE_KEYBOARD_TYPE=ansi|iso|jis`, `GLIDE_SCROLL_LINES`, `GLIDE_SCROLL_PIXELS` for tuning.
+- `docs/THREAT_MODEL.md`: what pairing protects and what it doesn't, trust in the LAN, and the
+  host-dials (listen) mode.
+- Both sides' message decoders are fuzzed on every CI run (`cargo test`, `glide-selftest`), and
+  CI now runs `cargo clippy` with warnings as errors and a gitleaks secret scan.
 
 ### Changed
 - Volume and mute keys pressed in the viewer now change the PC's volume instead of being sent to
   the Mac (where they had no effect).
+- Received file names: if shortening a very long name would leave a Windows device name such as
+  `CON`, it gets a `_` prefix like any other device name (protocol §6.3, new step 5).
 
 ### Fixed
 - Mouse: clicks landed up to 1 point up and to the left of the pointer, increasingly toward the
@@ -55,8 +61,18 @@ changed for them, not how. Delete empty subsections when the release is cut.
 - ISO keyboards: the key left of 1 and the extra key left of Z were swapped on Macs with an ISO
   keyboard type, as macOS's own driver swaps them.
 - The keyboard hook never waits on the network, so a file upload can't freeze the PC's keyboard.
+- Viewer: a bitmap on the Windows clipboard with unusual colour masks could crash debug builds
+  and got wrong colours in release builds. `--probe`'s video parameter parser no longer panics
+  on a truncated NAL unit.
 
 ### Security
+- Mac host: mouse and wheel messages with invalid numbers (NaN, infinity, absurd wheel
+  deltas) are dropped. Before, a paired viewer could crash the host with one.
+- Viewer: a misbehaving or compromised Mac can no longer exhaust the PC's memory or CPU through
+  rapid file offers with huge path lists, endless new cursor shapes or display names, or a tiny
+  clipboard PNG with a giant embedded colour profile. Oversized cursor shapes are ignored.
+- Both sides: checking a file offer for a name that is both a file and a folder is now
+  O(n log n) instead of building every folder prefix (~1 GB for a hostile 10 000-file offer).
 
 ## [0.2.0] - 2026-11-14
 

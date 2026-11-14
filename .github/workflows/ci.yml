@@ -46,7 +46,9 @@ jobs:
           cmp "$RUNNER_TEMP/d.json" docs/display-vectors.json
           python3 tools/mock_host.py --input-vectors "$RUNNER_TEMP/i.json"    # §3.6 input messages
           cmp "$RUNNER_TEMP/i.json" docs/input-vectors.json
-          python3 tools/mock_host.py --selftest                       # clipboard/latency/file/display/input codecs
+          python3 tools/mock_host.py --file-vectors "$RUNNER_TEMP/f.json"     # §6 file messages + name rules
+          cmp "$RUNNER_TEMP/f.json" docs/file-transfer-vectors.json
+          python3 tools/mock_host.py --selftest                               # Python reference self-checks
       - name: No personal paths in the tree
         # Examples and tests use placeholders such as %USERPROFILE% or C:\Users\me; see CONTRIBUTING.md.
         run: |
@@ -115,11 +117,19 @@ jobs:
         with:
           toolchain: stable
           targets: x86_64-pc-windows-gnu
+          components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: windows
       - name: cargo test
+        # Includes the seeded fuzz tests (src/fuzz_tests.rs); GLIDE_FUZZ_SEED reproduces a failure.
         run: cargo test --locked
+      - name: cargo clippy (Linux, and the Windows target for src/win)
+        # Lint levels are in Cargo.toml [lints]. `cargo fmt --check` isn't enforced yet: the tree
+        # predates rustfmt and CONTRIBUTING asks to format only touched code.
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings
       - name: Cross-build glide-client.exe (x86_64-pc-windows-gnu)
         run: cargo build --locked --release --target x86_64-pc-windows-gnu
       - name: Check exe

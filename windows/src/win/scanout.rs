@@ -30,6 +30,12 @@ fn qpc() -> i64 {
     q
 }
 
+impl Default for ScanoutClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScanoutClock {
     pub fn new() -> ScanoutClock {
         let mut f = 0i64;

@@ -142,6 +142,7 @@ public struct ScrollConverter {
 
     /// Whole units out of an accumulator, keeping the fraction (bounded to the Int32 range).
     private static func take(_ v: inout Double) -> Int32 {
+        guard v.isFinite else { v = 0; return 0 }  // NaN passes min/max and would trap in Int32()
         let whole = max(min(v.rounded(.towardZero), Double(Int32.max)), Double(Int32.min))
         v -= whole
         if abs(v) >= 1 { v = 0 }  // only after clamping a huge value

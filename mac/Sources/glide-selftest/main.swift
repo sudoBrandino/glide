@@ -491,5 +491,8 @@ do {
     let vpath = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "../docs/test-vectors.json"
     try inputTests(vectorsDir: URL(fileURLWithPath: vpath).deletingLastPathComponent())
 } catch { failures += 1; print("  FAIL input threw \(error)") }
+inputValidationTests()
+fileHardeningTests()
+fuzzTests(vectorsDir: URL(fileURLWithPath: CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "../docs/test-vectors.json").deletingLastPathComponent())
 print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)

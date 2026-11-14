@@ -74,7 +74,7 @@ fn compile(entry: &str, target: &str) -> Result<Vec<u8>> {
         let r = D3DCompile(
             SHADER.as_ptr() as *const _,
             SHADER.len(),
-            PCSTR(b"glide.hlsl\0".as_ptr()),
+            PCSTR(c"glide.hlsl".as_ptr().cast()),
             None,
             None,
             PCSTR(entry_c.as_ptr()),

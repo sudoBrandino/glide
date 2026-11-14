@@ -570,6 +570,9 @@ def sanitize_component(c):
         stem = c[:len(c) - len(ext)]
         c = _trunc_utf8(stem, FILE_COMPONENT_MAX - len(ext.encode())) + ext
         c = c.rstrip(". ") or "_"
+        # Step 5: the cut can expose a device name ("CON" + spaces + "x" -> "CON"): check again.
+        if _ascii_upper(c.split(".", 1)[0].rstrip(" ")) in RESERVED:
+            c = "_" + c
     return c
 
 
@@ -774,6 +777,9 @@ PATH_VECTORS = [
     ("\u65e5" * 100 + ".png", ["\u65e5" * 65 + ".png"]),
     ("y" * 300, ["y" * 200]),
     ("z" * 190 + "." + "e" * 40, ["z" * 190 + "." + "e" * 9]),
+    ("CON" + " " * 197 + "xyz", ["_CON"]),
+    ("NUL" + " " * 193 + "abcdefgh.txt", ["_NUL" + " " * 193 + ".txt"]),
+    ("com1" + "." * 250 + "y", ["_com1" + "." * 194 + "y"]),
     ("/".join(["d"] * 32), ["d"] * 32),
     ("/".join(["d"] * 33), None),
     ("p" * 4097, None),
@@ -1803,6 +1809,10 @@ class Session:
             self.send_msg(display_changed(self.streamed, REASON_RESTORED, back["id"]))
 
     def input_loop(self):
+        def input_ok(vals, limit):
+            # PROTOCOL.md §3: NaN/inf, |coordinate| > 1000 or |wheel| > 10000 notches is malformed.
+            return all(math.isfinite(v) and abs(v) <= limit for v in vals)
+
         names = {0x10: "MouseMove", 0x11: "MouseButton", 0x12: "MouseWheel", 0x13: "Key", 0x14: "ReleaseAll",
                  0x20: "RequestKeyframe", 0x21: "SetMode", 0x50: "Clipboard"}
         moves = 0
@@ -1825,12 +1835,18 @@ class Session:
                 if self.args.quiet_input or moves % 30 != 1:
                     continue
                 x, y = struct.unpack("<ff", m[1:9])
+                if not input_ok((x, y), 1000):
+                    log(f"{self.addr}: malformed MouseMove {m.hex()} dropped (§3)")
+                    continue
                 log(f"{self.addr}: MouseMove x={x:.4f} y={y:.4f} (logging 1 in 30)")
             elif t == 0x11:
                 b, d = m[1], m[2]
                 log(f"{self.addr}: MouseButton {['L', 'R', 'M', 'back', 'fwd'][b] if b < 5 else b} {'down' if d else 'up'}")
             elif t == 0x12:
                 dx, dy = struct.unpack("<ff", m[1:9])
+                if not input_ok((dx, dy), 10000):
+                    log(f"{self.addr}: malformed MouseWheel {m.hex()} dropped (§3)")
+                    continue
                 log(f"{self.addr}: MouseWheel dx={dx:+.3f} dy={dy:+.3f}")
             elif t == 0x13:
                 (u,) = struct.unpack("<H", m[1:3])

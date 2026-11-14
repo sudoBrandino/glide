@@ -140,12 +140,13 @@ pub struct Tracker {
     pub window_us: u64,
 }
 
+// Inputs include host-supplied timestamps: saturate instead of overflowing.
 fn ms(a: u64, b: u64) -> f64 {
-    (b as i64 - a as i64) as f64 / 1000.0
+    (b as i64).saturating_sub(a as i64) as f64 / 1000.0
 }
 
 fn ms_i(a: i64, b: u64) -> f64 {
-    (b as i64 - a) as f64 / 1000.0
+    (b as i64).saturating_sub(a) as f64 / 1000.0
 }
 
 impl Tracker {

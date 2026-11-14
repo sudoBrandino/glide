@@ -30,6 +30,8 @@ pub mod util;
 pub mod version;
 
 #[cfg(test)]
+mod fuzz_tests;
+#[cfg(test)]
 pub(crate) mod testhost;
 
 #[cfg(windows)]
