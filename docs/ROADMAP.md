@@ -86,7 +86,10 @@ Next:
 - [x] **Security v2** (see the top of this file)
 - [ ] **Virtual display** that matches the viewer (CGVirtualDisplay), for example a 4K monitor →
   1920×1080 HiDPI at 120 Hz. This drops the BetterDisplay dependency and the need to switch modes
-  with `tools/display-mode.swift`.
+  with `tools/display-mode.swift`. Implemented as an opt-in on `feat/virtual-display`
+  ([VIRTUAL_DISPLAY.md](VIRTUAL_DISPLAY.md)). It still needs `glide-host --virtual-display-selftest`
+  on real hardware and a live session before it can be marked done. Possible follow-up: mirroring
+  the physical display of the virtual one.
 - [ ] **UDP video transport with NACK/FEC**, because TCP head-of-line blocking hurts on loss
 - [x] Multi-monitor support and a display picker (PROTOCOL.md §3.5; one display at a time, no spanning)
 - [ ] Glass-to-glass latency measurement on the real LAN

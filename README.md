@@ -66,6 +66,7 @@ See the feature table below and [`docs/ROADMAP.md`](docs/ROADMAP.md) for what is
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Pipelines, hybrid/canvas model, threading |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | What's done and what's next |
 | [`docs/LATENCY.md`](docs/LATENCY.md) | Latency breakdown, glass-to-glass test, tuning results |
+| [`docs/VIRTUAL_DISPLAY.md`](docs/VIRTUAL_DISPLAY.md) | Optional virtual display sized to the viewer (design, risks, how to try it) |
 | [`windows/README.md`](windows/README.md) | Viewer reference: all flags, env vars, headless modes |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to build, test and send changes |
 | [`SECURITY.md`](SECURITY.md) | How to report a vulnerability |
@@ -307,7 +308,7 @@ hooks.
 `tools/install-host.sh`) shows a menu-bar item: state icon (waiting / dialing / connected / paused /
 problem), viewer name + IP, stream mode, resolution, fps / Mbps / encode ms, and actions (Disconnect,
 Pause, Send Files to Viewer…, Recent Transfers, Pair New Viewer…, Paired Viewers ▸ name ▸ Remove…,
-Display Mode, Open Log, Restart, Quit Until Next Login — plain Quit would just be relaunched by the
+Display Mode, Virtual Display, Open Log, Restart, Quit Until Next Login — plain Quit would just be relaunched by the
 agent's KeepAlive). The last security event ("Rejected unknown viewer …", "Paired …") is shown as an
 info row.
 
@@ -352,6 +353,17 @@ with `.forSession` scope before capture starts (mid-session: one re-capture → 
 keyframe), and the previous mode is restored 10 s after the viewer disconnects
 (`restoreOnDisconnect`, default true). Changing the mode yourself during a session pauses automatic
 switching until the next session (and that mode is kept).
+
+**Virtual display** (optional, off by default; `"virtualDisplay"` in host.json or the menu's
+*Virtual Display* submenu): Glide creates a virtual monitor sized to the viewer and streams it
+instead of the Mac's own screen, so a headless Mac, or a Mac whose screen doesn't match the viewer,
+streams pixel-perfect without BetterDisplay. A 4K viewer gets a panel that looks like 1920×1080 at
+HiDPI (3840×2160 px), and a 1440p viewer gets 2560×1440 at 1x. The **Display mode** policy above
+decides HiDPI or 1x. The display is kept 30 s after a disconnect, so a reconnect doesn't reshuffle
+windows. `"lifetime": "always"` keeps it while the host runs, and `makeMain` makes it the main
+display. It uses a private CoreGraphics API, falls back to the physical display if that fails, and
+comes with a self-test: run `glide-host --virtual-display-selftest` before you turn it on. See
+[`docs/VIRTUAL_DISPLAY.md`](docs/VIRTUAL_DISPLAY.md).
 
 Only an authenticated viewer can replace the active session. Unauthenticated connections are
 closed after 5 s without a valid ClientHello; at most 4 can be pending (2 per source IP), and a new

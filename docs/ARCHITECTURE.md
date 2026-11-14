@@ -22,7 +22,8 @@ capture ─► diff ─► encode ─► record layer ─► TCP ─► record l
 | Host | `glide-host/Encoder.swift` | VideoToolbox compression sessions (HEVC 4:2:0 or 4:4:4, H.264). |
 | Host | `glide-host/CursorMonitor.swift`, `InputInjector.swift` | Cursor shape and position out, CGEvent injection in. |
 | Host | `glide-host/Power.swift` | Sleep and display-sleep assertions, display wake on input. |
-| Host | `glide-host/ActiveDisplay.swift`, `GlideCore/Displays.swift` | Which display is served (PROTOCOL.md §3.5): the session's selection by identity, else the `--display` pin, else the main display; the display list. Capture, input, display-mode policy and the menu resolve it on use. |
+| Host | `glide-host/ActiveDisplay.swift`, `GlideCore/Displays.swift` | Which display is served (PROTOCOL.md §3.5): the session's selection by identity, else Glide's virtual display while it exists, else the `--display` pin, else the main display; the display list. Capture, input, display-mode policy and the menu resolve it on use. |
+| Host | `GlideCore/VirtualDisplayPolicy.swift`, `glide-host/VirtualDisplay.swift`, `CGlideVirtualDisplay` | Optional virtual display sized to the viewer: mode planning and the keep-alive state machine (pure, unit-tested), the CGVirtualDisplay lifecycle, and a runtime-lookup Objective-C shim for the private classes ([VIRTUAL_DISPLAY.md](VIRTUAL_DISPLAY.md)). |
 | Host | `GlideCore/FileNames.swift`, `FileTransfer.swift` | File transfer (PROTOCOL.md §6): name sanitizer, receiver, sender, `FileTransferEngine`. |
 | Host | `glide-host/HostFiles.swift` | Per-session file transfer wiring (chunk pacing on `bytesInFlight`, Finder pasteboard pull), notifications. |
 | Viewer | `windows/src/{protocol,crypto,net}.rs` | Codec, crypto and TCP transport. These are platform independent and unit-tested on Linux, macOS and Windows. |
