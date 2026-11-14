@@ -576,7 +576,11 @@ final class Session: @unchecked Sendable {
             ActiveDisplay.select(identity, owner: self.id)
             let target = ActiveDisplay.current()
             log("session \(self.id): \(reason == .host ? "Mac menu" : "viewer") selected \(identity.map { "display \(display) “\($0.name)”" } ?? "the default display") -> streaming \(target)")
-            guard let p = self.pipeline else { return }  // not capturing yet: the first capture uses it
+            guard let p = self.pipeline else {
+                // Not capturing yet: the first capture picks the selection up; move the mode policy now.
+                DisplayModeController.shared.servedDisplayChanged { _ in }
+                return
+            }
             let shown = self.displayLock.withLock { self.announcedDisplay }
             if target == shown {
                 self.sendDisplayList()  // selected_id changed
