@@ -16,6 +16,30 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ## [Unreleased]
 
+### Added
+
+- **Guided installers.** On the Mac,
+  `curl -fsSL https://raw.githubusercontent.com/sudoBrandino/glide/main/install.sh | bash`
+  downloads the latest release, checks it against `SHA256SUMS`, installs the app and its
+  LaunchAgent, replaces an older Glide Host that would compete for the screen, walks through
+  Screen Recording and Accessibility (clearing grants left over from a previous version), asks
+  which side connects and opens the pairing window. On Windows,
+  `irm https://raw.githubusercontent.com/sudoBrandino/glide/main/install.ps1 | iex` does the same
+  for the viewer: it installs it where an existing viewer lives, so firewall rules keep applying,
+  offers a firewall rule and Start menu and sign-in shortcuts. Run either again to update or to
+  change the connection. Both have `--uninstall` / `-Uninstall`.
+- **Homebrew:** `brew install --cask sudobrandino/glide/glide-host`, then `glide-setup` (the same
+  installer, shipped inside the app); run `glide-setup` again after `brew upgrade`.
+- `glide-host --permission-status` reports whether Screen Recording and Accessibility are granted,
+  without prompting. The installer uses it to notice the grants as soon as you make them.
+
+### Changed
+
+- The LaunchAgent keeps the host running only while the app exists (`KeepAlive` `PathState`):
+  deleting the app no longer leaves launchd retrying in the background. Run the installer once
+  to switch an existing install over.
+- `tools/install-host.sh` is now a thin wrapper around `install.sh`.
+
 ## [0.2.0] - 2026-11-14
 
 The first public release. Protocol version 2.

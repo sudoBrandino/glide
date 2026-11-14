@@ -93,6 +93,9 @@ func usage() -> Never {
            glide-host --identity            (print this Mac's key fingerprint)
            glide-host --version             (print the version and protocol version)
            glide-host --request-permissions (prompt for Screen Recording + Accessibility, wait, exit)
+           glide-host --permission-status   (print whether both are granted, without prompting; run it
+                                             with `open -W -a "Glide Host" --stdout F --args …` so
+                                             the answer is about Glide Host, not the terminal)
            glide-host --set-connect HOST[:PORT] (save the default dial-out target in host.json)
            glide-host --selftest-ui [--out DIR] (print the status menu per state + display-mode picks; no capture)
            glide-host --encode-bench [SECONDS]  (offline VideoToolbox encode timing, normal vs low-latency RC,
@@ -142,6 +145,12 @@ if let i = args.firstIndex(of: "--encode-bench") {  // offline; never captures o
     runEncodeBench(seconds: secs)
 }
 
+if args.contains("--permission-status") {
+    // Read-only, for install.sh: a fresh process sees a new Screen Recording grant, which the
+    // --request-permissions process only sees after a relaunch.
+    print("screen-recording=\(CGPreflightScreenCaptureAccess() ? "granted" : "missing") accessibility=\(AXIsProcessTrusted() ? "granted" : "missing")")
+    exit(0)
+}
 if args.contains("--request-permissions") {
     // Run from the app bundle so macOS attributes the grants to Glide Host itself.
     let screen0 = CGPreflightScreenCaptureAccess(), ax0 = AXIsProcessTrusted()

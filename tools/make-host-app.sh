@@ -62,6 +62,9 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 plutil -lint "$OUT/Contents/Info.plist" >/dev/null
+# The installer and setup assistant, shipped inside the app so Homebrew (and anyone with only the
+# app) can run it: the cask links it as `glide-setup`. It finds the app it lives in.
+install -m 0755 "$ROOT/install.sh" "$OUT/Contents/Resources/glide-setup"
 SIGN_FLAGS=(--timestamp=none)
 [[ "${GLIDE_HARDENED_RUNTIME:-0}" == 1 ]] && SIGN_FLAGS=(--options runtime --timestamp)
 codesign --force "${SIGN_FLAGS[@]}" --sign "$SIGN_ID" --identifier "$GLIDE_BUNDLE_ID" "$OUT"
