@@ -146,7 +146,7 @@ identically:
   Ctrl→Cmd happens on the viewer, so the host injects exactly what it receives.
   - Pointer: `x·width` over the captured display's bounds in points, with the delta fields set.
   - Scrolling: notched wheels become line scrolls; touchpads and high-resolution wheels become pixel
-    scrolls inside a gesture (began/changed/ended, ended after 100 ms idle). PROTOCOL.md §3.5.
+    scrolls inside a gesture (began/changed/ended, ended after 100 ms idle). PROTOCOL.md §3.6.
     `GLIDE_SCROLL_LINES` (default 3 per notch) and `GLIDE_SCROLL_PIXELS` (default 48 per notch) tune it.
   - Keys: media keys are posted as system-defined events. On an ISO keyboard type the HID 0x35/0x64
     keys are swapped like macOS's own driver does; `GLIDE_KEYBOARD_TYPE=ansi|iso|jis` overrides the

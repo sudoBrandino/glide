@@ -460,7 +460,7 @@ def consumer_key(usage, down):
 
 
 def input_decode(m):
-    """-> (kind, fields) for one §3.5 message; raises ValueError/struct.error if malformed."""
+    """-> (kind, fields) for one §3.6 message; raises ValueError/struct.error if malformed."""
     t = m[0]
     if t == 0x44 and len(m) == 5:
         return "caps", {"flags": struct.unpack("<I", m[1:5])[0]}

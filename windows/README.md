@@ -170,7 +170,7 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   While the window has focus and the keyboard is captured, a low-level keyboard hook sends Win, Alt+Tab, Alt+Space and similar keys to the host.
   To leave the window, click outside it, press Ctrl+Alt+Shift+K, or press Ctrl+Alt+Del, which cannot be intercepted
   (keys held at that moment are released on the Mac when the secure desktop takes the keyboard).
-- **Input details** (PROTOCOL.md §3, §3.5). With a host that sends `InputCaps`:
+- **Input details** (PROTOCOL.md §3, §3.6). With a host that sends `InputCaps`:
   - Scrolling keeps its source: a notched wheel arrives as Mac line scrolling (3 lines per notch), a precision
     touchpad or high-resolution wheel as smooth pixel scrolling with gesture phases. *Natural scrolling* reverses both.
   - Caps Lock and Num Lock stay with Windows (the PC's LEDs stay right) and their state is sent to the Mac.

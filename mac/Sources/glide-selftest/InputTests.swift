@@ -2,7 +2,7 @@ import CoreGraphics
 import Foundation
 import GlideCore
 
-// Input (PROTOCOL.md §3, §3.5): wire vectors (docs/input-vectors.json) and the injector's pure
+// Input (PROTOCOL.md §3, §3.6): wire vectors (docs/input-vectors.json) and the injector's pure
 // logic — pointer mapping, click counting, scroll conversion, keymap.
 
 struct InputVectors: Decodable {

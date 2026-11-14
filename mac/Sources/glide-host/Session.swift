@@ -425,7 +425,7 @@ final class Session: @unchecked Sendable {
                 }
                 // Only to viewers with caps bit 11 (PROTOCOL.md §6), after ServerHello.
                 if let f = self.files { self.send(.file(f.caps)) }
-                // Only to viewers with caps bit 12 (PROTOCOL.md §3.5), after ServerHello.
+                // Only to viewers with caps bit 12 (PROTOCOL.md §3.6), after ServerHello.
                 if caps.contains(.inputExt) { self.send(.inputCaps(.all)) }
                 if self.audioOff { self.send(.audioConfig(.off)) }
                 self.audio?.arm()

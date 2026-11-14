@@ -36,7 +36,7 @@ public enum HIDKeymap {
         }
     }
 
-    /// Consumer page (0x0C) usages of `KeyExtra` ConsumerKey (PROTOCOL.md §3.5).
+    /// Consumer page (0x0C) usages of `KeyExtra` ConsumerKey (PROTOCOL.md §3.6).
     public static func systemKey(forConsumerUsage usage: UInt16) -> SystemKey? {
         switch usage {
         case 0xCD: return .play

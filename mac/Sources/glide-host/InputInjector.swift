@@ -16,7 +16,7 @@ final class InputInjector {
     private var heldSystemKeys = Set<Int32>()  // NX key types (media keys)
     private var flags: CGEventFlags = []
     private var capsOn = false
-    /// The viewer sends its Caps Lock state (§3.5 LockState): Caps Lock follows it, not key presses.
+    /// The viewer sends its Caps Lock state (§3.6 LockState): Caps Lock follows it, not key presses.
     private var locksFromViewer = false
     /// Where the last injected event put the pointer (nil: ask the window server).
     private var lastPos: CGPoint?
@@ -69,7 +69,7 @@ final class InputInjector {
         movePointer(to: p, dx: Double(p.x - from.x), dy: Double(p.y - from.y))
     }
 
-    /// §3.5 relative motion (pointer-lock mode): the pointer moves by the raw counts (clamped to the
+    /// §3.6 relative motion (pointer-lock mode): the pointer moves by the raw counts (clamped to the
     /// display) while the event's delta carries the full motion, so games keep turning at the edge.
     func mouseDelta(dx: Int16, dy: Int16) {
         let p = PointerMapping.offset(currentPos, dx: CGFloat(dx), dy: CGFloat(dy), in: bounds)
@@ -130,7 +130,7 @@ final class InputInjector {
         scroll(precise: scroller.inferPrecise(dx: dx, dy: dy), dx: dx, dy: dy)
     }
 
-    /// §3.5 Scroll.
+    /// §3.6 Scroll.
     func scroll(precise: Bool, dx: Float, dy: Float) {
         for o in scroller.scroll(precise: precise, dx: dx, dy: dy, now: ProcessInfo.processInfo.systemUptime) { postScroll(o) }
         if scroller.inGesture { armScrollTimer() }
@@ -219,7 +219,7 @@ final class InputInjector {
         e?.post(tap: .cghidEventTap)
     }
 
-    /// §3.5 KeyExtra.
+    /// §3.6 KeyExtra.
     func keyExtra(_ k: KeyExtra) {
         switch k {
         case let .lockState(l):

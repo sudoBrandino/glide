@@ -1,6 +1,6 @@
 //! Viewer-side input logic that doesn't need Win32, so it is unit-tested on every OS:
 //! key routing (local hotkeys, forwarding, keys left to Windows), keypad navigation with Num Lock
-//! off, media keys, scroll source/direction, and relative-motion splitting (PROTOCOL.md §3, §3.5).
+//! off, media keys, scroll source/direction, and relative-motion splitting (PROTOCOL.md §3, §3.6).
 //! `win::app` feeds it the raw Win32 events.
 
 use std::collections::HashSet;
@@ -30,7 +30,7 @@ pub struct KeyCtx {
     /// Connected, and the keyboard isn't released to Windows.
     pub forwarding: bool,
     pub ctrl_as_cmd: bool,
-    /// The host takes lock-key state (§3.5 InputCaps bit2): Caps Lock / Num Lock stay with
+    /// The host takes lock-key state (§3.6 InputCaps bit2): Caps Lock / Num Lock stay with
     /// Windows (LEDs right) and their state is sent as LockState instead.
     pub locks_local: bool,
 }
@@ -112,7 +112,7 @@ pub enum MediaKey {
     /// Volume up/down/mute: kept on this PC. The Mac's audio plays here, so this PC's volume is the
     /// one that matters (and the Mac's output volume doesn't change the captured stream).
     Volume,
-    /// Play/pause, next, previous, stop: HID Consumer usage for the Mac (§3.5 ConsumerKey).
+    /// Play/pause, next, previous, stop: HID Consumer usage for the Mac (§3.6 ConsumerKey).
     Transport(u16),
 }
 
@@ -142,7 +142,7 @@ pub struct WheelState {
 impl WheelState {
     /// `delta`: the message's wheel delta (120 = one notch; positive = away from the user / right).
     /// `touchpad`: Windows says the message came from a touchpad. `natural`: invert both axes.
-    /// `scroll_msg`: the host accepts §3.5 Scroll (else legacy MouseWheel).
+    /// `scroll_msg`: the host accepts §3.6 Scroll (else legacy MouseWheel).
     pub fn message(&mut self, delta: i16, horizontal: bool, touchpad: bool, natural: bool, scroll_msg: bool, now_us: u64) -> ClientMsg {
         let fine = touchpad || delta as i32 % WHEEL_DELTA as i32 != 0;
         if fine {

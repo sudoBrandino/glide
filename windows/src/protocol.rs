@@ -99,7 +99,7 @@ pub const MSG_VIDEO_FRAME: u8 = 0x40;
 pub const MSG_CURSOR_POS: u8 = 0x41;
 pub const MSG_CURSOR_SHAPE: u8 = 0x42;
 pub const MSG_CURSOR_SHAPE_REF: u8 = 0x43;
-/// Host → viewer (§3.5): `u32 flags` (INPUT_CAPS_*), only to viewers with CAP_INPUT_EXT.
+/// Host → viewer (§3.6): `u32 flags` (INPUT_CAPS_*), only to viewers with CAP_INPUT_EXT.
 pub const MSG_INPUT_CAPS: u8 = 0x44;
 pub const MSG_CLIPBOARD_CAPS: u8 = 0x51;
 /// Per-frame host pipeline timestamps (§3.4), host -> client.
@@ -149,7 +149,7 @@ pub const AUDIO_CODEC_OFF: u8 = 0;
 pub const AUDIO_CODEC_PCM_S16: u8 = 1;
 pub const AUDIO_CODEC_OPUS: u8 = 2;
 
-// Input extensions (§3.5)
+// Input extensions (§3.6)
 /// InputCaps flags: which messages the host accepts.
 pub const INPUT_CAPS_SCROLL: u32 = 1 << 0;
 pub const INPUT_CAPS_RELATIVE: u32 = 1 << 1;
@@ -1351,7 +1351,7 @@ mod tests {
         assert_eq!(CAP_CLIPBOARD, 0x100);
     }
 
-    /// docs/input-vectors.json (§3.5; also checked by glide-selftest and mock_host.py --selftest).
+    /// docs/input-vectors.json (§3.6; also checked by glide-selftest and mock_host.py --selftest).
     #[test]
     fn input_messages_match_reference_bytes() {
         let v: serde_json::Value = serde_json::from_str(include_str!("../../docs/input-vectors.json")).unwrap();

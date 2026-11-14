@@ -2,7 +2,7 @@ import CoreGraphics
 import Foundation
 
 // Pure input logic used by the host's InputInjector, kept free of CGEvent posting so that
-// glide-selftest can check it (PROTOCOL.md §3 and §3.5).
+// glide-selftest can check it (PROTOCOL.md §3 and §3.6).
 
 /// Viewer coordinates -> global display points.
 public enum PointerMapping {
@@ -18,7 +18,7 @@ public enum PointerMapping {
         CGPoint(x: axis(x, b.minX, b.width), y: axis(y, b.minY, b.height))
     }
 
-    /// Relative motion (§3.5 MouseDelta): `p` moved by `dx`, `dy` points, clamped to the display.
+    /// Relative motion (§3.6 MouseDelta): `p` moved by `dx`, `dy` points, clamped to the display.
     public static func offset(_ p: CGPoint, dx: CGFloat, dy: CGFloat, in b: CGRect) -> CGPoint {
         CGPoint(x: clamp(p.x + dx, b.minX, b.width), y: clamp(p.y + dy, b.minY, b.height))
     }
@@ -66,7 +66,7 @@ public struct ClickCounter {
     public mutating func reset() { last = nil }
 }
 
-/// Turns viewer scrolls (notches, §3 / §3.5) into Mac scroll events.
+/// Turns viewer scrolls (notches, §3 / §3.6) into Mac scroll events.
 ///
 /// - Discrete wheel notches become line scrolls (`linesPerNotch` per notch), which applications
 ///   treat as a real mouse wheel (their own smooth scrolling, line steps in terminals).
