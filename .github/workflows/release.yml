@@ -145,13 +145,17 @@ jobs:
           rm -f "$ZIP"
           ditto -c -k --sequesterRsrc --keepParent "$WORK/Glide Host.app" "$ZIP"
           spctl -a -vv -t exec "$WORK/Glide Host.app"
+      - name: DMG (from the final, possibly stapled, app)
+        run: tools/release.sh dmg
       - name: Remove signing keychain
         if: always()
         run: security delete-keychain "$RUNNER_TEMP/glide-sign.keychain-db" 2>/dev/null || true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-host
-          path: out/Glide-Host-*.zip
+          path: |
+            out/Glide-Host-*.zip
+            out/Glide-Host-*.dmg
           if-no-files-found: error
           retention-days: 14
 
@@ -219,14 +223,16 @@ jobs:
         if: github.event_name == 'push'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: out/Glide-*.zip
+          subject-path: |
+            out/Glide-*.zip
+            out/Glide-*.dmg
       - name: Create or update the draft release
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          files=(out/Glide-*.zip out/SHA256SUMS out/glide-host.rb)
+          files=(out/Glide-*.zip out/Glide-*.dmg out/SHA256SUMS out/glide-host.rb)
           if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
             if [ "$state" != "true" ]; then
               echo "::error::release $TAG is already published; not touching it"; exit 1

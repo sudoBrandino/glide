@@ -3,6 +3,8 @@
 #
 #   tools/release.sh                 everything below, into dist/release/<version>/
 #   tools/release.sh host            Glide-Host-<ver>-macos-<arch>.zip   (macOS only)
+#   tools/release.sh dmg             Glide-Host-<ver>-macos-<arch>.dmg from that zip (macOS only;
+#                                    after notarizing, so the DMG holds the stapled app)
 #   tools/release.sh viewer          Glide-Viewer-<ver>-windows-x64.zip  (macOS or Linux, MinGW-w64)
 #   tools/release.sh notes           RELEASE_NOTES.md from CHANGELOG.md
 #   tools/release.sh sums            SHA256SUMS over the zips in the output folder
@@ -124,6 +126,26 @@ cmd_host() {
   echo "wrote $zip"
 }
 
+# The download most people use: open it, drag Glide Host to Applications, open it from there.
+# The app's setup window does the rest (login item, permissions, connection, pairing).
+cmd_dmg() {
+  [[ "$(uname)" == Darwin ]] || die "dmg needs macOS (hdiutil)"
+  local zip="" dmg="" stage=""
+  for zip in "$OUT"/Glide-Host-"$VERSION"-macos-*.zip; do
+    [[ -e "$zip" ]] || die "no Glide-Host-$VERSION-macos-*.zip in $OUT (run: tools/release.sh host)"
+    dmg="${zip%.zip}.dmg"
+    stage="$(mktemp -d)"
+    ditto -x -k "$zip" "$stage"
+    [[ -d "$stage/Glide Host.app" ]] || die "$zip holds no Glide Host.app"
+    ln -s /Applications "$stage/Applications"
+    rm -f "$dmg"
+    hdiutil create -quiet -volname "Glide Host $VERSION" -srcfolder "$stage" -fs HFS+ -format UDZO -ov "$dmg"
+    rm -rf "$stage"
+    hdiutil verify -quiet "$dmg"
+    echo "wrote $dmg"
+  done
+}
+
 cmd_viewer() {
   mkdir -p "$OUT"
   ensure_cargo
@@ -184,27 +206,30 @@ cmd_notes() {
     echo
     echo "| File | For |"
     echo "|---|---|"
-    for z in "$OUT"/Glide-Host-"$VERSION"-macos-*.zip; do
+    for z in "$OUT"/Glide-Host-"$VERSION"-macos-*.dmg "$OUT"/Glide-Host-"$VERSION"-macos-*.zip; do
       [[ -e "$z" ]] || continue
       local desc="macOS 14+ on Apple silicon"
-      [[ "$z" == *-universal.zip ]] && desc="macOS 14+, universal (Apple silicon; Intel untested, see the install guide)"
-      echo "| \`$(basename "$z")\` | Mac host: \`Glide Host.app\`, $desc. Signed ad hoc, not notarized |"
+      [[ "$z" == *-universal.* ]] && desc="macOS 14+, universal (Apple silicon; Intel untested, see the install guide)"
+      if [[ "$z" == *.dmg ]]; then
+        echo "| \`$(basename "$z")\` | **Mac host, start here:** open it, drag Glide Host to Applications, open it; its setup window does the rest. $desc |"
+      else
+        echo "| \`$(basename "$z")\` | Mac host as a zip (install script, Homebrew), $desc. Signed ad hoc, not notarized |"
+      fi
     done
     echo "| \`$VIEWER_ZIP\` | Windows viewer: \`glide-client.exe\`, Windows 10/11 x64 |"
     echo "| \`SHA256SUMS\` | Checksums: \`shasum -a 256 -c SHA256SUMS\` (Mac) or \`Get-FileHash\` (Windows) |"
     echo
     echo "## Install"
     echo
-    echo "**Mac**, in Terminal. A guided setup: it downloads and verifies the app, then walks through"
-    echo "the permissions, the connection and pairing:"
+    echo "**Mac:** download the \`.dmg\`, drag **Glide Host** to Applications and open it. The app is"
+    echo "not notarized, so the first time macOS refuses to open it: go to System Settings → Privacy &"
+    echo "Security and click **Open Anyway**. Then the setup window walks through starting at login,"
+    echo "the two permissions, the connection and pairing."
     echo
-    echo '```sh'
-    echo "curl -fsSL https://raw.githubusercontent.com/sudoBrandino/glide/v$VERSION/install.sh | bash"
-    echo '```'
+    echo "**Windows:** download the viewer zip, run \`glide-client.exe\` and follow its setup window."
     echo
-    echo "Or with Homebrew: \`brew install --cask sudobrandino/glide/glide-host\`, then \`glide-setup\`."
-    echo
-    echo "**Windows**, in PowerShell:"
+    echo "From a terminal instead (same result): \`curl -fsSL https://raw.githubusercontent.com/sudoBrandino/glide/v$VERSION/install.sh | bash\`,"
+    echo "or \`brew install --cask sudobrandino/glide/glide-host\` (then \`glide-setup\`). Windows, in PowerShell:"
     echo
     echo '```powershell'
     echo "irm https://raw.githubusercontent.com/sudoBrandino/glide/v$VERSION/install.ps1 | iex"
@@ -243,7 +268,7 @@ cmd_cask() {
 cmd_sums() {
   ( cd "$OUT"
     shopt -s nullglob
-    zips=(Glide-*.zip)
+    zips=(Glide-*.zip Glide-*.dmg)
     [[ ${#zips[@]} -gt 0 ]] || die "no Glide-*.zip in $OUT"
     sha256 "${zips[@]}" > SHA256SUMS
     cat SHA256SUMS )
@@ -252,6 +277,7 @@ cmd_sums() {
 case "${1:-all}" in
   check) cmd_check ;;
   host) cmd_host ;;
+  dmg) cmd_dmg ;;
   viewer) cmd_viewer ;;
   notes) cmd_notes ;;
   sums) cmd_sums ;;
@@ -260,6 +286,7 @@ case "${1:-all}" in
     cmd_check
     rm -rf "$OUT"
     cmd_host
+    cmd_dmg
     cmd_viewer
     cmd_notes
     say "SHA256SUMS"

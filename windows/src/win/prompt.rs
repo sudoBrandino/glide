@@ -179,8 +179,8 @@ unsafe extern "system" fn dlg_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
     }
 }
 
-/// PrintWindow → 32-bit BMP (test hook).
-fn dump_window(h: HWND, path: &str) -> Result<(i32, i32), String> {
+/// PrintWindow → 32-bit BMP (test hook; also the setup dialog's).
+pub(super) fn dump_window(h: HWND, path: &str) -> Result<(i32, i32), String> {
     unsafe {
         let mut rc = RECT::default();
         GetWindowRect(h, &mut rc).map_err(|e| e.to_string())?;

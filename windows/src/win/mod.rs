@@ -17,6 +17,7 @@ pub mod probe;
 pub mod prompt;
 pub mod render;
 pub mod scanout;
+pub mod setup;
 pub mod tray;
 
 use windows::Win32::Graphics::Gdi::*;

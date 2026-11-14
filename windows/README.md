@@ -17,7 +17,8 @@ The wire protocol is defined in `../docs/PROTOCOL.md`.
 | `src/clipboard.rs` | Clipboard sync logic without Win32: CRLF↔LF, echo guard, DIB↔PNG (`png` crate). Unit-tested. |
 | `src/files.rs` | File transfer (PROTOCOL.md §6) without Win32: name sanitizer, receiver (temp → SHA-256 → no-overwrite rename), sender (folder walk, chunking), `Service` (transfers + ack window). Unit-tested, incl. a two-service loopback. |
 | `src/annexb.rs`, `src/bench.rs` | Annex-B access-unit splitting, and the headless benchmark driver. |
-| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain, text panels), `app` (window, input, cursor, fullscreen, hotkeys), `clipboard` (clipboard listener/apply), `files` (drag & drop, notifications, open folder), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`, `dpapi` (identity key encryption), `prompt` (pairing dialog), `placement` (monitors), `tray`. |
+| `src/setup.rs` | Setup logic, platform independent: install folder, "offer to install?", Mac address check and port test, this PC's address, the firewall PowerShell (check + elevated allow). |
+| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain, text panels), `app` (window, input, cursor, fullscreen, hotkeys, the session loop incl. both mode), `clipboard` (clipboard listener/apply), `files` (drag & drop, notifications, open folder), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`, `dpapi` (identity key encryption), `prompt` (pairing dialog), `setup` (setup dialog, self-install, firewall, start at sign-in), `placement` (monitors), `tray`. |
 | `res/`, `build.rs` | Icon, manifest (themed controls, PerMonitorV2), pairing dialog and version info, linked into the exe: MinGW `windres` for the GNU target, `rc.exe` (via `embed-resource`) for MSVC. Regenerate the icon with `../tools/make_icon.py`. |
 | `assets/` | Small clips embedded in the exe for `--probe`. Regenerate them with `../tools/make_streams.sh --clips-only`. |
 
@@ -36,12 +37,39 @@ Shaders are compiled at runtime with `D3DCompile` from `d3dcompiler_47.dll`, whi
 ## Run
 
 ```
-glide-client.exe                               (uses the config file: listen on 7420 by default)
-glide-client.exe <host[:port]> [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--no-audio] [--bench SECONDS] [--probe]
+glide-client.exe                               (uses the config file; opens the setup dialog when nothing is set up)
+glide-client.exe <host[:port]> [--no-listen] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--no-audio] [--bench SECONDS] [--probe]
 glide-client.exe --listen [PORT] [same options]
+glide-client.exe --setup                       (open the setup dialog)
 glide-client.exe --forget-host [host[:port] | --listen [PORT]]   (unpair, then exit)
 glide-client.exe --identity                                         (print this viewer's key fingerprint)
 ```
+
+### Setup dialog (no command line needed)
+
+Double-click `glide-client.exe`. When nothing is set up yet, or the exe runs from outside the install
+folder (for example Downloads), the **setup dialog** opens first. It is also in the Glide menu and the
+tray icon (*Set up…*), and `--setup` opens it.
+
+- **Mac's address** and **Test**: a TCP connect to the Mac's Glide port, with the answer below it.
+- **Let the Mac connect to this PC** (config `accept_incoming`, on by default) and **Allow in Windows
+  Firewall** (UAC shield): one elevated PowerShell step that removes inbound Block rules for the exe
+  (Windows adds one when someone cancels its own prompt) and adds an inbound Allow rule "Glide Viewer"
+  for TCP 7420 on Private and Domain networks. The dialog checks the rules (and warns when the network
+  is set to Public) without elevation.
+- **This PC's address**: to type into the Mac's setup window when only Mac → PC connections work.
+- **Start Glide when I sign in**: the `HKCU\…\Run` value "Glide Viewer" (an install.ps1 Startup
+  shortcut is replaced, since it may carry old arguments).
+- **Install Glide Viewer on this PC** (shown when running from elsewhere): copies the exe (and
+  README.txt/LICENSE.txt beside it) to `%LOCALAPPDATA%\Glide`, or to the folder the Start Menu
+  shortcut "Glide Viewer.lnk" already points to; writes that shortcut; closes a running viewer first
+  (asks); starts the installed copy. The downloaded file stays where it is. Declining remembers this
+  exe (`portable_exe`) so it doesn't ask again.
+- **Connect** saves the settings. From the menu it restarts the viewer with them.
+- A Start Menu shortcut that carries arguments (older install.ps1) is rewritten without them, so the
+  config decides.
+- Test hooks: `GLIDE_SETUP_DUMP=x.bmp` saves a capture of the dialog; `GLIDE_SETUP_ANSWER=connect|cancel`
+  presses a button after about 0.5 s.
 
 ### Config file, identity and pairing
 
@@ -51,8 +79,10 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
 ```json
 {
   "version": 1,
-  "listen_port": 7420,      // used when "host" is null: wait for glide-host --connect
-  "host": null,             // "mac.local:7420" = dial the Mac instead
+  "listen_port": 7420,      // where the Mac can connect to this PC (glide-host --connect)
+  "host": null,             // "mac.local:7420" = dial the Mac (and keep listening, see below)
+  "accept_incoming": true,  // with "host": also listen on listen_port; false = dial only
+  "portable_exe": null,     // an exe the user chose to run without installing (setup dialog)
   "mode": null,             // "fast" | "hybrid" | "sharp"; null = auto (hybrid if 4:4:4 decodes)
   "ctrl_as_cmd": true,       // Ctrl → Command, Win → Control (menu → Input)
   "natural_scrolling": false, // reverse the wheel/touchpad direction sent to the Mac (menu → Input)
@@ -82,7 +112,9 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
 (The real file is plain JSON, without comments.)
 
 - **Precedence:** command-line flags win over the config file.
-  - A positional `host`, then `--listen [PORT]`, then the config's `host`, then listening on `listen_port`.
+  - A positional `host` (both mode; `--no-listen` = dial only; `--listen PORT` sets the port it
+    listens on), then `--listen [PORT]` alone (listen only), then the config's `host` (both mode
+    unless `"accept_incoming": false`), then listening on `listen_port`.
   - `--mode` wins over `"mode"`, which wins over auto.
   - `--no-ctrl-as-cmd` / `--ctrl-as-cmd` win over `"ctrl_as_cmd"`.
   - `--no-audio` wins over `"audio"`.
@@ -107,7 +139,7 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   - **Pre-auth timeout:** a peer that hasn't completed the handshake after 5 s is disconnected.
 
   These limit who may start a handshake; the host's pinned key is what authenticates it.
-- **Tray icon:** Connect / Disconnect / Reconnect, Stats overlay, Mute, Open config file, Forget host (unpair)…, Quit.
+- **Tray icon:** Connect / Disconnect / Reconnect, Stats overlay, Mute, Set up…, Open config file, Forget host (unpair)…, Quit.
   - *Disconnect* also stops listening, so the host can't reconnect until you choose *Connect*.
   - Left-click brings the window to the front.
 
@@ -115,6 +147,13 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
 - **The viewer survives disconnects.** The window opens right away and shows a centered status line, for example
   "Waiting for host on port 7420…".
   - In `--listen` mode it goes back to listening after every disconnect. In connect mode it retries every 2 s.
+  - **Both mode** (the Mac's address is known and `accept_incoming` is on, the default): one loop,
+    one connection at a time. Each round it first takes a Mac connection that arrived while it was
+    busy (it waits in the kernel backlog), else dials the Mac with a 1.5 s connect timeout, else waits
+    up to 2 s for the Mac to dial in. Whichever direction the network allows connects; the status
+    line says "Connecting to … (the Mac can also connect to this PC)". If port 7420 is taken it
+    dials only and says so. The pin is stored under the address (`host:port`) for both directions;
+    a pin under `listen:PORT` (a viewer that used to listen) is used and copied to the address.
   - While disconnected, the last picture stays on screen, dimmed, under a status line such as "Connection lost — …" or "Not paired with … yet — …".
   - Held keys and buttons are released, and local keys stop being captured until the host is back.
   - A new connection resets the decoders and canvas through the normal VideoConfig/SharpLayerConfig flow.
@@ -258,7 +297,8 @@ The GUI command for the real host (run it in the interactive desktop session, e.
 %USERPROFILE%\glide\glide-client.exe
 ```
 
-With the default config this listens on port 7420. On first run, pair it: on the Mac choose Glide →
+On first run the setup dialog asks for the Mac's address (or leave it empty and let the Mac connect).
+With the default config and no address this listens on port 7420. Then pair: on the Mac choose Glide →
 *Pair New Viewer…* (or `glide-host --pair`), then confirm the code on both screens.
 
 ### Headless modes (these work over SSH in session 0)

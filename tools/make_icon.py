@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Generate windows/res/glide.ico (the viewer's app icon) with no third-party modules.
+"""Generate windows/res/glide.ico (the viewer's app icon) and mac/Resources/AppIcon.icns (the
+host's) with no third-party modules.
 
-A rounded square with a blue→teal gradient and a white "G". Sizes 16–256; 256 is PNG-compressed,
-the rest are 32-bit DIBs. Run: python3 tools/make_icon.py
+A rounded square with a blue→teal gradient and a white "G". ICO sizes 16–256; 256 is
+PNG-compressed, the rest are 32-bit DIBs. The .icns is built with macOS `iconutil` from PNGs
+(skipped elsewhere). Run: python3 tools/make_icon.py
 """
-import math, os, struct, zlib
+import math, os, shutil, struct, subprocess, sys, tempfile, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "..", "windows", "res", "glide.ico")
+ICNS = os.path.join(HERE, "..", "mac", "Resources", "AppIcon.icns")
+# iconset name -> pixel size
+ICONSET = {"16x16": 16, "16x16@2x": 32, "32x32": 32, "32x32@2x": 64, "128x128": 128,
+           "128x128@2x": 256, "256x256": 256, "256x256@2x": 512, "512x512": 512, "512x512@2x": 1024}
 SIZES = [16, 20, 24, 32, 40, 48, 64, 256]
 SS = 4  # supersampling per axis
 
@@ -39,7 +45,8 @@ def sample(u, v):
     return col
 
 
-def render(n):
+def render(n, ss=SS):
+    SS = ss
     px = []
     for j in range(n):
         row = []
@@ -94,6 +101,24 @@ def main():
     with open(OUT, "wb") as f:
         f.write(out + data)
     print(f"wrote {OUT} ({len(out + data)} bytes)")
+    if sys.platform == "darwin" and shutil.which("iconutil"):
+        write_icns()
+
+
+def write_icns():
+    tmp = tempfile.mkdtemp()
+    iconset = os.path.join(tmp, "AppIcon.iconset")
+    os.makedirs(iconset)
+    cache = {}
+    for name, n in ICONSET.items():
+        if n not in cache:
+            cache[n] = png(n, render(n, 4 if n <= 256 else 2))
+        with open(os.path.join(iconset, f"icon_{name}.png"), "wb") as f:
+            f.write(cache[n])
+    os.makedirs(os.path.dirname(ICNS), exist_ok=True)
+    subprocess.run(["iconutil", "-c", "icns", "-o", ICNS, iconset], check=True)
+    shutil.rmtree(tmp)
+    print(f"wrote {ICNS} ({os.path.getsize(ICNS)} bytes)")
 
 
 if __name__ == "__main__":

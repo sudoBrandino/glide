@@ -1,6 +1,6 @@
 //! Notification-area (tray) icon: tooltip = window title; left click brings the viewer to
 //! the front; right click opens Connect / Disconnect / Reconnect / Stats / Mute / received files /
-//! cancel file transfer / Open config / Forget host (unpair) / Quit. `notify` shows a notification
+//! cancel file transfer / Set up / Open config / Forget host (unpair) / Quit. `notify` shows a notification
 //! balloon (file transfer results). Commands arrive at the viewer window as WM_COMMAND.
 
 use std::sync::OnceLock;
@@ -21,6 +21,7 @@ pub enum MenuCmd {
     CancelFiles,
     OpenDownloads,
     Quit,
+    SetUp,
 }
 
 /// What the menu shows (enabled/checked state).
@@ -36,7 +37,7 @@ pub struct MenuState {
 }
 
 const BASE: u16 = 0x4100;
-const CMDS: [MenuCmd; 10] = [
+const CMDS: [MenuCmd; 11] = [
     MenuCmd::Connect,
     MenuCmd::Disconnect,
     MenuCmd::Reconnect,
@@ -47,6 +48,7 @@ const CMDS: [MenuCmd; 10] = [
     MenuCmd::CancelFiles,
     MenuCmd::OpenDownloads,
     MenuCmd::Quit,
+    MenuCmd::SetUp,
 ];
 
 impl MenuCmd {
@@ -192,6 +194,7 @@ fn show_menu(hwnd: HWND, st: &MenuState) {
             item(MenuCmd::CancelFiles, "Cancel file &transfer\tCtrl+Alt+Shift+X", gray(!busy));
             let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         }
+        item(MenuCmd::SetUp, "Set &up…", MF_ENABLED);
         item(MenuCmd::OpenConfig, "Open &config file", MF_ENABLED);
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         match &st.paired {

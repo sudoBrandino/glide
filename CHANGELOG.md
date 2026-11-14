@@ -18,6 +18,24 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ### Added
 
+- **Setup without Terminal.** The Mac host ships as a `.dmg`: drag Glide Host to Applications and
+  open it. A setup window walks through starting at login, Screen Recording and Accessibility
+  (with live status and the right Settings page), the connection (this Mac's address, and the
+  PC's) and pairing. It opens by itself while something is missing, from the menu bar (Set Up
+  Glide Host…), and when the app is opened again. Opening a newer download while Glide Host runs
+  offers to replace it. On Windows, running `glide-client.exe` opens a setup window that installs
+  the viewer (Start menu entry), asks for the Mac's address with a Test button, adds the firewall
+  rule with one administrator prompt and can start Glide at sign-in. Both reopen from the Glide
+  menu / tray (Set up…).
+- **Either side can connect.** The host always listens and also dials the PC once it knows its
+  address; the viewer dials the Mac and also listens. So when the network only allows one
+  direction (say, a Mac on its own segment that may reach the PC), Glide still connects, without
+  choosing a "mode". `"listen": false` (host.json) / `"accept_incoming": false` (viewer) or
+  `--no-listen` on either side turn listening off.
+- The Mac host starts at login as a login item (System Settings → General → Login Items) instead
+  of a script-written LaunchAgent; `glide-host --login-item on|off|status` does the same from a
+  script. The host now has an app icon.
+
 - **Guided installers.** On the Mac,
   `curl -fsSL https://raw.githubusercontent.com/sudoBrandino/glide/main/install.sh | bash`
   downloads the latest release, checks it against `SHA256SUMS`, installs the app and its

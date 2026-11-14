@@ -170,9 +170,13 @@ identically:
 
 ### Connection management
 
-- **Listen mode:** `Server` runs an `NWListener`.
-- **Dial mode** (`--connect` or `connect` in `host.json`): it keeps one outbound `NWConnection`
-  and redials 2 s after it drops.
+- **Listening:** `Server` always runs an `NWListener` (unless `listen: false` with a PC address).
+- **Dialing** (`--connect`, `connect` in `host.json`, or the setup window): it also keeps one
+  outbound `NWConnection` to the PC and redials 2 s after it drops. The dialer stays idle while a
+  session that came in through the listener is active, so there is one session at a time. The
+  viewer mirrors this (`windows/src/win/app.rs`, `both_round`): with the Mac's address it takes a
+  queued inbound connection first, else dials for 1.5 s, else waits 2 s for the Mac to dial in.
+  Whichever direction the network allows connects.
 - Either way, the connection is handed to a new `Session`, and there is only one active session.
   On `feat/host-ux`, a connection must authenticate before it can replace the active session.
 

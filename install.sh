@@ -568,7 +568,11 @@ uninstall() {
     rm -f "$f"
     ok "removed LaunchAgent $l"
     [[ -n "$app" ]] || app="${OPT_DIR:-$HOME/Applications}/Glide Host.app"
+    [[ -d "$app" || -n "$OPT_DIR" ]] || app="/Applications/Glide Host.app"
     if [[ -d "$app" ]]; then
+      # The login item the app's setup window registers (stops that host too). Hosts before 0.3
+      # don't know the flag; nothing to undo there.
+      "$app/Contents/MacOS/glide-host" --login-item off >/dev/null 2>&1 && ok "removed the login item"
       if [[ "$app" == "$SELF_APP" ]] || { command -v brew >/dev/null && brew list --cask glide-host >/dev/null 2>&1; }; then
         info "the app was installed with Homebrew: remove it with  brew uninstall --cask glide-host"
       else

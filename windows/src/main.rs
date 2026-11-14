@@ -1,8 +1,10 @@
 //! glide-client: Glide remote desktop viewer.
 //!
-//! Usage: glide-client [host[:port] | --listen [PORT]] [--mode fast|sharp|hybrid]
+//! Usage: glide-client [host[:port] [--no-listen] | --listen [PORT]] [--mode fast|sharp|hybrid]
 //!                     [--no-ctrl-as-cmd] [--bench SECONDS] [--probe] [--forget-host] [--identity]
-//! With no target, the viewer uses %APPDATA%\Glide\config.json (default: listen on 7420).
+//! With no target, the viewer uses %APPDATA%\Glide\config.json (default: listen on 7420). With
+//! the Mac's address it dials the Mac and also listens, so either side may connect. A plain
+//! launch with nothing set up (or from outside the install folder) opens the setup dialog.
 //! Security v2: no passwords; the viewer pairs with the host once (docs/PROTOCOL.md §2).
 
 use glide::config::{self, Store, TargetSpec};
@@ -22,8 +24,15 @@ pub struct Args {
     /// Start in latency test mode (docs/LATENCY.md).
     latency_test: bool,
     probe: bool,
-    /// Reverse-connect: listen on this port and let the host dial in.
+    /// Reverse-connect: listen on this port and let the host dial in (with a host: the port
+    /// both mode listens on).
     listen: Option<u16>,
+    /// With a host: dial only, don't also listen for the Mac.
+    no_listen: bool,
+    /// Open the setup dialog (also opens by itself when nothing is set up yet).
+    setup: bool,
+    /// Started by the setup dialog (install / new settings): don't open it again.
+    after_setup: bool,
     /// Remove the pinned host key for the target (unpair) and exit.
     forget_host: bool,
     /// Print this viewer's key fingerprint and exit.
@@ -40,13 +49,18 @@ pub struct Args {
     audio_selftest: Option<f64>,
 }
 
-const USAGE: &str = "usage: glide-client [host[:port] | --listen [PORT]] [options...]
+const USAGE: &str = "usage: glide-client [host[:port] [--no-listen] | --listen [PORT]] [options...]
 
-  (no target)        use the config file: dial its \"host\" if set, else listen on its
-                     \"listen_port\" (default 7420)
-  host[:port]        dial a Glide host (default port 7420)
+  (no target)        use the config file: dial its \"host\" if set (and listen, see below), else
+                     listen on its \"listen_port\" (default 7420). Opens the setup dialog when
+                     nothing is set up yet, or when run from outside the install folder
+  host[:port]        dial a Glide host (default port 7420) and also listen on 7420 (or
+                     --listen PORT), so the Mac can connect when the network only allows Mac -> PC;
+                     one connection at a time (config \"accept_incoming\")
+  --no-listen        with a host: dial only
   --listen [PORT]    reverse connect: listen on 0.0.0.0:PORT (default 7420) and let the host
                      dial in (glide-host --connect); same protocol
+  --setup            open the setup dialog (Mac address, firewall, start at sign-in, install)
   --mode M           fast = 4:2:0 only; sharp = 4:4:4 every frame; hybrid = 4:2:0 while moving +
                      4:4:4 refinement at rest. Default: config, else hybrid if this PC decodes
                      HEVC 4:4:4, else fast
@@ -107,6 +121,9 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Strin
                 a.bench = Some(v.parse::<f64>().map_err(|_| format!("bad --bench value {v}"))?);
             }
             "--probe" => a.probe = true,
+            "--no-listen" => a.no_listen = true,
+            "--setup" => a.setup = true,
+            "--after-setup" => a.after_setup = true,
             "--latency-test" => a.latency_test = true,
             "--no-audio" => a.audio = Some(false),
             "--audio-selftest" => {
@@ -248,8 +265,18 @@ fn main() -> ExitCode {
         eprintln!("note: GLIDE_PASSWORD is ignored: Glide v2 pairs keys instead of using a password");
     }
 
-    let target = config::resolve_target(args.host.as_deref(), args.listen, &store.config);
+    // Visual setup (GUI launches only): nothing set up yet, an exe outside the install folder,
+    // or --setup. It may install and relaunch the installed copy (then this process exits).
+    #[cfg(windows)]
+    if args.bench.is_none() && !args.forget_host && !args.identity && !args.after_setup && (args.setup || (args.host.is_none() && args.listen.is_none())) {
+        match glide::win::setup::at_startup(&mut store, args.setup) {
+            glide::win::setup::Startup::Continue => {}
+            glide::win::setup::Startup::Exit => return ExitCode::SUCCESS,
+        }
+    }
+    let target = config::resolve_target(args.host.as_deref(), args.listen, args.no_listen, &store.config);
     let pin_target = config::pin_target(&target);
+    let pin_fallback = config::pin_fallback(&target);
     if args.forget_host {
         match store.forget_host(&pin_target) {
             Some(p) => eprintln!("forgot host key {} for {pin_target} ({})", p.key, p.name),
@@ -276,7 +303,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let host = match &target {
-        TargetSpec::Connect(h) => h.clone(),
+        TargetSpec::Connect(h) | TargetSpec::Both { host: h, .. } => h.clone(),
         TargetSpec::Listen(p) => format!("listen:{p}"),
     };
     let ctrl_as_cmd = args.ctrl_as_cmd.unwrap_or(store.config.ctrl_as_cmd);
@@ -349,6 +376,7 @@ fn main() -> ExitCode {
             let target = match target {
                 TargetSpec::Listen(port) => Target::Listen(port),
                 TargetSpec::Connect(h) => Target::Connect(h),
+                TargetSpec::Both { host, port } => Target::Both { addr: host, port },
             };
             let opts = Options {
                 ctrl_as_cmd,
@@ -361,7 +389,7 @@ fn main() -> ExitCode {
                 clipboard: args.clipboard.unwrap_or(store.config.clipboard),
                 store,
             };
-            return match glide::win::app::run(Connector { target, identity, pin_target, hello }, opts) {
+            return match glide::win::app::run(Connector { target, identity, pin_target, pin_fallback, hello }, opts) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -382,13 +410,14 @@ fn main() -> ExitCode {
         identity,
         name: client_name(),
         target: pin_target.clone(),
-        pinned: store.config.pinned_key(&pin_target),
+        pinned: store.config.pinned_key_or(&pin_target, pin_fallback.as_deref()),
         request_pairing: false,
         pairing: Arc::new(ConsolePairing),
     };
+    // One-shot: dial (both mode doesn't wait for the host to dial in here).
     let res = match &target {
         TargetSpec::Listen(port) => Connection::listen(*port, &auth, &hello),
-        TargetSpec::Connect(h) => Connection::connect(h, &auth, &hello),
+        TargetSpec::Connect(h) | TargetSpec::Both { host: h, .. } => Connection::connect(h, &auth, &hello),
     };
     let conn = match res {
         Ok(c) => c,
@@ -482,10 +511,14 @@ mod tests {
         let mut c = config::Config { host: Some("cfg-host".into()), ..config::Config::default() };
         c.set_mode(Mode::Fast);
         let a = p(&["--listen", "--mode", "hybrid"]).unwrap();
-        assert_eq!(config::resolve_target(a.host.as_deref(), a.listen, &c), TargetSpec::Listen(7420));
+        assert_eq!(config::resolve_target(a.host.as_deref(), a.listen, a.no_listen, &c), TargetSpec::Listen(7420));
         assert_eq!(config::resolve_mode(a.mode, &c, true).0, Mode::Hybrid);
         let a = p(&[]).unwrap();
-        assert_eq!(config::resolve_target(a.host.as_deref(), a.listen, &c), TargetSpec::Connect("cfg-host".into()));
+        assert_eq!(config::resolve_target(a.host.as_deref(), a.listen, a.no_listen, &c), TargetSpec::Both { host: "cfg-host".into(), port: 7420 });
+        let a = p(&["mac", "--no-listen"]).unwrap();
+        assert!(a.no_listen);
+        assert_eq!(config::resolve_target(a.host.as_deref(), a.listen, a.no_listen, &c), TargetSpec::Connect("mac".into()));
+        assert!(p(&["--setup"]).unwrap().setup);
         assert_eq!(config::resolve_mode(a.mode, &c, true).0, Mode::Fast);
         assert!(a.ctrl_as_cmd.unwrap_or(c.ctrl_as_cmd));
     }
