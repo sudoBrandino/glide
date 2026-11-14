@@ -1555,7 +1555,7 @@ mod tests {
         assert_eq!(c.total, 3);
         assert_eq!(c.skipped.len(), 3, "{:?}", c.skipped);
         // Limits
-        assert_eq!(collect(&[src.clone()], &Limits { max_total_bytes: 2, max_files: 10 }).err().unwrap().0, status::TOO_LARGE);
+        assert_eq!(collect(std::slice::from_ref(&src), &Limits { max_total_bytes: 2, max_files: 10 }).err().unwrap().0, status::TOO_LARGE);
         assert_eq!(collect(&[src], &Limits { max_total_bytes: 100, max_files: 1 }).err().unwrap().0, status::TOO_LARGE);
         fs::remove_dir_all(&d).unwrap();
     }
@@ -1565,7 +1565,7 @@ mod tests {
         let d = tmpdir("out");
         let f = d.join("f.bin");
         fs::write(&f, vec![1u8; 300_000]).unwrap();
-        let c = collect(&[f.clone()], &Limits::default()).unwrap();
+        let c = collect(std::slice::from_ref(&f), &Limits::default()).unwrap();
         fs::write(&f, vec![1u8; 10]).unwrap(); // shrinks before sending
         let mut og = Outgoing::new(1, c);
         assert_eq!(og.next_msg().unwrap_err().0, status::SOURCE_CHANGED);

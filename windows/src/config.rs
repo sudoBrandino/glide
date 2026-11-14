@@ -560,9 +560,7 @@ mod tests {
         assert!(l.warning.is_none());
         assert!(l.needs_save, "missing fields → write them out");
         assert_eq!(l.config, Config::default());
-        let mut c = Config::default();
-        c.hud = true;
-        c.bar_pinned = true;
+        let mut c = Config { hud: true, bar_pinned: true, ..Config::default() };
         c.set_mode(Mode::Sharp);
         c.host = Some("mac.local:7420".into());
         c.clipboard = false;

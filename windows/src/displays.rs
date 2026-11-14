@@ -119,7 +119,7 @@ pub fn label(d: &MacDisplay) -> String {
     }
     if d.refresh > 0 {
         let hz = d.refresh as f64 / 100.0;
-        if d.refresh % 100 == 0 {
+        if d.refresh.is_multiple_of(100) {
             s.push_str(&format!(" @ {hz:.0} Hz"));
         } else {
             s.push_str(&format!(" @ {hz:.2} Hz"));

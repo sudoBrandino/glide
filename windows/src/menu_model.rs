@@ -100,7 +100,7 @@ impl Cmd {
     }
     pub fn from_id(id: u32) -> Option<Cmd> {
         if (DISPLAY_ID_BASE..0xF000).contains(&id) {
-            return (id % 16 == 0).then(|| Cmd::ShowDisplay(((id - DISPLAY_ID_BASE) / 16) as u8));
+            return id.is_multiple_of(16).then(|| Cmd::ShowDisplay(((id - DISPLAY_ID_BASE) / 16) as u8));
         }
         let off = id.checked_sub(ID_BASE)?;
         if off % 16 != 0 {
@@ -383,7 +383,7 @@ pub fn to_text(items: &[Item]) -> String {
 mod tests {
     use super::*;
 
-    fn find<'a>(items: &'a [Item], c: Cmd) -> Option<&'a Item> {
+    fn find(items: &[Item], c: Cmd) -> Option<&Item> {
         for it in items {
             match it {
                 Item::Cmd { cmd, .. } if *cmd == c => return Some(it),
