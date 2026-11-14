@@ -72,6 +72,10 @@ public enum FileNames {
             let budget = maxComponentBytes - utf8Len(ext)
             while utf8Len(stem) > budget { stem.removeLast() }
             s = trimTrailing(stem + ext)
+            // Step 5 (§6.3): the cut can expose a device name ("CON" + spaces + "x" -> "CON").
+            var cut = Scalars(s.prefix { $0 != "." })
+            while cut.last == " " { cut.removeLast() }
+            if reserved.contains(asciiUpper(cut)) { s.insert("_", at: 0) }
         }
         return string(s)
     }
@@ -189,13 +193,27 @@ public enum FileOffers {
             do { rel.append(try FileNames.sanitizePath(f.path)) } catch { return .failure(FileFailure(FileStatus.badName, "file \(i + 1): \(error)")) }
         }
         // A name can't be both a file and a folder (case-insensitively).
-        let key = { (c: ArraySlice<String>) in c.joined(separator: "/").lowercased() }
-        var dirs = Set<String>()
-        for c in rel where c.count > 1 { for n in 1..<c.count { dirs.insert(key(c[..<n])) } }
-        if let c = rel.first(where: { dirs.contains(key($0[...])) }) {
+        if let c = fileFolderConflict(rel) {
             return .failure(FileFailure(FileStatus.badName, "'\(c.joined(separator: "/"))' is both a file and a folder"))
         }
         return .success(rel)
+    }
+
+    /// The first file whose path is also a folder of another file (case-insensitively), if any.
+    /// Sorted keys plus one binary search per file: O(n log n). Collecting every folder prefix in
+    /// a set costs O(depth² · length) per file, which a hostile 10 000-file offer of 4 KiB paths
+    /// turns into gigabytes of strings.
+    static func fileFolderConflict(_ rel: [[String]]) -> [String]? {
+        // Compare UTF-8 bytes: String's < is Unicode-aware and not a plain prefix order.
+        let keys = rel.enumerated().map { (Array($0.element.joined(separator: "/").lowercased().utf8), $0.offset) }
+            .sorted { $0.0.lexicographicallyPrecedes($1.0) }
+        for (k, i) in keys {
+            let dir = k + [UInt8(ascii: "/")]
+            var lo = 0, hi = keys.count
+            while lo < hi { let mid = (lo + hi) / 2; if keys[mid].0.lexicographicallyPrecedes(dir) { lo = mid + 1 } else { hi = mid } }
+            if lo < keys.count, keys[lo].0.starts(with: dir) { return rel[i] }
+        }
+        return nil
     }
 
     public static func byteText(_ n: UInt64) -> String {

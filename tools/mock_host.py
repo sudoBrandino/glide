@@ -475,6 +475,9 @@ def sanitize_component(c):
         stem = c[:len(c) - len(ext)]
         c = _trunc_utf8(stem, FILE_COMPONENT_MAX - len(ext.encode())) + ext
         c = c.rstrip(". ") or "_"
+        # Step 5: the cut can expose a device name ("CON" + spaces + "x" -> "CON"): check again.
+        if _ascii_upper(c.split(".", 1)[0].rstrip(" ")) in RESERVED:
+            c = "_" + c
     return c
 
 
@@ -679,6 +682,9 @@ PATH_VECTORS = [
     ("\u65e5" * 100 + ".png", ["\u65e5" * 65 + ".png"]),
     ("y" * 300, ["y" * 200]),
     ("z" * 190 + "." + "e" * 40, ["z" * 190 + "." + "e" * 9]),
+    ("CON" + " " * 197 + "xyz", ["_CON"]),
+    ("NUL" + " " * 193 + "abcdefgh.txt", ["_NUL" + " " * 193 + ".txt"]),
+    ("com1" + "." * 250 + "y", ["_com1" + "." * 194 + "y"]),
     ("/".join(["d"] * 32), ["d"] * 32),
     ("/".join(["d"] * 33), None),
     ("p" * 4097, None),

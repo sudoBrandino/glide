@@ -13,9 +13,9 @@
 //! Received files are never opened or executed.
 
 use crate::protocol::{FileEntry, FileMsg, FILE_CAPS_RECEIVE, FILE_CAPS_SEND, FILE_CHUNK_MAX, FILE_HOST_ID_BIT, FILE_SEND_WINDOW, FILE_WINDOW};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -139,6 +139,10 @@ pub fn sanitize_component(c: &str) -> String {
             cut -= 1;
         }
         s = trim_trailing(&format!("{}{}", &stem[..cut], ext));
+        // Cutting can expose a device name ("CON" + 197 spaces + "x" -> "CON"): check again.
+        if is_reserved(s.split('.').next().unwrap_or("").trim_end_matches(' ')) {
+            s.insert(0, '_');
+        }
     }
     s
 }
@@ -233,17 +237,27 @@ pub fn validate_offer(id: u32, total: u64, files: &[FileEntry], limits: &Limits,
         }
     }
     // A name can't be both a file and a folder (case-insensitively, as on Windows/macOS).
-    let key = |c: &[String]| c.join("/").to_lowercase();
-    let mut dirs = HashSet::new();
-    for c in &rel {
-        for n in 1..c.len() {
-            dirs.insert(key(&c[..n]));
-        }
-    }
-    if let Some(c) = rel.iter().find(|c| dirs.contains(&key(c))) {
+    if let Some(c) = file_folder_conflict(&rel) {
         return Err((status::BAD_NAME, format!("'{}' is both a file and a folder", c.join("/"))));
     }
     Ok(rel)
+}
+
+/// The first file whose path is also a folder of another file (case-insensitively), if any.
+/// Sorted keys plus one binary search per file: O(n log n) in time and O(total bytes) in memory.
+/// (Collecting every folder prefix in a set costs O(depth²·length) per file, which a hostile
+/// 10 000-file, 4 KiB-path offer turns into ~1 GB and seconds of work.)
+fn file_folder_conflict(rel: &[Vec<String>]) -> Option<&Vec<String>> {
+    let mut keys: Vec<(String, usize)> = rel.iter().enumerate().map(|(i, c)| (c.join("/").to_lowercase(), i)).collect();
+    keys.sort_unstable();
+    for (k, i) in &keys {
+        let dir = format!("{k}/");
+        let at = keys.partition_point(|(o, _)| o.as_str() < dir.as_str());
+        if keys.get(at).is_some_and(|(o, _)| o.starts_with(&dir)) {
+            return Some(&rel[*i]);
+        }
+    }
+    None
 }
 
 /// Latest modification time a receiver applies: 9999-12-31T23:59:59.999Z.
@@ -809,7 +823,14 @@ struct Shared {
     /// Chunk bytes handed to the writer thread but not yet written.
     queued: AtomicU64,
     overflowed: AtomicBool,
+    /// Offers handed to the worker but not yet answered. A sender runs one transfer at a time
+    /// (§6.4), so more than a couple means it ignores that; extra offers are dropped instead of
+    /// queueing up to 32 MiB each.
+    pending_offers: AtomicU32,
 }
+
+/// Offers that may wait for the worker at once (one being validated, one queued).
+const MAX_PENDING_OFFERS: u32 = 2;
 
 /// Unwritten chunk bytes a receiver tolerates before it cancels (a sender honoring the window
 /// never gets near this; bounds memory against one that doesn't).
@@ -842,6 +863,7 @@ impl Service {
             inc_tx: Mutex::new(tx),
             queued: AtomicU64::new(0),
             overflowed: AtomicBool::new(false),
+            pending_offers: AtomicU32::new(0),
         });
         {
             let sh = sh.clone();
@@ -992,7 +1014,13 @@ impl Service {
             }
             FileMsg::Offer { id, total_bytes, files } => {
                 self.sh.overflowed.store(false, Ordering::Relaxed);
-                Some(IncJob::Offer { gen, id, total: total_bytes, files })
+                if self.sh.pending_offers.fetch_add(1, Ordering::Relaxed) >= MAX_PENDING_OFFERS {
+                    self.sh.pending_offers.fetch_sub(1, Ordering::Relaxed);
+                    eprintln!("files: dropping offer {id:#x}: the peer sent offers faster than they can be answered");
+                    None
+                } else {
+                    Some(IncJob::Offer { gen, id, total: total_bytes, files })
+                }
             }
             FileMsg::Chunk { id, index, offset, data } => {
                 let n = data.len() as u64;
@@ -1192,6 +1220,14 @@ fn run_outgoing(sh: &Shared, send: &SendFn, gen: u64, og: &mut Outgoing) -> Resu
 }
 
 /// Incoming transfers (offers, chunk writes, verification), one at a time.
+struct PendingOffer<'a>(&'a AtomicU32);
+
+impl Drop for PendingOffer<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 fn in_worker(sh: &Shared, rx: mpsc::Receiver<IncJob>) {
     let mut cur: Option<(u64, Incoming)> = None;
     let peer_send = |gen: u64| -> Option<SendFn> {
@@ -1206,6 +1242,8 @@ fn in_worker(sh: &Shared, rx: mpsc::Receiver<IncJob>) {
     for job in rx {
         match job {
             IncJob::Offer { gen, id, total, files } => {
+                // Decrements when this job is done (any path out of this arm).
+                let _pending = PendingOffer(&sh.pending_offers);
                 let Some(send) = peer_send(gen) else { continue };
                 let cfg = sh.cfg.lock().unwrap().clone();
                 let n = files.len() as u32;

@@ -765,6 +765,8 @@ implementations are checked against `docs/file-transfer-vectors.json`, generated
       extension (from the last `.`, if not at position 0 and at most 32 bytes); strip trailing
       `.`/` ` again. (200 leaves room for the collision suffix under the 255 limits of
       APFS/NTFS.)
+   5. if step 4 cut the name, apply step 3 again: a cut can expose a device name
+      (`CON` + 197 spaces + `xyz` → `CON` → `_CON`). A component is therefore at most 201 bytes.
 3. **Never overwrite.** Files are saved under the receiver's download folder
    (host: `~/Downloads/Glide`, viewer: `<Downloads>\Glide`; configurable). Each top-level folder
    of the offer becomes a *new* folder — `Photos (2)`, `Photos (3)`… if the name is taken — so a
