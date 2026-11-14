@@ -66,7 +66,7 @@ See the feature table below and [`docs/ROADMAP.md`](docs/ROADMAP.md) for what is
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Pipelines, hybrid/canvas model, threading |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | What's done and what's next |
 | [`docs/LATENCY.md`](docs/LATENCY.md) | Latency breakdown, glass-to-glass test, tuning results |
-| [`docs/VIRTUAL_DISPLAY.md`](docs/VIRTUAL_DISPLAY.md) | Optional virtual display sized to the viewer (design, risks, how to try it) |
+| [`docs/VIRTUAL_DISPLAY.md`](docs/VIRTUAL_DISPLAY.md) | The virtual display Glide streams by default: behavior, measured macOS findings, opt-out, self-test |
 | [`windows/README.md`](windows/README.md) | Viewer reference: all flags, env vars, headless modes |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to build, test and send changes |
 | [`SECURITY.md`](SECURITY.md) | How to report a vulnerability |
@@ -138,7 +138,8 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the details.
 | Viewer UX | in progress |
 | Host UX: menu-bar item, automatic display mode, auth-gated session replacement | done |
 | Security v2: Noise XX, key pinning, pairing with a code confirmed on both screens | done (PROTOCOL.md §1–2) |
-| Virtual display, UDP transport, multi-monitor, relay for WAN | planned |
+| Virtual display matching the viewer (pixels and refresh rate), on by default; your monitor mirrors it during a session | done (needs a live-session check on real hardware) |
+| UDP transport, relay for WAN | planned |
 
 ## Performance
 
@@ -354,15 +355,20 @@ keyframe), and the previous mode is restored 10 s after the viewer disconnects
 (`restoreOnDisconnect`, default true). Changing the mode yourself during a session pauses automatic
 switching until the next session (and that mode is kept).
 
-**Virtual display** (optional, off by default; `"virtualDisplay"` in host.json or the menu's
-*Virtual Display* submenu): Glide creates a virtual monitor sized to the viewer and streams it
-instead of the Mac's own screen, so a headless Mac, or a Mac whose screen doesn't match the viewer,
-streams pixel-perfect without BetterDisplay. A 4K viewer gets a panel that looks like 1920×1080 at
-HiDPI (3840×2160 px), and a 1440p viewer gets 2560×1440 at 1x. The **Display mode** policy above
-decides HiDPI or 1x. The display is kept 30 s after a disconnect, so a reconnect doesn't reshuffle
-windows. `"lifetime": "always"` keeps it while the host runs, and `makeMain` makes it the main
-display. It uses a private CoreGraphics API, falls back to the physical display if that fails, and
-comes with a self-test: run `glide-host --virtual-display-selftest` before you turn it on. See
+**Virtual display** (on by default; `"virtualDisplay"` in host.json or the menu's *Virtual Display*
+submenu). When a viewer connects, Glide creates a virtual monitor with the viewer's exact pixels and
+monitor refresh rate (120/144 Hz viewers get a 120/144 Hz panel) and streams it 1:1. There is no
+downscaling of a 4608 px-wide Retina desktop, no mode switch of your monitor, and no dummy plug on a
+headless Mac. A 4K viewer gets a panel that looks like 1920×1080 at HiDPI (3840×2160 px); a 1440p
+viewer gets 2560×1440 at 1x. The **Display mode** policy above decides HiDPI or 1x.
+
+While the session lasts, your main monitor **mirrors** the virtual display. There is one desktop
+at the viewer's size, with every window on it. When the viewer has been gone 10 s, the mirror ends,
+your monitor's own mode comes back, and the virtual display is removed. On a Mac without a monitor
+it is the only screen and is kept. `"whenMonitorAttached": "extend"` puts it beside your monitor
+instead, and `"stream"` streams the monitor as before. Opt out with `"enabled": false` or the menu.
+It uses a private CoreGraphics API and falls back to the physical display if that fails. Check it
+with `glide-host --virtual-display-selftest`. See
 [`docs/VIRTUAL_DISPLAY.md`](docs/VIRTUAL_DISPLAY.md).
 
 Only an authenticated viewer can replace the active session. Unauthenticated connections are
