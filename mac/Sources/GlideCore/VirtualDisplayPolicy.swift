@@ -168,7 +168,9 @@ public struct VirtualDisplayPlan: Equatable, Sendable, CustomStringConvertible {
 /// When the virtual display exists. Pure state machine; the host feeds it events and performs the
 /// returned action. Times are seconds on any monotonic clock. `onlyDisplay`: the virtual display is
 /// the Mac's only display (headless or lid closed without a monitor), so it is never removed when
-/// idle.
+/// idle. `wanted`: a virtual display is wanted with the displays online now
+/// (`VirtualDisplayTopology.wantsVirtual`: false with "stream" and a monitor attached), which
+/// overrides always-on.
 public struct VirtualDisplayLifecycle: Equatable, Sendable {
     public enum Phase: Equatable, Sendable {
         /// No display.
@@ -183,16 +185,32 @@ public struct VirtualDisplayLifecycle: Equatable, Sendable {
 
     public enum Action: Equatable, Sendable {
         case none
-        /// Create it for the connecting viewer, then set up the streaming arrangement.
+        /// Create it. Once it is online, `created()` says what to set up.
         case create
         /// It exists: size it for the connecting viewer and set up the streaming arrangement.
         case resume
+        /// It is still being created (always-on at launch, or a re-create): the creation sets up
+        /// the arrangement for the phase at that time (`created()`) and answers the viewer.
+        case awaitCreation
         /// Restore the Mac's arrangement, keep the display.
         case standby
         /// Restore the Mac's arrangement, then remove the display.
         case destroy
-        /// Call `timerFired(now:onlyDisplay:)` at this time.
+        /// Call `timerFired(now:onlyDisplay:wanted:)` at this time.
         case scheduleTimer(at: Double)
+    }
+
+    /// What a creation that just finished sets up. Decided when it finishes, not when it started:
+    /// a viewer may have connected (or left) meanwhile.
+    public enum Ready: Equatable, Sendable {
+        /// A viewer uses it: the streaming arrangement.
+        case streaming
+        /// No viewer: hidden behind the main monitor (or alone).
+        case standby
+        /// The viewer left while it was created; the keep-alive timer decides.
+        case keep
+        /// Not wanted any more: remove it.
+        case discard
     }
 
     public private(set) var phase: Phase = .off
@@ -200,6 +218,8 @@ public struct VirtualDisplayLifecycle: Equatable, Sendable {
     public private(set) var enabled = false
     public private(set) var alwaysOn = false
     public private(set) var keepAlive: Double = VirtualDisplayConfig.defaultKeepAlive
+    /// A create is in flight (between `.create` and `created()` / `lost()`).
+    public private(set) var creating = false
 
     public init(enabled: Bool = false, alwaysOn: Bool = false, keepAlive: Double = VirtualDisplayConfig.defaultKeepAlive) {
         self.enabled = enabled; self.alwaysOn = alwaysOn; self.keepAlive = keepAlive
@@ -208,63 +228,115 @@ public struct VirtualDisplayLifecycle: Equatable, Sendable {
     public var exists: Bool { phase != .off }
 
     /// The host started.
-    public mutating func launched() -> Action {
-        guard enabled, alwaysOn, phase == .off else { return .none }
+    public mutating func launched(wanted: Bool = true) -> Action {
+        guard enabled, alwaysOn, wanted, phase == .off else { return .none }
         phase = .standby
+        creating = true
         return .create
     }
 
-    public mutating func sessionBegan() -> Action {
+    public mutating func sessionBegan(wanted: Bool = true) -> Action {
         sessionActive = true
         guard enabled else { return .none }
+        guard wanted else { return off() }  // "stream" with a monitor: this session streams the monitor
         let wasOff = phase == .off
         phase = .inUse
-        return wasOff ? .create : .resume  // lingering/standby: reuse it (no window reshuffle)
+        if wasOff { creating = true; return .create }
+        return creating ? .awaitCreation : .resume  // lingering/standby: reuse it (no window reshuffle)
     }
 
-    public mutating func sessionEnded(now: Double, onlyDisplay: Bool) -> Action {
+    public mutating func sessionEnded(now: Double, onlyDisplay: Bool, wanted: Bool = true) -> Action {
         sessionActive = false
         guard phase == .inUse else { return .none }
         if keepAlive > 0 {
             phase = .lingering(until: now + keepAlive)
             return .scheduleTimer(at: now + keepAlive)
         }
-        return idle(onlyDisplay: onlyDisplay)
+        return idle(onlyDisplay: onlyDisplay, wanted: wanted)
     }
 
     /// A timer scheduled earlier fired. Stale timers (a viewer came back, or a newer linger
     /// started) are ignored.
-    public mutating func timerFired(now: Double, onlyDisplay: Bool) -> Action {
+    public mutating func timerFired(now: Double, onlyDisplay: Bool, wanted: Bool = true) -> Action {
         guard case let .lingering(until) = phase, now >= until - 0.05 else { return .none }
-        return idle(onlyDisplay: onlyDisplay)
+        return idle(onlyDisplay: onlyDisplay, wanted: wanted)
     }
 
-    private mutating func idle(onlyDisplay: Bool) -> Action {
-        if alwaysOn || onlyDisplay { phase = .standby; return .standby }
+    /// The creation finished (the display is online and its mode read back).
+    public mutating func created() -> Ready {
+        creating = false
+        switch phase {
+        case .inUse: return .streaming
+        case .standby: return .standby
+        case .lingering: return .keep
+        case .off: return .discard
+        }
+    }
+
+    /// The host re-creates the display (the viewer outgrew its limits): the phase stays.
+    public mutating func recreating() {
+        guard phase != .off else { return }
+        creating = true
+    }
+
+    /// Displays were added, removed or rearranged (a monitor plugged in, the lid opened). An idle
+    /// display that is no longer the only one and isn't always-on is removed; an always-on one
+    /// re-hides behind the (new) main monitor; "stream" with a monitor removes an idle one. A
+    /// connected viewer keeps it.
+    public mutating func displaysChanged(onlyDisplay: Bool, wanted: Bool = true) -> Action {
+        guard enabled, !creating else { return .none }
+        switch phase {
+        case .standby:
+            if onlyDisplay || (alwaysOn && wanted) { return .standby }
+            return off()
+        case .lingering:
+            return wanted || onlyDisplay ? .none : off()
+        case .off:
+            guard alwaysOn, wanted, !sessionActive else { return .none }
+            phase = .standby
+            creating = true
+            return .create
+        case .inUse:
+            return .none
+        }
+    }
+
+    private mutating func idle(onlyDisplay: Bool, wanted: Bool) -> Action {
+        if onlyDisplay || (alwaysOn && wanted) {
+            phase = .standby
+            return creating ? .none : .standby  // a creation in flight sets up standby itself
+        }
+        return off()
+    }
+
+    private mutating func off() -> Action {
+        creating = false
+        guard phase != .off else { return .none }
         phase = .off
         return .destroy
     }
 
     /// Settings changed (menu or host.json).
-    public mutating func configure(enabled: Bool, alwaysOn: Bool, keepAlive: Double, onlyDisplay: Bool) -> Action {
+    public mutating func configure(enabled: Bool, alwaysOn: Bool, keepAlive: Double, onlyDisplay: Bool, wanted: Bool = true) -> Action {
         self.enabled = enabled; self.alwaysOn = alwaysOn; self.keepAlive = keepAlive
-        if !enabled {
-            guard phase != .off else { return .none }
-            phase = .off
-            return .destroy
-        }
+        if !enabled { return off() }
         switch phase {
         case .off:
-            if sessionActive { phase = .inUse; return .create }
-            if alwaysOn { phase = .standby; return .create }
+            if sessionActive {
+                guard wanted else { return .none }
+                phase = .inUse; creating = true; return .create
+            }
+            if alwaysOn && wanted { phase = .standby; creating = true; return .create }
             return .none
-        case .standby where !alwaysOn && !onlyDisplay:
-            phase = .off
-            return .destroy
-        case .lingering where alwaysOn:
+        case .standby:
+            if onlyDisplay || (alwaysOn && wanted) { return .none }
+            return off()
+        case .lingering:
+            if !wanted && !onlyDisplay { return off() }
+            guard alwaysOn else { return .none }
             phase = .standby
-            return .standby
-        default:
+            return creating ? .none : .standby
+        case .inUse:
             return .none
         }
     }
@@ -272,13 +344,72 @@ public struct VirtualDisplayLifecycle: Equatable, Sendable {
     /// Remove it now (menu). A connected viewer keeps it.
     public mutating func removeRequested() -> Action {
         guard phase != .off, phase != .inUse else { return .none }
-        phase = .off
-        return .destroy
+        return off()
     }
 
     /// Creation failed, or the system terminated the display: back to off (the next session or
     /// settings change tries again).
-    public mutating func lost() { phase = .off }
+    public mutating func lost() { phase = .off; creating = false }
+}
+
+/// How the virtual display sits among the Mac's displays (host state; `VirtualDisplayTopology` is
+/// the choice for streaming).
+public enum VirtualDisplayLayout: Equatable, Sendable {
+    /// Untouched (alone, or extended where macOS put it).
+    case none
+    /// `physical` mirrors the virtual display, which is at (0,0) (streaming, "mirror").
+    case mirror(physical: UInt32)
+    /// The virtual display was made main (streaming, "extend"); `previousMain` gets it back.
+    case extendMain(previousMain: UInt32)
+    /// The virtual display mirrors `physical`: hidden while idle (no extra desktop area).
+    case hidden(behind: UInt32)
+
+    /// The physical display the layout involves.
+    public var physical: UInt32? {
+        switch self {
+        case let .mirror(p), let .hidden(p), let .extendMain(p): return p
+        case .none: return nil
+        }
+    }
+
+    /// The monitor that mirrors the virtual display.
+    public var mirroring: UInt32? { if case let .mirror(p) = self { return p }; return nil }
+
+    /// One step that brings the recorded layout back in line with the displays online now.
+    public enum Fix: Equatable, Sendable {
+        /// The layout's physical display went offline (lid closed, unplugged): forget it without a
+        /// display-configuration transaction on the offline display. If it mirrored the virtual
+        /// display, its mode is restored once it is back.
+        case forget(UInt32)
+        /// A monitor mirrors the virtual display outside the layout (it came back online still
+        /// mirroring, for example the built-in panel when the lid opens): end that mirror, then
+        /// restore its mode.
+        case unmirror(UInt32)
+        /// Streaming with "mirror" and no mirror in place while a monitor mirrors the virtual
+        /// display: take it as the streaming mirror.
+        case adopt(UInt32)
+    }
+
+    /// The fixes for `displays` (every online display except the virtual one and Glide's
+    /// leftovers, with whom each mirrors). Run on screen-parameter changes.
+    public static func reconcile(_ layout: VirtualDisplayLayout, virtual: UInt32, streaming: Bool, mode: VirtualDisplayMonitorMode,
+                                 displays: [VirtualDisplayTopology.Display]) -> [Fix] {
+        var fixes: [Fix] = []
+        var layout = layout
+        if let p = layout.physical, !displays.contains(where: { $0.id == p }) {
+            fixes.append(.forget(p))
+            layout = .none
+        }
+        for d in displays where d.mirrorOf == virtual && layout.mirroring != d.id {
+            if streaming, mode == .mirror, layout == .none {
+                fixes.append(.adopt(d.id))
+                layout = .mirror(physical: d.id)
+            } else {
+                fixes.append(.unmirror(d.id))
+            }
+        }
+        return fixes
+    }
 }
 
 /// How the virtual display sits among the Mac's displays while it is streamed.

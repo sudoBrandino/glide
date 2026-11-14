@@ -416,23 +416,24 @@ if let target = connectTarget {
 } else {
     server.start()
 }
-// SIGTERM (launchctl, install scripts) and SIGINT: give the Mac its display arrangement back and
-// remove the virtual display before exiting (a mirror set whose master vanishes is dissolved by
-// macOS, which can leave the monitor in another mode). Handled on the main queue, where the
-// virtual display's state lives; a wedged main queue still exits after 3 s.
+// SIGTERM (launchctl, install scripts) and SIGINT: give the Mac its display arrangement back,
+// remove the virtual display and restore the monitor's own mode before exiting (a mirror set whose
+// master vanishes is dissolved by macOS, which can leave the monitor in another mode). Handled on
+// the main queue, where the display state lives; the restore waits up to 1.5 s for the monitor to
+// settle after the mirror ends. A wedged main queue still exits after 6 s.
 var signalSources: [DispatchSourceSignal] = []
 for sig in [SIGINT, SIGTERM] {
     signal(sig, SIG_IGN)
     let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
     src.setEventHandler {
         unlink(PairingController.socketPath)
-        if !hostTestMode { VirtualDisplayManager.shared.shutdown(reason: sig == SIGTERM ? "SIGTERM" : "SIGINT") }
+        if !hostTestMode { restoreDisplaysBeforeExit(reason: sig == SIGTERM ? "SIGTERM" : "SIGINT") }
         exit(0)
     }
     src.resume()
     signalSources.append(src)
     let backstop = DispatchSource.makeSignalSource(signal: sig, queue: .global())
-    backstop.setEventHandler { DispatchQueue.global().asyncAfter(deadline: .now() + 3) { exit(0) } }
+    backstop.setEventHandler { DispatchQueue.global().asyncAfter(deadline: .now() + 6) { exit(0) } }
     backstop.resume()
     signalSources.append(backstop)
 }

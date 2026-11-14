@@ -82,17 +82,18 @@ func virtualDisplayTests() throws {
     check(l.sessionBegan() == .none && !l.exists, "vd life: disabled -> nothing")
     l = VirtualDisplayLifecycle(enabled: true, keepAlive: 10)
     check(l.launched() == .none, "vd life: per-session display not created at launch")
-    check(l.sessionBegan() == .create && l.phase == .inUse, "vd life: session -> create")
+    check(l.sessionBegan() == .create && l.phase == .inUse && l.creating, "vd life: session -> create")
+    check(l.created() == .streaming && !l.creating, "vd life: created for the viewer -> streaming arrangement")
     check(l.sessionEnded(now: 100, onlyDisplay: false) == .scheduleTimer(at: 110) && l.phase == .lingering(until: 110), "vd life: disconnect -> keep 10 s")
     check(l.timerFired(now: 105, onlyDisplay: false) == .none && l.exists, "vd life: early timer ignored")
     check(l.timerFired(now: 110, onlyDisplay: false) == .destroy && l.phase == .off, "vd life: idle with a monitor -> restore arrangement, remove")
-    _ = l.sessionBegan(); _ = l.sessionEnded(now: 200, onlyDisplay: false)
+    _ = l.sessionBegan(); _ = l.created(); _ = l.sessionEnded(now: 200, onlyDisplay: false)
     check(l.sessionBegan() == .resume && l.phase == .inUse, "vd life: reconnect within keep-alive resumes the same display")
     check(l.timerFired(now: 210, onlyDisplay: false) == .none && l.exists, "vd life: stale timer after reconnect ignored")
     check(l.sessionEnded(now: 240, onlyDisplay: false) == .scheduleTimer(at: 250), "vd life: second disconnect re-arms")
     check(l.timerFired(now: 210, onlyDisplay: false) == .none && l.timerFired(now: 250, onlyDisplay: false) == .destroy, "vd life: only the newest deadline acts")
     var h = VirtualDisplayLifecycle(enabled: true, keepAlive: 10)
-    _ = h.sessionBegan(); _ = h.sessionEnded(now: 0, onlyDisplay: true)
+    _ = h.sessionBegan(); _ = h.created(); _ = h.sessionEnded(now: 0, onlyDisplay: true)
     check(h.timerFired(now: 10, onlyDisplay: true) == .standby && h.phase == .standby, "vd life: headless (only display) -> kept on standby")
     check(h.sessionBegan() == .resume, "vd life: headless reconnect resumes")
     check(h.configure(enabled: true, alwaysOn: false, keepAlive: 10, onlyDisplay: true) == .none, "vd life: settings change keeps a headless display")
@@ -100,7 +101,8 @@ func virtualDisplayTests() throws {
     _ = z.sessionBegan()
     check(z.sessionEnded(now: 1, onlyDisplay: false) == .destroy && !z.exists, "vd life: keepAlive 0 -> idle at once")
     var a = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
-    check(a.launched() == .create && a.phase == .standby, "vd life: always-on -> create at launch")
+    check(a.launched() == .create && a.phase == .standby && a.creating, "vd life: always-on -> create at launch")
+    check(a.created() == .standby && !a.creating, "vd life: always-on created with no viewer -> standby (hidden)")
     check(a.sessionBegan() == .resume && a.phase == .inUse, "vd life: always-on session resumes it")
     check(a.sessionEnded(now: 5, onlyDisplay: false) == .scheduleTimer(at: 15), "vd life: always-on keeps the streaming arrangement for keep-alive")
     check(a.timerFired(now: 15, onlyDisplay: false) == .standby && a.phase == .standby, "vd life: always-on idle -> standby (hidden), not removed")
@@ -118,12 +120,95 @@ func virtualDisplayTests() throws {
     check(n.configure(enabled: true, alwaysOn: true, keepAlive: 10, onlyDisplay: false) == .create && n.phase == .standby, "vd life: always-on switched on -> create")
     check(n.configure(enabled: true, alwaysOn: false, keepAlive: 10, onlyDisplay: false) == .destroy, "vd life: always-on switched off with no viewer -> destroy")
     var g = VirtualDisplayLifecycle(enabled: true)
-    _ = g.sessionBegan(); _ = g.sessionEnded(now: 0, onlyDisplay: false)
+    _ = g.sessionBegan(); _ = g.created(); _ = g.sessionEnded(now: 0, onlyDisplay: false)
     check(g.configure(enabled: true, alwaysOn: true, keepAlive: 10, onlyDisplay: false) == .standby && g.phase == .standby && g.timerFired(now: 30, onlyDisplay: false) == .none,
           "vd life: always-on while lingering -> standby now, timer ignored")
     var f = VirtualDisplayLifecycle(enabled: true)
     _ = f.sessionBegan(); f.lost()
     check(!f.exists && f.sessionEnded(now: 0, onlyDisplay: false) == .none && f.sessionBegan() == .create, "vd life: failed/lost/skipped -> retried next session")
+
+    // Finding 1: a viewer that connects while the launch create is still in flight is answered by
+    // the creation, which arranges for the phase *when it finishes* (streaming), never standby.
+    var race = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    _ = race.launched()
+    check(race.sessionBegan() == .awaitCreation && race.phase == .inUse, "vd race: viewer during the launch create -> waits for it (no second create/resume)")
+    check(race.created() == .streaming, "vd race: launch create finishing after the viewer connected -> streaming arrangement, not standby")
+    check(race.sessionEnded(now: 0, onlyDisplay: false) == .scheduleTimer(at: 10), "vd race: then a normal disconnect")
+    var left = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    _ = left.launched(); _ = left.sessionBegan()
+    check(left.sessionEnded(now: 0, onlyDisplay: false) == .scheduleTimer(at: 10) && left.created() == .keep,
+          "vd race: viewer came and went during the create -> keep (the timer decides)")
+    check(left.timerFired(now: 10, onlyDisplay: false) == .standby, "vd race: ... then standby")
+    var gone = VirtualDisplayLifecycle(enabled: true, keepAlive: 0)
+    _ = gone.sessionBegan()
+    check(gone.sessionEnded(now: 0, onlyDisplay: false) == .destroy && !gone.creating && gone.created() == .discard,
+          "vd race: per-session viewer left during the create (keep-alive 0) -> destroy; a late completion discards")
+    var quick = VirtualDisplayLifecycle(enabled: true, alwaysOn: true, keepAlive: 0)
+    _ = quick.launched(); _ = quick.sessionBegan()
+    check(quick.sessionEnded(now: 0, onlyDisplay: false) == .none && quick.phase == .standby && quick.created() == .standby,
+          "vd race: always-on, viewer left during the create -> the creation sets up standby itself")
+    var re = VirtualDisplayLifecycle(enabled: true)
+    _ = re.sessionBegan(); _ = re.created()
+    re.recreating()
+    check(re.creating && re.phase == .inUse && re.displaysChanged(onlyDisplay: false) == .none && re.created() == .streaming,
+          "vd race: re-create (viewer outgrew the limits) -> streaming decided at completion")
+    var reIdle = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    _ = reIdle.launched(); _ = reIdle.created(); _ = reIdle.sessionBegan(); _ = reIdle.sessionEnded(now: 0, onlyDisplay: false)
+    _ = reIdle.timerFired(now: 10, onlyDisplay: false)
+    reIdle.recreating()
+    check(reIdle.sessionBegan() == .awaitCreation && reIdle.created() == .streaming, "vd race: viewer during a standby re-create -> streaming")
+    var offRe = VirtualDisplayLifecycle(enabled: true)
+    offRe.recreating()
+    check(!offRe.creating, "vd race: nothing to re-create while off")
+    var lostC = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    _ = lostC.launched(); lostC.lost()
+    check(!lostC.creating && lostC.sessionBegan() == .create, "vd race: a failed create clears the in-flight flag")
+
+    // Finding 4: idle standby re-evaluated on display changes.
+    var hs = VirtualDisplayLifecycle(enabled: true, keepAlive: 0)
+    _ = hs.sessionBegan(); _ = hs.created(); _ = hs.sessionEnded(now: 0, onlyDisplay: true)
+    check(hs.phase == .standby && hs.displaysChanged(onlyDisplay: true) == .standby, "vd displays: headless standby, still headless -> re-hide (no-op)")
+    check(hs.displaysChanged(onlyDisplay: false) == .destroy && !hs.exists, "vd displays: headless standby, monitor plugged in / lid opened -> removed")
+    var ao = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    _ = ao.launched(); _ = ao.created()
+    check(ao.displaysChanged(onlyDisplay: false) == .standby && ao.phase == .standby, "vd displays: always-on standby, monitor change -> hide behind the new main monitor")
+    var aoc = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    _ = aoc.launched()
+    check(aoc.displaysChanged(onlyDisplay: false) == .none, "vd displays: ignored while it is being created")
+    var use = VirtualDisplayLifecycle(enabled: true)
+    _ = use.sessionBegan(); _ = use.created()
+    check(use.displaysChanged(onlyDisplay: false) == .none && use.displaysChanged(onlyDisplay: false, wanted: false) == .none,
+          "vd displays: a connected viewer keeps it")
+    var lin = VirtualDisplayLifecycle(enabled: true)
+    _ = lin.sessionBegan(); _ = lin.created(); _ = lin.sessionEnded(now: 0, onlyDisplay: false)
+    check(lin.displaysChanged(onlyDisplay: false) == .none && lin.exists, "vd displays: lingering -> the timer decides")
+    var poff = VirtualDisplayLifecycle(enabled: true)
+    check(poff.displaysChanged(onlyDisplay: true) == .none && !poff.exists, "vd displays: per-session, off, headless -> created at the next session")
+    var dis = VirtualDisplayLifecycle(enabled: false)
+    check(dis.displaysChanged(onlyDisplay: true) == .none, "vd displays: disabled -> nothing")
+
+    // Finding 11: "stream" with a monitor means no virtual display, always-on included.
+    var st = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    check(st.launched(wanted: false) == .none && !st.exists, "vd stream: always-on + stream + monitor -> not created at launch")
+    check(st.displaysChanged(onlyDisplay: true, wanted: true) == .create && st.phase == .standby, "vd stream: monitor unplugged (headless) -> always-on display created")
+    _ = st.created()
+    check(st.displaysChanged(onlyDisplay: false, wanted: false) == .destroy && !st.exists, "vd stream: monitor plugged back in -> idle always-on display removed")
+    var st2 = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    _ = st2.launched(); _ = st2.created()
+    check(st2.configure(enabled: true, alwaysOn: true, keepAlive: 10, onlyDisplay: false, wanted: false) == .destroy, "vd stream: switched to stream from the menu -> idle display removed")
+    var st3 = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    _ = st3.launched(); _ = st3.created()
+    check(st3.sessionBegan(wanted: false) == .destroy && !st3.exists && st3.sessionActive, "vd stream: viewer connects to an always-on display in stream mode -> removed, monitor streamed")
+    check(st3.sessionEnded(now: 0, onlyDisplay: false, wanted: false) == .none, "vd stream: ... nothing to do on disconnect")
+    var st4 = VirtualDisplayLifecycle(enabled: true, alwaysOn: true, keepAlive: 0)
+    _ = st4.launched(); _ = st4.created(); _ = st4.sessionBegan()
+    check(st4.sessionEnded(now: 0, onlyDisplay: false, wanted: false) == .destroy, "vd stream: always-on idles with a monitor in stream mode -> removed, not hidden")
+    var st5 = VirtualDisplayLifecycle(enabled: true)
+    check(st5.sessionBegan(wanted: false) == .none && !st5.exists, "vd stream: per-session + monitor -> nothing created")
+    check(st5.configure(enabled: true, alwaysOn: false, keepAlive: 10, onlyDisplay: false, wanted: false) == .none, "vd stream: enabled mid-session with a monitor -> still nothing")
+    var st6 = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    check(st6.configure(enabled: true, alwaysOn: true, keepAlive: 10, onlyDisplay: false, wanted: false) == .none && !st6.exists,
+          "vd stream: always-on switched on in stream mode with a monitor -> nothing")
 
     // Arrangement while streaming.
     typealias D = VirtualDisplayTopology.Display
@@ -142,6 +227,79 @@ func virtualDisplayTests() throws {
           "vd topology: extend (main or not)")
     check(!VirtualDisplayTopology.wantsVirtual(mode: .stream, physicalDisplays: 1) && VirtualDisplayTopology.wantsVirtual(mode: .stream, physicalDisplays: 0)
           && VirtualDisplayTopology.wantsVirtual(mode: .mirror, physicalDisplays: 2), "vd topology: \"stream\" uses the monitor, the virtual display only headless")
+
+    // Finding 4: the recorded arrangement follows displays that go offline or come back mirroring.
+    let LID: UInt32 = 1
+    typealias L = VirtualDisplayLayout
+    check(L.reconcile(.mirror(physical: LID), virtual: V, streaming: true, mode: .mirror, displays: [D(id: OMEN)]) == [.forget(LID)],
+          "vd reconcile: lid closed while the built-in panel mirrors it -> forget it (no transaction on the offline panel)")
+    check(L.reconcile(.hidden(behind: LID), virtual: V, streaming: false, mode: .mirror, displays: []) == [.forget(LID)],
+          "vd reconcile: lid closed while idle and hidden behind the panel -> forget it")
+    check(L.reconcile(.none, virtual: V, streaming: false, mode: .mirror, displays: [D(id: LID, mirrorOf: V)]) == [.unmirror(LID)],
+          "vd reconcile: lid opened, panel came back still mirroring the idle display -> end that mirror")
+    check(L.reconcile(.hidden(behind: OMEN), virtual: V, streaming: false, mode: .mirror, displays: [D(id: OMEN), D(id: LID, mirrorOf: V)]) == [.unmirror(LID)],
+          "vd reconcile: stray mirror while hidden -> ended")
+    check(L.reconcile(.none, virtual: V, streaming: true, mode: .mirror, displays: [D(id: LID, mirrorOf: V)]) == [.adopt(LID)],
+          "vd reconcile: streaming (mirror), panel came back mirroring -> adopted as the streaming mirror")
+    check(L.reconcile(.extendMain(previousMain: OMEN), virtual: V, streaming: true, mode: .extend, displays: [D(id: OMEN), D(id: LID, mirrorOf: V)]) == [.unmirror(LID)],
+          "vd reconcile: streaming (extend), a monitor mirrors it -> ended")
+    check(L.reconcile(.mirror(physical: OMEN), virtual: V, streaming: true, mode: .mirror, displays: [D(id: OMEN, mirrorOf: V), D(id: LID)]).isEmpty
+          && L.reconcile(.none, virtual: V, streaming: false, mode: .mirror, displays: [D(id: OMEN)]).isEmpty,
+          "vd reconcile: nothing to fix -> nothing")
+    check(L.reconcile(.mirror(physical: LID), virtual: V, streaming: true, mode: .mirror, displays: [D(id: OMEN, mirrorOf: V)]) == [.forget(LID), .adopt(OMEN)],
+          "vd reconcile: mirror monitor swapped -> forget the old one, adopt the new one")
+    check(L.mirror(physical: OMEN).mirroring == OMEN && L.hidden(behind: OMEN).mirroring == nil && L.extendMain(previousMain: LID).physical == LID && L.none.physical == nil,
+          "vd layout: accessors")
+
+    // Findings 2, 5, 8: the saved mode is restored onto the right monitor, at its refresh rate,
+    // and a pending restore is never overwritten by the mirrored mode.
+    func ident(_ id: UInt32, _ v: UInt32, _ m: UInt32, _ s: UInt32) -> DisplayIdentity { DisplayIdentity(id: id, vendor: v, model: m, serial: s, name: "") }
+    let omen = ident(2, 0x30AE, 0x6A1F, 777), builtin = ident(1, 0x610, 0xA050, 0)
+    check(ModeRestore.resolve(identity: omen, legacyID: 2, online: [builtin, omen]) == .display(2), "restore target: same ID and hardware")
+    check(ModeRestore.resolve(identity: omen, legacyID: 2, online: [builtin, ident(5, 0x30AE, 0x6A1F, 777)]) == .display(5), "restore target: monitor replugged with a new ID -> followed by serial")
+    check(ModeRestore.resolve(identity: omen, legacyID: 2, online: [ident(2, 0x1E6D, 0x5B11, 42), builtin]) == .notConnected,
+          "restore target: ID reused by a different monitor after a reboot -> not that one (kept until the OMEN is back)")
+    check(ModeRestore.resolve(identity: builtin, legacyID: 1, online: [ident(3, 0x610, 0xA050, 0), omen]) == .display(3), "restore target: no serial, one vendor/model match -> it")
+    check(ModeRestore.resolve(identity: ident(4, 0x22, 0x33, 0), legacyID: nil, online: [ident(5, 0x22, 0x33, 0), ident(6, 0x22, 0x33, 0)]) == .notConnected,
+          "restore target: no serial, two identical monitors -> ambiguous, not guessed")
+    check(ModeRestore.resolve(identity: ident(4, 0x22, 0x33, 0), legacyID: nil, online: [ident(4, 0x22, 0x33, 0), ident(6, 0x22, 0x33, 0)]) == .display(4),
+          "restore target: no serial but the same ID and hardware -> it")
+    check(ModeRestore.resolve(identity: nil, legacyID: 2, online: [omen]) == .display(2) && ModeRestore.resolve(identity: nil, legacyID: 9, online: [omen]) == .notConnected
+          && ModeRestore.resolve(identity: nil, legacyID: nil, online: [omen]) == .served, "restore target: old files (bare ID, or none) still work")
+    check(ModeRestore.beforeMirror(pending: nil, display: 2, served: 10) == .remember, "before mirror: nothing pending -> remember")
+    check(ModeRestore.beforeMirror(pending: .display(2), display: 2, served: 10) == .keepPending,
+          "before mirror: a restore for this monitor is pending (failed un-mirror, earlier switch) -> never overwritten by the current mode")
+    check(ModeRestore.beforeMirror(pending: .display(1), display: 2, served: 10) == .otherPending, "before mirror: another connected display's restore -> left alone")
+    check(ModeRestore.beforeMirror(pending: .notConnected, display: 2, served: 10) == .remember, "before mirror: pending for a display that's gone -> replaced")
+    check(ModeRestore.beforeMirror(pending: .served, display: 2, served: 2) == .keepPending && ModeRestore.beforeMirror(pending: .served, display: 2, served: 10) == .otherPending,
+          "before mirror: legacy restore (served display)")
+    func md(_ w: Int, _ h: Int, _ hz: Double, hi: Bool = false) -> DisplayModeInfo { .init(width: w, height: h, pixelWidth: hi ? w * 2 : w, pixelHeight: hi ? h * 2 : h, refreshRate: hz) }
+    let omenModes = [md(3840, 2160, 60), md(3840, 2160, 120), md(3840, 2160, 165), md(2560, 1440, 60), md(2560, 1440, 165), md(1920, 1080, 60, hi: true), md(1920, 1080, 165, hi: true)]
+    check(ModeRestore.choose(saved: md(3840, 2160, 165), current: md(3840, 2160, 60), available: omenModes) == .switchTo(md(3840, 2160, 165)),
+          "restore: 165 Hz monitor left at 60 Hz by the mirror -> back to 165 Hz (same size isn't enough)")
+    check(ModeRestore.choose(saved: md(3840, 2160, 165), current: md(3840, 2160, 165), available: omenModes) == .alreadyThere, "restore: already at size and rate -> nothing")
+    check(ModeRestore.choose(saved: md(3840, 2160, 164.99), current: md(1920, 1080, 60, hi: true), available: omenModes) == .switchTo(md(3840, 2160, 165)),
+          "restore: rates within 0.5 Hz are the same (164.99 / 165)")
+    check(ModeRestore.choose(saved: md(2560, 1440, 240), current: md(3840, 2160, 60), available: omenModes) == .switchTo(md(2560, 1440, 165)),
+          "restore: saved rate no longer offered -> same size, closest rate")
+    check(ModeRestore.choose(saved: md(2560, 1440, 240), current: md(2560, 1440, 60), available: omenModes) == .alreadyThere,
+          "restore: saved rate gone and already at the size -> size only, left alone")
+    check(ModeRestore.choose(saved: md(1920, 1080, 165, hi: true), current: md(1920, 1080, 60, hi: true), available: omenModes) == .switchTo(md(1920, 1080, 165, hi: true)),
+          "restore: HiDPI mode at its rate")
+    check(ModeRestore.choose(saved: md(5120, 2880, 60, hi: true), current: md(3840, 2160, 60), available: omenModes) == .unavailable, "restore: size no longer offered -> unavailable")
+    check(ModeRestore.choose(saved: md(2560, 1440, 0), current: md(3840, 2160, 60), available: omenModes) == .switchTo(md(2560, 1440, 60))
+          && ModeRestore.choose(saved: md(2560, 1440, 0), current: md(2560, 1440, 165), available: omenModes) == .alreadyThere, "restore: no saved rate -> size only")
+
+    // host.json "display": old files (bare restoreDisplay) decode; new ones carry the identity.
+    let oldJSON = #"{"mode":"retina","restore":{"width":3840,"height":2160,"pixelWidth":3840,"pixelHeight":2160,"refreshRate":165},"restoreDisplay":2}"#
+    let oldS = try JSONDecoder().decode(DisplaySettings.self, from: Data(oldJSON.utf8))
+    check(oldS.restore == md(3840, 2160, 165) && oldS.restoreDisplay == 2 && oldS.restoreIdentity == nil && oldS.preference == .retina,
+          "display settings: files without restoreIdentity still decode (bare display ID)")
+    let newS = DisplaySettings(restore: md(3840, 2160, 165), restoreDisplay: 2, restoreIdentity: omen)
+    let rt = try JSONDecoder().decode(DisplaySettings.self, from: JSONEncoder().encode(newS))
+    check(rt == newS && rt.restoreIdentity?.serial == 777, "display settings: restoreIdentity round-trips")
+    check(try JSONDecoder().decode(DisplaySettings.self, from: Data("{}".utf8)) == DisplaySettings(), "display settings: empty -> defaults")
+    check(ModeRestore.afterMirrorSettle > 0 && ModeRestore.afterMirrorSettle <= 2, "restore: exit waits at most ~1.5 s for a monitor that just stopped mirroring")
 
     // host.json parsing: defaults (on, mirror, viewer's refresh), clamps, unknown strings.
     let d = try JSONDecoder().decode(VirtualDisplayConfig.self, from: Data("{}".utf8))

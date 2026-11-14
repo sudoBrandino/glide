@@ -610,21 +610,19 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     @objc private func restart() {
         log("menu: restart (launchd relaunches the host)")
-        VirtualDisplayManager.shared.shutdown(reason: "restart")
+        restoreDisplaysBeforeExit(reason: "restart")
         exit(0)
     }
 
     @objc private func quit() {
-        DisplayModeController.shared.restoreNow(reason: "quit")
-        VirtualDisplayManager.shared.shutdown(reason: "quit")
+        restoreDisplaysBeforeExit(reason: "quit")
         log("menu: quit")
         exit(0)
     }
 
     @objc private func quitUntilLogin() {
         guard let label = launchdLabel else { quit(); return }
-        DisplayModeController.shared.restoreNow(reason: "quit until next login")
-        VirtualDisplayManager.shared.shutdown(reason: "quit until next login")
+        restoreDisplaysBeforeExit(reason: "quit until next login")
         log("menu: quit until next login (launchctl bootout gui/\(getuid())/\(label))")
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/launchctl")

@@ -37,17 +37,11 @@ final class VirtualDisplayManager: @unchecked Sendable {
     static let serialNumbers: [UInt32] = [1, 2]
     static let onlineTimeout: TimeInterval = 4
 
-    /// How the virtual display sits among the Mac's displays.
-    enum Arrangement: Equatable {
-        /// Untouched (alone, or extended where macOS put it).
-        case none
-        /// `physical` mirrors the virtual display, which is at (0,0) (streaming, "mirror").
-        case mirror(physical: CGDirectDisplayID)
-        /// The virtual display was made main (streaming, "extend"); `previousMain` gets it back.
-        case extendMain(previousMain: CGDirectDisplayID)
-        /// The virtual display mirrors `physical`: hidden while idle (no extra desktop area).
-        case hidden(behind: CGDirectDisplayID)
-    }
+    /// How the virtual display sits among the Mac's displays (GlideCore, unit-tested).
+    typealias Arrangement = VirtualDisplayLayout
+    /// Display changes come in bursts (and Glide's own arrangement changes cause some): the idle
+    /// display is re-evaluated once they have settled.
+    static let reconcileDelay: TimeInterval = 0.5
 
     private(set) var config = VirtualDisplayConfig()
     private var loaded = false
@@ -62,12 +56,17 @@ final class VirtualDisplayManager: @unchecked Sendable {
     private var viewerHz: Int?
     private(set) var arrangement: Arrangement = .none
     /// The monitor that mirrors the virtual display right now (streaming, "mirror").
-    var mirroredPhysical: CGDirectDisplayID? { if case let .mirror(p) = arrangement { return p }; return nil }
+    var mirroredPhysical: CGDirectDisplayID? { arrangement.mirroring }
     /// Removed from service but not yet released: every display was asleep (macOS would defer the
     /// removal anyway); released at the next wake, or reused by the next session.
     private var releaseOnWake = false
     private var lingerTimer: DispatchWorkItem?
     private var lingerUntil: Date?
+    private var reconcileWork: DispatchWorkItem?
+    /// Answers owed to connecting viewers (`sessionBegan(ready:)`, and the re-create in
+    /// `applyPolicy`): given once the display is online and arranged, or failed. Kept while a
+    /// creation is in flight, which answers them itself (`answerReady`).
+    private var readyWaiters: [(Bool) -> Void] = []
     /// Bumped on every create/destroy/apply so stale async completions do nothing.
     private var generation = 0
     private(set) var lastError: String?
@@ -118,7 +117,9 @@ final class VirtualDisplayManager: @unchecked Sendable {
                 + ", with a monitor: \(config.monitorMode.rawValue)\(config.monitorMode == .extend && config.wantsMain ? " (main)" : "")"
                 + ", \(config.refreshRate.map { "\(Int($0)) Hz" } ?? "viewer's refresh rate")\(config.fixedSize.map { ", fixed \($0.w)x\($0.h)" } ?? ""))")
             if let why = Self.unavailableReason { log("virtual display: UNAVAILABLE (\(why)); Glide will use the physical display") }
-            perform(lifecycle.launched(), reason: "always on")
+            let wanted = self.wanted
+            if config.alwaysOn && !wanted { log("virtual display: not created at launch: \(Self.streamReason)") }
+            perform(lifecycle.launched(wanted: wanted), reason: "always on")
         }
     }
 
@@ -131,7 +132,16 @@ final class VirtualDisplayManager: @unchecked Sendable {
         loadConfig()
         viewerHz = hz > 0 ? hz : nil
         skippedReason = nil
-        let a = lifecycle.sessionBegan()
+        let wanted = self.wanted
+        let a = lifecycle.sessionBegan(wanted: wanted)
+        if lifecycle.enabled && !wanted {
+            // "stream" with a monitor attached: no virtual display at all, even an always-on one.
+            skippedReason = Self.streamReason
+            log("virtual display: not used for this viewer: \(Self.streamReason)")
+            perform(a, reason: "\"stream\" with a monitor attached")
+            ready(false)
+            return
+        }
         if a == .create, let why = reasonToSkip() {
             lifecycle.lost()  // stays off for this session; sessionActive is remembered
             skippedReason = why
@@ -143,7 +153,7 @@ final class VirtualDisplayManager: @unchecked Sendable {
     }
 
     func sessionEnded() {
-        perform(lifecycle.sessionEnded(now: Self.now(), onlyDisplay: isOnlyDisplay), reason: "viewer disconnected")
+        perform(lifecycle.sessionEnded(now: Self.now(), onlyDisplay: isOnlyDisplay, wanted: wanted), reason: "viewer disconnected")
     }
 
     func owns(_ id: CGDirectDisplayID) -> Bool { id != 0 && displayID == id }
@@ -172,11 +182,12 @@ final class VirtualDisplayManager: @unchecked Sendable {
             return true
         }
         note(action: "re-creating for \(p): larger than the \(d.maxPixelsWide)x\(d.maxPixelsHigh) px limit set at creation (\(reason))")
-        let streaming = lifecycle.phase == .inUse
+        // What the new display sets up is decided when it is online (lifecycle.created()), not now.
         release(reason: "re-create", allowDefer: false)
-        create(reason: reason, streaming: streaming) { _ in
+        readyWaiters.append { _ in
             NotificationCenter.default.post(name: NSApplication.didChangeScreenParametersNotification, object: NSApp)
         }
+        create(reason: reason)
         return true
     }
 
@@ -187,6 +198,8 @@ final class VirtualDisplayManager: @unchecked Sendable {
     func setMonitorMode(_ m: VirtualDisplayMonitorMode) {
         persist { $0.whenMonitorAttached = m.rawValue }
         log("virtual display: with a monitor attached: \(m.rawValue) (from the next connection)")
+        // An idle display goes now if "stream" no longer wants one; a connected viewer keeps it.
+        reconfigure(reason: "with a monitor: \(m.rawValue)")
     }
     func setMakeMain(_ on: Bool) {
         persist { $0.makeMain = on }
@@ -199,13 +212,16 @@ final class VirtualDisplayManager: @unchecked Sendable {
 
     /// Before quitting: put the arrangement back and remove the display. Process exit would remove
     /// it too while the displays are awake, but not the arrangement (macOS dissolves a mirror set
-    /// whose master disappears and may leave the monitor in another mode).
-    func shutdown(reason: String) {
-        guard display != nil else { return }
+    /// whose master disappears and may leave the monitor in another mode). Returns the monitor
+    /// that stopped mirroring and when, for `DisplayModeController.restoreBeforeExit`.
+    @discardableResult
+    func shutdown(reason: String) -> (display: CGDirectDisplayID, at: TimeInterval)? {
+        reconcileWork?.cancel(); reconcileWork = nil
+        guard display != nil else { generation += 1; return nil }  // also cancels a pending create
         if Self.allDisplaysAsleep() {
             log("virtual display: every display is asleep; macOS removes display \(displayID ?? 0) at the next display wake")
         }
-        release(reason: reason, allowDefer: false)
+        return release(reason: reason, allowDefer: false)
     }
 
     var sessionHoldsIt: Bool { lifecycle.phase == .inUse && exists }
@@ -239,19 +255,25 @@ final class VirtualDisplayManager: @unchecked Sendable {
     private func perform(_ a: VirtualDisplayLifecycle.Action, reason: String, ready: ((Bool) -> Void)? = nil) {
         // The lifecycle has already moved: a pending linger timer only matters while lingering.
         if case .lingering = lifecycle.phase {} else { lingerTimer?.cancel(); lingerTimer = nil; lingerUntil = nil }
+        if let ready { readyWaiters.append(ready) }
         switch a {
         case .none:
-            ready?(exists)
+            answerReady()
         case .create:
-            create(reason: reason, streaming: lifecycle.phase == .inUse, ready: ready)
+            create(reason: reason)
         case .resume:
-            resume(reason: reason, ready: ready)
+            resume(reason: reason)
+        case .awaitCreation:
+            // Connected while the display is still being created (always-on at launch, a launchd
+            // relaunch with the viewer reconnecting): the creation arranges it for streaming,
+            // because the phase is .inUse when it finishes, and answers this viewer.
+            log("virtual display: \(reason) while it is being created; streaming it once it is online")
         case .standby:
             standby(reason: reason)
-            ready?(exists)
+            answerReady()
         case .destroy:
             release(reason: reason, allowDefer: true)
-            ready?(false)
+            answerReady()
         case let .scheduleTimer(at):
             lingerTimer?.cancel()
             let delay = max(0, at - Self.now())
@@ -259,27 +281,44 @@ final class VirtualDisplayManager: @unchecked Sendable {
                 guard let self else { return }
                 self.lingerTimer = nil
                 self.lingerUntil = nil
-                self.perform(self.lifecycle.timerFired(now: Self.now(), onlyDisplay: self.isOnlyDisplay), reason: "no viewer for \(Int(self.config.keepAlive)) s")
+                self.perform(self.lifecycle.timerFired(now: Self.now(), onlyDisplay: self.isOnlyDisplay, wanted: self.wanted),
+                             reason: "no viewer for \(Int(self.config.keepAlive)) s")
             }
             lingerTimer = work
             lingerUntil = Date().addingTimeInterval(delay)
             log("virtual display: keeping the arrangement for \(Int(delay)) s in case the viewer reconnects")
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
-            ready?(exists)
+            answerReady()
         }
+    }
+
+    /// Gives every owed answer (`readyWaiters`) the current state, unless a creation is in flight:
+    /// that creation answers once the display is online and arranged, or failed.
+    private func answerReady() {
+        guard !lifecycle.creating, !readyWaiters.isEmpty else { return }
+        let w = readyWaiters
+        readyWaiters = []
+        let e = exists
+        w.forEach { $0(e) }
     }
 
     private func reconfigure(reason: String) {
         loadConfig()
-        perform(lifecycle.configure(enabled: active, alwaysOn: config.alwaysOn, keepAlive: config.keepAlive, onlyDisplay: isOnlyDisplay), reason: reason)
+        perform(lifecycle.configure(enabled: active, alwaysOn: config.alwaysOn, keepAlive: config.keepAlive, onlyDisplay: isOnlyDisplay, wanted: wanted),
+                reason: reason)
+    }
+
+    static let streamReason = "a monitor is attached and whenMonitorAttached is \"stream\""
+
+    /// A virtual display is wanted with the displays online now: not with "stream" and a monitor.
+    private var wanted: Bool {
+        VirtualDisplayTopology.wantsVirtual(mode: config.monitorMode, physicalDisplays: Self.physicalDisplays(excluding: displayID).count)
     }
 
     /// Why a connecting viewer should get the physical display instead (nil: use the virtual one).
+    /// ("stream" with a monitor is decided by the lifecycle, `wanted`.)
     private func reasonToSkip() -> String? {
         let physical = Self.physicalDisplays(excluding: displayID)
-        if !VirtualDisplayTopology.wantsVirtual(mode: config.monitorMode, physicalDisplays: physical.count) {
-            return "a monitor is attached and whenMonitorAttached is \"stream\""
-        }
         // The main monitor already shows exactly what the viewer wants: stream it 1:1, change nothing.
         let main = CGMainDisplayID()
         if physical.contains(main), let (p, _) = desiredPlan(), p.matches(CGDisplayCopyDisplayMode(main).map(DisplayModeInfo.init)) {
@@ -300,12 +339,14 @@ final class VirtualDisplayManager: @unchecked Sendable {
         return (p, size)
     }
 
-    private func create(reason: String, streaming: Bool, ready: ((Bool) -> Void)?) {
+    /// Creates the display; once it is online and its mode read back, sets up what the lifecycle
+    /// says *then* (`created()`): a viewer may have connected or left meanwhile.
+    private func create(reason: String) {
         func fail(_ msg: String) {
             note(error: msg)
             log("virtual display: falling back to the physical display")
             lifecycle.lost()
-            ready?(false)
+            answerReady()
         }
         if let why = Self.unavailableReason { fail("unavailable: \(why)"); return }
         guard let (wanted, size) = desiredPlan() else { fail("no usable size for the viewer"); return }
@@ -314,9 +355,15 @@ final class VirtualDisplayManager: @unchecked Sendable {
             releaseOnWake = false
             log("virtual display: reusing display \(d.displayID) (its removal was waiting for the displays to wake)")
             ActiveDisplay.setVirtual(d.displayID, mode: plan?.expected)
-            resume(reason: reason, ready: ready)
+            switch lifecycle.created() {
+            case .streaming: resume(reason: reason)
+            case .standby: standby(reason: "no viewer"); answerReady()
+            case .keep: answerReady()
+            case .discard: release(reason: "no longer wanted", allowDefer: true); answerReady()
+            }
             return
         }
+        lifecycle.recreating()  // (already set when the lifecycle asked for it)
         if display != nil { release(reason: "replaced", allowDefer: false) }
         // The physical display goes back to its own mode before the virtual one takes over.
         DisplayModeController.shared.restorePhysicalBeforeVirtual()
@@ -331,8 +378,9 @@ final class VirtualDisplayManager: @unchecked Sendable {
             Power.wakeDisplay()
         }
         let deadline = Date().addingTimeInterval(stale.isEmpty ? 0 : 3)
+        // Superseded (removed or re-created meanwhile): whoever superseded it answers the viewers.
         func attempt() {
-            guard gen == generation else { ready?(exists); return }
+            guard gen == generation else { answerReady(); return }
             if !Self.staleDisplays(excluding: nil).isEmpty && Date() < deadline {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { attempt() }
                 return
@@ -371,13 +419,20 @@ final class VirtualDisplayManager: @unchecked Sendable {
             let id = d.displayID
             let online = Date().addingTimeInterval(Self.onlineTimeout)
             func poll() {
-                guard gen == generation, display != nil else { ready?(exists); return }
+                guard gen == generation, display != nil else { answerReady(); return }
                 if ActiveDisplay.isOnline(id) {
                     settle(d, p, gen: gen) { [self] _ in
-                        guard gen == generation, display != nil else { ready?(exists); return }
-                        if streaming { _ = setArrangement(streamingArrangement()) } else { standby(reason: "no viewer") }
+                        guard gen == generation, display != nil else { answerReady(); return }
+                        // Decided now, not when the creation started: a viewer that connected
+                        // meanwhile gets the streaming arrangement, and an idle display is hidden.
+                        switch lifecycle.created() {
+                        case .streaming: _ = setArrangement(streamingArrangement())
+                        case .standby: standby(reason: "no viewer")
+                        case .keep: break
+                        case .discard: release(reason: "no longer wanted", allowDefer: true); answerReady(); return
+                        }
                         // A moment for WindowServer to publish the new arrangement before capture starts.
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in ready?(exists) }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in answerReady() }
                     }
                 } else if Date() > online {
                     release(reason: "not online", allowDefer: false)
@@ -393,8 +448,8 @@ final class VirtualDisplayManager: @unchecked Sendable {
 
     /// A viewer connects to the display that already exists (lingering or standby): arrange it for
     /// streaming, size it for this viewer, read the mode back.
-    private func resume(reason: String, ready: ((Bool) -> Void)?) {
-        guard let d = display, !releaseOnWake else { create(reason: reason, streaming: true, ready: ready); return }
+    private func resume(reason: String) {
+        guard let d = display, !releaseOnWake else { create(reason: reason); return }
         // Out of a hidden mirror first: a mirror slave's mode follows its master, not our settings.
         _ = setArrangement(streamingArrangement())
         let gen = generation
@@ -404,43 +459,63 @@ final class VirtualDisplayManager: @unchecked Sendable {
             }
         } else if let (p, _) = desiredPlan(), !p.fits(maxPixelsWide: Int(d.maxPixelsWide), maxPixelsHigh: Int(d.maxPixelsHigh)) {
             release(reason: "viewer outgrew it", allowDefer: false)
-            create(reason: reason, streaming: true, ready: ready)
+            create(reason: reason)
             return
         }
-        guard let p = plan else { ready?(exists); return }
+        guard let p = plan else { answerReady(); return }
         settle(d, p, gen: gen) { [self] _ in
-            guard gen == generation else { ready?(exists); return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in ready?(exists) }
+            guard gen == generation else { answerReady(); return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in answerReady() }
         }
     }
 
     /// No viewer, display kept: give the Mac its arrangement back and hide the display behind the
-    /// main monitor (mirroring it), so the idle display adds no invisible desktop area.
+    /// main monitor (mirroring it), so the idle display adds no invisible desktop area. Re-run on
+    /// display changes, so it follows a new main monitor.
     private func standby(reason: String) {
         guard exists else { return }
-        let target: Arrangement
-        if let m = Self.physicalDisplays(excluding: displayID).first(where: { $0 == mainPhysical() }) ?? Self.physicalDisplays(excluding: displayID).first {
-            target = .hidden(behind: m)
-        } else {
-            target = .none
-        }
-        if setArrangement(target), target != .none { note(action: "idle, hidden behind display \(physicalOf(target) ?? 0) (\(reason))") }
+        let target = standbyTarget()
+        if setArrangement(target), target != .none { note(action: "idle, hidden behind display \(target.physical ?? 0) (\(reason))") }
+    }
+
+    /// Hidden behind the main monitor: the main display if it is physical, else the monitor it is
+    /// hidden behind now (still online), else any monitor; alone without one. A monitor that
+    /// mirrors another monitor (the user's own mirror set) is never the target.
+    private func standbyTarget() -> Arrangement {
+        let physical = Self.physicalDisplays(excluding: displayID)
+        let masters = physical.filter { let m = CGDisplayMirrorsDisplay($0); return m == kCGNullDirectDisplay || m == displayID }
+        let main = CGMainDisplayID()
+        let current = arrangement.physical.flatMap { masters.contains($0) ? $0 : nil }
+        guard let m = masters.first(where: { $0 == main }) ?? current ?? masters.first ?? physical.first else { return .none }
+        return .hidden(behind: m)
     }
 
     /// Restores the arrangement and releases the display. With `allowDefer`, a display whose
     /// screens are all asleep is only taken out of service and released at the next wake (macOS
     /// would defer the removal anyway, and a same-identity display can't be created meanwhile).
-    private func release(reason: String, allowDefer: Bool) {
+    /// Always leaves the arrangement `.none`; a monitor that mirrored it gets its mode restored
+    /// even if ending the mirror failed (removing the display ends it). Returns that monitor.
+    @discardableResult
+    private func release(reason: String, allowDefer: Bool) -> (display: CGDirectDisplayID, at: TimeInterval)? {
         lingerTimer?.cancel(); lingerTimer = nil; lingerUntil = nil
-        guard let d = display else { return }
+        generation += 1  // also cancels a create still waiting for a leftover display to go away
+        guard let d = display else { return nil }
         let id = d.displayID
-        _ = setArrangement(.none)
-        generation += 1
+        let leaving = arrangement.mirroring
+        if !setArrangement(.none) || arrangement != .none {
+            // The transaction failed. Never keep a stale arrangement: `.mirror(P)` would block every
+            // later restore of P (heldByMirror), and the next mirror would save the wrong mode.
+            if let p = leaving {
+                log("virtual display: could not end the mirror of display \(p); removing the display ends it")
+                scheduleRestoreAfterMirror(p)
+            }
+            arrangement = .none
+        }
         ActiveDisplay.setVirtual(nil, mode: nil)
         if allowDefer && Self.allDisplaysAsleep() {
             releaseOnWake = true
             note(action: "display \(id) out of service; removed when the displays wake (\(reason))")
-            return
+            return leaving.map { ($0, Self.now()) }
         }
         releaseOnWake = false
         d.invalidate()
@@ -451,6 +526,12 @@ final class VirtualDisplayManager: @unchecked Sendable {
             guard let self, self.displayID != id, Self.onlineDisplays().contains(id) else { return }
             log("virtual display: display \(id) is still online 4 s after release\(Self.allDisplaysAsleep() ? " (displays asleep: macOS removes it at the next wake)" : "")")
         }
+        return leaving.map { ($0, Self.now()) }
+    }
+
+    /// Gives `p` its own mode back once macOS has settled it after the mirror ended.
+    private func scheduleRestoreAfterMirror(_ p: CGDirectDisplayID) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + ModeRestore.afterMirrorSettle) { DisplayModeController.shared.restoreAfterMirror(p) }
     }
 
     private func screensWoke() {
@@ -467,6 +548,8 @@ final class VirtualDisplayManager: @unchecked Sendable {
     private func terminated(_ gen: Int) {
         guard gen == generation, let d = display else { return }
         note(error: "macOS removed display \(d.displayID)")
+        // The mirror ended with it: the monitor gets its own mode back.
+        if let p = arrangement.mirroring { scheduleRestoreAfterMirror(p) }
         arrangement = .none
         generation += 1
         ActiveDisplay.setVirtual(nil, mode: nil)
@@ -475,6 +558,7 @@ final class VirtualDisplayManager: @unchecked Sendable {
         plan = nil
         releaseOnWake = false
         lifecycle.lost()
+        answerReady()
     }
 
     private func apply(_ p: VirtualDisplayPlan, to d: GLDVirtualDisplay) throws {
@@ -484,7 +568,9 @@ final class VirtualDisplayManager: @unchecked Sendable {
     // MARK: Reading the mode back
 
     /// Waits until macOS shows the planned size, then records the mode it actually uses (capture,
-    /// input mapping and DisplayInfo use it).
+    /// input mapping and DisplayInfo use it). `done` is always called, once: with the mode read
+    /// back, or, if the display was removed, re-created or given a newer plan meanwhile, with the
+    /// mode known now (the newer action reads its own mode back; an old plan is never re-applied).
     ///
     /// The creating process gets no CoreGraphics mode for its own virtual display and AppKit does
     /// not list it, so: CGDisplayBounds (points; reliable in-process) must reach the planned
@@ -494,12 +580,14 @@ final class VirtualDisplayManager: @unchecked Sendable {
     private func settle(_ d: GLDVirtualDisplay, _ p: VirtualDisplayPlan, gen: Int, retried: Bool = false, done: @escaping (DisplayModeInfo) -> Void) {
         let id = d.displayID
         let deadline = Date().addingTimeInterval(2)
+        func superseded() -> Bool { gen != generation || display !== d || plan != p }
+        func known() -> DisplayModeInfo { ActiveDisplay.mode(of: id) ?? p.expected }
         func pointsMatch() -> Bool {
             let b = CGDisplayBounds(id)
             return Int(b.width.rounded()) == p.expected.width && Int(b.height.rounded()) == p.expected.height
         }
         func poll() {
-            guard gen == generation, display === d else { return }
+            if superseded() { done(known()); return }
             if case .hidden = arrangement { done(p.expected); return }  // a mirror slave shows its master's size
             if pointsMatch() { probe(); return }
             if Date() < deadline { DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { poll() }; return }
@@ -512,10 +600,10 @@ final class VirtualDisplayManager: @unchecked Sendable {
             probe()
         }
         func probe() {
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            DispatchQueue.global(qos: .userInitiated).async {
                 let child = DisplayModeProbe.current(of: id)
                 DispatchQueue.main.async {
-                    guard let self, gen == self.generation, self.display === d else { return }
+                    if superseded() { done(known()); return }
                     let b = CGDisplayBounds(id)
                     let actual = Self.conclude(boundsW: Int(b.width.rounded()), boundsH: Int(b.height.rounded()), child: child, plan: p)
                     if !actual.sameSize(p.expected) {
@@ -536,8 +624,58 @@ final class VirtualDisplayManager: @unchecked Sendable {
         return "\(Int(b.width))x\(Int(b.height)) pt"
     }
 
+    // MARK: Display changes
+
     private func screenParametersChanged() {
-        // Nothing to track: the mode only changes when Glide re-applies settings (settle reads it).
+        // The mode only changes when Glide re-applies settings (settle reads it). What does change:
+        // monitors come and go, the lid opens or closes. Re-evaluated once the burst settles.
+        reconcileWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.reconcileWork = nil
+            self?.displaysChanged()
+        }
+        reconcileWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.reconcileDelay, execute: work)
+    }
+
+    /// Brings the arrangement in line with the displays online now (VirtualDisplayLayout.reconcile)
+    /// and re-evaluates an idle display (VirtualDisplayLifecycle.displaysChanged): removed when it
+    /// is no longer the only display and isn't always-on (or "stream" no longer wants it), hidden
+    /// behind the new main monitor when always-on.
+    private func displaysChanged() {
+        guard started, active, !lifecycle.creating else { return }
+        if let v = displayID, !releaseOnWake {
+            let others = Self.onlineDisplays().filter { $0 != v && !Self.isGlideDisplay($0) }.map {
+                VirtualDisplayTopology.Display(id: $0, mirrorOf: CGDisplayMirrorsDisplay($0))
+            }
+            for fix in VirtualDisplayLayout.reconcile(arrangement, virtual: v, streaming: lifecycle.phase == .inUse, mode: config.monitorMode, displays: others) {
+                switch fix {
+                case let .forget(p):
+                    let was = arrangement
+                    arrangement = .none
+                    switch was {
+                    case .mirror:
+                        // No transaction on an offline display; its mode is restored when it is back.
+                        note(action: "display \(p) went offline while it mirrored the virtual display")
+                        DisplayModeController.shared.restoreAfterMirror(p)
+                    case .hidden:
+                        note(action: "display \(p), which the idle display was hidden behind, went offline")
+                        if CGDisplayMirrorsDisplay(v) != kCGNullDirectDisplay { _ = Self.configure { CGConfigureDisplayMirrorOfDisplay($0, v, kCGNullDirectDisplay) } }
+                    case .extendMain, .none:
+                        note(action: "display \(p) went offline")
+                    }
+                case let .unmirror(p):
+                    // Typically the built-in panel coming back (lid opened) still in the mirror set.
+                    let ok = Self.configure { CGConfigureDisplayMirrorOfDisplay($0, p, kCGNullDirectDisplay) }
+                    note(action: "display \(p) came back mirroring the virtual display: \(ok ? "mirror ended" : "could not end the mirror")")
+                    scheduleRestoreAfterMirror(p)
+                case let .adopt(p):
+                    arrangement = .mirror(physical: p)
+                    note(action: "display \(p) came back and mirrors the virtual display again")
+                }
+            }
+        }
+        perform(lifecycle.displaysChanged(onlyDisplay: isOnlyDisplay, wanted: wanted), reason: "displays changed")
     }
 
     // MARK: Arrangement
@@ -548,17 +686,9 @@ final class VirtualDisplayManager: @unchecked Sendable {
     private func mainPhysical() -> CGDirectDisplayID? {
         if case let .mirror(p) = arrangement { return p }
         if case let .extendMain(prev) = arrangement { return prev }
-        if case let .hidden(p) = arrangement { return p }
+        if case let .hidden(p) = arrangement, Self.onlineDisplays().contains(p) { return p }
         let main = CGMainDisplayID()
         return main == displayID ? nil : main
-    }
-
-    private func physicalOf(_ a: Arrangement) -> CGDirectDisplayID? {
-        switch a {
-        case let .mirror(p), let .hidden(p): return p
-        case let .extendMain(p): return p
-        case .none: return nil
-        }
     }
 
     /// The arrangement for streaming (VirtualDisplayTopology, unit-tested).
@@ -608,11 +738,16 @@ final class VirtualDisplayManager: @unchecked Sendable {
         // Remember the monitor's own mode before it mirrors us: macOS switches a mirror slave to a
         // matching mode (and normally restores it when the mirror ends; if it doesn't, Glide does).
         if case let .mirror(p) = target { DisplayModeController.shared.rememberBeforeMirror(p) }
+        let online = Self.onlineDisplays()
         let ok = Self.configure { cfg in
             switch from {
             case let .mirror(p):
-                CGConfigureDisplayMirrorOfDisplay(cfg, p, kCGNullDirectDisplay)
-                CGConfigureDisplayOrigin(cfg, p, 0, 0)
+                // A monitor that went offline (lid closed) is left out: configuring an offline
+                // display fails the whole transaction.
+                if online.contains(p) {
+                    CGConfigureDisplayMirrorOfDisplay(cfg, p, kCGNullDirectDisplay)
+                    CGConfigureDisplayOrigin(cfg, p, 0, 0)
+                }
                 if target == .none {  // keep the (soon removed) virtual display out of the way, to the right
                     let w = DisplayModeController.shared.rememberedMode(of: p)?.width ?? Int(CGDisplayBounds(p).width)
                     CGConfigureDisplayOrigin(cfg, v, Int32(clamping: w), 0)
@@ -642,7 +777,7 @@ final class VirtualDisplayManager: @unchecked Sendable {
         if case let .mirror(p) = from {
             log("virtual display: display \(p) no longer mirrors it")
             // macOS normally gives the monitor its mode back; check after it settles.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { DisplayModeController.shared.restoreAfterMirror(p) }
+            scheduleRestoreAfterMirror(p)
         }
         return true
     }

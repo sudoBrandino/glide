@@ -37,12 +37,14 @@ larger than the viewer's desktop are shrunk to fit when the mirror starts, exact
 used to switch your monitor's mode. They are not moved to another screen.
 
 When the viewer disconnects, Glide waits `keepAliveSeconds` (10 s) in case it reconnects, then
-ends the mirror, gives your monitor its own mode back, and removes the virtual display. Every
-arrangement change is made `.forSession`, so nothing survives logout.
+ends the mirror, gives your monitor its own mode back (same size **and refresh rate**), and removes
+the virtual display. Every arrangement change is made `.forSession`, so nothing survives logout.
 
 **Without a monitor** (headless, or a laptop with the lid closed and no external display): the
 virtual display is the Mac's only screen, so it is the main display by itself. It is kept when the
-viewer disconnects, because removing the Mac's only screen would leave it with none.
+viewer disconnects, because removing the Mac's only screen would leave it with none. If a monitor
+is plugged in or the lid opens later, Glide removes the idle display (or, with `lifetime:
+"always"`, hides it behind the new main monitor); see "Display changes" below.
 
 **If your main monitor already matches the viewer exactly** (same points and pixels, for example a
 4K monitor at "looks like 1920×1080" and a 4K viewer on Retina), Glide streams the monitor directly
@@ -57,7 +59,9 @@ and creates nothing.
 | (c) Stream the monitor | everything | untouched | untouched, but captured at its own size (4608 px downscaled) or mode-switched | used automatically when it already matches; otherwise the old path |
 
 Extend (`"extend"`, made main by default) and stream (`"stream"`) are available in the menu and
-in host.json.
+in host.json. `"stream"` means no virtual display at all while a monitor is attached, even with
+`lifetime: "always"`: an idle always-on display is removed when you pick it (or when a monitor is
+plugged in), and created again when the Mac has no monitor.
 
 Sleep: a session keeps the displays awake (as before). When idle, the displays sleep normally.
 
@@ -77,9 +81,9 @@ Sleep: a session keeps the displays awake (as before). When idle, the displays s
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Master switch. `false` opts out. A `--display N` pin also turns the default off; set `true` explicitly to use both. |
-| `whenMonitorAttached` | `"mirror"` | `"mirror"`: the main monitor mirrors the virtual display while a viewer is connected. `"extend"`: the virtual display sits beside your monitors. `"stream"`: no virtual display while a monitor is attached (the old behavior). |
+| `whenMonitorAttached` | `"mirror"` | `"mirror"`: the main monitor mirrors the virtual display while a viewer is connected. `"extend"`: the virtual display sits beside your monitors. `"stream"`: no virtual display while a monitor is attached, always-on included (the old behavior). |
 | `makeMain` | `true` | `"extend"` only: make the virtual display the main display (menu bar, Dock, new windows) while it is streamed. |
-| `lifetime` | `"session"` | `"session"`: created when a viewer connects, removed `keepAliveSeconds` after it leaves (kept if it is the only display). `"always"`: created at launch and kept; when idle it hides behind your monitor (it mirrors it), so it adds no invisible desktop area. |
+| `lifetime` | `"session"` | `"session"`: created when a viewer connects, removed `keepAliveSeconds` after it leaves (kept while it is the only display). `"always"`: created at launch and kept; when idle it hides behind your main monitor (it mirrors it), so it adds no invisible desktop area. Not with `"stream"` while a monitor is attached. |
 | `keepAliveSeconds` | `10` | After a disconnect, keep the streaming arrangement this long, so a quick reconnect changes nothing. `0` = at once. |
 | `refreshRate` | unset | Panel refresh rate in Hz (24–240). Unset: the viewer's monitor refresh rate (ClientHello `max_fps`, which the Windows viewer fills from its monitor), else 120 Hz. If macOS refuses the rate, Glide uses 60 Hz. |
 | `width`, `height` | unset | Fixed panel size in pixels instead of the viewer's size. |
@@ -134,7 +138,12 @@ What Glide does about it:
   asleep at that moment, Glide takes it out of service (it is no longer streamed or listed) and
   releases it at the next display wake, or reuses it if a viewer connects first.
 - Before releasing, Glide always ends the mirror explicitly and restores your monitor's mode. That
-  includes Quit, Restart, `SIGTERM` (`launchctl`, install scripts) and `SIGINT`.
+  includes Quit, Restart, `SIGTERM` (`launchctl`, install scripts) and `SIGINT`: Glide ends the
+  mirror and removes the display first, waits about 1.5 s for macOS to give the monitor a mode of
+  its own (a restore before that is undone by macOS), restores the saved mode synchronously, clears
+  `display.restore`, and only then exits. A mode Glide switched on a monitor it streamed directly
+  (virtual display off) is restored on exit too. If ending the mirror fails, Glide still forgets
+  the mirror (removing the display ends it) and restores the monitor's mode.
 - At startup and before creating a display, Glide looks for a leftover Glide display (same
   vendor/product). If one exists, it wakes the displays (a connecting session wakes them anyway),
   waits up to 3 s for macOS to finish the removal, and then uses serial 2 if serial 1 is still
@@ -186,7 +195,38 @@ physical display is touched:
   it had: a `.forSession` switch, or a new display's first default, is lost. So Glide remembers your
   monitor's mode before mirroring (persisted in host.json `display.restore`, so a crash is covered
   by the startup restore) and puts it back if macOS didn't.
+- A restore that is already pending for the monitor is **never overwritten** by the next mirror:
+  the pending mode is the monitor's own, while the current one may already be the mirrored mode (an
+  earlier mirror whose restore failed or is still due, or a mode switch while the display was being
+  created). If a restore for another connected display is pending, the monitor's mode isn't saved
+  (one slot); a pending restore for a display that is no longer connected is replaced.
+- The saved mode records the monitor by its §3.5 identity (`display.restoreIdentity`: vendor,
+  model, serial), because display IDs are reused after a reboot or a replug. At startup and on
+  every restore Glide finds the monitor by identity: the same ID with the same hardware, else the
+  same vendor/model/serial, else (no serial) the only display with that vendor/model; never a
+  different monitor that got the old ID. Files written before this (`display.restoreDisplay`
+  only) still work by the bare ID. A restore whose monitor isn't connected is kept until it is.
+- The restore matches **size and refresh rate** (within 0.5 Hz), so a 165 or 240 Hz monitor that
+  mirrored a 60 Hz virtual display comes back at 165/240 Hz. If that rate no longer exists, the same
+  size at the closest rate is used.
 - Settings applied to a mirror slave take effect only once it is master again.
+
+## Display changes
+
+Glide re-evaluates the virtual display 0.5 s after a burst of display changes (monitor plugged or
+unplugged, lid opened or closed):
+
+- **Idle, and no longer the only display** (a monitor was plugged in or the lid opened on a
+  headless Mac): a per-session display is removed; an always-on one is hidden behind the new main
+  monitor. With `"stream"`, an idle display is removed either way.
+- **A monitor in the arrangement went offline** (the lid closed while the built-in panel mirrored
+  the virtual display, or the idle display was hidden behind it): Glide forgets it without a
+  display-configuration transaction on the offline display (one would fail the whole transaction),
+  and restores its saved mode once it is back.
+- **A monitor comes back still mirroring the virtual display** (macOS can bring the built-in panel
+  back in its mirror set when the lid opens): while idle, Glide ends that mirror and restores the
+  monitor's mode; while streaming with `"mirror"`, it takes the monitor as the streaming mirror.
+- A connected viewer keeps the display; the changes above apply when it is idle.
 
 ## How it fits in
 
@@ -194,8 +234,14 @@ physical display is touched:
   - `VirtualDisplayConfig`: host.json and the refresh-rate choice.
   - `VirtualDisplayPlan`: the mode for a viewer, the 6K creation limits, and the "monitor already
     matches" check.
-  - `VirtualDisplayLifecycle`: create, resume, standby and destroy.
+  - `VirtualDisplayLifecycle`: create, resume, standby and destroy; what a finished creation
+    sets up (decided by the phase when it finishes, not when it started); display changes;
+    "stream" with a monitor (`wanted`).
   - `VirtualDisplayTopology`: mirror, extend or alone.
+  - `VirtualDisplayLayout`: the arrangement, and `reconcile` for displays that went offline or came
+    back mirroring.
+  - `ModeRestore` and `DisplaySettings`: which display a saved mode belongs to (by identity),
+    whether a mirror may save one, and the restore match (size and refresh rate).
   - `DisplayModeInfo.parseListing`: the child read-back.
 - `CGlideVirtualDisplay` is a small Objective-C target that wraps the private classes (see "API
   surface").
@@ -220,6 +266,14 @@ Sequence on connect:
    its mode back.
 6. The streaming arrangement is set up: the monitor mirrors it, or it extends.
 7. `ActiveDisplay.current()` returns it, and capture starts.
+
+A viewer that connects while the display is still being created (an always-on display right after
+launch, for example after Restart or a launchd relaunch with the viewer reconnecting) waits for
+that creation, which sets up the streaming arrangement because a viewer is connected when it
+finishes; it never hides the display under a session. Every wait answers: if the display is removed,
+re-created or re-planned meanwhile, the session is told what is known now, and
+`DisplayModeController` starts the session anyway after 16 s. An older plan's read-back never
+re-applies its settings after a newer plan.
 
 If anything fails, the error is logged and shown in the menu, and Glide serves the physical
 display.
@@ -348,7 +402,8 @@ stand-in's persisted mode instead of its previous one, which the test reports as
   wake the displays: move the mouse, or run `caffeinate -u -t 2`. Otherwise it goes at logout or
   reboot.
 - Arrangement changes are `.forSession` and end at logout. Your monitor's mode is restored when
-  the mirror ends (and at the next host start after a crash).
+  the mirror ends, on Quit, Restart and termination signals, and at the next host start after a
+  crash.
 
 ## References
 

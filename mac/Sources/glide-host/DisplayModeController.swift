@@ -2,25 +2,7 @@ import AppKit
 import CoreGraphics
 import GlideCore
 
-/// Display settings persisted in host.json under "display". Stored as strings and parsed leniently:
-/// a typo must never make host.json undecodable (HostConfig.load would then fall back to defaults).
-struct DisplaySettings: Codable, Equatable {
-    /// automatic | crisp | smooth | retina | manual (default automatic)
-    var mode: String?
-    /// What automatic picks for 4K-class viewers: retina (looks like 1920x1080) | smooth (looks like 2560x1440)
-    var highDPIViewer: String?
-    /// Restore the pre-session display mode when the viewer disconnects (default true).
-    var restoreOnDisconnect: Bool?
-    /// The mode to restore (set when Glide first switches the mode; cleared once restored).
-    var restore: DisplayModeInfo?
-    /// The display `restore` belongs to (nil in files written before multi-display support: the
-    /// display being served).
-    var restoreDisplay: UInt32?
-
-    var preference: DisplayModePreference { mode.flatMap { DisplayModePreference(rawValue: $0.lowercased()) } ?? .automatic }
-    var highDPIChoice: HighDPIViewerChoice { highDPIViewer.flatMap { HighDPIViewerChoice(rawValue: $0.lowercased()) } ?? .retina }
-    var restoreEnabled: Bool { restoreOnDisconnect ?? true }
-}
+// DisplaySettings (host.json "display") lives in GlideCore/ModeRestore.swift.
 
 extension HostConfig {
     /// Read-modify-write of host.json that refuses to write if the file can't be decoded
@@ -65,6 +47,8 @@ final class DisplayModeController: @unchecked Sendable {
     /// re-entrantly, before CGCompleteDisplayConfiguration returns).
     private var notifiedSinceSwitch = false
     private var pendingRestore: DispatchWorkItem?
+    /// A restore is waiting for its display to come back online (lid closed, unplugged).
+    private var awaitingDisplay = false
     private var viewDebounce: DispatchWorkItem?
     private var settleWaiters: [() -> Void] = []
     /// Human-readable last action, for the menu.
@@ -79,6 +63,9 @@ final class DisplayModeController: @unchecked Sendable {
     static let restoreGrace: TimeInterval = 10      // reconnects within this keep the mode
     static let startupRestoreGrace: TimeInterval = 30
     static let viewSizeDebounce: TimeInterval = 0.6
+    /// Longest wait for the virtual display before a session starts anyway: leftover removal (3 s),
+    /// coming online (4 s), read-back with one re-apply (4 s) and the child probe (3 s).
+    static let virtualDisplayTimeout: TimeInterval = 16
 
     // MARK: Setup
 
@@ -104,7 +91,14 @@ final class DisplayModeController: @unchecked Sendable {
             log("display: policy \(settings.preference.rawValue) (4K viewers: \(settings.highDPIChoice.rawValue)), restore on disconnect \(settings.restoreEnabled ? "on" : "off"), current \(tracker.expected.map { "\($0)" } ?? "?")")
             if let r = settings.restore {
                 // Left over from a previous run (crash/update mid-session). A reconnecting viewer cancels this.
-                log("display: pending restore to \(r) from a previous run (in \(Int(Self.startupRestoreGrace))s unless a viewer connects)")
+                // Matched by identity: display IDs are reused after a reboot or replug.
+                let on: String
+                switch restoreDestination() {
+                case let .display(id): on = " on display \(id)"
+                case .notConnected: on = " (its display isn't connected; restored when it is)"
+                case .served: on = ""
+                }
+                log("display: pending restore to \(r)\(on) from a previous run (in \(Int(Self.startupRestoreGrace))s unless a viewer connects)")
                 scheduleRestore(after: Self.startupRestoreGrace, reason: "previous run")
             }
         }
@@ -125,15 +119,26 @@ final class DisplayModeController: @unchecked Sendable {
             // The virtual display (on by default) is created first, sized to this viewer's pixels
             // and refresh rate; once it is online it is `displayID` and the policy below applies to
             // it like to any display.
-            VirtualDisplayManager.shared.sessionBegan(viewerHz: viewerHz) { [self] _ in
+            // Answered once: by the virtual display, or by the fallback timeout if it never answers
+            // (the session must start streaming either way).
+            var answered = false
+            let proceed = { [self] in
+                guard !answered else { return }
+                answered = true
                 guard owner == id else { return }
                 trackedDisplay = displayID
                 tracker.reset(current: currentMode())
-                if settings.restore != nil, let rd = settings.restoreDisplay, rd != displayID {
+                if settings.restore != nil, case let .display(rd) = restoreDestination(), rd != displayID {
                     // Left by a session that streamed another display (§3.5): that display isn't watched now.
-                    if settings.restoreEnabled && ActiveDisplay.isOnline(rd) { restore(reason: "display \(rd) not streamed now") } else { setRestoreTarget(nil) }
+                    if settings.restoreEnabled { restore(reason: "display \(rd) not streamed now") } else { setRestoreTarget(nil) }
                 }
                 if applyPolicy(reason: "viewer connected") { waitForSettle(then) } else { then() }
+            }
+            VirtualDisplayManager.shared.sessionBegan(viewerHz: viewerHz) { _ in proceed() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.virtualDisplayTimeout) {
+                guard !answered else { return }
+                log("display: the virtual display didn't answer within \(Int(Self.virtualDisplayTimeout)) s; starting the session with display \(ActiveDisplay.current())")
+                proceed()
             }
         }
     }
@@ -224,7 +229,7 @@ final class DisplayModeController: @unchecked Sendable {
 
     func setRestoreOnDisconnect(_ on: Bool) { persist { $0.restoreOnDisconnect = on } }
 
-    /// Restore the pre-Glide mode immediately (menu action / quitting). Mid-session this also stops
+    /// Restore the pre-Glide mode immediately (menu action). Mid-session this also stops
     /// auto-switching for the rest of the session.
     func restoreNow(reason: String) {
         if owner != nil { userOverride = true }
@@ -267,10 +272,10 @@ final class DisplayModeController: @unchecked Sendable {
         return ok
     }
 
-    private func scheduleRestore(after: TimeInterval, reason: String) {
+    private func scheduleRestore(after: TimeInterval, reason: String, evenInSession: Bool = false) {
         pendingRestore?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.owner == nil else { return }
+            guard let self, evenInSession || self.owner == nil else { return }
             self.pendingRestore = nil
             self.restore(reason: reason)
         }
@@ -287,24 +292,53 @@ final class DisplayModeController: @unchecked Sendable {
 
     /// A monitor is about to mirror the virtual display (macOS gives a mirror slave a matching
     /// mode): remember its own mode, persisted, so it comes back even after a crash (startup restore).
+    /// A restore already pending for this monitor is never overwritten: it holds the monitor's real
+    /// mode, and the current one may already be Glide's (an earlier mirror whose restore failed or
+    /// is still due, or a switch while the display was created).
     func rememberBeforeMirror(_ display: CGDirectDisplayID) {
         loadSettings()
-        guard settings.restore == nil || settings.restoreDisplay == display, let m = currentMode(of: display) else { return }
-        guard settings.restore != m || settings.restoreDisplay != display else { return }
-        persist { $0.restore = m; $0.restoreDisplay = display }
-        log("display: remembering display \(display)'s mode \(m) while it mirrors the virtual display")
+        switch ModeRestore.beforeMirror(pending: settings.restore == nil ? nil : restoreDestination(), display: display, served: displayID) {
+        case .keepPending:
+            log("display: display \(display) mirrors the virtual display; keeping its saved mode \(settings.restore.map { "\($0)" } ?? "?")")
+        case .otherPending:
+            log("display: display \(display) mirrors the virtual display; not saving its mode (a restore for another display is pending)")
+        case .remember:
+            guard let m = currentMode(of: display) else { return }
+            awaitingDisplay = false
+            persist { $0.restore = m; $0.restoreDisplay = display; $0.restoreIdentity = Self.identity(of: display) }
+            log("display: remembering display \(display)'s mode \(m) @ \(Int(m.refreshRate.rounded())) Hz while it mirrors the virtual display")
+        }
     }
 
     /// The mode remembered for `display` (rememberBeforeMirror or an earlier switch), if any.
     func rememberedMode(of display: CGDirectDisplayID) -> DisplayModeInfo? {
-        settings.restoreDisplay == display ? settings.restore : nil
+        restoreDestination() == .display(display) ? settings.restore : nil
     }
 
     /// The mirror ended: give the monitor its own mode back if macOS didn't (this is the user's
     /// mode, so it is restored regardless of "restore on disconnect").
     func restoreAfterMirror(_ display: CGDirectDisplayID) {
-        guard settings.restore != nil, settings.restoreDisplay == display else { return }
-        restore(reason: "mirror ended")
+        guard settings.restore != nil else { return }
+        switch restoreDestination() {
+        case let .display(id) where id == display: restore(reason: "mirror ended")
+        case .notConnected: restore(reason: "mirror ended")  // went offline while mirroring: restored when it is back
+        default: return
+        }
+    }
+
+    /// Quit, Restart, SIGTERM, SIGINT, after `VirtualDisplayManager.shutdown` (which ended the
+    /// mirror of `unmirrored`, if any): restores the saved mode now, synchronously, because the
+    /// process exits right after. A monitor that just stopped mirroring first gets the time macOS
+    /// takes to give it a mode of its own (else macOS undoes the restore); the wait is bounded.
+    func restoreBeforeExit(reason: String, unmirrored: (display: CGDirectDisplayID, at: TimeInterval)?) {
+        loadSettings()
+        pendingRestore?.cancel(); pendingRestore = nil
+        guard settings.restore != nil else { return }
+        if let u = unmirrored, restoreDestination() == .display(u.display) {
+            let wait = min(ModeRestore.afterMirrorSettle, max(0, u.at + ModeRestore.afterMirrorSettle - ProcessInfo.processInfo.systemUptime))
+            if wait > 0 { Thread.sleep(forTimeInterval: wait) }  // not the run loop: nothing else may run while exiting
+        }
+        restore(reason: reason)
     }
 
     /// `display` currently mirrors Glide's virtual display: its mode follows the mirror, so a
@@ -315,24 +349,54 @@ final class DisplayModeController: @unchecked Sendable {
         return CGDisplayMirrorsDisplay(display) == v
     }
 
+    /// Where the saved restore applies now, by identity (display IDs are reused after a reboot or
+    /// a replug; files without an identity use the saved ID).
+    private func restoreDestination() -> ModeRestore.Target {
+        ModeRestore.resolve(identity: settings.restoreIdentity, legacyID: settings.restoreDisplay, online: Self.onlineIdentities())
+    }
+
+    /// The resolved display, or the served one for files written before multi-display support.
+    private func restoreTargetID() -> CGDirectDisplayID? {
+        switch restoreDestination() {
+        case let .display(id): return id
+        case .served: return displayID
+        case .notConnected: return nil
+        }
+    }
+
     private func restore(reason: String) {
         pendingRestore?.cancel(); pendingRestore = nil
         guard let r = settings.restore else { return }
         // The display Glide switched, which need not be the one served now (§3.5 selection).
-        let target = settings.restoreDisplay ?? displayID
-        if heldByMirror(target) { log("display: display \(target) mirrors the virtual display; restoring \(r) when the mirror ends"); return }
-        setRestoreTarget(nil)
+        guard let target = restoreTargetID() else {
+            // Kept (persisted) until the display is back: restored then, or at the next start.
+            awaitingDisplay = true
+            log("display: display for the saved mode \(r) isn't connected; restoring it when it is back"); return
+        }
         if ActiveDisplay.isVirtual(target) {  // a saved mode belongs to a physical display
+            setRestoreTarget(nil)
             log("display: not restoring \(r) onto the virtual display; dropped"); return
         }
-        guard ActiveDisplay.isOnline(target) else { log("display: can't restore \(r): display \(target) is offline"); return }
-        if let cur = currentMode(of: target), cur.sameSize(r) { return }
-        guard let mode = modes(of: target).first(where: { $0.info.sameSize(r) })?.mode else {
-            log("display: can't restore \(r) on display \(target): mode no longer available"); return
+        guard ActiveDisplay.isOnline(target) else {
+            awaitingDisplay = true
+            log("display: display \(target) is offline; restoring \(r) when it is back"); return
         }
-        let ok = configure(mode, on: target, from: currentMode(of: target))
-        lastAction = "\(ok ? "restored" : "FAILED to restore") \(r)\(target != displayID ? " on display \(target)" : "") (\(reason))"
-        log("display: " + lastAction!)
+        if heldByMirror(target) { log("display: display \(target) mirrors the virtual display; restoring \(r) when the mirror ends"); return }
+        awaitingDisplay = false
+        setRestoreTarget(nil)
+        let all = modes(of: target)
+        switch ModeRestore.choose(saved: r, current: currentMode(of: target), available: all.map(\.info)) {
+        case .alreadyThere:
+            return
+        case .unavailable:
+            log("display: can't restore \(r) on display \(target): mode no longer available")
+        case let .switchTo(m):
+            guard let mode = all.first(where: { $0.info == m })?.mode else { return }
+            let ok = configure(mode, on: target, from: currentMode(of: target))
+            let rate = ModeRestore.sameRate(m.refreshRate, r.refreshRate) ? "" : " (\(Int(r.refreshRate.rounded())) Hz is gone; \(Int(m.refreshRate.rounded())) Hz)"
+            lastAction = "\(ok ? "restored" : "FAILED to restore") \(m) @ \(Int(m.refreshRate.rounded())) Hz\(rate)\(target != displayID ? " on display \(target)" : "") (\(reason))"
+            log("display: " + lastAction!)
+        }
     }
 
     private func configure(_ mode: CGDisplayMode, on display: CGDirectDisplayID? = nil, from: DisplayModeInfo?) -> Bool {
@@ -368,15 +432,17 @@ final class DisplayModeController: @unchecked Sendable {
         userOverride = false
         log("display: now serving display \(displayID) (was \(old)), current \(currentMode().map { "\($0)" } ?? "?")")
         if settings.restore != nil {
-            let rd = settings.restoreDisplay ?? old
-            if rd != displayID {
+            let target = restoreDestination()
+            let rd: CGDirectDisplayID? = target == .served ? old : { if case let .display(id) = target { return id }; return nil }()
+            if let rd, rd != displayID {
                 if owner != nil && settings.restoreEnabled && ActiveDisplay.isOnline(rd) {
                     restore(reason: "display \(rd) no longer streamed")
-                } else if owner != nil || !ActiveDisplay.isOnline(rd) {
+                } else if owner != nil && ActiveDisplay.isOnline(rd) {
                     log("display: dropping pending restore (it was for display \(rd))")
                     pendingRestore?.cancel(); pendingRestore = nil
                     setRestoreTarget(nil)
-                }  // else: no viewer, and the pending restore (grace period) still handles display rd
+                }  // else: no viewer, and the pending restore (grace period) still handles display rd;
+                   // or display rd is offline: kept until it is back (screenParametersChanged)
             }
         }
         tracker.reset(current: currentMode())
@@ -390,6 +456,13 @@ final class DisplayModeController: @unchecked Sendable {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { w.forEach { $0() } }
         }
         notifiedSinceSwitch = true
+        // The display a saved mode belongs to is back (lid opened, replugged): restore it once it settled.
+        if awaitingDisplay, settings.restore != nil, case let .display(t) = restoreDestination(), ActiveDisplay.isOnline(t),
+           !heldByMirror(t), owner == nil || t != displayID {
+            awaitingDisplay = false
+            log("display: display \(t) is back; restoring its saved mode")
+            scheduleRestore(after: ModeRestore.afterMirrorSettle, reason: "display \(t) is back", evenInSession: owner != nil)
+        }
         if displayID != trackedDisplay {
             // Lid closed/opened, monitor swapped or the selected display went away/came back:
             // modes of the old display mean nothing here.
@@ -427,10 +500,26 @@ final class DisplayModeController: @unchecked Sendable {
 
     private func setRestoreTarget(_ m: DisplayModeInfo?) {
         // A monitor mirroring the virtual display keeps its remembered mode until the mirror ends.
-        if m == nil, let rd = settings.restoreDisplay, heldByMirror(rd) { return }
+        if m == nil, let rd = restoreTargetID(), heldByMirror(rd) { return }
         let d = m == nil ? nil : UInt32(trackedDisplay)
-        guard settings.restore != m || settings.restoreDisplay != d else { return }
-        persist { $0.restore = m; $0.restoreDisplay = d }
+        let ident = d.map(Self.identity(of:))
+        guard settings.restore != m || settings.restoreDisplay != d || settings.restoreIdentity != ident else { return }
+        if m == nil { awaitingDisplay = false }
+        persist { $0.restore = m; $0.restoreDisplay = d; $0.restoreIdentity = ident }
+    }
+
+    /// The §3.5 identity a saved mode is matched by (the name is informational).
+    static func identity(of id: CGDirectDisplayID) -> DisplayIdentity {
+        DisplayIdentity(id: id, vendor: CGDisplayVendorNumber(id), model: CGDisplayModelNumber(id), serial: CGDisplaySerialNumber(id),
+                        name: ActiveDisplay.descriptor(id)?.name ?? "")
+    }
+
+    /// Every online display except Glide's virtual ones, mirrored ones included (a monitor that
+    /// mirrors the virtual display is still the display a saved mode belongs to).
+    static func onlineIdentities() -> [DisplayIdentity] {
+        VirtualDisplayManager.physicalDisplays(excluding: nil).map {
+            DisplayIdentity(id: $0, vendor: CGDisplayVendorNumber($0), model: CGDisplayModelNumber($0), serial: CGDisplaySerialNumber($0), name: "")
+        }
     }
 
     private func persist(_ f: (inout DisplaySettings) -> Void) {
@@ -453,6 +542,15 @@ final class DisplayModeController: @unchecked Sendable {
     func currentMode(of display: CGDirectDisplayID? = nil) -> DisplayModeInfo? {
         ActiveDisplay.mode(of: display ?? displayID)
     }
+}
+
+/// Quit, Restart, SIGTERM and SIGINT (main thread): end the mirror and remove the virtual display
+/// first, then give the monitor its own mode back synchronously, so the restore isn't deferred
+/// behind a mirror that is about to end, nor lost to the exit that follows. Clears host.json
+/// `display.restore` once restored.
+func restoreDisplaysBeforeExit(reason: String) {
+    let unmirrored = VirtualDisplayManager.shared.shutdown(reason: reason)
+    DisplayModeController.shared.restoreBeforeExit(reason: reason, unmirrored: unmirrored)
 }
 
 extension DisplayModeInfo {

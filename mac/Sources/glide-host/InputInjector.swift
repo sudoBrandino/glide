@@ -43,7 +43,12 @@ final class InputInjector {
         if let v = env["GLIDE_SCROLL_PIXELS"].flatMap(Double.init), v > 0, v <= 1000 { scroller.pixelsPerNotch = v }
     }
 
-    func setDisplay(_ id: CGDirectDisplayID) { displayID = id }
+    func setDisplay(_ id: CGDirectDisplayID) {
+        // The last position belongs to the old display's rectangle; relative motion would continue
+        // from there (off the new display, or clamped to its edge).
+        if displayID != id { lastPos = nil }
+        displayID = id
+    }
 
     private var bounds: CGRect {
         let id = displayID.flatMap { ActiveDisplay.isOnline($0) ? $0 : nil } ?? ActiveDisplay.current()
