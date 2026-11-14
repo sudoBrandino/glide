@@ -1964,6 +1964,7 @@ def main():
         sys.exit(0)
     if args.display_vectors:
         open(args.display_vectors, "w").write(display_vectors_json())
+        sys.exit(0)
     if args.input_vectors:
         open(args.input_vectors, "w").write(input_vectors_json())
         sys.exit(0)
