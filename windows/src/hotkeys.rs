@@ -28,6 +28,8 @@ pub enum Action {
     /// Stream the Mac display to the right / left of the current one (PROTOCOL.md §3.5).
     NextDisplay,
     PrevDisplay,
+    /// Relative mouse ("pointer lock") for games and 3D apps (PROTOCOL.md §3.6).
+    ToggleRelativeMouse,
 }
 
 impl Action {
@@ -51,6 +53,7 @@ impl Action {
             "latency" | "l" => Action::LatencyTest,
             "nextdisplay" | "right" => Action::NextDisplay,
             "prevdisplay" | "left" => Action::PrevDisplay,
+            "relative" | "g" => Action::ToggleRelativeMouse,
             _ => return None,
         })
     }
@@ -60,6 +63,7 @@ impl Action {
 pub const KEY_A: u16 = 0x04;
 pub const KEY_D: u16 = 0x07;
 pub const KEY_F: u16 = 0x09;
+pub const KEY_G: u16 = 0x0A;
 pub const KEY_H: u16 = 0x0B;
 pub const KEY_K: u16 = 0x0E;
 pub const KEY_L: u16 = 0x0F;
@@ -88,6 +92,7 @@ pub const TABLE: &[(u16, Action, &str)] = &[
     (KEY_L, Action::LatencyTest, "Ctrl+Alt+Shift+L  latency test: read the host's test pattern (glide-probe --pattern-only)"),
     (KEY_RIGHT, Action::NextDisplay, "Ctrl+Alt+Shift+→  show the next Mac display (to the right)"),
     (KEY_LEFT, Action::PrevDisplay, "Ctrl+Alt+Shift+←  show the previous Mac display (to the left)"),
+    (KEY_G, Action::ToggleRelativeMouse, "Ctrl+Alt+Shift+G  relative mouse for games / 3D apps (hides and locks the pointer)"),
 ];
 
 pub fn help() -> String {

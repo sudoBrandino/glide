@@ -27,6 +27,7 @@ capture ─► diff ─► encode ─► record layer ─► TCP ─► record l
 | Host | `glide-host/HostFiles.swift` | Per-session file transfer wiring (chunk pacing on `bytesInFlight`, Finder pasteboard pull), notifications. |
 | Viewer | `windows/src/{protocol,crypto,net}.rs` | Codec, crypto and TCP transport. These are platform independent and unit-tested on Linux, macOS and Windows. |
 | Viewer | `windows/src/{hid,annexb,bench}.rs` | Scancode → HID table, Annex-B splitter, the headless benchmark. |
+| Viewer | `windows/src/input.rs` | Key routing (hotkeys, forwarding, keys left to Windows), keypad navigation, media keys, scroll source and direction, relative-motion messages. |
 | Viewer | `windows/src/files.rs`, `win/files.rs` | File transfer: platform-independent service + Win32 drag & drop / notifications. |
 | Viewer | `windows/src/displays.rs` | Mac display picker logic (§3.5): identity matching, cycling, remembered display, toasts. |
 | Viewer | `windows/src/win/*` | Windows only: D3D11 device, Media Foundation decoders, renderer, window and input, cursor, `--probe`. |
@@ -140,8 +141,16 @@ identically:
   bitmap, scaled to encoded pixels, cached by id so repeats are `CursorShapeRef`) and `CursorPos`.
   The viewer shows it as the native Windows cursor, so pointer movement has zero video latency.
 - **Input:** input arrives as USB HID usages and normalized mouse coordinates. `InputInjector`
-  posts CGEvents on a dedicated queue. Remapping such as Ctrl→Cmd happens on the viewer, so the
-  host injects exactly what it receives.
+  posts CGEvents on a dedicated queue; its pure logic (pointer mapping, click counting, scroll
+  conversion) is in `GlideCore/InputLogic.swift` and checked by `glide-selftest`. Remapping such as
+  Ctrl→Cmd happens on the viewer, so the host injects exactly what it receives.
+  - Pointer: `x·width` over the captured display's bounds in points, with the delta fields set.
+  - Scrolling: notched wheels become line scrolls; touchpads and high-resolution wheels become pixel
+    scrolls inside a gesture (began/changed/ended, ended after 100 ms idle). PROTOCOL.md §3.6.
+    `GLIDE_SCROLL_LINES` (default 3 per notch) and `GLIDE_SCROLL_PIXELS` (default 48 per notch) tune it.
+  - Keys: media keys are posted as system-defined events. On an ISO keyboard type the HID 0x35/0x64
+    keys are swapped like macOS's own driver does; `GLIDE_KEYBOARD_TYPE=ansi|iso|jis` overrides the
+    Mac's keyboard type for injected keys.
 - **Power:**
   - While the host runs, it holds a *prevent idle system sleep* assertion, because a sleeping Mac
     can't dial out or answer.
@@ -174,7 +183,8 @@ The viewer (`windows/src/win/app.rs`) runs these threads:
 
 - **UI thread:** the Win32 window and message loop, raw keyboard and mouse input, a low-level
   keyboard hook that sends Win, Alt+Tab and similar keys to the host, the cursor, fullscreen,
-  and monitor and DPI tracking.
+  and monitor and DPI tracking. It never writes to the socket itself: input goes through a queue
+  to the **input thread**, so a full socket (a file upload) can't stall the keyboard hook.
 - **Render thread:** owns the D3D11 device, both Media Foundation decoders, the canvas and the
   swap chain. Frames arrive from the network over a channel and are presented as soon as they
   decode.

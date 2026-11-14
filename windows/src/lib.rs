@@ -19,6 +19,7 @@ pub mod hid;
 pub mod hotkeys;
 pub mod hud;
 pub mod identity;
+pub mod input;
 pub mod latency;
 pub mod menu_model;
 pub mod net;

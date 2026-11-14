@@ -21,6 +21,8 @@ pub const CAP_AUDIO_OPUS: u32 = 1 << 10;
 pub const CAP_FILES: u32 = 1 << 11;
 /// Display selection: DisplayList / DisplayChanged / SelectDisplay (PROTOCOL.md §3.5).
 pub const CAP_DISPLAYS: u32 = 1 << 13;
+/// Input extensions (§3.6): the viewer understands InputCaps and sends Scroll/MouseDelta/KeyExtra.
+pub const CAP_INPUT_EXT: u32 = 1 << 12;
 
 // Client -> Host message types
 pub const MSG_CLIENT_HELLO: u8 = 0x01;
@@ -34,6 +36,10 @@ pub const MSG_VIEW_SIZE: u8 = 0x15;
 pub const MSG_SET_DISPLAY_PREFERENCE: u8 = 0x16;
 /// Stream a given Mac display (§3.5).
 pub const MSG_SELECT_DISPLAY: u8 = 0x1A;
+/// Input extensions (§3.6), viewer → host; only after the host's InputCaps.
+pub const MSG_SCROLL: u8 = 0x17;
+pub const MSG_MOUSE_DELTA: u8 = 0x18;
+pub const MSG_KEY_EXTRA: u8 = 0x19;
 pub const MSG_REQUEST_KEYFRAME: u8 = 0x20;
 pub const MSG_SET_MODE: u8 = 0x21;
 pub const MSG_PING: u8 = 0x30;
@@ -93,6 +99,8 @@ pub const MSG_VIDEO_FRAME: u8 = 0x40;
 pub const MSG_CURSOR_POS: u8 = 0x41;
 pub const MSG_CURSOR_SHAPE: u8 = 0x42;
 pub const MSG_CURSOR_SHAPE_REF: u8 = 0x43;
+/// Host → viewer (§3.6): `u32 flags` (INPUT_CAPS_*), only to viewers with CAP_INPUT_EXT.
+pub const MSG_INPUT_CAPS: u8 = 0x44;
 pub const MSG_CLIPBOARD_CAPS: u8 = 0x51;
 /// Per-frame host pipeline timestamps (§3.4), host -> client.
 pub const MSG_FRAME_TIMING: u8 = 0x81;
@@ -140,6 +148,22 @@ pub const FILE_HOST_ID_BIT: u32 = 0x8000_0000;
 pub const AUDIO_CODEC_OFF: u8 = 0;
 pub const AUDIO_CODEC_PCM_S16: u8 = 1;
 pub const AUDIO_CODEC_OPUS: u8 = 2;
+
+// Input extensions (§3.6)
+/// InputCaps flags: which messages the host accepts.
+pub const INPUT_CAPS_SCROLL: u32 = 1 << 0;
+pub const INPUT_CAPS_RELATIVE: u32 = 1 << 1;
+pub const INPUT_CAPS_LOCKS: u32 = 1 << 2;
+pub const INPUT_CAPS_CONSUMER: u32 = 1 << 3;
+/// Scroll flags bit0: touchpad / high-resolution wheel.
+pub const SCROLL_PRECISE: u8 = 1;
+/// KeyExtra kinds.
+pub const KEY_EXTRA_LOCKS: u8 = 0;
+pub const KEY_EXTRA_CONSUMER: u8 = 1;
+/// LockState bits.
+pub const LOCK_CAPS: u8 = 1;
+pub const LOCK_NUM: u8 = 2;
+pub const LOCK_SCROLL: u8 = 4;
 
 pub const MOUSE_LEFT: u8 = 0;
 pub const MOUSE_RIGHT: u8 = 1;
@@ -510,6 +534,14 @@ pub enum ClientMsg {
     SetDisplayPreference { mode: u8 },
     /// Stream Mac display `display_id` (0 = the host's default), §3.5.
     SelectDisplay { display_id: u32 },
+    /// §3.6: scroll in notches (like MouseWheel) with its source (`SCROLL_PRECISE`).
+    Scroll { flags: u8, dx: f32, dy: f32 },
+    /// §3.6: relative motion in device counts (pointer-lock mode).
+    MouseDelta { dx: i16, dy: i16 },
+    /// §3.6 KeyExtra kind 0: lock-key state (`LOCK_*` bits).
+    LockState { locks: u8 },
+    /// §3.6 KeyExtra kind 1: HID Consumer page usage (media keys).
+    ConsumerKey { usage: u16, down: bool },
 }
 
 /// One Mac display from DisplayList (§3.5). `id` is volatile (this connection only).
@@ -590,6 +622,8 @@ pub enum HostMsg {
     DisplayList { streamed: u32, selected: u32, displays: Vec<MacDisplay> },
     /// `reason` = `DISPLAY_REASON_*`.
     DisplayChanged { display_id: u32, reason: u8, requested: u32 },
+    /// §3.6: the input-extension messages this host accepts (`INPUT_CAPS_*`).
+    InputCaps { flags: u32 },
     /// Unknown message type: ignored for forward compatibility.
     Unknown { msg_type: u8 },
 }
@@ -808,6 +842,10 @@ impl ClientMsg {
                 .finish(),
             ClientMsg::SetDisplayPreference { mode } => Writer::new(MSG_SET_DISPLAY_PREFERENCE).u8(*mode).finish(),
             ClientMsg::SelectDisplay { display_id } => Writer::new(MSG_SELECT_DISPLAY).u32(*display_id).finish(),
+            ClientMsg::Scroll { flags, dx, dy } => Writer::new(MSG_SCROLL).u8(*flags).f32(*dx).f32(*dy).finish(),
+            ClientMsg::MouseDelta { dx, dy } => Writer::new(MSG_MOUSE_DELTA).u16(*dx as u16).u16(*dy as u16).finish(),
+            ClientMsg::LockState { locks } => Writer::new(MSG_KEY_EXTRA).u8(KEY_EXTRA_LOCKS).u8(*locks).finish(),
+            ClientMsg::ConsumerKey { usage, down } => Writer::new(MSG_KEY_EXTRA).u8(KEY_EXTRA_CONSUMER).u16(*usage).u8(*down as u8).finish(),
         }
     }
 
@@ -853,6 +891,13 @@ impl ClientMsg {
             }),
             MSG_SET_DISPLAY_PREFERENCE => ClientMsg::SetDisplayPreference { mode: r.u8()? },
             MSG_SELECT_DISPLAY => ClientMsg::SelectDisplay { display_id: r.u32()? },
+            MSG_SCROLL => ClientMsg::Scroll { flags: r.u8()?, dx: r.f32()?, dy: r.f32()? },
+            MSG_MOUSE_DELTA => ClientMsg::MouseDelta { dx: r.u16()? as i16, dy: r.u16()? as i16 },
+            MSG_KEY_EXTRA => match r.u8()? {
+                KEY_EXTRA_LOCKS => ClientMsg::LockState { locks: r.u8()? },
+                KEY_EXTRA_CONSUMER => ClientMsg::ConsumerKey { usage: r.u16()?, down: r.u8()? != 0 },
+                _ => return Err(DecodeError::BadLength(t)), // unknown kind: a host ignores it
+            },
             _ => return Err(DecodeError::BadLength(t)),
         })
     }
@@ -957,6 +1002,7 @@ impl HostMsg {
                 HostMsg::DisplayList { streamed, selected, displays }
             }
             MSG_DISPLAY_CHANGED => HostMsg::DisplayChanged { display_id: r.u32()?, reason: r.u8()?, requested: r.u32()? },
+            MSG_INPUT_CAPS => HostMsg::InputCaps { flags: r.u32()? },
             other => HostMsg::Unknown { msg_type: other },
         };
         Ok(msg)
@@ -1047,6 +1093,7 @@ impl HostMsg {
             HostMsg::DisplayChanged { display_id, reason, requested } => {
                 Writer::new(MSG_DISPLAY_CHANGED).u32(*display_id).u8(*reason).u32(*requested).finish()
             }
+            HostMsg::InputCaps { flags } => Writer::new(MSG_INPUT_CAPS).u32(*flags).finish(),
             HostMsg::Unknown { msg_type } => vec![*msg_type],
         }
     }
@@ -1304,6 +1351,37 @@ mod tests {
         assert_eq!(crate::util::hex(&caps.encode()), "510300000000000001");
         assert_eq!(HostMsg::decode(caps.encode()).unwrap(), caps);
         assert_eq!(CAP_CLIPBOARD, 0x100);
+    }
+
+    /// docs/input-vectors.json (§3.6; also checked by glide-selftest and mock_host.py --selftest).
+    #[test]
+    fn input_messages_match_reference_bytes() {
+        let v: serde_json::Value = serde_json::from_str(include_str!("../../docs/input-vectors.json")).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        let get = |name: &str| {
+            let m = msgs.iter().find(|m| m["name"] == name).unwrap_or_else(|| panic!("no vector {name}"));
+            crate::util::unhex(m["hex"].as_str().unwrap())
+        };
+        let caps = HostMsg::InputCaps { flags: INPUT_CAPS_SCROLL | INPUT_CAPS_RELATIVE | INPUT_CAPS_LOCKS | INPUT_CAPS_CONSUMER };
+        assert_eq!(caps.encode(), get("InputCaps"));
+        assert_eq!(HostMsg::decode(get("InputCaps")).unwrap(), caps);
+        let cases = [
+            ("ScrollPrecise", ClientMsg::Scroll { flags: SCROLL_PRECISE, dx: 0.0, dy: 0.25 }),
+            ("ScrollDiscrete", ClientMsg::Scroll { flags: 0, dx: -1.0, dy: 0.0 }),
+            ("MouseDelta", ClientMsg::MouseDelta { dx: 5, dy: -3 }),
+            ("LockState", ClientMsg::LockState { locks: LOCK_CAPS }),
+            ("ConsumerKey", ClientMsg::ConsumerKey { usage: 0xCD, down: true }),
+        ];
+        assert_eq!(cases.len() + 1, msgs.len(), "one case per reference message");
+        for (name, m) in cases {
+            let want = get(name);
+            assert_eq!(m.encode(), want, "{name}");
+            assert_eq!(ClientMsg::decode(&want).unwrap(), m, "{name}");
+            for n in 1..want.len() {
+                assert!(ClientMsg::decode(&want[..n]).is_err(), "{name} truncated to {n}");
+            }
+        }
+        assert_eq!(CAP_INPUT_EXT, 0x1000);
     }
 
     /// docs/file-transfer-vectors.json "messages" (also checked by glide-selftest and mock_host.py).

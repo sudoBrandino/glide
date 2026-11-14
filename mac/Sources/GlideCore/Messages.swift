@@ -28,6 +28,31 @@ public struct CodecCaps: OptionSet, Sendable {
     public static let files = CodecCaps(rawValue: 1 << 11)
     /// Display selection: DisplayList / DisplayChanged / SelectDisplay (§3.5).
     public static let displays = CodecCaps(rawValue: 1 << 13)
+    /// Input extensions: the viewer understands InputCaps and sends §3.6 messages.
+    public static let inputExt = CodecCaps(rawValue: 1 << 12)
+}
+
+/// InputCaps flags (PROTOCOL.md §3.6): which input-extension messages the host accepts.
+public struct InputCaps: OptionSet, Sendable {
+    public let rawValue: UInt32
+    public init(rawValue: UInt32) { self.rawValue = rawValue }
+    public static let scroll = InputCaps(rawValue: 1 << 0)
+    public static let relative = InputCaps(rawValue: 1 << 1)
+    public static let locks = InputCaps(rawValue: 1 << 2)
+    public static let consumer = InputCaps(rawValue: 1 << 3)
+    public static let all: InputCaps = [.scroll, .relative, .locks, .consumer]
+}
+
+/// `0x19` KeyExtra bodies (§3.6).
+public enum KeyExtra: Equatable, Sendable {
+    /// Lock-key state: bit0 Caps Lock, bit1 Num Lock, bit2 Scroll Lock.
+    case lockState(UInt8)
+    /// HID Consumer page (0x0C) usage.
+    case consumerKey(usage: UInt16, down: Bool)
+    /// A kind this host doesn't know: ignored.
+    case unknown(kind: UInt8)
+
+    public static let capsLock: UInt8 = 1, numLock: UInt8 = 2, scrollLock: UInt8 = 4
 }
 
 /// One file of a FileOffer (PROTOCOL.md §6). `path` is '/'-separated and relative; receivers sanitize it.
@@ -277,6 +302,12 @@ public enum ClientMessage {
     case setDisplayPreference(mode: UInt8)
     /// §3.5: stream display `id` (0 = the host's default).
     case selectDisplay(id: UInt32)
+    /// §3.6: notches like mouseWheel; `precise` = touchpad / high-resolution wheel.
+    case scroll(precise: Bool, dx: Float, dy: Float)
+    /// §3.6: relative motion in device counts (pointer-lock mode).
+    case mouseDelta(dx: Int16, dy: Int16)
+    /// §3.6 `0x19`.
+    case keyExtra(KeyExtra)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -302,6 +333,15 @@ public enum ClientMessage {
             for v in [r.hostUs, r.networkUs, r.queueUs, r.decodeUs, r.renderUs, r.scanoutUs, r.totalUs, r.groundTruthUs] { w.u32(v) }
         case let .setDisplayPreference(m): w.u8(0x16); w.u8(m)
         case let .selectDisplay(id): w.u8(0x1A); w.u32(id)
+        case let .scroll(precise, dx, dy): w.u8(0x17); w.u8(precise ? 1 : 0); w.f32(dx); w.f32(dy)
+        case let .mouseDelta(dx, dy): w.u8(0x18); w.u16(UInt16(bitPattern: dx)); w.u16(UInt16(bitPattern: dy))
+        case let .keyExtra(k):
+            w.u8(0x19)
+            switch k {
+            case let .lockState(l): w.u8(0); w.u8(l)
+            case let .consumerKey(u, d): w.u8(1); w.u16(u); w.u8(d ? 1 : 0)
+            case let .unknown(kind): w.u8(kind)
+            }
         }
         return w.data
     }
@@ -347,6 +387,14 @@ public enum ClientMessage {
                                                 renderUs: try r.u32(), scanoutUs: try r.u32(), totalUs: try r.u32(), groundTruthUs: try r.u32()))
         case 0x16: return .setDisplayPreference(mode: try r.u8())
         case 0x1A: return .selectDisplay(id: try r.u32())
+        case 0x17: return .scroll(precise: try r.u8() & 1 != 0, dx: try r.f32(), dy: try r.f32())
+        case 0x18: return .mouseDelta(dx: Int16(bitPattern: try r.u16()), dy: Int16(bitPattern: try r.u16()))
+        case 0x19:
+            switch try r.u8() {
+            case 0: return .keyExtra(.lockState(try r.u8()))
+            case 1: return .keyExtra(.consumerKey(usage: try r.u16(), down: try r.u8() != 0))
+            case let k: return .keyExtra(.unknown(kind: k))
+            }
         default: throw WireError.unknownMessage(t)
         }
     }
@@ -382,6 +430,8 @@ public enum HostMessage {
     case displayList(streamed: UInt32, selected: UInt32, displays: [DisplayDescriptor])
     /// §3.5 (caps bit 13 only): `reason` is a `DisplayChangeReason` raw value.
     case displayChanged(id: UInt32, reason: UInt8, requested: UInt32)
+    /// §3.6, only to viewers with caps bit 12, after ServerHello.
+    case inputCaps(InputCaps)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -421,6 +471,7 @@ public enum HostMessage {
             w.u8(UInt8(list.count))
             for d in list { d.write(&w) }
         case let .displayChanged(id, reason, requested): w.u8(0x07); w.u32(id); w.u8(reason); w.u32(requested)
+        case let .inputCaps(c): w.u8(0x44); w.u32(c.rawValue)
         }
         return w.data
     }
@@ -461,6 +512,7 @@ public enum HostMessage {
             let streamed = try r.u32(), selected = try r.u32(), n = Int(try r.u8())
             return .displayList(streamed: streamed, selected: selected, displays: try (0..<n).map { _ in try DisplayDescriptor.read(&r) })
         case 0x07: return .displayChanged(id: try r.u32(), reason: try r.u8(), requested: try r.u32())
+        case 0x44: return .inputCaps(InputCaps(rawValue: try r.u32()))
         default: throw WireError.unknownMessage(t)
         }
     }

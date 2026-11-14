@@ -47,9 +47,16 @@ pub enum Cmd {
     ShowDefaultDisplay,
     /// Stream the Mac display at this index of the host's DisplayList (ids are dynamic; see `id`).
     ShowDisplay(u8),
+    /// Input submenu: Ctrl → Command / Win → Control on or off.
+    ToggleCtrlAsCmd,
+    /// Input submenu: invert scrolling.
+    ToggleNaturalScroll,
+    /// Input submenu: relative mouse (pointer lock, PROTOCOL.md §3.6).
+    ToggleRelativeMouse,
 }
 
-const ALL: [Cmd; 33] = [
+// New commands go at the end: ids are positions in this list.
+const ALL: [Cmd; 36] = [
     Cmd::ModeFast,
     Cmd::ModeHybrid,
     Cmd::ModeSharp,
@@ -83,6 +90,9 @@ const ALL: [Cmd; 33] = [
     Cmd::OpenReceived,
     Cmd::LatencyTest,
     Cmd::ShowDefaultDisplay,
+    Cmd::ToggleCtrlAsCmd,
+    Cmd::ToggleNaturalScroll,
+    Cmd::ToggleRelativeMouse,
 ];
 
 /// Menu ids: 0x2000 + 16·index. Low nibble zero and below 0xF000, so the same ids work as
@@ -222,6 +232,11 @@ pub struct MenuState {
     pub latency_test: bool,
     /// The Mac's displays (DisplayList, §3.5); None = this host doesn't support choosing.
     pub displays: Option<crate::displays::DisplayState>,
+    /// Ctrl → Command, Win → Control.
+    pub ctrl_as_cmd: bool,
+    pub natural_scrolling: bool,
+    /// None = the connected host doesn't take relative motion (or not connected); Some(on).
+    pub relative_mouse: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -267,6 +282,14 @@ fn display_picker_items(s: &MenuState) -> Vec<Item> {
     v
 }
 
+fn input_items(s: &MenuState) -> Vec<Item> {
+    vec![
+        cmd(Cmd::ToggleCtrlAsCmd, "&Ctrl as Command (Win as Control)", s.ctrl_as_cmd, true),
+        cmd(Cmd::ToggleNaturalScroll, "&Natural scrolling (reverse direction)", s.natural_scrolling, true),
+        cmd(Cmd::ToggleRelativeMouse, "&Relative mouse (games, 3D)\tCtrl+Alt+Shift+G", s.relative_mouse == Some(true), s.relative_mouse.is_some()),
+    ]
+}
+
 /// The full context menu (connection bar / Ctrl+Alt+Shift+Space).
 pub fn build(s: &MenuState) -> Vec<Item> {
     let live = s.connected;
@@ -308,6 +331,7 @@ pub fn build(s: &MenuState) -> Vec<Item> {
         cmd(Cmd::LatencyTest, "&Latency test\tCtrl+Alt+Shift+L", s.latency_test, true),
         cmd(Cmd::ToggleFullscreen, "F&ullscreen\tCtrl+Alt+Shift+F", s.fullscreen, true),
         cmd(Cmd::ToggleKeyboard, "Release &keyboard\tCtrl+Alt+Shift+K", s.keyboard_released, true),
+        Item::Sub { label: "&Input".into(), enabled: true, items: input_items(s) },
         cmd(Cmd::PinBar, "&Pin connection bar", s.bar_pinned, true),
         Item::Separator,
         cmd(Cmd::RefreshPicture, "Re&fresh picture\tCtrl+Alt+Shift+R", false, live),
@@ -495,6 +519,19 @@ mod tests {
             assert_eq!(Cmd::from_name(&Cmd::ShowDisplay(i).name()), Some(Cmd::ShowDisplay(i)));
         }
         assert_eq!(Cmd::from_id(0xE001), None);
+    }
+
+    #[test]
+    fn input_items() {
+        let s = MenuState { connected: true, ctrl_as_cmd: true, ..Default::default() };
+        let m = build(&s);
+        assert_eq!(state(&m, Cmd::ToggleCtrlAsCmd), (true, true));
+        assert_eq!(state(&m, Cmd::ToggleNaturalScroll), (false, true));
+        assert_eq!(state(&m, Cmd::ToggleRelativeMouse), (false, false), "host without relative motion");
+        let m = build(&MenuState { relative_mouse: Some(true), natural_scrolling: true, ..s });
+        assert_eq!(state(&m, Cmd::ToggleRelativeMouse), (true, true));
+        assert_eq!(state(&m, Cmd::ToggleNaturalScroll), (true, true));
+        assert!(to_text(&m).contains("Relative mouse (games, 3D)    Ctrl+Alt+Shift+G"));
     }
 
     #[test]
