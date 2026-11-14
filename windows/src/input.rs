@@ -176,6 +176,52 @@ pub fn mouse_deltas(mut dx: i64, mut dy: i64) -> Vec<ClientMsg> {
     out
 }
 
+/// Merge a backlog of queued input before it is sent (after the link stalled, or a 1–8 kHz mouse
+/// in relative mode outpacing the writer): a run of consecutive `MouseMove`s becomes its last one
+/// (positions are absolute), and a run of consecutive `MouseDelta`s becomes their exact sum (split
+/// again as `mouse_deltas` does; a zero sum sends nothing). Every other message is kept as is, and
+/// nothing is reordered: a run ends at any other message, so motion stays on the same side of each
+/// button, key, wheel and lock-state message.
+pub fn coalesce(msgs: impl IntoIterator<Item = ClientMsg>) -> Vec<ClientMsg> {
+    enum Run {
+        None,
+        Move(ClientMsg),
+        Delta(i64, i64),
+    }
+    fn flush(run: &mut Run, out: &mut Vec<ClientMsg>) {
+        match std::mem::replace(run, Run::None) {
+            Run::None => {}
+            Run::Move(m) => out.push(m),
+            Run::Delta(dx, dy) => out.extend(mouse_deltas(dx, dy)),
+        }
+    }
+    let mut out = Vec::new();
+    let mut run = Run::None;
+    for m in msgs {
+        match (m, &mut run) {
+            (m @ ClientMsg::MouseMove { .. }, Run::Move(last)) => *last = m,
+            (m @ ClientMsg::MouseMove { .. }, _) => {
+                flush(&mut run, &mut out);
+                run = Run::Move(m);
+            }
+            (ClientMsg::MouseDelta { dx, dy }, Run::Delta(sx, sy)) => {
+                *sx += dx as i64;
+                *sy += dy as i64;
+            }
+            (ClientMsg::MouseDelta { dx, dy }, _) => {
+                flush(&mut run, &mut out);
+                run = Run::Delta(dx as i64, dy as i64);
+            }
+            (m, _) => {
+                flush(&mut run, &mut out);
+                out.push(m);
+            }
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
 /// LockState bits from the three toggle states.
 pub fn lock_bits(caps: bool, num: bool, scroll: bool) -> u8 {
     use crate::protocol::{LOCK_CAPS, LOCK_NUM, LOCK_SCROLL};
@@ -189,6 +235,94 @@ mod tests {
     use crate::hotkeys::{KEY_H, KEY_SPACE};
 
     const FWD: KeyCtx = KeyCtx { forwarding: true, ctrl_as_cmd: true, locks_local: false };
+
+    fn mv(x: f32) -> ClientMsg {
+        ClientMsg::MouseMove { x, y: 1.0 - x }
+    }
+    fn d(dx: i16, dy: i16) -> ClientMsg {
+        ClientMsg::MouseDelta { dx, dy }
+    }
+    fn delta_sum(m: &[ClientMsg]) -> (i64, i64) {
+        m.iter().fold((0, 0), |(x, y), m| match m {
+            ClientMsg::MouseDelta { dx, dy } => (x + *dx as i64, y + *dy as i64),
+            _ => (x, y),
+        })
+    }
+
+    #[test]
+    fn coalesce_keeps_last_move_of_each_run_and_order() {
+        let btn = |down| ClientMsg::MouseButton { button: 0, down };
+        let key = ClientMsg::Key { hid_usage: 0x04, down: true };
+        let wheel = ClientMsg::Scroll { flags: SCROLL_PRECISE, dx: 0.0, dy: 0.25 };
+        let locks = ClientMsg::LockState { locks: 1 };
+        let input = vec![
+            mv(0.1),
+            mv(0.2),
+            mv(0.3),
+            btn(true),
+            mv(0.4),
+            mv(0.5),
+            btn(false),
+            key.clone(),
+            mv(0.6),
+            wheel.clone(),
+            wheel.clone(),
+            mv(0.7),
+            locks.clone(),
+            ClientMsg::ReleaseAll,
+            mv(0.8),
+            mv(0.9),
+        ];
+        let want = vec![
+            mv(0.3),
+            btn(true),
+            mv(0.5),
+            btn(false),
+            key,
+            mv(0.6),
+            wheel.clone(),
+            wheel, // wheel and other messages are never merged
+            mv(0.7),
+            locks,
+            ClientMsg::ReleaseAll,
+            mv(0.9),
+        ];
+        assert_eq!(coalesce(input), want);
+        assert_eq!(coalesce(Vec::new()), Vec::<ClientMsg>::new());
+        assert_eq!(coalesce(vec![ClientMsg::ReleaseAll]), vec![ClientMsg::ReleaseAll]);
+    }
+
+    #[test]
+    fn coalesce_sums_delta_runs_exactly() {
+        let btn = |down| ClientMsg::MouseButton { button: 1, down };
+        // A 8 kHz mouse for a while: 4000 reports, mixed signs.
+        let run1: Vec<ClientMsg> = (0..4000).map(|i| d((i % 7) as i16 - 2, (i % 5) as i16 - 3)).collect();
+        let run2 = vec![d(i16::MAX, i16::MIN), d(i16::MAX, i16::MIN), d(5, 0)];
+        let mut input = run1.clone();
+        input.push(btn(true));
+        input.extend(run2.clone());
+        input.push(btn(false));
+        input.extend([d(3, -4), d(-3, 4)]); // sums to zero: nothing to send
+        input.push(mv(0.5));
+        input.push(d(1, 1));
+        let out = coalesce(input);
+
+        let b_down = out.iter().position(|m| *m == btn(true)).unwrap();
+        let b_up = out.iter().position(|m| *m == btn(false)).unwrap();
+        assert_eq!(delta_sum(&out[..b_down]), delta_sum(&run1));
+        assert_eq!(b_down, 1, "4000 reports merge into one message: {:?}", &out[..b_down]);
+        // Larger than i16: exact, split into several messages.
+        assert_eq!(delta_sum(&out[b_down + 1..b_up]), (2 * i16::MAX as i64 + 5, 2 * i16::MIN as i64));
+        assert_eq!(b_up - b_down - 1, 3);
+        assert_eq!(&out[b_up + 1..], &[mv(0.5), d(1, 1)]);
+    }
+
+    #[test]
+    fn coalesce_never_merges_across_moves_and_deltas() {
+        // Absolute and relative motion don't commute: keep each run where it was.
+        let out = coalesce(vec![mv(0.1), d(1, 0), d(2, 0), mv(0.2), mv(0.3), d(-4, 1)]);
+        assert_eq!(out, vec![mv(0.1), d(3, 0), mv(0.3), d(-4, 1)]);
+    }
 
     #[test]
     fn forwards_with_remap_and_tracks_physical_keys() {

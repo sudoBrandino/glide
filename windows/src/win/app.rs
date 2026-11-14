@@ -110,6 +110,9 @@ const WM_APP_INPUTCAPS: u32 = WM_APP + 0x40;
 const LOCK_TIMER: usize = 0x40;
 /// While focused: notice the secure desktop (Ctrl+Alt+Del, UAC) taking the keyboard mid-chord.
 const DESKTOP_TIMER: usize = 0x41;
+const DESKTOP_TICK_MS: u32 = 500;
+/// A DESKTOP_TIMER gap this long: the UI thread stalled past `LowLevelHooksTimeout` (≤ 1 s).
+const UI_STALL: Duration = Duration::from_millis(1000);
 
 enum RenderCmd {
     Frame { frame_id: u32, data: Vec<u8>, keyframe: bool, sharp: bool, rects: Option<Vec<protocol::Rect>> },
@@ -269,6 +272,8 @@ struct UiState {
     last_title: String,
     /// Ctrl+Alt+Shift+K: keyboard released to Windows (no LL hook, nothing forwarded).
     kb_released: bool,
+    /// Last DESKTOP_TIMER tick (None while unfocused): a long gap means this thread stalled.
+    desktop_tick: Option<Instant>,
     hud_on: bool,
     last_hud: Vec<String>,
     /// Last normal (not maximized / fullscreen / minimized) outer window rect.
@@ -292,14 +297,28 @@ fn ui() -> &'static UiCtx {
 }
 
 /// Messages from the UI thread go through this queue to the "glide-input" thread, so neither the
-/// UI thread nor the low-level keyboard hook running on it ever blocks on a full socket (e.g.
-/// behind a file upload). A hook that stalls freezes the keyboard of the whole PC, and Windows
-/// silently removes it after `LowLevelHooksTimeout`. One queue keeps everything in order.
-static INPUT_TX: OnceLock<mpsc::Sender<ClientMsg>> = OnceLock::new();
+/// UI thread nor the low-level keyboard hook running on it ever blocks on a full socket (behind a
+/// file upload, or a link that silently dropped). A hook that stalls freezes the keyboard of the
+/// whole PC, and Windows silently removes it after `LowLevelHooksTimeout`. One queue keeps
+/// everything in order.
+static INPUT_TX: OnceLock<mpsc::Sender<InputCmd>> = OnceLock::new();
+
+enum InputCmd {
+    /// Send to the current connection.
+    Msg(ClientMsg),
+    /// After the input queued before it: send `ReleaseAll` on `sender`, shut it down, and
+    /// signal `ack`. See `close_connection`.
+    Close { sender: Sender, ack: Option<mpsc::Sender<()>> },
+}
+
+/// Most queued commands handled (and their input merged) in one go.
+const INPUT_BATCH_MAX: usize = 4096;
+/// A write blocked this long means the link is stalled: closing doesn't queue a ReleaseAll behind it.
+const STALL_SHUTDOWN: Duration = Duration::from_millis(250);
 
 fn send(msg: ClientMsg) {
     if let Some(tx) = INPUT_TX.get() {
-        let _ = tx.send(msg);
+        let _ = tx.send(InputCmd::Msg(msg));
         return;
     }
     let s = ui().shared.sender.lock().unwrap().clone();
@@ -308,8 +327,32 @@ fn send(msg: ClientMsg) {
     }
 }
 
+/// Release everything on the Mac and close the connection `s` (Reconnect, Disconnect, Forget
+/// host, exit) without the UI thread, and the keyboard hook on it, ever waiting on the network:
+/// the ReleaseAll and the shutdown go through the input queue, behind the input already queued.
+/// If a write is already stuck (a stalled link), the socket is shut down at once instead: nothing
+/// would get through, and the host releases everything when the connection drops anyway.
+/// With `wait`, waits up to that long for the queue to get there (only at exit, when the hook is
+/// gone), then shuts down regardless.
+fn close_connection(s: Sender, wait: Option<Duration>) {
+    let tx = INPUT_TX.get().filter(|_| !s.write_stalled(STALL_SHUTDOWN));
+    let Some(tx) = tx else {
+        s.shutdown();
+        return;
+    };
+    let (ack_tx, ack_rx) = mpsc::channel();
+    if tx.send(InputCmd::Close { sender: s.clone(), ack: Some(ack_tx) }).is_err() {
+        s.shutdown();
+        return;
+    }
+    if let Some(w) = wait {
+        let _ = ack_rx.recv_timeout(w);
+        s.shutdown();
+    }
+}
+
 fn start_input_thread(shared: Arc<Shared>) {
-    let (tx, rx) = mpsc::channel::<ClientMsg>();
+    let (tx, rx) = mpsc::channel::<InputCmd>();
     if INPUT_TX.set(tx).is_err() {
         return;
     }
@@ -318,13 +361,61 @@ fn start_input_thread(shared: Arc<Shared>) {
             use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
             let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
         }
-        for m in rx {
-            let s = shared.sender.lock().unwrap().clone();
-            if let Some(s) = s {
-                let _ = s.send(&m);
+        while let Ok(first) = rx.recv() {
+            // Everything queued meanwhile (while the previous write was blocked) goes out merged.
+            let mut batch = vec![first];
+            while batch.len() < INPUT_BATCH_MAX {
+                match rx.try_recv() {
+                    Ok(c) => batch.push(c),
+                    Err(_) => break,
+                }
+            }
+            if !run_input_batch(&shared, batch) {
+                // The connection failed (e.g. a write timed out on a stalled link): input queued for
+                // it is stale; never replay it on the next connection. Closes still run.
+                let stale: Vec<InputCmd> = rx.try_iter().filter(|c| matches!(c, InputCmd::Close { .. })).collect();
+                run_input_batch(&shared, stale);
             }
         }
     });
+}
+
+/// Send one batch from the input queue in order, with runs of motion merged (`input::coalesce`).
+/// Returns false if a send failed (the rest of the batch's input is dropped).
+fn run_input_batch(shared: &Shared, batch: Vec<InputCmd>) -> bool {
+    let mut ok = true;
+    let mut pending: Vec<ClientMsg> = Vec::new();
+    let flush = |pending: &mut Vec<ClientMsg>, ok: &mut bool| {
+        if pending.is_empty() {
+            return;
+        }
+        let msgs = input::coalesce(pending.drain(..));
+        if !*ok {
+            return;
+        }
+        let Some(s) = shared.sender.lock().unwrap().clone() else { return };
+        for m in &msgs {
+            if s.send(m).is_err() {
+                *ok = false;
+                return;
+            }
+        }
+    };
+    for c in batch {
+        match c {
+            InputCmd::Msg(m) => pending.push(m),
+            InputCmd::Close { sender, ack } => {
+                flush(&mut pending, &mut ok);
+                let _ = sender.send(&ClientMsg::ReleaseAll);
+                sender.shutdown();
+                if let Some(a) = ack {
+                    let _ = a.send(());
+                }
+            }
+        }
+    }
+    flush(&mut pending, &mut ok);
+    ok
 }
 
 fn host_has(flag: u32) -> bool {
@@ -1024,10 +1115,12 @@ fn set_focus_state(hwnd: HWND, active: bool) {
         }
         // Lock keys may have changed while another window had the keyboard.
         sync_locks(true);
+        STATE.with(|s| s.borrow_mut().desktop_tick = Some(Instant::now()));
         unsafe {
-            SetTimer(Some(hwnd), DESKTOP_TIMER, 500, None);
+            SetTimer(Some(hwnd), DESKTOP_TIMER, DESKTOP_TICK_MS, None);
         }
     } else {
+        STATE.with(|s| s.borrow_mut().desktop_tick = None);
         unsafe {
             let _ = KillTimer(Some(hwnd), DESKTOP_TIMER);
         }
@@ -1052,6 +1145,29 @@ fn remove_hook() {
         unsafe {
             let _ = UnhookWindowsHookEx(h);
         }
+    }
+}
+
+/// Install the LL hook again if it is supposed to be installed. Windows silently removes a
+/// low-level hook whose thread misses `LowLevelHooksTimeout` (at most 1 s), and there is no API
+/// to ask whether it still is installed; `hook` stays `Some`. Unhooking a removed hook just fails,
+/// and a needless reinstall is harmless.
+fn reinstall_hook(why: &str) {
+    if STATE.with(|s| s.borrow().hook.is_none()) {
+        return;
+    }
+    eprintln!("input: reinstalling the keyboard hook ({why})");
+    remove_hook();
+    install_hook();
+}
+
+/// DESKTOP_TIMER tick (every `DESKTOP_TICK_MS` while focused): a late tick means this thread
+/// was blocked long enough for Windows to have removed the keyboard hook.
+fn check_ui_stall() {
+    let now = Instant::now();
+    let gap = STATE.with(|s| s.borrow_mut().desktop_tick.replace(now)).map(|t| now - t);
+    if let Some(g) = gap.filter(|g| *g >= UI_STALL) {
+        reinstall_hook(&format!("UI thread stalled for {} ms", g.as_millis()));
     }
 }
 
@@ -1525,8 +1641,7 @@ fn do_action(hwnd: HWND, a: Action) {
             match cur {
                 Some(s) => {
                     sh.reconnect.store(true, Ordering::Relaxed);
-                    let _ = s.send(&ClientMsg::ReleaseAll);
-                    s.shutdown();
+                    close_connection(s, None);
                     toast("Reconnecting…");
                 }
                 None => toast("Not connected — retrying"),
@@ -1735,8 +1850,7 @@ fn set_paused(hwnd: HWND, paused: bool) {
     if paused {
         sh.abort_accept.store(true, Ordering::Relaxed);
         if let Some(s) = sh.sender.lock().unwrap().clone() {
-            let _ = s.send(&ClientMsg::ReleaseAll);
-            s.shutdown();
+            close_connection(s, None);
         }
         toast("Disconnected");
     } else {
@@ -1893,8 +2007,7 @@ fn forget_host(hwnd: HWND) {
     ui().shared.repair.store(false, Ordering::Relaxed);
     if let Some(s) = ui().shared.sender.lock().unwrap().clone() {
         ui().shared.reconnect.store(true, Ordering::Relaxed);
-        let _ = s.send(&ClientMsg::ReleaseAll);
-        s.shutdown();
+        close_connection(s, None);
     }
     toast(format!("Forgot “{name}” — pair again from the Mac (Pair New Viewer…)"));
 }
@@ -1971,7 +2084,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == DESKTOP_TIMER => {
+            check_ui_stall();
             check_input_desktop(hwnd);
+            // Windows resets the cursor clip (Ctrl+Alt+Del, UAC, another app's ClipCursor): put
+            // it back, or the hidden cursor wanders out of the window.
+            if relative() && STATE.with(|s| s.borrow().focused) && !MENU_OPEN.load(Ordering::Relaxed) {
+                confine_cursor(hwnd);
+            }
             LRESULT(0)
         }
         WM_APP_INPUTCAPS => {
@@ -2148,6 +2267,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
             let sc = hid::scancode_from_lparam(lparam.0);
             if handle_key(hwnd, wparam.0 as u32, (sc & 0xFF) as u32, sc & hid::EXT != 0, down) {
+                // The hook would have consumed this key: it is gone (Windows removed it).
+                if down && !MENU_OPEN.load(Ordering::Relaxed) {
+                    reinstall_hook("a key it should have taken reached the window");
+                }
                 LRESULT(0)
             } else {
                 DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -2758,6 +2881,13 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
                 if shared.quit.load(Ordering::Relaxed) {
                     break None;
                 }
+                // Closed on this side (Reconnect, Disconnect, Forget host) or a write timed out:
+                // don't wait for the receive thread, which on Windows can stay blocked in recv()
+                // on a dead link until TCP gives up. It stays silent once `conn.stop()` ran.
+                if conn.sender.is_closed() {
+                    let r = ended_rx.recv_timeout(Duration::from_millis(200)).ok();
+                    break Some(r.or_else(|| conn.sender.close_reason()).unwrap_or_else(|| "closed by the viewer".into()));
+                }
             }
         }
     };
@@ -3015,8 +3145,7 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
     shared.quit.store(true, Ordering::Relaxed);
     shared.abort_accept.store(true, Ordering::Relaxed);
     if let Some(s) = shared.sender.lock().unwrap().take() {
-        let _ = s.send(&ClientMsg::ReleaseAll);
-        s.shutdown();
+        close_connection(s, Some(Duration::from_millis(500)));
     }
     let _ = render_tx.send(RenderCmd::Quit);
     if let Some(a) = &shared.audio {
