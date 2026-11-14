@@ -298,6 +298,10 @@ fn main() -> ExitCode {
         if store.config.file_transfer && args.bench.is_none() {
             caps |= protocol::CAP_FILES;
         }
+        // Mac display picker (§3.5): GUI viewer only (menu, hotkeys, toasts).
+        if args.bench.is_none() {
+            caps |= protocol::CAP_DISPLAYS;
+        }
     }
     let audio_on = args.audio.unwrap_or(store.config.audio);
     if audio_on {

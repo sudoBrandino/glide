@@ -43,9 +43,13 @@ pub enum Cmd {
     OpenReceived,
     /// Latency test mode (docs/LATENCY.md).
     LatencyTest,
+    /// Stream the host's default Mac display (SelectDisplay 0, PROTOCOL.md §3.5).
+    ShowDefaultDisplay,
+    /// Stream the Mac display at this index of the host's DisplayList (ids are dynamic; see `id`).
+    ShowDisplay(u8),
 }
 
-const ALL: [Cmd; 32] = [
+const ALL: [Cmd; 33] = [
     Cmd::ModeFast,
     Cmd::ModeHybrid,
     Cmd::ModeSharp,
@@ -78,17 +82,26 @@ const ALL: [Cmd; 32] = [
     Cmd::CancelFiles,
     Cmd::OpenReceived,
     Cmd::LatencyTest,
+    Cmd::ShowDefaultDisplay,
 ];
 
 /// Menu ids: 0x2000 + 16·index. Low nibble zero and below 0xF000, so the same ids work as
 /// WM_SYSCOMMAND values in the window's system menu.
 const ID_BASE: u32 = 0x2000;
+/// `ShowDisplay(i)`: 0xE000 + 16·i (≤ 0xEFF0, still below the system's SC_* range).
+const DISPLAY_ID_BASE: u32 = 0xE000;
 
 impl Cmd {
     pub fn id(self) -> u32 {
+        if let Cmd::ShowDisplay(i) = self {
+            return DISPLAY_ID_BASE + 16 * i as u32;
+        }
         ID_BASE + 16 * ALL.iter().position(|c| *c == self).unwrap() as u32
     }
     pub fn from_id(id: u32) -> Option<Cmd> {
+        if (DISPLAY_ID_BASE..0xF000).contains(&id) {
+            return (id % 16 == 0).then(|| Cmd::ShowDisplay(((id - DISPLAY_ID_BASE) / 16) as u8));
+        }
         let off = id.checked_sub(ID_BASE)?;
         if off % 16 != 0 {
             return None;
@@ -100,7 +113,11 @@ impl Cmd {
         format!("{self:?}").to_ascii_lowercase()
     }
     pub fn from_name(s: &str) -> Option<Cmd> {
-        ALL.iter().copied().find(|c| c.name() == s.trim().to_ascii_lowercase())
+        let s = s.trim().to_ascii_lowercase();
+        if let Some(i) = s.strip_prefix("showdisplay(").and_then(|r| r.strip_suffix(')')).and_then(|n| n.parse().ok()) {
+            return Some(Cmd::ShowDisplay(i));
+        }
+        ALL.iter().copied().find(|c| c.name() == s)
     }
     pub fn mode(self) -> Option<Mode> {
         match self {
@@ -203,6 +220,8 @@ pub struct MenuState {
     pub files_busy: bool,
     /// Latency test mode is on (Ctrl+Alt+Shift+L).
     pub latency_test: bool,
+    /// The Mac's displays (DisplayList, §3.5); None = this host doesn't support choosing.
+    pub displays: Option<crate::displays::DisplayState>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -230,6 +249,22 @@ fn stream_mode_items(s: &MenuState) -> Vec<Item> {
         Item::Separator,
         Item::Info("Cycle: Ctrl+Alt+Shift+M".into()),
     ]
+}
+
+/// "Show Mac display" submenu: automatic + one radio item per Mac display (§3.5).
+fn display_picker_items(s: &MenuState) -> Vec<Item> {
+    let Some(st) = s.displays.as_ref().filter(|_| s.connected) else {
+        return vec![Item::Info(if s.connected { "Not supported by this host".into() } else { "Not connected".into() })];
+    };
+    let mut v = vec![Item::Info(format!("Showing: {}", st.name(st.streamed))), Item::Separator];
+    v.push(radio(Cmd::ShowDefaultDisplay, "&Automatic (the Mac's main display)", st.selected == 0, true));
+    for (i, d) in st.displays.iter().enumerate().take(255) {
+        let accel = if i < 9 { format!("&{}  ", i + 1) } else { String::new() };
+        v.push(radio(Cmd::ShowDisplay(i as u8), &format!("{accel}{}", crate::displays::label(d)), st.selected != 0 && st.streamed == d.id, true));
+    }
+    v.push(Item::Separator);
+    v.push(Item::Info("Next / previous: Ctrl+Alt+Shift+→ / ←".into()));
+    v
 }
 
 /// The full context menu (connection bar / Ctrl+Alt+Shift+Space).
@@ -264,6 +299,7 @@ pub fn build(s: &MenuState) -> Vec<Item> {
         Item::Separator,
         Item::Sub { label: "Stream &mode".into(), enabled: true, items: stream_mode_items(s) },
         Item::Sub { label: "Mac &display".into(), enabled: true, items: display },
+        Item::Sub { label: "Show Mac displa&y".into(), enabled: true, items: display_picker_items(s) },
         Item::Sub { label: "Send to &Mac".into(), enabled: live, items: send },
         Item::Separator,
         cmd(Cmd::ToggleMute, "M&ute audio\tCtrl+Alt+Shift+A", s.audio_muted == Some(true), s.audio_muted.is_some()),
@@ -414,6 +450,51 @@ mod tests {
         assert!(text.contains("— Now: 1920×1080 Retina"), "{text}");
         assert!(text.contains("(•) Retina (HiDPI, 1:1 backing)"), "{text}");
         assert!(text.contains("Mute audio    Ctrl+Alt+Shift+A"), "{text}");
+    }
+
+    #[test]
+    fn display_picker() {
+        use crate::displays::DisplayState;
+        use crate::protocol::MacDisplay;
+        let d = |id: u32, name: &str, flags: u8| MacDisplay {
+            id,
+            flags,
+            width: 1920,
+            height: 1080,
+            pixel_width: 1920,
+            pixel_height: 1080,
+            refresh: 6000,
+            name: name.into(),
+            ..Default::default()
+        };
+        let mut st = DisplayState::default();
+        st.apply_list(7, 0, vec![d(7, "Built-in", 1 | 2 | 8), d(9, "DELL", 0)]);
+        let base = MenuState { connected: true, displays: Some(st.clone()), ..Default::default() };
+        let m = build(&base);
+        assert_eq!(state(&m, Cmd::ShowDefaultDisplay), (true, true), "no selection → automatic checked");
+        assert_eq!(state(&m, Cmd::ShowDisplay(0)), (false, true));
+        assert_eq!(state(&m, Cmd::ShowDisplay(1)), (false, true));
+        let text = to_text(&m);
+        assert!(text.contains("— Showing: Built-in"), "{text}");
+        assert!(text.contains("( ) 2  DELL — 1920×1080 @ 60 Hz"), "{text}");
+        assert!(text.contains("Ctrl+Alt+Shift+→ / ←"), "{text}");
+        st.apply_list(9, 9, st.displays.clone());
+        let m = build(&MenuState { displays: Some(st), ..base.clone() });
+        assert_eq!(state(&m, Cmd::ShowDisplay(1)), (true, true));
+        assert_eq!(state(&m, Cmd::ShowDefaultDisplay), (false, true));
+        // old host / disconnected: an explanation instead of items
+        let m = build(&MenuState { displays: None, ..base.clone() });
+        assert!(find(&m, Cmd::ShowDefaultDisplay).is_none());
+        assert!(to_text(&m).contains("Not supported by this host"));
+        assert!(to_text(&build(&MenuState { connected: false, ..base })).contains("— Not connected"));
+        // dynamic ids
+        for i in [0u8, 1, 8, 255] {
+            let id = Cmd::ShowDisplay(i).id();
+            assert!(id & 0xF == 0 && id < 0xF000);
+            assert_eq!(Cmd::from_id(id), Some(Cmd::ShowDisplay(i)));
+            assert_eq!(Cmd::from_name(&Cmd::ShowDisplay(i).name()), Some(Cmd::ShowDisplay(i)));
+        }
+        assert_eq!(Cmd::from_id(0xE001), None);
     }
 
     #[test]
