@@ -55,6 +55,9 @@ check "reinstall with --listen" run --yes --no-start --app "$SRC" --listen
 check "  says reinstalling" grep -q "reinstalling Glide Host 9.9.9" "$T/out"
 check "  connect target removed" test -z "$(connect)"
 
+check "--app naming the installed app sets it up in place" run --yes --no-start --app "$APP"
+check "  app still there" test -x "$APP/Contents/MacOS/glide-host"
+
 OTHER="$HOME/Library/LaunchAgents/com.example.old.glide.host.plist"
 cp "$PLIST" "$OTHER"
 check "another Glide agent blocks an unattended install" bash -c '! "$0" --yes --no-start --app "$1" >/dev/null 2>&1' "$ROOT/install.sh" "$SRC"

@@ -261,6 +261,10 @@ inspect_app() {
     IN_PLACE=1; APP="$SRC_APP"
   else
     APP="${OPT_DIR:-$HOME/Applications}/Glide Host.app"
+    # --app naming the installed app itself: copying it over itself would delete it first.
+    if [[ -d "$APP" && "$(cd "$SRC_APP" && pwd -P)" == "$(cd "$APP" && pwd -P)" ]]; then
+      IN_PLACE=1; APP="$SRC_APP"
+    fi
   fi
   PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
   [[ -d "$APP" ]] && OLD_VERSION="$(plist_get "$APP" CFBundleShortVersionString)"
@@ -378,24 +382,31 @@ permissions() {
   step "Screen Recording and Accessibility"
   local status="" legacy=0 i="" granted=0
   status="$(perm_status)"
-  if [[ -z "$status" ]]; then
-    # 0.2.0: --request-permissions prints the status first, then prompts for what's missing.
-    legacy=1
-    perm_request
-    for i in $(seq 1 50); do status="$(head -1 "$PERM_OUT")"; [[ -n "$status" ]] && break; sleep 0.2; done
-    status="${status//Screen Recording: /screen-recording=}"; status="${status//Accessibility: /accessibility=}"
-    [[ -n "$status" ]] || { perm_stop; warn "could not start Glide Host to check its permissions"; return 0; }
-  fi
-  if [[ "$status" == *"screen-recording=granted"*"accessibility=granted"* ]]; then
-    perm_stop; ok "both granted"; return 0
-  fi
   # An update gets a new ad-hoc signature, so a grant made for the previous build can still show
   # as switched on in System Settings without applying. Clear such stale entries so that macOS
   # asks afresh. Nothing is lost: the permission is missing either way.
-  if [[ -n "$OLD_VERSION" ]]; then
-    perm_stop
-    if [[ "$status" == *"screen-recording=missing"* ]]; then tccutil reset ScreenCapture "$LABEL" >/dev/null 2>&1 || true; fi
-    if [[ "$status" == *"accessibility=missing"* ]]; then tccutil reset Accessibility "$LABEL" >/dev/null 2>&1 || true; fi
+  if [[ -n "$status" ]]; then
+    if [[ "$status" == *"screen-recording=granted"*"accessibility=granted"* ]]; then
+      ok "both granted"; return 0
+    fi
+    if [[ -n "$OLD_VERSION" ]]; then
+      if [[ "$status" == *"screen-recording=missing"* ]]; then tccutil reset ScreenCapture "$LABEL" >/dev/null 2>&1 || true; fi
+      if [[ "$status" == *"accessibility=missing"* ]]; then tccutil reset Accessibility "$LABEL" >/dev/null 2>&1 || true; fi
+    fi
+  else
+    # 0.2.0 has no --permission-status. Its --request-permissions doesn't flush its output, so
+    # nothing can be read from it until it exits: when both are granted (at once if they already
+    # are), or after 10 minutes. On a version change the old grants are stale (see above).
+    legacy=1
+    if [[ -n "$OLD_VERSION" && "$OLD_VERSION" != "$NEW_VERSION" ]]; then
+      tccutil reset ScreenCapture "$LABEL" >/dev/null 2>&1 || true
+      tccutil reset Accessibility "$LABEL" >/dev/null 2>&1 || true
+    fi
+    perm_request
+    for i in $(seq 1 15); do kill -0 "$PERM_PID" 2>/dev/null || break; sleep 0.2; done
+    if ! kill -0 "$PERM_PID" 2>/dev/null && [[ "$(head -1 "$PERM_OUT")" == *"Screen Recording: granted, Accessibility: granted"* ]]; then
+      perm_stop; rm -f "$PERM_OUT"; ok "both granted"; return 0
+    fi
   fi
   [[ -n "$PERM_PID" ]] || perm_request
   info "macOS asks now. In each dialog choose ${B}Open System Settings${N}, then switch on"
