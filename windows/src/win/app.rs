@@ -116,6 +116,13 @@ enum RenderCmd {
     Quit,
 }
 
+/// Largest cursor side accepted from the host (the Mac host never sends more, §3).
+const CURSOR_MAX_SIDE: u16 = 256;
+/// Cursor cache bounds: far above any real session, low enough that a hostile host can't
+/// exhaust memory with an endless stream of new shape ids.
+const CURSOR_CACHE_SHAPES: usize = 1024;
+const CURSOR_CACHE_BYTES: usize = 64 << 20;
+
 #[derive(Default)]
 struct CursorState {
     shapes: HashMap<u32, CursorImage>,
@@ -2347,7 +2354,17 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
                 let _ = tx.send(RenderCmd::Config(c));
             }
             NetEvent::Msg(HostMsg::CursorShape { shape_id, w, h, hot_x, hot_y, bgra }) => {
+                // Untrusted: hosts send at most 256x256 (PROTOCOL.md §3); keep the cache bounded.
+                if w > CURSOR_MAX_SIDE || h > CURSOR_MAX_SIDE {
+                    return;
+                }
                 let mut c = shared.cursor.lock().unwrap();
+                if !c.shapes.contains_key(&shape_id)
+                    && (c.shapes.len() >= CURSOR_CACHE_SHAPES
+                        || c.shapes.values().map(|s| s.bgra.len()).sum::<usize>() + bgra.len() > CURSOR_CACHE_BYTES)
+                {
+                    c.shapes.clear();
+                }
                 c.shapes.insert(
                     shape_id,
                     CursorImage { w: w as u32, h: h as u32, hot_x: hot_x as u32, hot_y: hot_y as u32, bgra },

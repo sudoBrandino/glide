@@ -221,14 +221,15 @@ impl JitterBuffer {
             return true;
         }
         if let Some(bump) = self.pending_bump.take() {
-            if self.end_ts_us.is_some_and(|end| capture_time_us > end + PAUSE_GAP_US) {
+            if self.end_ts_us.is_some_and(|end| capture_time_us > end.saturating_add(PAUSE_GAP_US)) {
                 // The host went quiet; nothing arrived late. Undo the underrun's target bump.
                 self.target -= bump;
                 self.stats.underruns -= 1;
                 self.stats.pauses += 1;
             }
         }
-        self.end_ts_us = Some(capture_time_us + n as u64 * 1_000_000 / self.rate.max(1) as u64);
+        // Host-supplied timestamp: saturate rather than overflow.
+        self.end_ts_us = Some(capture_time_us.saturating_add(n as u64 * 1_000_000 / self.rate.max(1) as u64));
         self.q.extend(pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0));
         self.markers.push_back((self.tail_abs, capture_time_us));
         self.tail_abs += n as u64;

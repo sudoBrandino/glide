@@ -452,7 +452,8 @@ pub struct FrameTiming {
 impl FrameTiming {
     /// Absolute host time of a stage offset, if known.
     pub fn at(&self, d: u32) -> Option<u64> {
-        (d != TIMING_UNKNOWN).then(|| self.capture_us + d as u64)
+        // Host-supplied: an absurd capture time is "unknown", not an overflow.
+        (d != TIMING_UNKNOWN).then(|| self.capture_us.checked_add(d as u64)).flatten()
     }
 }
 
@@ -887,7 +888,7 @@ impl HostMsg {
                 let flags = r.u8()?;
                 let rects = if flags & FRAME_FLAG_RECTS != 0 {
                     let n = r.u16()? as usize;
-                    let mut v = Vec::with_capacity(n);
+                    let mut v = Vec::with_capacity(n.min(r.remaining() / 8)); // don't trust n for the allocation
                     for _ in 0..n {
                         v.push(Rect { x: r.u16()?, y: r.u16()?, w: r.u16()?, h: r.u16()? });
                     }
@@ -907,7 +908,8 @@ impl HostMsg {
                 let h = r.u16()?;
                 let hot_x = r.u16()?;
                 let hot_y = r.u16()?;
-                let n = w as usize * h as usize * 4;
+                // checked: `usize` is 32 bits on 32-bit targets (65535² × 4 overflows it).
+                let n = (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(4)).ok_or(DecodeError::BadLength(t))?;
                 let rest = r.rest();
                 if rest.len() < n {
                     return Err(DecodeError::BadLength(t));

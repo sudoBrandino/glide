@@ -345,7 +345,10 @@ Rules:
 - Keyframes carry VPS/SPS/PPS (HEVC) or SPS/PPS (H.264) in-band, Annex-B with 4-byte start codes.
 - No B-frames; decode order == display order. Client should display every frame immediately.
 - The host only sends frames when the screen changes; long gaps are normal.
-- `CursorShape` sizes are in **host pixels**; client may scale by its own view scale.
+- `CursorShape` sizes are in **host pixels**; client may scale by its own view scale. `w` and `h`
+  are at most 256 (hosts don't send larger shapes; viewers ignore them). Viewers bound their shape
+  cache (Glide's: 1024 shapes / 64 MiB, then it starts over); a `CursorShapeRef` to a shape the
+  viewer doesn't have leaves the current cursor unchanged.
 
 ## 3.1 Hybrid mode and the viewer canvas
 

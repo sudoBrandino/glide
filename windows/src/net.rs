@@ -169,8 +169,13 @@ impl ClockSync {
             self.rtts_ms.drain(..5_000);
         }
         let t_mid = client_time_us + rtt / 2;
-        self.window.push_back(PongSample { t_mid, rtt, offset: host_time_us as i64 - t_mid as i64 });
+        // host_time_us and the echoed client time are host-supplied: wrap, never overflow.
+        self.window.push_back(PongSample { t_mid, rtt, offset: (host_time_us as i64).wrapping_sub(t_mid as i64) });
         while self.window.front().is_some_and(|s| t_mid.saturating_sub(s.t_mid) > self.window_us) {
+            self.window.pop_front();
+        }
+        // Real pings give ~60 samples per window; a host flooding Pongs must not make refit O(n²).
+        while self.window.len() > MAX_PONG_SAMPLES {
             self.window.pop_front();
         }
         self.refit();
@@ -199,11 +204,12 @@ impl ClockSync {
         // the line by its asymmetry: only fit near-minimal exchanges.
         let limit = best.rtt + (best.rtt / 2).max(100);
         mins.retain(|m| m.rtt <= limit);
-        let span = mins.last().unwrap().t_mid - mins[0].t_mid;
+        // Samples are in arrival order; t_mid isn't monotonic (RTTs vary, and Pongs are untrusted).
+        let span = mins.last().unwrap().t_mid.saturating_sub(mins[0].t_mid);
         if mins.len() >= 4 && span >= 20_000_000 {
             let n = mins.len() as f64;
             let t0 = mins[0].t_mid;
-            let xs: Vec<f64> = mins.iter().map(|m| (m.t_mid - t0) as f64).collect();
+            let xs: Vec<f64> = mins.iter().map(|m| m.t_mid as f64 - t0 as f64).collect();
             let ys: Vec<f64> = mins.iter().map(|m| m.offset as f64).collect();
             let mx = xs.iter().sum::<f64>() / n;
             let my = ys.iter().sum::<f64>() / n;
@@ -245,15 +251,18 @@ impl ClockSync {
     pub fn host_to_client_us(&self, host_us: u64) -> Option<i64> {
         let o = self.offset_us?;
         // Evaluate the (slowly varying) offset at the event's own time.
-        let approx = (host_us as i64 - o).max(0) as u64;
-        self.offset_at(approx).map(|o| host_us as i64 - o)
+        let approx = (host_us as i64).saturating_sub(o).max(0) as u64;
+        self.offset_at(approx).map(|o| (host_us as i64).saturating_sub(o))
     }
 
     /// Convert a client `now_us()` timestamp into host time, if synced.
     pub fn client_to_host_us(&self, client_us: u64) -> Option<i64> {
-        self.offset_at(client_us).map(|o| client_us as i64 + o)
+        self.offset_at(client_us).map(|o| (client_us as i64).saturating_add(o))
     }
 }
+
+/// Clock-sync samples kept (2 Hz pings over the 30 s window need ~60).
+const MAX_PONG_SAMPLES: usize = 256;
 
 /// Pings sent 50 ms apart right after connecting (fast initial clock sync).
 pub const PING_BURST: u32 = 8;
