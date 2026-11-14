@@ -244,7 +244,8 @@ What you see on the Mac itself:
 Quitting or restarting Glide Host ends the mirror, puts the monitor's mode back and removes the
 virtual display. Nothing Glide changes survives logging out.
 
-To turn it off: menu bar → **Virtual Display**, or in
+To turn it off: menu bar → **Virtual Display** → untick **Use a Virtual Display Sized to the
+Viewer**, or in
 `~/Library/Application Support/Glide/host.json`:
 
 ```json
@@ -252,8 +253,8 @@ To turn it off: menu bar → **Virtual Display**, or in
 ```
 
 The menu also offers **Stream the Monitor Instead** (the pre-0.2 behavior: the host switches the
-monitor to a mode that suits the viewer) and **Extend** (the virtual display sits beside the
-monitor instead of being mirrored).
+monitor to a mode that suits the viewer) and **Extend: Place It Beside the Monitor** (the virtual
+display sits beside the monitor instead of being mirrored).
 
 The virtual display uses macOS's `CGVirtualDisplay`, an undocumented API that a macOS update may
 change; if it's unavailable, Glide logs why and streams the monitor. To check it on your Mac
