@@ -10,7 +10,11 @@ let package = Package(
     ],
     targets: [
         .target(name: "GlideCore"),
-        .executableTarget(name: "glide-host", dependencies: ["GlideCore"]),
+        // Objective-C shim for the private CGVirtualDisplay classes (runtime lookup, no private
+        // symbols linked; docs/VIRTUAL_DISPLAY.md). Builds with the Command Line Tools.
+        .target(name: "CGlideVirtualDisplay",
+                linkerSettings: [.linkedFramework("CoreGraphics"), .linkedFramework("Foundation")]),
+        .executableTarget(name: "glide-host", dependencies: ["GlideCore", "CGlideVirtualDisplay"]),
         .executableTarget(name: "glide-probe", dependencies: ["GlideCore"]),
         .executableTarget(name: "glide-selftest", dependencies: ["GlideCore"]),
     ],
