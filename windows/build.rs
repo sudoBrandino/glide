@@ -18,6 +18,7 @@ fn main() {
         return;
     }
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    write_version_header(&out_dir);
     match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
         Ok("gnu") => windres(&out_dir),
         Ok("msvc") => msvc(&out_dir),
@@ -35,6 +36,8 @@ fn windres(out_dir: &std::path::Path) {
         .current_dir("res")
         .args(["--input-format=rc", "--output-format=coff", "-i", "glide.rc", "-o"])
         .arg(&out)
+        .arg("--include-dir")
+        .arg(out_dir)
         .status();
     match status {
         Ok(s) if s.success() => println!("cargo:rustc-link-arg-bins={}", out.display()),
@@ -52,4 +55,17 @@ fn msvc(out_dir: &std::path::Path) {
     embed_resource::compile(out_dir.join("glide.rc"), embed_resource::NONE).manifest_required().unwrap();
     // The manifest is embedded as resource 1 (RT_MANIFEST); don't let link.exe add its own.
     println!("cargo:rustc-link-arg-bins=/MANIFEST:NO");
+}
+
+/// glide.rc's VERSIONINFO, from the crate version (which tests keep equal to the VERSION file).
+fn write_version_header(out_dir: &std::path::Path) {
+    let v = |k: &str| std::env::var(k).unwrap_or_default();
+    let h = format!(
+        "#define GLIDE_VER_MAJOR {}\n#define GLIDE_VER_MINOR {}\n#define GLIDE_VER_PATCH {}\n#define GLIDE_VER_STR \"{}\"\n",
+        v("CARGO_PKG_VERSION_MAJOR"),
+        v("CARGO_PKG_VERSION_MINOR"),
+        v("CARGO_PKG_VERSION_PATCH"),
+        v("CARGO_PKG_VERSION"),
+    );
+    std::fs::write(out_dir.join("glide_version.h"), h).expect("write glide_version.h");
 }

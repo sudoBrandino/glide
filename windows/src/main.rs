@@ -55,6 +55,7 @@ const USAGE: &str = "usage: glide-client [host[:port] | --listen [PORT]] [option
   --forget-host      unpair: forget the host key pinned for the target, then exit (the next
                      connection pairs again; the Mac must be in \"Pair New Viewer…\" mode)
   --identity         print this viewer's key fingerprint (shown on the Mac while pairing) and exit
+  --version          print the version and protocol version, then exit
   --no-audio         don't stream the Mac's sound (config \"audio\"; Ctrl+Alt+Shift+A mutes)
   --audio-selftest [SECONDS]
                      headless: open the default output device and run the audio path on
@@ -164,6 +165,10 @@ fn main() -> ExitCode {
     // Physical pixels everywhere (monitor sizes for ClientHello/ViewSize, window, swap chain).
     #[cfg(windows)]
     glide::win::set_dpi_awareness();
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("{}", glide::version::banner());
+        return ExitCode::SUCCESS;
+    }
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {

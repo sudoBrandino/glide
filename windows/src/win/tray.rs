@@ -199,6 +199,8 @@ fn show_menu(hwnd: HWND, st: &MenuState) {
             None => item(MenuCmd::ForgetHost, "&Forget host (unpair) — not paired", MF_GRAYED),
         }
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+        let ver: Vec<u16> = format!("Glide {}", crate::version::display()).encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = AppendMenuW(m, MF_STRING | MF_GRAYED, 0, PCWSTR(ver.as_ptr()));
         item(MenuCmd::Quit, "&Quit Glide", MF_ENABLED);
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);

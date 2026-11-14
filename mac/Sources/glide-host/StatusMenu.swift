@@ -133,6 +133,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
         add("Open Log", #selector(openLog))
+        menu.addItem(withTitle: "Glide Host \(GlideVersion.display)", action: nil, keyEquivalent: "").isEnabled = false
         menu.addItem(.separator())
         if launchdLabel != nil {
             add("Restart Glide Host", #selector(restart))
