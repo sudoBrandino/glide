@@ -60,7 +60,15 @@ changed for them, not how. Delete empty subsections when the release is cut.
   events the system ignored); media play/pause/next/previous no longer vanish when the viewer has focus.
 - ISO keyboards: the key left of 1 and the extra key left of Z were swapped on Macs with an ISO
   keyboard type, as macOS's own driver swaps them.
-- The keyboard hook never waits on the network, so a file upload can't freeze the PC's keyboard.
+- Keyboard and mouse input reach the network through a queue, so neither a file upload nor a
+  network that silently drops makes the PC's keyboard freeze. Reconnect, Disconnect and Forget
+  host no longer hang the viewer on a stalled connection, a send that makes no progress for 5 s
+  ends the connection, and if Windows dropped the keyboard hook after a stall the viewer puts it
+  back.
+- After a stall, queued mouse motion is merged instead of replaying seconds of stale movement on
+  the Mac, and a high-rate mouse in relative mode no longer builds a backlog.
+- Relative mouse: the pointer is held in the window again after Ctrl+Alt+Del or a UAC prompt
+  (before, it could wander out).
 - Viewer: a bitmap on the Windows clipboard with unusual colour masks could crash debug builds
   and got wrong colours in release builds. `--probe`'s video parameter parser no longer panics
   on a truncated NAL unit.

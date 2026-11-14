@@ -11,10 +11,17 @@ use crate::protocol::{ClientMsg, HostMsg, VideoConfig};
 use crate::util::now_us;
 use std::io::{BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// A blocked socket write that makes no progress for this long fails and ends the connection.
+/// Records are written in `WRITE_PIECE` pieces, so this measures a stalled link (less than
+/// `WRITE_PIECE` accepted by the kernel in the whole interval), not a slow one.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Largest single socket write (see `WRITE_TIMEOUT`).
+const WRITE_PIECE: usize = 16 << 10;
 
 /// Thread-safe encrypted message writer. Cloning shares the same socket and counter.
 ///
@@ -24,23 +31,38 @@ use std::time::{Duration, Instant};
 ///   while no normal send is waiting, so an input event never queues behind more than the one
 ///   chunk (≤ FILE_CHUNK_MAX) already being written. Bulk senders also bound what sits in the
 ///   kernel socket buffer with the FileAck window (FILE_WINDOW), see `files`.
+///
+/// `shutdown` and the state queries (`is_closed`, `write_stalled`) never take the writer lock, so
+/// they never wait behind a write blocked on a full socket buffer (a silently dropped link). Such a
+/// write fails after `WRITE_TIMEOUT` and closes the connection.
 #[derive(Clone)]
 pub struct Sender {
     inner: Arc<Mutex<SenderInner>>,
     /// Normal-priority sends waiting for (or holding) the lock.
     urgent: Arc<AtomicUsize>,
+    state: Arc<SenderState>,
 }
 
 struct SenderInner {
     out: Box<dyn Write + Send>,
+    sealer: Sealer,
+}
+
+/// Lock-free side of a `Sender`.
+struct SenderState {
     /// Same socket, for shutdown (None for in-memory test writers).
     closer: Option<TcpStream>,
-    sealer: Sealer,
-    dead: bool,
+    dead: AtomicBool,
+    /// When the write in progress started (µs since `epoch`, at least 1); 0 when idle.
+    writing_since: AtomicU64,
+    epoch: Instant,
+    /// Why the connection closed on the send side (first write error).
+    error: Mutex<Option<String>>,
 }
 
 impl Sender {
-    fn new(stream: TcpStream, sealer: Sealer) -> std::io::Result<Sender> {
+    fn new(stream: TcpStream, sealer: Sealer, write_timeout: Duration) -> std::io::Result<Sender> {
+        stream.set_write_timeout(Some(write_timeout))?;
         let closer = stream.try_clone()?;
         Ok(Sender::with_writer(Box::new(stream), Some(closer), sealer))
     }
@@ -48,20 +70,37 @@ impl Sender {
     /// A sender over any writer (tests and tooling).
     pub fn with_writer(out: Box<dyn Write + Send>, closer: Option<TcpStream>, sealer: Sealer) -> Sender {
         Sender {
-            inner: Arc::new(Mutex::new(SenderInner { out, closer, sealer, dead: false })),
+            inner: Arc::new(Mutex::new(SenderInner { out, sealer })),
             urgent: Arc::new(AtomicUsize::new(0)),
+            state: Arc::new(SenderState {
+                closer,
+                dead: AtomicBool::new(false),
+                writing_since: AtomicU64::new(0),
+                epoch: Instant::now(),
+                error: Mutex::new(None),
+            }),
         }
     }
 
-    fn write_locked(g: &mut SenderInner, pt: &[u8]) -> std::io::Result<()> {
-        if g.dead {
+    fn write_locked(&self, g: &mut SenderInner, pt: &[u8]) -> std::io::Result<()> {
+        if self.is_closed() {
             return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "connection closed"));
         }
         // Seal under the lock so record order on the wire == counter order.
         let rec = g.sealer.seal(pt);
-        let r = g.out.write_all(&rec);
-        if r.is_err() {
-            g.dead = true;
+        let st = &self.state;
+        st.writing_since.store((st.epoch.elapsed().as_micros() as u64).max(1), Ordering::SeqCst);
+        let r = rec.chunks(WRITE_PIECE).try_for_each(|piece| g.out.write_all(piece));
+        st.writing_since.store(0, Ordering::SeqCst);
+        if let Err(e) = &r {
+            // A partial record can't be continued: end the connection (the receive thread sees it).
+            let msg = if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
+                "send timed out (network stalled)".to_string()
+            } else {
+                format!("send failed: {e}")
+            };
+            st.error.lock().unwrap().get_or_insert(msg);
+            self.shutdown();
         }
         r
     }
@@ -76,7 +115,7 @@ impl Sender {
         self.urgent.fetch_add(1, Ordering::SeqCst);
         let mut g = self.inner.lock().unwrap();
         self.urgent.fetch_sub(1, Ordering::SeqCst);
-        Self::write_locked(&mut g, pt)
+        self.write_locked(&mut g, pt)
     }
 
     /// Send a low-priority message (a file chunk): waits until no normal send is pending.
@@ -88,11 +127,14 @@ impl Sender {
     pub fn send_bulk_plaintext(&self, pt: &[u8]) -> std::io::Result<()> {
         let mut spins = 0u32;
         loop {
+            if self.is_closed() {
+                return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "connection closed"));
+            }
             if self.urgent.load(Ordering::SeqCst) == 0 {
                 let mut g = self.inner.lock().unwrap();
                 // Re-check under the lock: a normal send that arrived meanwhile goes first.
                 if self.urgent.load(Ordering::SeqCst) == 0 {
-                    return Self::write_locked(&mut g, pt);
+                    return self.write_locked(&mut g, pt);
                 }
             }
             spins += 1;
@@ -104,12 +146,33 @@ impl Sender {
         }
     }
 
+    /// Close the connection. Never waits for a writer: later sends fail at once, and the socket
+    /// is shut down so a blocked write (and the peer) see it.
     pub fn shutdown(&self) {
-        let mut g = self.inner.lock().unwrap();
-        g.dead = true;
-        if let Some(c) = &g.closer {
+        let st = &self.state;
+        if st.dead.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(c) = &st.closer {
             let _ = c.shutdown(Shutdown::Both);
         }
+    }
+
+    /// `shutdown` was called or a write failed.
+    pub fn is_closed(&self) -> bool {
+        self.state.dead.load(Ordering::SeqCst)
+    }
+
+    /// Why the send side closed, if a write failed.
+    pub fn close_reason(&self) -> Option<String> {
+        self.state.error.lock().unwrap().clone()
+    }
+
+    /// A write has been blocked for at least `min` (the link is stalled).
+    pub fn write_stalled(&self, min: Duration) -> bool {
+        let st = &self.state;
+        let since = st.writing_since.load(Ordering::SeqCst);
+        since != 0 && (st.epoch.elapsed().as_micros() as u64).saturating_sub(since) >= min.as_micros() as u64
     }
 }
 
@@ -697,7 +760,7 @@ impl Connection {
         stream.set_read_timeout(None).map_err(ConnectError::Io)?;
         reader.get_ref().set_read_timeout(None).map_err(ConnectError::Io)?;
         Ok(Connection {
-            sender: Sender::new(stream, sealer).map_err(ConnectError::Io)?,
+            sender: Sender::new(stream, sealer, WRITE_TIMEOUT).map_err(ConnectError::Io)?,
             host_name,
             config,
             clock: Arc::new(Mutex::new(ClockSync::default())),
@@ -723,12 +786,16 @@ impl Connection {
             .spawn(move || {
                 let mut buf = Vec::with_capacity(1 << 20);
                 loop {
-                    let pt = match opener.read_record(&mut reader, &mut buf) {
+                    let r = opener.read_record(&mut reader, &mut buf);
+                    if stop.load(Ordering::Relaxed) {
+                        // The session ended (it may already run a new connection): stay silent.
+                        sender.shutdown();
+                        return;
+                    }
+                    let pt = match r {
                         Ok(pt) => pt,
                         Err(e) => {
-                            if !stop.load(Ordering::Relaxed) {
-                                handler(NetEvent::Closed(e.to_string()));
-                            }
+                            handler(NetEvent::Closed(e.to_string()));
                             sender.shutdown();
                             return;
                         }
@@ -1010,19 +1077,40 @@ pub(crate) mod tests {
 
     /// In-memory "link": records which kind of record was written and how many bulk bytes had
     /// been written before it; sleeps per byte to model a slow network.
+    /// Logs one entry per complete record (the Sender writes a record in several pieces):
+    /// (is bulk, bulk bytes written before it). Records over 4 KiB count as bulk.
     struct SlowLink {
         log: Arc<Mutex<Vec<(bool, usize)>>>,
         bulk_written: Arc<AtomicUsize>,
         ns_per_byte: u64,
+        /// Bytes of the current record still to come, and its total length.
+        left: usize,
+        len: usize,
+    }
+
+    impl SlowLink {
+        fn new(log: Arc<Mutex<Vec<(bool, usize)>>>, bulk_written: Arc<AtomicUsize>, ns_per_byte: u64) -> SlowLink {
+            SlowLink { log, bulk_written, ns_per_byte, left: 0, len: 0 }
+        }
     }
 
     impl Write for SlowLink {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            let bulk = b.len() > 4096;
+            if self.left == 0 {
+                // A record starts: u32 LE ciphertext length, then the ciphertext.
+                assert!(b.len() >= 4, "a record's length prefix was split");
+                self.len = 4 + u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
+                self.left = self.len;
+            }
+            assert!(b.len() <= self.left, "a write spans two records");
             std::thread::sleep(Duration::from_nanos(self.ns_per_byte * b.len() as u64));
-            self.log.lock().unwrap().push((bulk, self.bulk_written.load(Ordering::SeqCst)));
-            if bulk {
-                self.bulk_written.fetch_add(b.len(), Ordering::SeqCst);
+            self.left -= b.len();
+            if self.left == 0 {
+                let bulk = self.len > 4096;
+                self.log.lock().unwrap().push((bulk, self.bulk_written.load(Ordering::SeqCst)));
+                if bulk {
+                    self.bulk_written.fetch_add(self.len, Ordering::SeqCst);
+                }
             }
             Ok(b.len())
         }
@@ -1040,7 +1128,7 @@ pub(crate) mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let bulk_written = Arc::new(AtomicUsize::new(0));
         // ~250 MB/s: a 256 KiB chunk takes ~1 ms.
-        let link = SlowLink { log: log.clone(), bulk_written: bulk_written.clone(), ns_per_byte: 4 };
+        let link = SlowLink::new(log.clone(), bulk_written.clone(), 4);
         let s = Sender::with_writer(Box::new(link), None, Sealer::new(&[7u8; 32]));
         const CHUNKS: usize = 40;
         let bulk = {
@@ -1078,7 +1166,7 @@ pub(crate) mod tests {
     fn bulk_yields_to_pending_urgent_sends() {
         // With an urgent sender registered, a bulk send must not start.
         let log = Arc::new(Mutex::new(Vec::new()));
-        let link = SlowLink { log: log.clone(), bulk_written: Arc::new(AtomicUsize::new(0)), ns_per_byte: 0 };
+        let link = SlowLink::new(log.clone(), Arc::new(AtomicUsize::new(0)), 0);
         let s = Sender::with_writer(Box::new(link), None, Sealer::new(&[1u8; 32]));
         s.urgent.fetch_add(1, Ordering::SeqCst);
         let b = {
@@ -1092,6 +1180,93 @@ pub(crate) mod tests {
         assert_eq!(log.lock().unwrap().len(), 1);
         s.shutdown();
         assert!(s.send(&ClientMsg::ReleaseAll).is_err());
+    }
+
+    /// A writer stuck like a full socket buffer on a dead link, until `release` is set.
+    struct StuckLink {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl Write for StuckLink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.entered.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Finding: the UI thread's shutdown() waited for the writer lock held by a write blocked on a
+    /// stalled link, freezing the UI and the keyboard hook. shutdown() must return at once, and
+    /// every later send must fail fast instead of queueing behind the stuck write.
+    #[test]
+    fn shutdown_never_waits_for_a_blocked_writer() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let link = StuckLink { entered: entered.clone(), release: release.clone() };
+        let s = Sender::with_writer(Box::new(link), None, Sealer::new(&[3u8; 32]));
+        let w = {
+            let s = s.clone();
+            thread::spawn(move || s.send(&ClientMsg::Key { hid_usage: 4, down: true }))
+        };
+        let t0 = Instant::now();
+        while !entered.load(Ordering::SeqCst) {
+            assert!(t0.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(30));
+        assert!(s.write_stalled(Duration::from_millis(20)));
+        assert!(!s.write_stalled(Duration::from_secs(60)));
+        assert!(!s.is_closed());
+
+        // Run it on another thread, so a regression fails the test instead of hanging it.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        {
+            let s = s.clone();
+            thread::spawn(move || {
+                s.shutdown();
+                let _ = done_tx.send(s.send_bulk(&ClientMsg::ReleaseAll).is_err());
+            });
+        }
+        let r = done_rx.recv_timeout(Duration::from_millis(500));
+        release.store(true, Ordering::SeqCst);
+        assert_eq!(r, Ok(true), "shutdown/send waited behind a stuck write (or the send succeeded)");
+        assert!(s.is_closed());
+
+        // The stuck write itself completes (it was already under way); nothing after it is sent.
+        w.join().unwrap().unwrap();
+        assert!(!s.write_stalled(Duration::ZERO));
+        assert!(s.send(&ClientMsg::ReleaseAll).is_err());
+    }
+
+    /// A peer that stops reading (silently dropped link): the blocked write fails after the write
+    /// timeout and closes the connection, instead of blocking forever.
+    #[test]
+    fn stalled_write_times_out_and_closes() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (peer, _) = l.accept().unwrap(); // never reads
+        let s = Sender::new(client, Sealer::new(&[5u8; 32]), Duration::from_millis(200)).unwrap();
+        let chunk = vec![0x50u8; 64 << 10];
+        let t0 = Instant::now();
+        let mut sent = 0usize;
+        let err = loop {
+            match s.send_plaintext(&chunk) {
+                Ok(()) => sent += 1,
+                Err(e) => break e,
+            }
+            assert!(sent < 4096, "256 MiB went into a socket nobody reads");
+            assert!(t0.elapsed() < Duration::from_secs(20));
+        };
+        assert!(s.is_closed(), "failed write must close the connection ({err})");
+        assert!(s.close_reason().is_some_and(|r| r.contains("timed out")), "{:?} ({err})", s.close_reason());
+        assert!(s.send(&ClientMsg::ReleaseAll).is_err());
+        drop(peer);
     }
 
     #[test]
