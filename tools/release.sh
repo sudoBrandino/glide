@@ -66,7 +66,7 @@ cmd_check() {
   # Releasing from a tag: everything under [Unreleased] must have been folded into [$VERSION],
   # or the release notes silently miss it.
   if [[ "${GITHUB_REF:-}" == refs/tags/* || "${GLIDE_RELEASE_STRICT:-0}" == 1 ]]; then
-    [[ -z "$(changelog_section Unreleased | grep -v '^###' | tr -d '[:space:]')" ]] \
+    [[ -z "$(changelog_section Unreleased | { grep -v '^###' || true; } | tr -d '[:space:]')" ]] \
       || die "CHANGELOG.md still has entries under [Unreleased]; fold them into [$VERSION] before tagging"
   fi
   if [[ "$GLIDE_BUILD_COMMIT" == *-dirty ]]; then
