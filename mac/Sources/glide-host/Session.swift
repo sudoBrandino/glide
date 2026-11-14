@@ -11,7 +11,7 @@ final class Session: @unchecked Sendable {
     private let channel: SecureChannel
     private let settings: HostSettings
     private let injector: InputInjector
-    private let inputQueue = DispatchQueue(label: "glide.input", qos: .userInteractive)
+    private var inputQueue: DispatchQueue { injector.queue }
     private var pipeline: VideoPipeline?
     private var audio: AudioPipeline?
     private var audioOff = false
@@ -353,6 +353,9 @@ final class Session: @unchecked Sendable {
         case let .mouseWheel(dx, dy): inputQueue.async { self.injector.wheel(dx: dx, dy: dy) }
         case let .key(u, down): Power.wakeDisplay(); inputQueue.async { self.injector.key(usage: u, down: down) }
         case .releaseAll: inputQueue.async { self.injector.releaseAll() }
+        case let .scroll(precise, dx, dy): inputQueue.async { self.injector.scroll(precise: precise, dx: dx, dy: dy) }
+        case let .mouseDelta(dx, dy): Power.wakeDisplay(); inputQueue.async { self.injector.mouseDelta(dx: dx, dy: dy) }
+        case let .keyExtra(k): Power.wakeDisplay(); inputQueue.async { self.injector.keyExtra(k) }
         case .requestKeyframe: pipeline?.requestKeyframe()
         case let .viewSize(vw, vh):
             HostStatus.shared.viewSize(id: id, w: Int(vw), h: Int(vh))
@@ -422,6 +425,8 @@ final class Session: @unchecked Sendable {
                 }
                 // Only to viewers with caps bit 11 (PROTOCOL.md §6), after ServerHello.
                 if let f = self.files { self.send(.file(f.caps)) }
+                // Only to viewers with caps bit 12 (PROTOCOL.md §3.5), after ServerHello.
+                if caps.contains(.inputExt) { self.send(.inputCaps(.all)) }
                 if self.audioOff { self.send(.audioConfig(.off)) }
                 self.audio?.arm()
                 self.helloSent = true
