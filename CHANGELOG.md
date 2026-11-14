@@ -24,6 +24,17 @@ changed for them, not how. Delete empty subsections when the release is cut.
   and switches back when it returns. New protocol messages (§3.5, capability bit 13) are ignored
   by older hosts and viewers.
 
+- **Virtual display (optional, off by default):** the Mac host can create a virtual monitor sized to
+  the viewer and stream it instead of its own screen, so a headless Mac, or a Mac whose screen
+  doesn't match the viewer, streams pixel-perfect without BetterDisplay. A 4K viewer gets a panel
+  that looks like 1920×1080 at HiDPI, and a 1440p viewer gets 2560×1440 at 1x. The existing Display
+  Mode setting chooses HiDPI or 1x. The display is kept 30 s after a disconnect so reconnects don't
+  move windows, and it can be kept always on or made the main display. Turn it on in the menu bar
+  (*Virtual Display*) or in host.json `"virtualDisplay"`. It uses a private macOS API: Glide falls
+  back to the physical display if the API is missing or fails. Run
+  `glide-host --virtual-display-selftest` once before turning it on. See `docs/VIRTUAL_DISPLAY.md`.
+  No protocol change.
+
 ### Changed
 
 ### Fixed
