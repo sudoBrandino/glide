@@ -2,7 +2,59 @@ import Foundation
 
 /// USB HID Keyboard/Keypad page (0x07) usage -> macOS virtual key code (kVK_*).
 public enum HIDKeymap {
-    public static func macKeyCode(forUsage usage: UInt16) -> UInt16? { table[usage] }
+    /// `iso`: the Mac takes the events as coming from an ISO keyboard (its keyboard type, see
+    /// InputInjector). macOS's own HID driver swaps two keys for ISO keyboards, and so must we:
+    /// on ISO the key left of 1 (HID 0x35, "^" on German, "`" on a UK PC) is kVK_ISO_Section and
+    /// the extra key left of Z (HID 0x64, "<") is kVK_ANSI_Grave. Without the swap an ISO user
+    /// typed "<" for "^" and vice versa.
+    public static func macKeyCode(forUsage usage: UInt16, iso: Bool = false) -> UInt16? {
+        if iso {
+            switch usage {
+            case 0x35: return 0x0A
+            case 0x64: return 0x32
+            default: break
+            }
+        }
+        return table[usage]
+    }
+
+    /// Mac system ("NX_SYSDEFINED") key types for media keys. A volume or play key posted as an
+    /// ordinary key event (kVK_VolumeUp etc.) reaches applications but not the system, so these
+    /// are posted as system-defined events instead. Values from IOKit/hidsystem/ev_keymap.h.
+    public enum SystemKey: Int32, Sendable {
+        case soundUp = 0, soundDown = 1, brightnessUp = 2, brightnessDown = 3, mute = 7
+        case play = 16, next = 17, previous = 18, fast = 19, rewind = 20
+    }
+
+    /// Keyboard page (0x07) Mute / Volume Up / Volume Down, as sent in `Key` by any viewer.
+    public static func systemKey(forKeyboardUsage usage: UInt16) -> SystemKey? {
+        switch usage {
+        case 0x7F: return .mute
+        case 0x80: return .soundUp
+        case 0x81: return .soundDown
+        default: return nil
+        }
+    }
+
+    /// Consumer page (0x0C) usages of `KeyExtra` ConsumerKey (PROTOCOL.md §3.6).
+    public static func systemKey(forConsumerUsage usage: UInt16) -> SystemKey? {
+        switch usage {
+        case 0xCD: return .play
+        case 0xB5: return .next
+        case 0xB6: return .previous
+        case 0xB3: return .fast
+        case 0xB4: return .rewind
+        case 0xE2: return .mute
+        case 0xE9: return .soundUp
+        case 0xEA: return .soundDown
+        case 0x6F: return .brightnessUp
+        case 0x70: return .brightnessDown
+        default: return nil  // 0xB7 Stop has no Mac equivalent
+        }
+    }
+
+    /// Every keyboard-page usage the table maps (for tests).
+    public static var mappedUsages: [UInt16] { table.keys.sorted() }
 
     public enum Modifier { case shift, control, option, command, capsLock }
 
@@ -47,12 +99,17 @@ public enum HIDKeymap {
         0x61: 0x5C, 0x62: 0x52, 0x63: 0x41,
         // ISO section key, Menu(contextual), keypad =
         0x64: 0x0A, 0x65: 0x6E, 0x67: 0x51,
-        // F13-F20
+        // F13-F20 (F21-F24 have no Mac key code)
         0x68: 0x69, 0x69: 0x6B, 0x6A: 0x71, 0x6B: 0x6A, 0x6C: 0x40, 0x6D: 0x4F, 0x6E: 0x50, 0x6F: 0x5A,
-        // Mute, Volume up/down
+        // Help
+        0x75: 0x72,
+        // Mute, Volume up/down (normally posted as system keys, see systemKey(forKeyboardUsage:))
         0x7F: 0x4A, 0x80: 0x48, 0x81: 0x49,
-        // JIS: keypad comma, Ro, Yen, Kana, Eisu
-        0x85: 0x5F, 0x87: 0x5E, 0x89: 0x5D, 0x90: 0x68, 0x91: 0x66,
+        // JIS / international: keypad comma (Brazil 0x85, JIS 0x8C), Ro, Yen, Kana, Eisu.
+        // PC Japanese keyboards: Katakana/Hiragana and Henkan (right of space) -> Kana,
+        // Muhenkan (left of space) -> Eisu, matching the keys in those positions on a Mac JIS keyboard.
+        0x85: 0x5F, 0x8C: 0x5F, 0x87: 0x5E, 0x89: 0x5D, 0x90: 0x68, 0x91: 0x66,
+        0x88: 0x68, 0x8A: 0x68, 0x8B: 0x66,
         // Modifiers: LCtrl LShift LAlt(Option) LGUI(Command) RCtrl RShift RAlt RGUI
         0xE0: 0x3B, 0xE1: 0x38, 0xE2: 0x3A, 0xE3: 0x37, 0xE4: 0x3E, 0xE5: 0x3C, 0xE6: 0x3D, 0xE7: 0x36,
     ]

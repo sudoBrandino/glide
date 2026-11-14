@@ -54,7 +54,8 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   "listen_port": 7420,      // used when "host" is null: wait for glide-host --connect
   "host": null,             // "mac.local:7420" = dial the Mac instead
   "mode": null,             // "fast" | "hybrid" | "sharp"; null = auto (hybrid if 4:4:4 decodes)
-  "ctrl_as_cmd": true,
+  "ctrl_as_cmd": true,       // Ctrl → Command, Win → Control (menu → Input)
+  "natural_scrolling": false, // reverse the wheel/touchpad direction sent to the Mac (menu → Input)
   "hud": false,             // stats overlay, toggled with Ctrl+Alt+Shift+H
   "bar_pinned": false,      // connection bar always visible (menu → Pin connection bar)
   "audio": true,            // play the Mac's sound (false = --no-audio)
@@ -163,10 +164,19 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   | Ctrl+Alt+Shift+X | cancel the running file transfer(s) |
   | Ctrl+Alt+Shift+L | latency test on/off: read the host's test pattern (`glide-probe --pattern-only`) back from the picture; switching it off writes a JSON report to `%TEMP%` ([`docs/LATENCY.md`](../docs/LATENCY.md)) |
   | Ctrl+Alt+Shift+→ / ← | show the next / previous Mac display (left to right), if the Mac has several. Also Glide menu → Show Mac display. The choice is remembered per host and re-selected on reconnect |
+  | Ctrl+Alt+Shift+G | relative mouse for games and 3D apps: the pointer is hidden and held in the window, and raw mouse motion goes to the Mac as deltas (`MouseDelta`, PROTOCOL.md §3.6). Press again, or leave the window, to exit. Needs a host that sends `InputCaps` |
   | Ctrl+Alt+Shift+Space | open the Glide menu at the mouse pointer |
 
   While the window has focus and the keyboard is captured, a low-level keyboard hook sends Win, Alt+Tab, Alt+Space and similar keys to the host.
-  To leave the window, click outside it, press Ctrl+Alt+Shift+K, or press Ctrl+Alt+Del, which cannot be intercepted.
+  To leave the window, click outside it, press Ctrl+Alt+Shift+K, or press Ctrl+Alt+Del, which cannot be intercepted
+  (keys held at that moment are released on the Mac when the secure desktop takes the keyboard).
+- **Input details** (PROTOCOL.md §3, §3.6). With a host that sends `InputCaps`:
+  - Scrolling keeps its source: a notched wheel arrives as Mac line scrolling (3 lines per notch), a precision
+    touchpad or high-resolution wheel as smooth pixel scrolling with gesture phases. *Natural scrolling* reverses both.
+  - Caps Lock and Num Lock stay with Windows (the PC's LEDs stay right) and their state is sent to the Mac.
+    With Num Lock off, keypad keys are Home/End/arrows/… on the Mac too.
+  - Play/pause, next, previous and stop go to the Mac. Volume and mute keys stay on this PC, where the Mac's sound plays.
+  - Older hosts get the previous messages (`MouseWheel`, `Key`), and the keys behave as before.
 - **Connection bar and Glide menu.** A slim tab at the top center of the window shows the host name, like the Microsoft Remote Desktop or Jump connection bar.
   - **Showing it:** move the mouse to the top edge (about 4 px) of the middle third of the window. This works windowed and fullscreen. The corners are excluded, so reaching for the Mac's menu bar there doesn't trigger it.
   - **Hiding it:** it hides 1.5 s after the mouse leaves. *Pin connection bar* keeps it visible, and the pin is saved as `bar_pinned`.
@@ -177,6 +187,8 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
     - Mac display ▸ Automatic / Crisp / Retina / Smooth / Don't change, plus a "Now: 1920×1080 Retina" line. This uses `SetDisplayPreference` / `DisplayInfo` (PROTOCOL.md §3.3), applies for the current session, and is disabled for hosts that don't send `DisplayInfo`.
     - Send to Mac ▸ Spotlight (Cmd+Space), Mission Control (Ctrl+Up), App switcher (Cmd+Tab), Force Quit (Cmd+Opt+Esc), Lock screen (Ctrl+Cmd+Q), Screenshot (Cmd+Shift+5).
     - Toggles: Mute audio, Clipboard sync, Stats overlay, Fullscreen, Release keyboard, Pin connection bar.
+    - Input ▸ Ctrl as Command (Win as Control), Natural scrolling, Relative mouse (games, 3D). The first two are saved
+      (`ctrl_as_cmd`, `natural_scrolling`).
     - Actions: Refresh picture, Reconnect, Disconnect/Connect, Send files… (disabled until file transfer lands), Settings… (opens `config.json`).
   - **Clipboard sync** can be switched at runtime and is saved as `"clipboard"`. Off means the clipboard listener is removed and nothing is sent or applied; the next ClientHello also stops advertising clipboard support. Turning it on during a session that started with it off reconnects once, to negotiate it.
   - **System menu:** the main items are also in the window's system menu (title-bar right-click, or Alt+Space while the keyboard is released): Glide menu…, Stream mode ▸, Mute audio, Stats overlay, Fullscreen, Refresh picture, Reconnect, Settings….
