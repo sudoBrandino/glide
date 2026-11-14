@@ -123,9 +123,17 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     // MARK: Lifecycle
 
     func start() async throws {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        var content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         // Re-resolve on every (re)start: the display from the last start may be gone (lid closed).
         let want = ActiveDisplay.current()
+        // A just-created virtual display can take a moment to show up in ScreenCaptureKit; don't
+        // silently capture another display meanwhile.
+        var tries = 0
+        while ActiveDisplay.isVirtual(want), !content.displays.contains(where: { $0.displayID == want }), tries < 10 {
+            tries += 1
+            try await Task.sleep(nanoseconds: 300_000_000)
+            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        }
         // ScreenCaptureKit may not list a display CoreGraphics already reports (just plugged in, or a
         // virtual display being set up): fall back to the default display, then to any.
         let def = ActiveDisplay.defaultDisplay()
@@ -135,7 +143,8 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         }
         if display.displayID != options.displayID { log("capture: display \(options.displayID) -> \(display.displayID)") }
         options.displayID = display.displayID
-        let mode = CGDisplayCopyDisplayMode(display.displayID)
+        // ActiveDisplay.mode: CoreGraphics reports no mode for our own virtual display.
+        let mode = ActiveDisplay.mode(of: display.displayID)
         let nativeW = mode?.pixelWidth ?? display.width
         var pw = nativeW, ph = mode?.pixelHeight ?? display.height
         let scale = Float(pw) / Float(max(display.width, 1))

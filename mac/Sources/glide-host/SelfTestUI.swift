@@ -24,6 +24,14 @@ func runSelfTestUI(outDir: String?) -> Never {
         print(line)
     }
 
+    let vd = VirtualDisplayManager.shared
+    vd.loadConfig()
+    print("virtual display: \(vd.config.isEnabled ? "enabled" : "off"), API \(VirtualDisplayManager.unavailableReason.map { "UNAVAILABLE: \($0)" } ?? "available"); would use:")
+    for (w, h) in [(2560, 1440), (3840, 2160), (1920, 1080), (3440, 1440)] {
+        let p = VirtualDisplayPlan.make(viewerW: w, viewerH: h, preference: dm.settings.preference, highDPIChoice: dm.settings.highDPIChoice, refreshRate: vd.config.hz)
+        print("  viewer \(w)x\(h): \(p.map { "\($0)" } ?? "-")")
+    }
+
     let menu = StatusMenu(actions: .init(), showStatusItem: false)
     let dir = outDir.map { URL(fileURLWithPath: $0, isDirectory: true) }
     if let dir { try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }

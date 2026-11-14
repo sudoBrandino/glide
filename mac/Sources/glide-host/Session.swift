@@ -438,7 +438,7 @@ final class Session: @unchecked Sendable {
             // monitor is swapped; the display-change observer re-captures).
             let shown = p.options.displayID
             self.inputQueue.async { self.injector.setDisplay(shown) }
-            let mode = CGDisplayCopyDisplayMode(shown)
+            let mode = ActiveDisplay.mode(of: shown)  // also right for Glide's own virtual display
             let native = CGFloat(mode?.pixelWidth ?? Int(cfg.width))
             self.cursor.scale = CGFloat(cfg.scale) * CGFloat(cfg.width) / max(native, 1)
         }

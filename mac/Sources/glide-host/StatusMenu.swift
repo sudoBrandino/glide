@@ -54,6 +54,15 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private let restoreNowItem = NSMenuItem(title: "Restore Now", action: #selector(restoreNow), keyEquivalent: "")
     private let displayInfoItem = NSMenuItem()
     private let displayActionItem = NSMenuItem()
+    // Virtual display (VirtualDisplay.swift)
+    private let virtualItem = NSMenuItem(title: "Virtual Display", action: nil, keyEquivalent: "")
+    private let virtualMenu = NSMenu()
+    private let virtualEnableItem = NSMenuItem(title: "Use a Virtual Display Sized to the Viewer", action: #selector(toggleVirtual), keyEquivalent: "")
+    private let virtualAlwaysItem = NSMenuItem(title: "Keep It When No Viewer Is Connected", action: #selector(toggleVirtualAlways), keyEquivalent: "")
+    private let virtualMainItem = NSMenuItem(title: "Make It the Main Display", action: #selector(toggleVirtualMain), keyEquivalent: "")
+    private let virtualRemoveItem = NSMenuItem(title: "Remove Virtual Display Now", action: #selector(removeVirtual), keyEquivalent: "")
+    private let virtualStatusItem = NSMenuItem()
+    private let virtualKeepItem = NSMenuItem()
     // File transfer (§6)
     private let sendFilesItem = NSMenuItem(title: "Send Files to Viewer…", action: #selector(sendFiles), keyEquivalent: "")
     private let fileProgressItem = NSMenuItem()
@@ -140,6 +149,15 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         for i in [displayInfoItem, displayActionItem] { i.isEnabled = false; displayMenu.addItem(i) }
         displayItem.submenu = displayMenu
         menu.addItem(displayItem)
+
+        virtualMenu.autoenablesItems = false
+        for i in [virtualEnableItem, virtualAlwaysItem, virtualMainItem] { i.target = self; virtualMenu.addItem(i) }
+        virtualMenu.addItem(.separator())
+        for i in [virtualStatusItem, virtualKeepItem] { i.isEnabled = false; virtualMenu.addItem(i) }
+        virtualRemoveItem.target = self
+        virtualMenu.addItem(virtualRemoveItem)
+        virtualItem.submenu = virtualMenu
+        menu.addItem(virtualItem)
 
         menu.addItem(.separator())
         add("Open Log", #selector(openLog))
@@ -251,15 +269,31 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             restoreNowItem.title = "Restore \(r) Now"
             restoreNowItem.isHidden = false
         } else { restoreNowItem.isHidden = true }
-        if let m = CGDisplayCopyDisplayMode(ActiveDisplay.current()) {
-            let info = DisplayModeInfo(m)
-            displayInfoItem.title = "Mac display: " + (info.hiDPI ? "looks like \(info.width)×\(info.height) (HiDPI, \(info.pixelWidth)×\(info.pixelHeight) px)" : "\(info.width)×\(info.height) (1x)") + String(format: " @ %.0f Hz", m.refreshRate)
+        if let info = dm.currentMode() {
+            let which = ActiveDisplay.isVirtual(dm.displayID) ? "Virtual display" : "Mac display"
+            displayInfoItem.title = "\(which): " + (info.hiDPI ? "looks like \(info.width)×\(info.height) (HiDPI, \(info.pixelWidth)×\(info.pixelHeight) px)" : "\(info.width)×\(info.height) (1x)") + String(format: " @ %.0f Hz", info.refreshRate)
         } else { displayInfoItem.title = "Mac display: unknown" }
         var action = dm.lastAction.map { "Last: \($0)" } ?? dm.describeChoice().map { "This viewer: \($0)" }
         if dm.userOverride { action = "Changed manually — automatic paused until next session" }
         displayActionItem.title = action ?? ""
         displayActionItem.isHidden = action == nil
         displayItem.title = "Display Mode: \(Self.prefTitle(st.preference))"
+
+        // Virtual display submenu
+        let vd = VirtualDisplayManager.shared
+        vd.loadConfig()
+        let vc = vd.config
+        virtualEnableItem.state = vc.isEnabled ? .on : .off
+        virtualEnableItem.toolTip = "Glide creates a virtual monitor matching the viewer and streams it instead of this Mac's screen (docs/VIRTUAL_DISPLAY.md)."
+        virtualAlwaysItem.state = vc.alwaysOn ? .on : .off
+        virtualMainItem.state = vc.wantsMain ? .on : .off
+        for i in [virtualAlwaysItem, virtualMainItem] { i.isEnabled = vc.isEnabled }
+        virtualStatusItem.title = "Status: " + vd.statusLine
+        virtualKeepItem.title = vc.alwaysOn ? "Kept while Glide runs" : "Kept \(Int(vc.keepAlive)) s after the viewer disconnects"
+        virtualKeepItem.isHidden = !vc.isEnabled
+        virtualRemoveItem.isHidden = !(vd.exists && !vd.sessionHoldsIt)
+        virtualItem.title = "Virtual Display: " + (vc.isEnabled ? (vd.exists ? "On" : "Enabled") : "Off")
+
         refreshDisplays(sessionActive: s.viewer != nil)
     }
 
@@ -478,6 +512,26 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         refresh()
     }
 
+    @objc private func toggleVirtual() {
+        let vd = VirtualDisplayManager.shared
+        vd.setEnabled(!vd.config.isEnabled)
+        refresh()
+    }
+
+    @objc private func toggleVirtualAlways() {
+        let vd = VirtualDisplayManager.shared
+        vd.setAlwaysOn(!vd.config.alwaysOn)
+        refresh()
+    }
+
+    @objc private func toggleVirtualMain() {
+        let vd = VirtualDisplayManager.shared
+        vd.setMakeMain(!vd.config.wantsMain)
+        refresh()
+    }
+
+    @objc private func removeVirtual() { VirtualDisplayManager.shared.removeNow(); refresh() }
+
     @objc private func restoreNow() { DisplayModeController.shared.restoreNow(reason: "menu"); refresh() }
 
     @objc private func openLog() {
@@ -522,6 +576,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     @objc private func quit() {
         DisplayModeController.shared.restoreNow(reason: "quit")
+        VirtualDisplayManager.shared.shutdown()
         log("menu: quit")
         exit(0)
     }
@@ -529,6 +584,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     @objc private func quitUntilLogin() {
         guard let label = launchdLabel else { quit(); return }
         DisplayModeController.shared.restoreNow(reason: "quit until next login")
+        VirtualDisplayManager.shared.shutdown()
         log("menu: quit until next login (launchctl bootout gui/\(getuid())/\(label))")
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/launchctl")

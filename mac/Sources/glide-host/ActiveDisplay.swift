@@ -1,12 +1,14 @@
 import AppKit
 import CoreGraphics
+import Foundation
 import GlideCore
 
 /// The display Glide serves, and the Mac's display list (PROTOCOL.md §3.5).
 ///
 /// Resolution order: the active session's selection (by identity, so a re-plugged monitor with a
-/// new ID is followed), else the `--display` pin while that display is online, otherwise whatever
-/// is the main display right now. Works for any `CGDirectDisplayID`, virtual displays included.
+/// new ID is followed), else Glide's own virtual display while it exists (VirtualDisplay.swift),
+/// else the `--display` pin while that display is online, otherwise whatever is the main display
+/// right now. Works for any `CGDirectDisplayID`.
 ///
 /// Never cache a display ID across a session. IDs go stale when the lid closes or a monitor is
 /// swapped, and CoreGraphics keeps answering for an offline ID (CGDisplayBounds returns its last
@@ -32,18 +34,38 @@ enum ActiveDisplay {
         lock.withLock { if _selection?.owner == owner { _selection = nil } }
     }
 
+    private static var virtualID: CGDirectDisplayID?
+    private static var virtualModeInfo: DisplayModeInfo?
+
+    /// Glide's virtual display, if one exists (read from any thread).
+    static var virtualDisplay: CGDirectDisplayID? { lock.lock(); defer { lock.unlock() }; return virtualID }
+
+    /// Set by VirtualDisplayManager (main thread) when it creates, reconfigures or removes the display.
+    static func setVirtual(_ id: CGDirectDisplayID?, mode: DisplayModeInfo?) {
+        lock.lock(); virtualID = id; virtualModeInfo = id == nil ? nil : mode; lock.unlock()
+    }
+
+    static func isVirtual(_ id: CGDirectDisplayID) -> Bool { id != 0 && virtualDisplay == id }
+
     static func current() -> CGDirectDisplayID {
         let sel = selection
         // Fast path (input injection calls this): the selected display is still there.
         if let s = sel, isOnline(s.id), sameHardware(s.id, s) { return s.id }
-        if sel == nil, pinned == nil { return CGMainDisplayID() }
-        return DisplaySelection.resolve(selection: sel, pinned: pinned, main: CGMainDisplayID(), displays: displays())
+        let preferred = preferredDefault()
+        if sel == nil, preferred == nil { return CGMainDisplayID() }
+        return DisplaySelection.resolve(selection: sel, pinned: preferred, main: CGMainDisplayID(), displays: displays())
+    }
+
+    /// The preferred default: the virtual display while it is online, else the `--display` pin.
+    private static func preferredDefault() -> CGDirectDisplayID? {
+        if let v = virtualDisplay, isOnline(v) { return v }
+        return pinned
     }
 
     /// What the host streams without a selection.
     static func defaultDisplay() -> CGDirectDisplayID {
-        guard pinned != nil else { return CGMainDisplayID() }
-        return DisplaySelection.defaultDisplay(pinned: pinned, main: CGMainDisplayID(), displays: displays())
+        guard let preferred = preferredDefault() else { return CGMainDisplayID() }
+        return DisplaySelection.defaultDisplay(pinned: preferred, main: CGMainDisplayID(), displays: displays())
     }
 
     static func isOnline(_ id: CGDirectDisplayID) -> Bool {
@@ -63,13 +85,13 @@ enum ActiveDisplay {
         guard CGGetOnlineDisplayList(n, &ids, &n) == .success else { return [] }
         let names = lock.withLock { _names }
         let main = CGMainDisplayID()
-        let def = pinned.flatMap { p in ids.contains(p) && isOnline(p) ? p : nil } ?? main
+        let def = preferredDefault().flatMap { p in ids.contains(p) && isOnline(p) ? p : nil } ?? main
         var out: [DisplayDescriptor] = []
         for id in ids.prefix(Int(n)) where isOnline(id) {
             // A hardware mirror set is one picture: list only its master.
             if CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay { continue }
             let b = CGDisplayBounds(id)
-            let mode = CGDisplayCopyDisplayMode(id)
+            let mode = mode(of: id)  // CoreGraphics reports no modes for our own virtual display
             let w = mode?.width ?? Int(b.width), h = mode?.height ?? Int(b.height)
             let pw = mode?.pixelWidth ?? w, ph = mode?.pixelHeight ?? h
             var flags: UInt8 = 0
@@ -102,4 +124,14 @@ enum ActiveDisplay {
 
     /// The listed display `id`, if online.
     static func descriptor(_ id: CGDirectDisplayID) -> DisplayDescriptor? { displays().first { $0.id == id } }
+
+    /// The current mode of `id`. CoreGraphics reports no modes for a virtual display to the process
+    /// that created it, so for Glide's own display this is the mode it configured (and verified via
+    /// NSScreen); see docs/VIRTUAL_DISPLAY.md.
+    static func mode(of id: CGDirectDisplayID) -> DisplayModeInfo? {
+        lock.lock()
+        let v = virtualID == id ? virtualModeInfo : nil
+        lock.unlock()
+        return v ?? CGDisplayCopyDisplayMode(id).map(DisplayModeInfo.init)
+    }
 }

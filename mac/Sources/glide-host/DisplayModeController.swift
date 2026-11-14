@@ -122,13 +122,18 @@ final class DisplayModeController: @unchecked Sendable {
             sessionPreference = nil
             userOverride = false
             viewer = (viewW, viewH)
-            trackedDisplay = displayID
-            tracker.reset(current: currentMode())
-            if settings.restore != nil, let rd = settings.restoreDisplay, rd != displayID {
-                // Left by a session that streamed another display (§3.5): that display isn't watched now.
-                if settings.restoreEnabled && ActiveDisplay.isOnline(rd) { restore(reason: "display \(rd) not streamed now") } else { setRestoreTarget(nil) }
+            // The virtual display (if enabled) is created first, sized to this viewer; once it is
+            // online it is `displayID` and the policy below applies to it like to any display.
+            VirtualDisplayManager.shared.sessionBegan { [self] _ in
+                guard owner == id else { return }
+                trackedDisplay = displayID
+                tracker.reset(current: currentMode())
+                if settings.restore != nil, let rd = settings.restoreDisplay, rd != displayID {
+                    // Left by a session that streamed another display (§3.5): that display isn't watched now.
+                    if settings.restoreEnabled && ActiveDisplay.isOnline(rd) { restore(reason: "display \(rd) not streamed now") } else { setRestoreTarget(nil) }
+                }
+                if applyPolicy(reason: "viewer connected") { waitForSettle(then) } else { then() }
             }
-            if applyPolicy(reason: "viewer connected") { waitForSettle(then) } else { then() }
         }
     }
 
@@ -156,6 +161,7 @@ final class DisplayModeController: @unchecked Sendable {
             sessionPreference = nil
             viewer = nil
             viewDebounce?.cancel(); viewDebounce = nil
+            VirtualDisplayManager.shared.sessionEnded()
             guard settings.restore != nil else { return }
             if settings.restoreEnabled && !userOverride {
                 scheduleRestore(after: Self.restoreGrace, reason: "viewer disconnected")
@@ -168,6 +174,8 @@ final class DisplayModeController: @unchecked Sendable {
     // MARK: Menu actions (main thread)
 
     var sessionActive: Bool { owner != nil }
+    /// The connected viewer's view size (pixels), if a session is active.
+    var viewerSize: (w: Int, h: Int)? { viewer.map { (w: $0.w, h: $0.h) } }
     var restoreTarget: DisplayModeInfo? { settings.restore }
 
     func setPreference(_ p: DisplayModePreference) {
@@ -225,6 +233,7 @@ final class DisplayModeController: @unchecked Sendable {
     /// What the policy would pick for the current viewer (for the menu).
     func describeChoice() -> String? {
         guard let v = viewer else { return nil }
+        if ActiveDisplay.isVirtual(displayID) { return VirtualDisplayManager.shared.plan.map { "virtual display \($0)" } }
         let style = DisplayModePolicy.resolve(effectivePreference, viewerW: v.w, viewerH: v.h, highDPIChoice: settings.highDPIChoice)
         guard let m = DisplayModePolicy.choose(preference: effectivePreference, viewerW: v.w, viewerH: v.h, modes: modes().map(\.info), current: currentMode(), highDPIChoice: settings.highDPIChoice) else { return nil }
         return "\(style.rawValue): \(m)"
@@ -235,6 +244,13 @@ final class DisplayModeController: @unchecked Sendable {
     /// Applies the policy for the current viewer. Returns true if the mode was switched.
     private func applyPolicy(reason: String) -> Bool {
         guard owner != nil, let v = viewer else { return false }
+        if ActiveDisplay.isVirtual(displayID) {
+            // Never CGConfigureDisplayWithDisplayMode a virtual display (VirtualDisplay.swift):
+            // re-apply its own settings instead.
+            let switched = VirtualDisplayManager.shared.applyPolicy(reason: reason)
+            if switched { lastAction = "virtual display: " + (VirtualDisplayManager.shared.lastAction ?? "reconfigured") }
+            return switched
+        }
         if userOverride { log("display: not switching (\(reason)) — mode was changed manually this session"); return false }
         let all = modes()
         let cur = currentMode()
@@ -261,12 +277,22 @@ final class DisplayModeController: @unchecked Sendable {
         DispatchQueue.main.asyncAfter(deadline: .now() + after, execute: work)
     }
 
+    /// The virtual display is about to take over: put the physical display back into the mode it
+    /// had before Glide switched it (while it is still `displayID`).
+    func restorePhysicalBeforeVirtual() {
+        guard settings.restore != nil, !ActiveDisplay.isVirtual(displayID) else { return }
+        restore(reason: "virtual display takes over")
+    }
+
     private func restore(reason: String) {
         pendingRestore?.cancel(); pendingRestore = nil
         guard let r = settings.restore else { return }
         // The display Glide switched, which need not be the one served now (§3.5 selection).
         let target = settings.restoreDisplay ?? displayID
         setRestoreTarget(nil)
+        if ActiveDisplay.isVirtual(target) {  // a saved mode belongs to a physical display
+            log("display: not restoring \(r) onto the virtual display; dropped"); return
+        }
         guard ActiveDisplay.isOnline(target) else { log("display: can't restore \(r): display \(target) is offline"); return }
         if let cur = currentMode(of: target), cur.sameSize(r) { return }
         guard let mode = modes(of: target).first(where: { $0.info.sameSize(r) })?.mode else {
@@ -338,6 +364,9 @@ final class DisplayModeController: @unchecked Sendable {
             _ = followServedDisplay(reason: "display changed")
             return
         }
+        // Our own virtual display changes mode only when Glide re-applies its settings; there is no
+        // user mode to track (and CoreGraphics reports no modes for it to this process).
+        if ActiveDisplay.isVirtual(displayID) { tracker.reset(current: currentMode()); return }
         guard let cur = currentMode(),
               tracker.observe(current: cur, now: ProcessInfo.processInfo.systemUptime) == .manual,
               owner != nil || settings.restore != nil else { return }
@@ -388,7 +417,7 @@ final class DisplayModeController: @unchecked Sendable {
     }
 
     func currentMode(of display: CGDirectDisplayID? = nil) -> DisplayModeInfo? {
-        CGDisplayCopyDisplayMode(display ?? displayID).map(DisplayModeInfo.init)
+        ActiveDisplay.mode(of: display ?? displayID)
     }
 }
 

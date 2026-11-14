@@ -40,6 +40,8 @@ struct HostConfig: Codable {
     var pairedViewers: [PairedViewer]? = nil
     /// File transfer options (HostFiles.swift).
     var files: FileSettings? = nil
+    /// Optional virtual display sized to the viewer (VirtualDisplay.swift, docs/VIRTUAL_DISPLAY.md).
+    var virtualDisplay: VirtualDisplayConfig? = nil
 
     static var dir: URL {
         let base: URL
@@ -95,6 +97,11 @@ func usage() -> Never {
            glide-host --selftest-ui [--out DIR] (print the status menu per state + display-mode picks; no capture)
            glide-host --encode-bench [SECONDS]  (offline VideoToolbox encode timing, normal vs low-latency RC,
                                                 synthetic 2560x1440 desktop content; no capture, no network)
+           glide-host --virtual-display-selftest [--viewer WxH] [--hz N] [--yes]
+                                               (CREATES a temporary virtual display for ~20 s and checks
+                                                creation, HiDPI/1x, resizing and removal; may move windows;
+                                                no capture, no network; docs/VIRTUAL_DISPLAY.md)
+           glide-host --list-display-modes [ID] (print a display's current and usable modes; read-only)
       Latency tuning (env, see docs/LATENCY.md): GLIDE_FPS=N (like --fps), GLIDE_LL=1 (low-latency RC),
       GLIDE_SCK_QUEUE_DEPTH=N (default 5), GLIDE_SCK_INTERVAL=native|fps (minimumFrameInterval)
       --connect: dial out to a client running `glide-client --listen` (reconnects automatically)
@@ -117,6 +124,14 @@ func takeValue(_ flag: String) -> String? {
 if args.contains("-h") || args.contains("--help") { usage() }
 if args.contains("--version") || args.contains("-V") { print(GlideVersion.banner("glide-host")); exit(0) }
 if args.contains("--selftest-ui") { runSelfTestUI(outDir: takeValue("--out")) }  // offscreen; never captures
+if let i = args.firstIndex(of: "--list-display-modes") {  // read-only
+    runListDisplayModes(i + 1 < args.count ? UInt32(args[i + 1]) : nil)
+}
+if args.contains("--virtual-display-selftest") {  // explicit only: creates a temporary virtual display
+    args.removeAll { $0 == "--virtual-display-selftest" }
+    let yes = args.contains("--yes")
+    runVirtualDisplaySelfTest(viewer: takeValue("--viewer"), hz: takeValue("--hz").flatMap(Double.init), skipCountdown: yes)
+}
 if let i = args.firstIndex(of: "--encode-bench") {  // offline; never captures or listens
     let secs = i + 1 < args.count ? Double(args[i + 1]) ?? 3 : 3
     runEncodeBench(seconds: secs)
@@ -363,7 +378,7 @@ let sleepAssertion = hostTestMode ? nil : Power.preventSystemSleep()
 if !hostTestMode { log(sleepAssertion != nil ? "power: preventing idle system sleep while the host runs" : "power: could not create sleep assertion") }
 app.setActivationPolicy(.accessory)  // LSUIElement: menu-bar status item only
 let server = try Server(settings: settings)
-if !hostTestMode { DisplayModeController.shared.start() }
+if !hostTestMode { DisplayModeController.shared.start(); VirtualDisplayManager.shared.start() }
 ActiveDisplay.refreshNames()
 if !hostTestMode {
     let ds = ActiveDisplay.displays()
