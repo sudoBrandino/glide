@@ -42,7 +42,10 @@ extension HostConfig {
 final class DisplayModeController: @unchecked Sendable {
     static let shared = DisplayModeController()
 
-    private(set) var displayID: CGDirectDisplayID = CGMainDisplayID()
+    /// Resolved on every use (ActiveDisplay): the lid closing or a monitor swap changes it.
+    var displayID: CGDirectDisplayID { ActiveDisplay.current() }
+    /// The display the tracker's modes belong to; a different one is a new display, not a manual change.
+    private var trackedDisplay: CGDirectDisplayID = 0
     private(set) var settings = DisplaySettings()
     private var loaded = false
     private var started = false
@@ -84,12 +87,12 @@ final class DisplayModeController: @unchecked Sendable {
         }
     }
 
-    func start(displayID: CGDirectDisplayID) {
+    func start() {
         DispatchQueue.main.async { [self] in
             guard !started else { return }
             started = true
-            self.displayID = displayID
             loadSettings()
+            trackedDisplay = displayID
             tracker.reset(current: currentMode())
             NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
                 self?.screenParametersChanged()
@@ -115,6 +118,7 @@ final class DisplayModeController: @unchecked Sendable {
             sessionPreference = nil
             userOverride = false
             viewer = (viewW, viewH)
+            trackedDisplay = displayID
             tracker.reset(current: currentMode())
             if applyPolicy(reason: "viewer connected") { waitForSettle(then) } else { then() }
         }
@@ -274,6 +278,21 @@ final class DisplayModeController: @unchecked Sendable {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { w.forEach { $0() } }
         }
         notifiedSinceSwitch = true
+        if displayID != trackedDisplay {
+            // Lid closed/opened or monitor swapped: modes of the old display mean nothing here.
+            let old = trackedDisplay
+            trackedDisplay = displayID
+            tracker.reset(current: currentMode())
+            log("display: now serving display \(displayID) (was \(old)), current \(currentMode().map { "\($0)" } ?? "?")")
+            if settings.restore != nil {
+                log("display: dropping pending restore (it was for display \(old))")
+                pendingRestore?.cancel(); pendingRestore = nil
+                setRestoreTarget(nil)
+            }
+            // A viewer is connected: give the new display the mode the policy wants for it.
+            if owner != nil && !userOverride { _ = applyPolicy(reason: "display changed") }
+            return
+        }
         guard let cur = currentMode(),
               tracker.observe(current: cur, now: ProcessInfo.processInfo.systemUptime) == .manual,
               owner != nil || settings.restore != nil else { return }

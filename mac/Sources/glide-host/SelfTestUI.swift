@@ -24,7 +24,7 @@ func runSelfTestUI(outDir: String?) -> Never {
         print(line)
     }
 
-    let menu = StatusMenu(actions: .init(), displayID: dm.displayID, showStatusItem: false)
+    let menu = StatusMenu(actions: .init(), showStatusItem: false)
     let dir = outDir.map { URL(fileURLWithPath: $0, isDirectory: true) }
     if let dir { try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
 

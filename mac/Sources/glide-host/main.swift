@@ -8,7 +8,6 @@ struct HostSettings {
     var port: UInt16 = 7420
     /// This Mac's static key (host-key, see HostIdentity).
     var identity: Curve25519.KeyAgreement.PrivateKey
-    var displayID: CGDirectDisplayID = CGMainDisplayID()
     var fps = 60
     var bitrateKbps = 0
     var maxWidth = 3840
@@ -167,7 +166,7 @@ if let v = ProcessInfo.processInfo.environment["GLIDE_FPS"], let n = Int(v), n >
 if let v = takeValue("--fps"), let n = Int(v) { settings.fps = n }
 if let v = takeValue("--bitrate-kbps"), let n = Int(v) { settings.bitrateKbps = n }
 if let v = takeValue("--max-width"), let n = Int(v) { settings.maxWidth = n }
-if let v = takeValue("--display"), let n = UInt32(v) { settings.displayID = n }
+if let v = takeValue("--display"), let n = UInt32(v) { ActiveDisplay.pinned = n }
 let connectTarget = takeValue("--connect") ?? config.connect
 guard args.isEmpty else { print("unknown arguments: \(args)"); usage() }
 
@@ -361,7 +360,7 @@ let sleepAssertion = hostTestMode ? nil : Power.preventSystemSleep()
 if !hostTestMode { log(sleepAssertion != nil ? "power: preventing idle system sleep while the host runs" : "power: could not create sleep assertion") }
 app.setActivationPolicy(.accessory)  // LSUIElement: menu-bar status item only
 let server = try Server(settings: settings)
-if !hostTestMode { DisplayModeController.shared.start(displayID: settings.displayID) }
+if !hostTestMode { DisplayModeController.shared.start() }
 let pairing = PairingController.shared
 pairing.showAlerts = !hostTestMode
 pairing.onOpen = { server.kickDialer() }
@@ -377,7 +376,7 @@ let statusMenu = StatusMenu(actions: .init(disconnect: { server.disconnect() }, 
                                            },
                                            sendFiles: { server.current?.sendFiles($0) ?? false },
                                            cancelFiles: { server.current?.cancelFiles() }),
-                            displayID: settings.displayID, showStatusItem: !hostTestMode)
+                            showStatusItem: !hostTestMode)
 HostNotifier.shared.setUp()
 statusMenu.downloadDir = settings.files.downloadDir
 log("files: transfer \(settings.files.enabled ? "on" : "off"), receiving \(settings.files.receive ? "on" : "off") into \(settings.files.downloadDir.path)")

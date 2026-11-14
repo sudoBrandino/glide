@@ -62,7 +62,7 @@ final class Session: @unchecked Sendable {
         self.id = id
         self.settings = settings
         self.channel = SecureChannel(connection: connection, queue: queue ?? DispatchQueue(label: "glide.session.\(id)", qos: .userInteractive))
-        self.injector = InputInjector(displayID: settings.displayID)
+        self.injector = InputInjector()
     }
 
     var peer: String { "\(channel.connection.endpoint)" }
@@ -392,7 +392,7 @@ final class Session: @unchecked Sendable {
         let fps = maxFps > 0 ? min(Int(maxFps), settings.fps) : settings.fps
         // Never send more pixels than the viewer can show 1:1 (e.g. a 5K HiDPI desktop to a 4K monitor).
         let viewerW = Int(viewW) > 0 ? Int(viewW) : settings.maxWidth
-        let p = VideoPipeline(options: .init(displayID: settings.displayID, mode: m, codec: codec, fps: fps, bitrateKbps: settings.bitrateKbps, maxWidth: min(settings.maxWidth, viewerW)))
+        let p = VideoPipeline(options: .init(displayID: ActiveDisplay.current(), mode: m, codec: codec, fps: fps, bitrateKbps: settings.bitrateKbps, maxWidth: min(settings.maxWidth, viewerW)))
         pipeline = p
         let maxInFlight = settings.maxInFlightBytes
         p.canSend = { [weak self] in (self?.channel.bytesInFlight ?? 0) < maxInFlight }
@@ -421,7 +421,11 @@ final class Session: @unchecked Sendable {
             }
             HostStatus.shared.video(id: self.id, config: cfg, hybrid: sharpCfg != nil)
             // Cursor bitmaps are in encoded pixels: backing scale x (encoded width / native width).
-            let mode = CGDisplayCopyDisplayMode(self.settings.displayID)
+            // Input maps onto the display actually being captured (it changes when the lid closes or a
+            // monitor is swapped; the display-change observer re-captures).
+            let shown = p.options.displayID
+            self.inputQueue.async { self.injector.setDisplay(shown) }
+            let mode = CGDisplayCopyDisplayMode(shown)
             let native = CGFloat(mode?.pixelWidth ?? Int(cfg.width))
             self.cursor.scale = CGFloat(cfg.scale) * CGFloat(cfg.width) / max(native, 1)
         }

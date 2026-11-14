@@ -18,7 +18,6 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     let menu = NSMenu()
     private var statusItem: NSStatusItem?
     private let actions: Actions
-    private let displayID: CGDirectDisplayID
     private var refreshTimer: Timer?
     private var menuOpen = false
     /// launchd label when run as the LaunchAgent (KeepAlive relaunches us on exit).
@@ -58,9 +57,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     /// Where received files go (host.json files.downloadDir).
     var downloadDir: URL?
 
-    init(actions: Actions, displayID: CGDirectDisplayID, showStatusItem: Bool = true) {
+    init(actions: Actions, showStatusItem: Bool = true) {
         self.actions = actions
-        self.displayID = displayID
         let env = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"]
         launchdLabel = (env?.isEmpty == false && env != "0") ? env : nil
         super.init()
@@ -242,7 +240,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             restoreNowItem.title = "Restore \(r) Now"
             restoreNowItem.isHidden = false
         } else { restoreNowItem.isHidden = true }
-        if let m = CGDisplayCopyDisplayMode(displayID) {
+        if let m = CGDisplayCopyDisplayMode(ActiveDisplay.current()) {
             let info = DisplayModeInfo(m)
             displayInfoItem.title = "Mac display: " + (info.hiDPI ? "looks like \(info.width)×\(info.height) (HiDPI, \(info.pixelWidth)×\(info.pixelHeight) px)" : "\(info.width)×\(info.height) (1x)") + String(format: " @ %.0f Hz", m.refreshRate)
         } else { displayInfoItem.title = "Mac display: unknown" }

@@ -5,7 +5,8 @@ import GlideCore
 /// Injects remote mouse/keyboard input as CGEvents. Call from a single serial queue.
 final class InputInjector {
     private let source = CGEventSource(stateID: .hidSystemState)
-    private var displayID: CGDirectDisplayID
+    /// The display being captured (Session sets it on every VideoConfig); nil or offline -> ActiveDisplay.
+    private var displayID: CGDirectDisplayID?
     private var heldButtons = Set<UInt8>()
     private var heldKeys = Set<UInt16>()      // mac key codes
     private var flags: CGEventFlags = []
@@ -16,15 +17,15 @@ final class InputInjector {
     /// Pixels scrolled per wheel notch.
     var pixelsPerNotch: CGFloat = 48
 
-    init(displayID: CGDirectDisplayID) {
-        self.displayID = displayID
+    init() {
         source?.localEventsSuppressionInterval = 0
     }
 
     func setDisplay(_ id: CGDirectDisplayID) { displayID = id }
 
     private func point(_ x: Float, _ y: Float) -> CGPoint {
-        let b = CGDisplayBounds(displayID)
+        let id = displayID.flatMap { ActiveDisplay.isOnline($0) ? $0 : nil } ?? ActiveDisplay.current()
+        let b = CGDisplayBounds(id)
         let cx = min(max(CGFloat(x), 0), 1), cy = min(max(CGFloat(y), 0), 1)
         return CGPoint(x: b.minX + cx * (b.width - 1), y: b.minY + cy * (b.height - 1))
     }
