@@ -42,6 +42,8 @@ jobs:
           python3 tools/gen_vectors.py "$RUNNER_TEMP/v.json"
           cmp "$RUNNER_TEMP/v.json" docs/test-vectors.json
           python3 tools/gen_vectors.py --check docs/test-vectors-rust.json  # Rust transcript, replayed in Python
+          python3 tools/mock_host.py --display-vectors "$RUNNER_TEMP/d.json"  # §3.5 display messages + matching
+          cmp "$RUNNER_TEMP/d.json" docs/display-vectors.json
       - name: No personal paths in the tree
         # Examples and tests use placeholders such as %USERPROFILE% or C:\Users\me; see CONTRIBUTING.md.
         run: |

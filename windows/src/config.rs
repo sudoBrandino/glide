@@ -100,6 +100,9 @@ pub struct Config {
     pub last_monitor: Option<String>,
     /// Per-monitor window state, keyed by monitor device name.
     pub windows: BTreeMap<String, WindowState>,
+    /// The Mac display last chosen in the display picker, per target (`pin_target`), by stable
+    /// identity (PROTOCOL.md §3.5). Absent = the host's default display.
+    pub last_display: BTreeMap<String, crate::displays::DisplayIdentity>,
 }
 
 impl Default for Config {
@@ -125,6 +128,7 @@ impl Default for Config {
             pinned_hosts: BTreeMap::new(),
             last_monitor: None,
             windows: BTreeMap::new(),
+            last_display: BTreeMap::new(),
         }
     }
 }
@@ -267,6 +271,7 @@ pub fn parse(text: &str) -> Loaded {
     field!(pinned_hosts);
     field!(last_monitor);
     field!(windows);
+    field!(last_display);
     if c.listen_port == 0 {
         c.listen_port = d.listen_port;
         bad.push("listen_port");

@@ -482,6 +482,10 @@ do {
     let vpath = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "../docs/test-vectors.json"
     try fileTests(vectorsDir: URL(fileURLWithPath: vpath).deletingLastPathComponent())
 } catch { failures += 1; print("  FAIL file transfer threw \(error)") }
+do {
+    let vpath = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "../docs/test-vectors.json"
+    try displayTests(vectorsDir: URL(fileURLWithPath: vpath).deletingLastPathComponent())
+} catch { failures += 1; print("  FAIL displays threw \(error)") }
 do { try displayWireTests() } catch { failures += 1; print("  FAIL display wire threw \(error)") }
 print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)

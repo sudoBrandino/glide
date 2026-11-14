@@ -19,6 +19,8 @@ pub const CAP_AUDIO_PCM: u32 = 1 << 9;
 pub const CAP_AUDIO_OPUS: u32 = 1 << 10;
 /// File transfer in both directions (§6).
 pub const CAP_FILES: u32 = 1 << 11;
+/// Display selection: DisplayList / DisplayChanged / SelectDisplay (PROTOCOL.md §3.5).
+pub const CAP_DISPLAYS: u32 = 1 << 13;
 
 // Client -> Host message types
 pub const MSG_CLIENT_HELLO: u8 = 0x01;
@@ -30,6 +32,8 @@ pub const MSG_RELEASE_ALL: u8 = 0x14;
 pub const MSG_VIEW_SIZE: u8 = 0x15;
 /// Viewer → host: Mac display-mode preference for this session (v1.3).
 pub const MSG_SET_DISPLAY_PREFERENCE: u8 = 0x16;
+/// Stream a given Mac display (§3.5).
+pub const MSG_SELECT_DISPLAY: u8 = 0x1A;
 pub const MSG_REQUEST_KEYFRAME: u8 = 0x20;
 pub const MSG_SET_MODE: u8 = 0x21;
 pub const MSG_PING: u8 = 0x30;
@@ -59,6 +63,23 @@ pub const AUTH_TIMEOUT: u8 = 4;
 pub const AUTH_BUSY: u8 = 5;
 /// Host → viewer: current display preference + mode (v1.3).
 pub const MSG_DISPLAY_INFO: u8 = 0x05;
+/// The Mac's displays (§3.5, caps bit 13).
+pub const MSG_DISPLAY_LIST: u8 = 0x06;
+/// The streamed display changed, or a SelectDisplay was answered (§3.5).
+pub const MSG_DISPLAY_CHANGED: u8 = 0x07;
+/// DisplayList entry flags.
+pub const DISPLAY_FLAG_MAIN: u8 = 1 << 0;
+pub const DISPLAY_FLAG_BUILTIN: u8 = 1 << 1;
+pub const DISPLAY_FLAG_HIDPI: u8 = 1 << 2;
+/// What SelectDisplay(0) streams.
+pub const DISPLAY_FLAG_DEFAULT: u8 = 1 << 3;
+/// DisplayChanged reasons.
+pub const DISPLAY_REASON_SELECTED: u8 = 0;
+pub const DISPLAY_REASON_UNAVAILABLE: u8 = 1;
+pub const DISPLAY_REASON_FALLBACK: u8 = 2;
+pub const DISPLAY_REASON_RESTORED: u8 = 3;
+pub const DISPLAY_REASON_HOST: u8 = 4;
+pub const DISPLAY_REASON_DEFAULT: u8 = 5;
 
 /// Mac display-mode preferences (SetDisplayPreference / DisplayInfo `u8 preference`).
 pub const DISPLAY_PREF_AUTOMATIC: u8 = 0;
@@ -486,6 +507,54 @@ pub enum ClientMsg {
     LatencyReport(LatencyReport),
     /// Mac display-mode preference for this session (`DISPLAY_PREF_*`).
     SetDisplayPreference { mode: u8 },
+    /// Stream Mac display `display_id` (0 = the host's default), §3.5.
+    SelectDisplay { display_id: u32 },
+}
+
+/// One Mac display from DisplayList (§3.5). `id` is volatile (this connection only).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MacDisplay {
+    pub id: u32,
+    pub flags: u8,
+    /// Top-left in global points (main display at 0,0; y grows downwards).
+    pub x: i32,
+    pub y: i32,
+    /// Current mode in points and backing pixels.
+    pub width: u16,
+    pub height: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+    /// 1/100 Hz, 0 = unknown.
+    pub refresh: u16,
+    pub vendor: u32,
+    pub model: u32,
+    pub serial: u32,
+    pub name: String,
+}
+
+impl MacDisplay {
+    fn write(&self, w: &mut Writer) {
+        w.u32(self.id).u8(self.flags).u32(self.x as u32).u32(self.y as u32);
+        w.u16(self.width).u16(self.height).u16(self.pixel_width).u16(self.pixel_height).u16(self.refresh);
+        w.u32(self.vendor).u32(self.model).u32(self.serial).str(&self.name);
+    }
+    fn read(r: &mut Reader) -> Result<MacDisplay, DecodeError> {
+        Ok(MacDisplay {
+            id: r.u32()?,
+            flags: r.u8()?,
+            x: r.u32()? as i32,
+            y: r.u32()? as i32,
+            width: r.u16()?,
+            height: r.u16()?,
+            pixel_width: r.u16()?,
+            pixel_height: r.u16()?,
+            refresh: r.u16()?,
+            vendor: r.u32()?,
+            model: r.u32()?,
+            serial: r.u32()?,
+            name: r.str_lossy()?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -516,6 +585,10 @@ pub enum HostMsg {
     /// Current Mac display preference (`DISPLAY_PREF_*`) and mode ("looks like" size in points,
     /// `hidpi` = Retina backing). Sent after ServerHello and whenever either changes.
     DisplayInfo { preference: u8, mode_w: u16, mode_h: u16, hidpi: bool },
+    /// The Mac's displays in list order (§3.5); `selected` 0 = following the host's default.
+    DisplayList { streamed: u32, selected: u32, displays: Vec<MacDisplay> },
+    /// `reason` = `DISPLAY_REASON_*`.
+    DisplayChanged { display_id: u32, reason: u8, requested: u32 },
     /// Unknown message type: ignored for forward compatibility.
     Unknown { msg_type: u8 },
 }
@@ -733,6 +806,7 @@ impl ClientMsg {
                 .u32(r.ground_truth_us)
                 .finish(),
             ClientMsg::SetDisplayPreference { mode } => Writer::new(MSG_SET_DISPLAY_PREFERENCE).u8(*mode).finish(),
+            ClientMsg::SelectDisplay { display_id } => Writer::new(MSG_SELECT_DISPLAY).u32(*display_id).finish(),
         }
     }
 
@@ -777,6 +851,7 @@ impl ClientMsg {
                 ground_truth_us: r.u32()?,
             }),
             MSG_SET_DISPLAY_PREFERENCE => ClientMsg::SetDisplayPreference { mode: r.u8()? },
+            MSG_SELECT_DISPLAY => ClientMsg::SelectDisplay { display_id: r.u32()? },
             _ => return Err(DecodeError::BadLength(t)),
         })
     }
@@ -874,6 +949,12 @@ impl HostMsg {
             MSG_DISPLAY_INFO => {
                 HostMsg::DisplayInfo { preference: r.u8()?, mode_w: r.u16()?, mode_h: r.u16()?, hidpi: r.u8()? != 0 }
             }
+            MSG_DISPLAY_LIST => {
+                let (streamed, selected, n) = (r.u32()?, r.u32()?, r.u8()?);
+                let displays = (0..n).map(|_| MacDisplay::read(&mut r)).collect::<Result<Vec<_>, _>>()?;
+                HostMsg::DisplayList { streamed, selected, displays }
+            }
+            MSG_DISPLAY_CHANGED => HostMsg::DisplayChanged { display_id: r.u32()?, reason: r.u8()?, requested: r.u32()? },
             other => HostMsg::Unknown { msg_type: other },
         };
         Ok(msg)
@@ -951,6 +1032,18 @@ impl HostMsg {
                 .finish(),
             HostMsg::DisplayInfo { preference, mode_w, mode_h, hidpi } => {
                 Writer::new(MSG_DISPLAY_INFO).u8(*preference).u16(*mode_w).u16(*mode_h).u8(*hidpi as u8).finish()
+            }
+            HostMsg::DisplayList { streamed, selected, displays } => {
+                let mut w = Writer::new(MSG_DISPLAY_LIST);
+                let list = &displays[..displays.len().min(255)];
+                w.u32(*streamed).u32(*selected).u8(list.len() as u8);
+                for d in list {
+                    d.write(&mut w);
+                }
+                w.finish()
+            }
+            HostMsg::DisplayChanged { display_id, reason, requested } => {
+                Writer::new(MSG_DISPLAY_CHANGED).u32(*display_id).u8(*reason).u32(*requested).finish()
             }
             HostMsg::Unknown { msg_type } => vec![*msg_type],
         }

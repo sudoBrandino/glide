@@ -25,6 +25,9 @@ pub enum Action {
     LatencyTest,
     PullFiles,
     CancelFiles,
+    /// Stream the Mac display to the right / left of the current one (PROTOCOL.md §3.5).
+    NextDisplay,
+    PrevDisplay,
 }
 
 impl Action {
@@ -46,6 +49,8 @@ impl Action {
             "pullfiles" | "v" => Action::PullFiles,
             "cancelfiles" | "x" => Action::CancelFiles,
             "latency" | "l" => Action::LatencyTest,
+            "nextdisplay" | "right" => Action::NextDisplay,
+            "prevdisplay" | "left" => Action::PrevDisplay,
             _ => return None,
         })
     }
@@ -65,6 +70,8 @@ pub const KEY_V: u16 = 0x19;
 pub const KEY_X: u16 = 0x1B;
 pub const KEY_ENTER: u16 = 0x28;
 pub const KEY_F11: u16 = 0x44;
+pub const KEY_RIGHT: u16 = 0x4F;
+pub const KEY_LEFT: u16 = 0x50;
 
 /// Hotkey table: (letter usage, action, description) — all with Ctrl+Alt+Shift.
 pub const TABLE: &[(u16, Action, &str)] = &[
@@ -79,6 +86,8 @@ pub const TABLE: &[(u16, Action, &str)] = &[
     (KEY_V, Action::PullFiles, "Ctrl+Alt+Shift+V  paste files copied in Finder (saved to Downloads\\Glide)"),
     (KEY_X, Action::CancelFiles, "Ctrl+Alt+Shift+X  cancel the file transfer"),
     (KEY_L, Action::LatencyTest, "Ctrl+Alt+Shift+L  latency test: read the host's test pattern (glide-probe --pattern-only)"),
+    (KEY_RIGHT, Action::NextDisplay, "Ctrl+Alt+Shift+→  show the next Mac display (to the right)"),
+    (KEY_LEFT, Action::PrevDisplay, "Ctrl+Alt+Shift+←  show the previous Mac display (to the left)"),
 ];
 
 pub fn help() -> String {
@@ -166,6 +175,11 @@ mod tests {
         assert_eq!(match_hotkey(CAS, KEY_X), Some(Action::CancelFiles));
         assert_eq!(match_hotkey(Mods { ctrl: true, ..Default::default() }, KEY_V), None, "Ctrl+V (Cmd+V) still pastes on the Mac");
         assert_eq!(match_hotkey(CAS, 0x05 /* B */), None);
+        assert_eq!(match_hotkey(CAS, KEY_RIGHT), Some(Action::NextDisplay));
+        assert_eq!(match_hotkey(CAS, KEY_LEFT), Some(Action::PrevDisplay));
+        assert_eq!(match_hotkey(Mods { ctrl: true, alt: true, ..Default::default() }, KEY_RIGHT), None, "Cmd+Opt+→ goes to the Mac");
+        assert_eq!(match_hotkey(Mods { ctrl: true, shift: true, ..Default::default() }, KEY_LEFT), None, "Cmd+Shift+← selects text on the Mac");
+        assert_eq!(match_hotkey(Mods::default(), KEY_RIGHT), None);
         // missing any modifier → forwarded to the host as usual (e.g. Cmd+Shift+H, Cmd+Opt+H)
         for m in [
             Mods { ctrl: false, ..CAS },
@@ -215,5 +229,11 @@ mod tests {
         assert_eq!(Action::from_name("pullfiles"), Some(Action::PullFiles));
         assert_eq!(Action::from_name("nope"), None);
         assert!(help().lines().count() == TABLE.len());
+        assert_eq!(Action::from_name("right"), Some(Action::NextDisplay));
+        // every hotkey key is bound once
+        let mut keys: Vec<u16> = TABLE.iter().map(|t| t.0).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), TABLE.len(), "duplicate hotkey");
     }
 }

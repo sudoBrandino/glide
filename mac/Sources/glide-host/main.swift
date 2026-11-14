@@ -364,6 +364,12 @@ if !hostTestMode { log(sleepAssertion != nil ? "power: preventing idle system sl
 app.setActivationPolicy(.accessory)  // LSUIElement: menu-bar status item only
 let server = try Server(settings: settings)
 if !hostTestMode { DisplayModeController.shared.start() }
+ActiveDisplay.refreshNames()
+if !hostTestMode {
+    let ds = ActiveDisplay.displays()
+    log("displays: " + (ds.isEmpty ? "none awake" : ds.map { "\($0.id) \($0.summary)\($0.isMain ? " (main)" : "")" }.joined(separator: "; "))
+        + (ActiveDisplay.pinned.map { "; --display \($0)" } ?? ""))
+}
 let pairing = PairingController.shared
 pairing.showAlerts = !hostTestMode
 pairing.onOpen = { server.kickDialer() }
@@ -378,7 +384,8 @@ let statusMenu = StatusMenu(actions: .init(disconnect: { server.disconnect() }, 
                                                server.endSessions(of: gone.compactMap(\.keyData))
                                            },
                                            sendFiles: { server.current?.sendFiles($0) ?? false },
-                                           cancelFiles: { server.current?.cancelFiles() }),
+                                           cancelFiles: { server.current?.cancelFiles() },
+                                           selectDisplay: { server.current?.selectDisplay($0, by: .host) }),
                             showStatusItem: !hostTestMode)
 HostNotifier.shared.setUp()
 statusMenu.downloadDir = settings.files.downloadDir

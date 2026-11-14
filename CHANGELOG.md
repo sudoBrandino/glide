@@ -17,6 +17,12 @@ changed for them, not how. Delete empty subsections when the release is cut.
 ## [Unreleased]
 
 ### Added
+- Multi-monitor: choose which Mac display to stream from the viewer's Glide menu (**Show Mac
+  display**) or cycle with **Ctrl+Alt+Shift+→ / ←**; the Mac menu bar has a matching
+  **Streamed Display** submenu. The choice is remembered per host and re-selected on reconnect,
+  even if the display's ID changed. Unplugging the streamed display falls back to the main one
+  and switches back when it returns. New protocol messages (§3.5, capability bit 13) are ignored
+  by older hosts and viewers.
 
 ### Changed
 

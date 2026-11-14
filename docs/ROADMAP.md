@@ -88,7 +88,7 @@ Next:
   1920×1080 HiDPI at 120 Hz. This drops the BetterDisplay dependency and the need to switch modes
   with `tools/display-mode.swift`.
 - [ ] **UDP video transport with NACK/FEC**, because TCP head-of-line blocking hurts on loss
-- [ ] Multi-monitor support and a display picker
+- [x] Multi-monitor support and a display picker (PROTOCOL.md §3.5; one display at a time, no spanning)
 - [ ] Glass-to-glass latency measurement on the real LAN
 - [ ] Clipboard: delayed-render virtual files on Windows paste (Explorer Ctrl+V of Mac files); big
   clipboard images could reuse the chunked file path so they don't stall video

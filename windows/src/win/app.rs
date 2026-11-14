@@ -20,6 +20,7 @@ use super::scanout::ScanoutClock;
 use super::{connbar as cbar, menu, placement, prompt, tray};
 use crate::menu_model::{self, Cmd};
 use crate::config::{self, Store};
+use crate::displays::{self, DisplayState};
 use crate::hid;
 use crate::hotkeys::{self, Action};
 use crate::blockcode;
@@ -176,6 +177,12 @@ struct Shared {
     hwnd: AtomicIsize,
     /// Mac display preference/mode from the host (DisplayInfo, §3.3); None until received.
     display_info: Mutex<Option<menu_model::DisplayInfo>>,
+    /// The Mac's displays (DisplayList, §3.5); None until received (old hosts never send it).
+    displays: Mutex<Option<DisplayState>>,
+    /// This connection already tried to re-select the remembered display.
+    display_restore_done: AtomicBool,
+    /// The display id re-selected from memory, until the host answers (toast "remembered").
+    display_restoring: Mutex<Option<u32>>,
     /// Audio output (None with --no-audio).
     audio: Option<Audio>,
     /// Per-frame latency breakdown (docs/LATENCY.md). Written by the receive and render
@@ -1070,12 +1077,16 @@ fn update_title(hwnd: HWND) {
         audio: audio_hud(),
         latency,
         latency_test: sh.latency_test.load(Ordering::Relaxed),
-        mac_display: sh
-            .display_info
-            .lock()
-            .unwrap()
+        mac_display: {
+            // "DELL U2723QE · 1920×1080 Retina (automatic)": which Mac display (§3.5) and its mode (§3.3).
+            let name = sh.displays.lock().unwrap().as_ref().map(|d| d.name(d.streamed));
+            let mode = sh.display_info.lock().unwrap().map(|d| format!("{} ({})", d.describe(), menu_model::display_pref_name(d.preference)));
+            match (name, mode) {
+                (Some(n), Some(m)) => Some(format!("{n} · {m}")),
+                (n, m) => n.or(m),
+            }
             .filter(|_| status.is_none())
-            .map(|d| format!("{} ({})", d.describe(), menu_model::display_pref_name(d.preference))),
+        },
     };
     let lines = hud::lines(&info);
     let hud_on = STATE.with(|s| {
@@ -1272,6 +1283,8 @@ fn do_action(hwnd: HWND, a: Action) {
         Action::ToggleMute => toggle_mute(hwnd),
         Action::PullFiles => toast(files::pull()),
         Action::CancelFiles => toast(files::cancel()),
+        Action::NextDisplay => cycle_display(1),
+        Action::PrevDisplay => cycle_display(-1),
         Action::LatencyTest => {
             if sh.latency_test.load(Ordering::Relaxed) {
                 let path = write_latency_report();
@@ -1304,6 +1317,30 @@ fn do_action(hwnd: HWND, a: Action) {
             }
         }
     }
+}
+
+/// Ctrl+Alt+Shift+→/←: stream the next/previous Mac display (§3.5). The host answers with
+/// DisplayChanged, whose toast replaces this one.
+fn cycle_display(step: i32) {
+    if !connected() {
+        toast("Not connected");
+        return;
+    }
+    let st = ui().shared.displays.lock().unwrap().clone();
+    match st {
+        None => toast("This Mac can't switch displays — update Glide Host"),
+        Some(st) => match st.cycle(step) {
+            Some(id) => select_display(id, &st),
+            None => toast(format!("The Mac has one display (“{}”)", st.name(st.streamed))),
+        },
+    }
+}
+
+/// Ask the host to stream display `id` (0 = its default).
+fn select_display(id: u32, st: &DisplayState) {
+    eprintln!("display: SelectDisplay {id}");
+    send(ClientMsg::SelectDisplay { display_id: id });
+    toast(if id == 0 { "Switching to the Mac's main display…".to_string() } else { format!("Switching to “{}”…", st.name(id)) });
 }
 
 /// Switch the stream mode (SetMode), remembered in the config and used for reconnects.
@@ -1350,6 +1387,7 @@ fn menu_state() -> menu_model::MenuState {
             file_pull: files::peer_flags().is_some_and(|f| f & protocol::FILE_CAPS_SEND != 0),
             files_busy: files::busy(),
             latency_test: sh.latency_test.load(Ordering::Relaxed),
+            displays: sh.displays.lock().unwrap().clone(),
         }
     })
 }
@@ -1426,6 +1464,16 @@ fn run_menu_cmd(hwnd: HWND, c: Cmd) {
         Cmd::ReceiveFiles => do_action(hwnd, Action::PullFiles),
         Cmd::CancelFiles => do_action(hwnd, Action::CancelFiles),
         Cmd::OpenReceived => files::open_folder(),
+        Cmd::ShowDefaultDisplay | Cmd::ShowDisplay(_) => {
+            let Some(st) = ui().shared.displays.lock().unwrap().clone().filter(|_| connected()) else { return };
+            match c {
+                Cmd::ShowDisplay(i) => match st.displays.get(i as usize) {
+                    Some(d) => select_display(d.id, &st),
+                    None => toast("That Mac display is gone"),
+                },
+                _ => select_display(0, &st),
+            }
+        }
         _ => {}
     }
 }
@@ -2258,6 +2306,9 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
     *shared.host_name.lock().unwrap() = conn.host_name.clone();
     *shared.config.lock().unwrap() = cfg;
     *shared.display_info.lock().unwrap() = None; // until this host sends DisplayInfo
+    *shared.displays.lock().unwrap() = None; // until this host sends DisplayList (§3.5)
+    shared.display_restore_done.store(false, Ordering::Relaxed);
+    *shared.display_restoring.lock().unwrap() = None;
     *shared.clock.lock().unwrap() = Some(conn.clock.clone());
     {
         // Fresh cursor state for the new host session.
@@ -2336,6 +2387,62 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
                 let d = menu_model::DisplayInfo { preference, mode_w, mode_h, hidpi };
                 eprintln!("mac display: {} ({})", d.describe(), menu_model::display_pref_name(preference));
                 *shared.display_info.lock().unwrap() = Some(d);
+            }
+            NetEvent::Msg(HostMsg::DisplayList { streamed, selected, displays }) => {
+                let st = {
+                    let mut g = shared.displays.lock().unwrap();
+                    let st = g.get_or_insert_with(DisplayState::default);
+                    st.apply_list(streamed, selected, displays);
+                    st.clone()
+                };
+                eprintln!(
+                    "mac displays: {} (streaming {}{})",
+                    st.displays.iter().map(|d| format!("{} {}", d.id, displays::label(d))).collect::<Vec<_>>().join("; "),
+                    st.streamed,
+                    if st.selected != 0 { ", selected" } else { "" }
+                );
+                // First list of this connection: re-select the display chosen last time (by identity;
+                // ids change across reconnects). Nothing is sent if it isn't connected to the Mac now.
+                if !shared.display_restore_done.swap(true, Ordering::Relaxed) {
+                    let remembered = ui().store.lock().unwrap().config.last_display.get(&shared.pin_target).cloned();
+                    match displays::restore_choice(remembered.as_ref(), &st) {
+                        Some(id) => {
+                            eprintln!("display: re-selecting remembered “{}” (now id {id})", st.name(id));
+                            *shared.display_restoring.lock().unwrap() = Some(id);
+                            let _ = sender.send(&ClientMsg::SelectDisplay { display_id: id });
+                        }
+                        None if remembered.is_some() && st.selected == 0 => {
+                            eprintln!("display: remembered “{}” isn't connected to the Mac; showing the default", remembered.unwrap().name)
+                        }
+                        None => {}
+                    }
+                }
+            }
+            NetEvent::Msg(HostMsg::DisplayChanged { display_id, reason, requested }) => {
+                let st = shared.displays.lock().unwrap().clone().unwrap_or_default();
+                let restoring = {
+                    let mut r = shared.display_restoring.lock().unwrap();
+                    let was = *r == Some(requested) && reason == protocol::DISPLAY_REASON_SELECTED;
+                    if *r == Some(requested) {
+                        *r = None;
+                    }
+                    was
+                };
+                // Only the viewer's own choices are remembered (not hot-plug fallbacks or the Mac menu).
+                if let Some(m) = displays::remember_after(&st, display_id, reason, requested) {
+                    let key = shared.pin_target.clone();
+                    ui().store.lock().unwrap().update(|c| match m {
+                        Some(i) => {
+                            c.last_display.insert(key, i);
+                        }
+                        None => {
+                            c.last_display.remove(&key);
+                        }
+                    });
+                }
+                let t = displays::changed_toast(&st, display_id, reason, requested, restoring);
+                eprintln!("display: {t} (id {display_id}, reason {reason}, requested {requested})");
+                let _ = tx.send(RenderCmd::Toast(t));
             }
             NetEvent::Msg(HostMsg::Clipboard(c)) => clipboard::incoming(c),
             NetEvent::Msg(HostMsg::File(m)) => files::incoming(m),
@@ -2427,6 +2534,9 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         present_info: Mutex::new("null".into()),
         clock_info: Mutex::new("null".into()),
         display_info: Mutex::new(None),
+        displays: Mutex::new(None),
+        display_restore_done: AtomicBool::new(false),
+        display_restoring: Mutex::new(None),
     });
     let (render_tx, render_rx) = mpsc::channel::<RenderCmd>();
     let latency_test = opts.latency_test || std::env::var("GLIDE_LATENCY_TEST").is_ok_and(|v| v == "1");

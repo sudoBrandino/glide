@@ -13,6 +13,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         /// Send files to the connected viewer; false if it can't take files.
         var sendFiles: ([URL]) -> Bool = { _ in false }
         var cancelFiles: () -> Void = {}
+        /// Stream display `id` (0 = default) in the current session (PROTOCOL.md §3.5).
+        var selectDisplay: (UInt32) -> Void = { _ in }
     }
 
     let menu = NSMenu()
@@ -41,6 +43,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private let viewersItem = NSMenuItem(title: "Paired Viewers", action: nil, keyEquivalent: "")
     private let viewersMenu = NSMenu()
     private let displayItem = NSMenuItem(title: "Display Mode", action: nil, keyEquivalent: "")
+    /// "Streamed Display: …" with one item per Mac display (§3.5).
+    private let streamedItem = NSMenuItem(title: "Streamed Display", action: nil, keyEquivalent: "")
+    private let streamedMenu = NSMenu()
+    private var shownDisplays: String?
     private let displayMenu = NSMenu()
     private var prefItems: [DisplayModePreference: NSMenuItem] = [:]
     private var highDPIItems: [HighDPIViewerChoice: NSMenuItem] = [:]
@@ -96,6 +102,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         recentItem.submenu = recentMenu
         for i in [sendFilesItem, fileProgressItem, cancelFilesItem, recentItem] { menu.addItem(i) }
         menu.addItem(.separator())
+
+        streamedMenu.autoenablesItems = false
+        streamedItem.submenu = streamedMenu
+        menu.addItem(streamedItem)
 
         displayMenu.autoenablesItems = false
         let prefs: [(DisplayModePreference, String)] = [
@@ -250,6 +260,42 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         displayActionItem.title = action ?? ""
         displayActionItem.isHidden = action == nil
         displayItem.title = "Display Mode: \(Self.prefTitle(st.preference))"
+        refreshDisplays(sessionActive: s.viewer != nil)
+    }
+
+    /// The Mac's displays with a check on the streamed one; choosing one switches the current
+    /// session to it (like the viewer's display picker). Rebuilt only when something changed.
+    private func refreshDisplays(sessionActive: Bool) {
+        let list = ActiveDisplay.displays()
+        let streamed = ActiveDisplay.current()
+        let selected = ActiveDisplay.selection
+        let name = list.first { $0.id == streamed }?.name ?? "Display \(streamed)"
+        streamedItem.title = "Streamed Display: \(name)"
+        streamedItem.isHidden = list.count <= 1 && selected == nil
+        let sig = "\(list) \(streamed) \(selected.map { "\($0)" } ?? "-") \(sessionActive)"
+        guard sig != shownDisplays else { return }
+        shownDisplays = sig
+        streamedMenu.removeAllItems()
+        let def = NSMenuItem(title: "Default — \(ActiveDisplay.pinned != nil ? "Pinned (--display)" : "Main Display")", action: #selector(chooseDisplay(_:)), keyEquivalent: "")
+        def.target = self; def.tag = 0; def.state = selected == nil ? .on : .off; def.isEnabled = sessionActive
+        streamedMenu.addItem(def)
+        streamedMenu.addItem(.separator())
+        for d in list {
+            var title = d.summary
+            if d.isMain { title += " · main" }
+            let i = NSMenuItem(title: title, action: #selector(chooseDisplay(_:)), keyEquivalent: "")
+            i.target = self; i.tag = Int(d.id); i.isEnabled = sessionActive
+            i.state = d.id == streamed ? (selected == nil ? .mixed : .on) : .off
+            streamedMenu.addItem(i)
+        }
+        streamedMenu.addItem(.separator())
+        let note = NSMenuItem(title: sessionActive ? "The viewer can switch too (Glide menu, Ctrl+Alt+Shift+←/→)" : "Choose while a viewer is connected", action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        streamedMenu.addItem(note)
+    }
+
+    @objc private func chooseDisplay(_ sender: NSMenuItem) {
+        actions.selectDisplay(UInt32(truncatingIfNeeded: sender.tag))
     }
 
     private var shownViewers: [PairedViewer]?

@@ -13,6 +13,9 @@ struct DisplaySettings: Codable, Equatable {
     var restoreOnDisconnect: Bool?
     /// The mode to restore (set when Glide first switches the mode; cleared once restored).
     var restore: DisplayModeInfo?
+    /// The display `restore` belongs to (nil in files written before multi-display support: the
+    /// display being served).
+    var restoreDisplay: UInt32?
 
     var preference: DisplayModePreference { mode.flatMap { DisplayModePreference(rawValue: $0.lowercased()) } ?? .automatic }
     var highDPIChoice: HighDPIViewerChoice { highDPIViewer.flatMap { HighDPIViewerChoice(rawValue: $0.lowercased()) } ?? .retina }
@@ -42,7 +45,8 @@ extension HostConfig {
 final class DisplayModeController: @unchecked Sendable {
     static let shared = DisplayModeController()
 
-    /// Resolved on every use (ActiveDisplay): the lid closing or a monitor swap changes it.
+    /// Resolved on every use (ActiveDisplay): the session's selected display (PROTOCOL.md §3.5), the
+    /// lid closing or a monitor swap changes it.
     var displayID: CGDirectDisplayID { ActiveDisplay.current() }
     /// The display the tracker's modes belong to; a different one is a new display, not a manual change.
     private var trackedDisplay: CGDirectDisplayID = 0
@@ -120,6 +124,10 @@ final class DisplayModeController: @unchecked Sendable {
             viewer = (viewW, viewH)
             trackedDisplay = displayID
             tracker.reset(current: currentMode())
+            if settings.restore != nil, let rd = settings.restoreDisplay, rd != displayID {
+                // Left by a session that streamed another display (§3.5): that display isn't watched now.
+                if settings.restoreEnabled && ActiveDisplay.isOnline(rd) { restore(reason: "display \(rd) not streamed now") } else { setRestoreTarget(nil) }
+            }
             if applyPolicy(reason: "viewer connected") { waitForSettle(then) } else { then() }
         }
     }
@@ -186,6 +194,17 @@ final class DisplayModeController: @unchecked Sendable {
         }
     }
 
+    /// The session's selected display changed (SelectDisplay / menu bar, §3.5). Gives the previous
+    /// display its pre-session mode back, applies the policy to the new one and calls
+    /// `then(switched)` on main once the display has settled. If the mode switched, Session's
+    /// display-change observer re-captures as well.
+    func servedDisplayChanged(then: @escaping (_ switched: Bool) -> Void) {
+        DispatchQueue.main.async { [self] in
+            guard displayID != trackedDisplay else { then(false); return }
+            if followServedDisplay(reason: "display selected") { waitForSettle { then(true) } } else { then(false) }
+        }
+    }
+
     func setHighDPIChoice(_ c: HighDPIViewerChoice) {
         persist { $0.highDPIViewer = c.rawValue }
         userOverride = false
@@ -245,31 +264,66 @@ final class DisplayModeController: @unchecked Sendable {
     private func restore(reason: String) {
         pendingRestore?.cancel(); pendingRestore = nil
         guard let r = settings.restore else { return }
+        // The display Glide switched, which need not be the one served now (§3.5 selection).
+        let target = settings.restoreDisplay ?? displayID
         setRestoreTarget(nil)
-        if let cur = currentMode(), cur.sameSize(r) { return }
-        guard let mode = modes().first(where: { $0.info.sameSize(r) })?.mode else {
-            log("display: can't restore \(r): mode no longer available"); return
+        guard ActiveDisplay.isOnline(target) else { log("display: can't restore \(r): display \(target) is offline"); return }
+        if let cur = currentMode(of: target), cur.sameSize(r) { return }
+        guard let mode = modes(of: target).first(where: { $0.info.sameSize(r) })?.mode else {
+            log("display: can't restore \(r) on display \(target): mode no longer available"); return
         }
-        let ok = configure(mode, from: currentMode())
-        lastAction = "\(ok ? "restored" : "FAILED to restore") \(r) (\(reason))"
+        let ok = configure(mode, on: target, from: currentMode(of: target))
+        lastAction = "\(ok ? "restored" : "FAILED to restore") \(r)\(target != displayID ? " on display \(target)" : "") (\(reason))"
         log("display: " + lastAction!)
     }
 
-    private func configure(_ mode: CGDisplayMode, from: DisplayModeInfo?) -> Bool {
+    private func configure(_ mode: CGDisplayMode, on display: CGDirectDisplayID? = nil, from: DisplayModeInfo?) -> Bool {
+        let display = display ?? displayID
+        // The tracker follows the served display only; restoring another display isn't a change here.
+        let tracked = display == trackedDisplay
         // Record the switch first: the screen-parameters notification can be delivered re-entrantly
         // inside CGCompleteDisplayConfiguration, before it returns.
-        tracker.willSwitch(from: from, to: DisplayModeInfo(mode), now: ProcessInfo.processInfo.systemUptime)
-        notifiedSinceSwitch = false
+        if tracked {
+            tracker.willSwitch(from: from, to: DisplayModeInfo(mode), now: ProcessInfo.processInfo.systemUptime)
+            notifiedSinceSwitch = false
+        }
         var cfg: CGDisplayConfigRef?
         var ok = CGBeginDisplayConfiguration(&cfg) == .success
         if ok {
-            CGConfigureDisplayWithDisplayMode(cfg, displayID, mode, nil)
+            CGConfigureDisplayWithDisplayMode(cfg, display, mode, nil)
             // forSession: an automatic change never outlives the login session (the user's own
             // permanent choice comes back after logout/reboot).
             ok = CGCompleteDisplayConfiguration(cfg, .forSession) == .success
         }
-        tracker.didSwitch(ok: ok, actual: currentMode(), now: ProcessInfo.processInfo.systemUptime)
+        if tracked { tracker.didSwitch(ok: ok, actual: currentMode(of: display), now: ProcessInfo.processInfo.systemUptime) }
         return ok
+    }
+
+    /// The served display changed (selection, lid, monitor swap): the tracker's modes belong to the
+    /// old display. Gives the old display its pre-session mode back while a viewer is connected
+    /// (it is no longer being watched), then applies the policy to the new one. Returns true if
+    /// the new display's mode was switched.
+    private func followServedDisplay(reason: String) -> Bool {
+        let old = trackedDisplay
+        trackedDisplay = displayID
+        // A manual change on the old display says nothing about this one.
+        userOverride = false
+        log("display: now serving display \(displayID) (was \(old)), current \(currentMode().map { "\($0)" } ?? "?")")
+        if settings.restore != nil {
+            let rd = settings.restoreDisplay ?? old
+            if rd != displayID {
+                if owner != nil && settings.restoreEnabled && ActiveDisplay.isOnline(rd) {
+                    restore(reason: "display \(rd) no longer streamed")
+                } else if owner != nil || !ActiveDisplay.isOnline(rd) {
+                    log("display: dropping pending restore (it was for display \(rd))")
+                    pendingRestore?.cancel(); pendingRestore = nil
+                    setRestoreTarget(nil)
+                }  // else: no viewer, and the pending restore (grace period) still handles display rd
+            }
+        }
+        tracker.reset(current: currentMode())
+        guard owner != nil else { return false }
+        return applyPolicy(reason: reason)
     }
 
     private func screenParametersChanged() {
@@ -279,18 +333,9 @@ final class DisplayModeController: @unchecked Sendable {
         }
         notifiedSinceSwitch = true
         if displayID != trackedDisplay {
-            // Lid closed/opened or monitor swapped: modes of the old display mean nothing here.
-            let old = trackedDisplay
-            trackedDisplay = displayID
-            tracker.reset(current: currentMode())
-            log("display: now serving display \(displayID) (was \(old)), current \(currentMode().map { "\($0)" } ?? "?")")
-            if settings.restore != nil {
-                log("display: dropping pending restore (it was for display \(old))")
-                pendingRestore?.cancel(); pendingRestore = nil
-                setRestoreTarget(nil)
-            }
-            // A viewer is connected: give the new display the mode the policy wants for it.
-            if owner != nil && !userOverride { _ = applyPolicy(reason: "display changed") }
+            // Lid closed/opened, monitor swapped or the selected display went away/came back:
+            // modes of the old display mean nothing here.
+            _ = followServedDisplay(reason: "display changed")
             return
         }
         guard let cur = currentMode(),
@@ -320,8 +365,9 @@ final class DisplayModeController: @unchecked Sendable {
     }
 
     private func setRestoreTarget(_ m: DisplayModeInfo?) {
-        guard settings.restore != m else { return }
-        persist { $0.restore = m }
+        let d = m == nil ? nil : UInt32(trackedDisplay)
+        guard settings.restore != m || settings.restoreDisplay != d else { return }
+        persist { $0.restore = m; $0.restoreDisplay = d }
     }
 
     private func persist(_ f: (inout DisplaySettings) -> Void) {
@@ -335,13 +381,15 @@ final class DisplayModeController: @unchecked Sendable {
 
     struct Mode { let mode: CGDisplayMode; let info: DisplayModeInfo }
 
-    func modes() -> [Mode] {
+    func modes(of display: CGDirectDisplayID? = nil) -> [Mode] {
         let opts = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
-        let all = (CGDisplayCopyAllDisplayModes(displayID, opts) as? [CGDisplayMode]) ?? []
+        let all = (CGDisplayCopyAllDisplayModes(display ?? displayID, opts) as? [CGDisplayMode]) ?? []
         return all.filter { $0.isUsableForDesktopGUI() }.map { Mode(mode: $0, info: DisplayModeInfo($0)) }
     }
 
-    func currentMode() -> DisplayModeInfo? { CGDisplayCopyDisplayMode(displayID).map(DisplayModeInfo.init) }
+    func currentMode(of display: CGDirectDisplayID? = nil) -> DisplayModeInfo? {
+        CGDisplayCopyDisplayMode(display ?? displayID).map(DisplayModeInfo.init)
+    }
 }
 
 extension DisplayModeInfo {
