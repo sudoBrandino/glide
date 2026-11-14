@@ -139,10 +139,13 @@ fn channel(v: u32, mask: u32) -> u8 {
         return 0;
     }
     let shift = mask.trailing_zeros();
-    let bits = (mask >> shift).count_ones().min(16);
-    let x = (v & mask) >> shift;
-    let max = (1u32 << bits) - 1;
-    ((x * 255 + max / 2) / max) as u8
+    let count = (mask >> shift).count_ones();
+    let bits = count.min(16);
+    // Masks come from untrusted DIB headers: wider than 16 bits keeps the top 16; a mask with
+    // holes can still exceed `max`, so clamp, and do the scaling in u64 (no overflow).
+    let x = (((v & mask) >> shift) >> (count - bits)) as u64;
+    let max = (1u64 << bits) - 1;
+    ((x.min(max) * 255 + max / 2) / max) as u8
 }
 
 /// Parse a packed DIB (CF_DIB / CF_DIBV5 content: BITMAPINFOHEADER/V4/V5 + optional masks +
@@ -319,9 +322,18 @@ pub fn rgba_to_png(img: &Rgba) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Decoder-internal allocation budget for one PNG (see `png_to_rgba`).
+const PNG_DECODER_LIMIT: usize = 16 << 20;
+
 /// Decode any PNG (palette, gray, 16-bit, ...) to RGBA8.
 pub fn png_to_rgba(data: &[u8]) -> Result<Rgba, String> {
-    let mut dec = png::Decoder::new_with_limits(std::io::Cursor::new(data), png::Limits { bytes: (MAX_PIXELS * 4) as usize });
+    // `Limits.bytes` bounds the decoder's own allocations (ancillary chunks such as a compressed
+    // iCCP profile, and one row buffer), not the image buffer we allocate below. Keep it at 16 MiB
+    // (a 2-Mpx-wide 16-bit RGBA row) and skip the chunks we never use, so a tiny PNG can't make
+    // the decoder inflate hundreds of MB.
+    let mut dec = png::Decoder::new_with_limits(std::io::Cursor::new(data), png::Limits { bytes: PNG_DECODER_LIMIT });
+    dec.set_ignore_iccp_chunk(true);
+    dec.set_ignore_text_chunk(true);
     dec.set_transformations(png::Transformations::normalize_to_color8());
     let mut rd = dec.read_info().map_err(|e| format!("png: {e}"))?;
     let (w, h) = (rd.info().width, rd.info().height);

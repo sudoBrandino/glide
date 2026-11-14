@@ -19,6 +19,7 @@ pub mod hid;
 pub mod hotkeys;
 pub mod hud;
 pub mod identity;
+pub mod input;
 pub mod latency;
 pub mod menu_model;
 pub mod net;
@@ -28,6 +29,8 @@ pub mod protocol;
 pub mod util;
 pub mod version;
 
+#[cfg(test)]
+mod fuzz_tests;
 #[cfg(test)]
 pub(crate) mod testhost;
 

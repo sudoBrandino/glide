@@ -23,6 +23,23 @@ changed for them, not how. Delete empty subsections when the release is cut.
   even if the display's ID changed. Unplugging the streamed display falls back to the main one
   and switches back when it returns. New protocol messages (§3.5, capability bit 13) are ignored
   by older hosts and viewers.
+- Input extensions (protocol §3.6, capability bit 12; older hosts and viewers keep the previous
+  behavior):
+  - Touchpad and high-resolution wheel scrolling arrives on the Mac as smooth pixel scrolling with
+    gesture phases; a notched wheel scrolls like a Mac mouse wheel (3 lines per notch).
+  - **Relative mouse** for games and 3D apps: **Ctrl+Alt+Shift+G** or Glide menu → Input. The pointer
+    is hidden and held in the window and raw mouse motion is sent to the Mac.
+  - Caps Lock and Num Lock stay in sync with the PC (its LEDs stay right); with Num Lock off the
+    keypad is Home/End/arrows on the Mac too.
+  - Media keys: play/pause, next, previous and stop control the Mac; volume keys stay on the PC,
+    where the Mac's sound plays.
+- Glide menu → **Input**: switch Ctrl as Command (Win as Control) on or off at runtime, and
+  **Natural scrolling** (reverses the direction; config `natural_scrolling`).
+- Host: `GLIDE_KEYBOARD_TYPE=ansi|iso|jis`, `GLIDE_SCROLL_LINES`, `GLIDE_SCROLL_PIXELS` for tuning.
+- `docs/THREAT_MODEL.md`: what pairing protects and what it doesn't, trust in the LAN, and the
+  host-dials (listen) mode.
+- Both sides' message decoders are fuzzed on every CI run (`cargo test`, `glide-selftest`), and
+  CI now runs `cargo clippy` with warnings as errors and a gitleaks secret scan.
 
 - **Virtual display, on by default:** when a viewer connects, the Mac host creates a virtual monitor
   with the viewer's exact pixels and monitor refresh rate and streams it 1:1. The Mac no longer
@@ -48,12 +65,39 @@ changed for them, not how. Delete empty subsections when the release is cut.
     viewer's refresh rate.
 
 ### Changed
+- Volume and mute keys pressed in the viewer now change the PC's volume instead of being sent to
+  the Mac (where they had no effect).
+- Received file names: if shortening a very long name would leave a Windows device name such as
+  `CON`, it gets a `_` prefix like any other device name (protocol §6.3, new step 5).
 
 ### Fixed
 - The host no longer treats a removed display as online: CoreGraphics returns -1, not 0, for a
   vanished display ID.
+- Mouse: clicks landed up to 1 point up and to the left of the pointer, increasingly toward the
+  right and bottom edges, and the last row and column of the Mac's screen were unreachable (Dock
+  autohide at the bottom, hot corners on the right).
+- Horizontal scrolling (tilt wheel, touchpad) went the wrong way on the Mac.
+- Mouse movement now carries motion deltas, so 3D views, games and some sliders respond to drags.
+- After opening the Glide menu with Ctrl+Alt+Shift+Space, typing a plain letter could fire a viewer
+  hotkey (H toggled the stats, D reconnected) and the next Space could stay held down on the Mac.
+- Keys held when pressing Ctrl+Alt+Del (or when a UAC prompt appears) no longer stay held on the Mac.
+- Mac volume and media keys sent by the viewer now act on the system (they were ordinary key
+  events the system ignored); media play/pause/next/previous no longer vanish when the viewer has focus.
+- ISO keyboards: the key left of 1 and the extra key left of Z were swapped on Macs with an ISO
+  keyboard type, as macOS's own driver swaps them.
+- The keyboard hook never waits on the network, so a file upload can't freeze the PC's keyboard.
+- Viewer: a bitmap on the Windows clipboard with unusual colour masks could crash debug builds
+  and got wrong colours in release builds. `--probe`'s video parameter parser no longer panics
+  on a truncated NAL unit.
 
 ### Security
+- Mac host: mouse and wheel messages with invalid numbers (NaN, infinity, absurd wheel
+  deltas) are dropped. Before, a paired viewer could crash the host with one.
+- Viewer: a misbehaving or compromised Mac can no longer exhaust the PC's memory or CPU through
+  rapid file offers with huge path lists, endless new cursor shapes or display names, or a tiny
+  clipboard PNG with a giant embedded colour profile. Oversized cursor shapes are ignored.
+- Both sides: checking a file offer for a name that is both a file and a folder is now
+  O(n log n) instead of building every folder prefix (~1 GB for a hostile 10 000-file offer).
 
 ## [0.2.0] - 2026-11-14
 

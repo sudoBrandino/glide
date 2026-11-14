@@ -1,0 +1,25 @@
+# gitleaks configuration (https://github.com/gitleaks/gitleaks). CI runs it on every pull request
+# and push (.github/workflows/ci.yml). It extends the default rule set; the allowlists below are
+# deliberately narrow: one rule, exact files. Anything else that looks like a secret still fails.
+
+title = "Glide"
+
+[extend]
+useDefault = true
+
+# The protocol test vectors publish fixed static/ephemeral keys, transport keys and nonces on
+# purpose, so all three implementations can be checked byte for byte (docs/PROTOCOL.md §4). They
+# protect nothing. Only `generic-api-key` matches them ("c2s_key", "s2c_key", "pw_key").
+[[allowlists]]
+description = "Deliberate test keys in the protocol test vectors"
+targetRules = ["generic-api-key"]
+paths = ['''^docs/test-vectors(-rust)?\.json$''']
+
+# The same vectors were once written to a stray file named "windows/--help" (a generator run with
+# a bad argument) in 7753e78 and deleted in 94e61e2. Only that commit and that path are allowed.
+[[allowlists]]
+description = "Stray copy of the test vectors in history (7753e78, removed in 94e61e2)"
+targetRules = ["generic-api-key"]
+condition = "AND"
+commits = ["7753e786ed1a00607ed62420cb85ba38b7f28aca"]
+paths = ['''^windows/--help$''']

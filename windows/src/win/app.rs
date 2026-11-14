@@ -23,6 +23,7 @@ use crate::config::{self, Store};
 use crate::displays::{self, DisplayState};
 use crate::hid;
 use crate::hotkeys::{self, Action};
+use crate::input::{self, KeyCtx, KeyOutcome, KeyRouter, MediaKey, WheelState};
 use crate::blockcode;
 use crate::hud;
 use crate::identity::Identity;
@@ -32,8 +33,8 @@ use crate::peers;
 use crate::protocol::{self, ClientMsg, HostMsg, Mode, VideoConfig, FRAME_FLAG_KEYFRAME, FRAME_FLAG_SHARP};
 use crate::util::{letterbox, now_us, present_rect};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicU8, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -42,7 +43,12 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::*;
+use windows::Win32::System::StationsAndDesktops::{CloseDesktop, OpenInputDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::Input::{
+    GetCurrentInputMessageSource, GetRawInputData, RegisterRawInputDevices, HRAWINPUT, IMDT_TOUCHPAD, INPUT_MESSAGE_SOURCE, MOUSE_MOVE_ABSOLUTE,
+    RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICE_FLAGS, RAWINPUTHEADER, RIDEV_REMOVE, RID_INPUT, RIM_TYPEMOUSE,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub struct Options {
@@ -98,6 +104,12 @@ const VIEW_TIMER: usize = 3;
 const PLACEMENT_TIMER: usize = 4;
 /// `GLIDE_TEST_ACTIONS` test hook: fires one queued action per tick.
 const TEST_ACTION_TIMER: usize = 5;
+/// The host's InputCaps arrived (§3.6): send the lock-key state.
+const WM_APP_INPUTCAPS: u32 = WM_APP + 0x40;
+/// A lock key changed: read and send the new state once Windows has applied it.
+const LOCK_TIMER: usize = 0x40;
+/// While focused: notice the secure desktop (Ctrl+Alt+Del, UAC) taking the keyboard mid-chord.
+const DESKTOP_TIMER: usize = 0x41;
 
 enum RenderCmd {
     Frame { frame_id: u32, data: Vec<u8>, keyframe: bool, sharp: bool, rects: Option<Vec<protocol::Rect>> },
@@ -115,6 +127,13 @@ enum RenderCmd {
     Redraw,
     Quit,
 }
+
+/// Largest cursor side accepted from the host (the Mac host never sends more, §3).
+const CURSOR_MAX_SIDE: u16 = 256;
+/// Cursor cache bounds: far above any real session, low enough that a hostile host can't
+/// exhaust memory with an endless stream of new shape ids.
+const CURSOR_CACHE_SHAPES: usize = 1024;
+const CURSOR_CACHE_BYTES: usize = 64 << 20;
 
 #[derive(Default)]
 struct CursorState {
@@ -194,11 +213,15 @@ struct Shared {
     present_info: Mutex<String>,
     /// Clock-sync facts for latency reports (kept after a disconnect).
     clock_info: Mutex<String>,
+    /// The connected host's InputCaps flags (§3.6); 0 while disconnected or for older hosts.
+    input_caps: AtomicU32,
 }
 
 /// Process-wide UI context (the low-level keyboard hook has no user pointer).
 struct UiCtx {
-    ctrl_as_cmd: bool,
+    /// Ctrl → Command, Win → Control (menu → Input toggles it; read by the keyboard hook).
+    ctrl_as_cmd: AtomicBool,
+    natural_scrolling: AtomicBool,
     render_tx: Mutex<mpsc::Sender<RenderCmd>>,
     shared: Arc<Shared>,
     store: Mutex<Store>,
@@ -233,9 +256,13 @@ struct UiState {
     hook: Option<HHOOK>,
     fullscreen_saved: Option<(isize, WINDOWPLACEMENT)>,
     last_move: Option<(f32, f32)>,
-    keys_down: HashSet<u16>,
+    keys: KeyRouter,
+    wheel: WheelState,
+    /// Relative mouse mode (§3.6 MouseDelta): raw input registered, cursor hidden and confined.
+    relative: bool,
+    /// Last LockState sent (None: not since connect / focus gain).
+    sent_locks: Option<u8>,
     buttons_down: u8,
-    swallow_up: HashSet<u16>,
     cursor_cache: HashMap<(u32, u32), HCURSOR>,
     stats_last: Option<hud::Counters>,
     focused: bool,
@@ -264,11 +291,49 @@ fn ui() -> &'static UiCtx {
     UI.get().expect("UI context")
 }
 
+/// Messages from the UI thread go through this queue to the "glide-input" thread, so neither the
+/// UI thread nor the low-level keyboard hook running on it ever blocks on a full socket (e.g.
+/// behind a file upload). A hook that stalls freezes the keyboard of the whole PC, and Windows
+/// silently removes it after `LowLevelHooksTimeout`. One queue keeps everything in order.
+static INPUT_TX: OnceLock<mpsc::Sender<ClientMsg>> = OnceLock::new();
+
 fn send(msg: ClientMsg) {
+    if let Some(tx) = INPUT_TX.get() {
+        let _ = tx.send(msg);
+        return;
+    }
     let s = ui().shared.sender.lock().unwrap().clone();
     if let Some(s) = s {
         let _ = s.send(&msg);
     }
+}
+
+fn start_input_thread(shared: Arc<Shared>) {
+    let (tx, rx) = mpsc::channel::<ClientMsg>();
+    if INPUT_TX.set(tx).is_err() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("glide-input".into()).spawn(move || {
+        unsafe {
+            use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        }
+        for m in rx {
+            let s = shared.sender.lock().unwrap().clone();
+            if let Some(s) = s {
+                let _ = s.send(&m);
+            }
+        }
+    });
+}
+
+fn host_has(flag: u32) -> bool {
+    ui().shared.input_caps.load(Ordering::Relaxed) & flag != 0
+}
+
+/// Keys go to the Mac (connected, keyboard not released).
+fn forwarding() -> bool {
+    connected() && !STATE.with(|s| s.borrow().kb_released)
 }
 
 fn connected() -> bool {
@@ -732,8 +797,7 @@ impl LatencyTest {
 fn release_all(hwnd: HWND) {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
-        s.keys_down.clear();
-        s.swallow_up.clear();
+        s.keys.reset();
         s.buttons_down = 0;
     });
     unsafe {
@@ -749,13 +813,27 @@ fn handle_key(hwnd: HWND, vk: u32, scan: u32, extended: bool, down: bool) -> boo
     if scan & 0x200 != 0 {
         return true;
     }
+    // Media keys (reported by virtual key): volume stays on this PC, where the Mac's audio plays;
+    // play/pause/next/previous/stop go to the Mac when the host takes them (§3.6 ConsumerKey).
+    if let Some(m) = input::media_key(vk) {
+        return match m {
+            MediaKey::Transport(usage) if forwarding() && host_has(protocol::INPUT_CAPS_CONSUMER) => {
+                send(ClientMsg::ConsumerKey { usage, down });
+                true
+            }
+            _ => false,
+        };
+    }
     let sc = (scan & 0xFF) as u16 | if extended { hid::EXT } else { 0 };
-    let usage = match VIRTUAL_KEY(vk as u16) {
-        VK_PAUSE => Some(hid::HID_PAUSE),
-        VK_NUMLOCK => Some(hid::HID_NUMLOCK),
-        VK_SNAPSHOT => Some(hid::HID_PRINTSCREEN),
-        VK_RSHIFT => Some(hid::HID_RSHIFT),
-        VK_LSHIFT => Some(hid::HID_LSHIFT),
+    let usage = match (input::keypad_nav(sc, vk), VIRTUAL_KEY(vk as u16)) {
+        // Num Lock off: keypad keys are navigation keys (keypad 5 does nothing).
+        (Some(0), _) => return forwarding(),
+        (Some(u), _) => Some(u),
+        (None, VK_PAUSE) => Some(hid::HID_PAUSE),
+        (None, VK_NUMLOCK) => Some(hid::HID_NUMLOCK),
+        (None, VK_SNAPSHOT) => Some(hid::HID_PRINTSCREEN),
+        (None, VK_RSHIFT) => Some(hid::HID_RSHIFT),
+        (None, VK_LSHIFT) => Some(hid::HID_LSHIFT),
         _ => hid::scancode_to_hid(sc).or_else(|| match vk {
             0x41..=0x5A => Some(0x04 + (vk - 0x41) as u16), // A-Z without a scancode
             0x31..=0x39 => Some(0x1E + (vk - 0x31) as u16),
@@ -763,41 +841,152 @@ fn handle_key(hwnd: HWND, vk: u32, scan: u32, extended: bool, down: bool) -> boo
             _ => None,
         }),
     };
-    let Some(usage) = usage else { return true };
+    // A key the Mac has no use for: swallow it while forwarding (no local launcher keys firing).
+    let Some(usage) = usage else { return forwarding() };
 
-    // Local hotkeys (F11, Alt+Enter, Ctrl+Alt+Shift+letter): handled here, never forwarded.
-    // Matched on physical keys; the action runs later on the UI thread (we may be in the LL hook).
-    let mods = STATE.with(|s| hotkeys::Mods::from_held(s.borrow().keys_down.iter().copied()));
-    if down {
-        if let Some(a) = hotkeys::match_hotkey(mods, usage) {
-            STATE.with(|s| s.borrow_mut().swallow_up.insert(usage));
+    let ctx = KeyCtx {
+        forwarding: forwarding(),
+        ctrl_as_cmd: ui().ctrl_as_cmd.load(Ordering::Relaxed),
+        locks_local: host_has(protocol::INPUT_CAPS_LOCKS),
+    };
+    // Matched on physical keys; a hotkey's action runs later on the UI thread (we may be in the LL hook).
+    match STATE.with(|s| s.borrow_mut().keys.on_key(usage, down, ctx)) {
+        KeyOutcome::Hotkey(a) => {
             unsafe {
                 let _ = PostMessageW(Some(hwnd), WM_APP_HOTKEY, WPARAM(a as usize), LPARAM(0));
             }
-            return true;
+            true
+        }
+        KeyOutcome::Swallow => true,
+        // Typematic repeats are forwarded as additional down events (the Mac doesn't repeat injected keys).
+        KeyOutcome::Send(out) => {
+            send(ClientMsg::Key { hid_usage: out, down });
+            true
+        }
+        KeyOutcome::Local => {
+            if ctx.forwarding && ctx.locks_local && (usage == input::HID_CAPSLOCK || usage == hid::HID_NUMLOCK) {
+                // Windows toggles the lock after the hook returns: read it a moment later.
+                unsafe {
+                    SetTimer(Some(hwnd), LOCK_TIMER, 30, None);
+                }
+            }
+            false
         }
     }
-    if !down && STATE.with(|s| s.borrow_mut().swallow_up.remove(&usage)) {
-        return true;
-    }
+}
 
-    // Track physical (pre-remap) state for the Alt check above.
-    STATE.with(|s| {
-        let mut s = s.borrow_mut();
-        if down {
-            s.keys_down.insert(usage);
-        } else {
-            s.keys_down.remove(&usage);
-        }
-    });
-    // While disconnected or with the keyboard released, keys behave normally on this PC.
-    if !connected() || STATE.with(|s| s.borrow().kb_released) {
-        return false;
+/// Send the lock-key state if the host takes it and it changed (`force`: send anyway).
+fn sync_locks(force: bool) {
+    if !forwarding() || !host_has(protocol::INPUT_CAPS_LOCKS) {
+        return;
     }
-    let out = if ui().ctrl_as_cmd { hid::remap_ctrl_as_cmd(usage) } else { usage };
-    // Typematic repeats are forwarded as additional down events.
-    send(ClientMsg::Key { hid_usage: out, down });
-    true
+    let on = |vk: VIRTUAL_KEY| unsafe { GetKeyState(vk.0 as i32) } & 1 != 0;
+    let locks = input::lock_bits(on(VK_CAPITAL), on(VK_NUMLOCK), on(VK_SCROLL));
+    let changed = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let c = force || s.sent_locks != Some(locks);
+        s.sent_locks = Some(locks);
+        c
+    });
+    if changed {
+        send(ClientMsg::LockState { locks });
+    }
+}
+
+/// The keyboard was taken mid-chord by the secure desktop (Ctrl+Alt+Del, UAC): its key-ups never
+/// reach us, so release everything instead of leaving Command/Option held on the Mac.
+fn check_input_desktop(hwnd: HWND) {
+    let held = STATE.with(|s| {
+        let s = s.borrow();
+        !s.keys.down.is_empty() || s.buttons_down != 0
+    });
+    if !held || !connected() {
+        return;
+    }
+    match unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) } {
+        Ok(d) => unsafe {
+            let _ = CloseDesktop(d);
+        },
+        Err(_) => {
+            eprintln!("input: secure desktop has the keyboard; releasing held keys");
+            release_all(hwnd);
+        }
+    }
+}
+
+// ------------------------------------------------------------------ relative mouse (§3.6)
+
+fn set_relative(hwnd: HWND, on: bool) {
+    let was = STATE.with(|s| s.borrow().relative);
+    if on == was {
+        return;
+    }
+    if on {
+        let rid = RAWINPUTDEVICE { usUsagePage: 0x01, usUsage: 0x02, dwFlags: RAWINPUTDEVICE_FLAGS(0), hwndTarget: hwnd };
+        if let Err(e) = unsafe { RegisterRawInputDevices(&[rid], std::mem::size_of::<RAWINPUTDEVICE>() as u32) } {
+            toast(format!("Relative mouse unavailable: {e}"));
+            return;
+        }
+        STATE.with(|s| s.borrow_mut().relative = true);
+        confine_cursor(hwnd);
+        unsafe {
+            SetCursor(None);
+        }
+        toast("Relative mouse on (games, 3D) — Ctrl+Alt+Shift+G to exit");
+    } else {
+        STATE.with(|s| s.borrow_mut().relative = false);
+        let rid = RAWINPUTDEVICE { usUsagePage: 0x01, usUsage: 0x02, dwFlags: RIDEV_REMOVE, hwndTarget: HWND::default() };
+        unsafe {
+            let _ = RegisterRawInputDevices(&[rid], std::mem::size_of::<RAWINPUTDEVICE>() as u32);
+            let _ = ClipCursor(None);
+        }
+        apply_cursor_if_inside(hwnd);
+        toast("Relative mouse off");
+    }
+    update_title(hwnd);
+}
+
+fn relative() -> bool {
+    STATE.with(|s| s.borrow().relative)
+}
+
+/// Keep the hidden cursor in a small box at the window center (never on the connection bar or
+/// outside the window), while raw input keeps reporting motion.
+fn confine_cursor(hwnd: HWND) {
+    let (w, h) = client_size(hwnd);
+    let mut c = POINT { x: (w / 2) as i32, y: (h / 2) as i32 };
+    unsafe {
+        let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut c);
+        let r = RECT { left: c.x - 1, top: c.y - 1, right: c.x + 1, bottom: c.y + 1 };
+        let _ = ClipCursor(Some(&r));
+    }
+}
+
+fn on_raw_input(lparam: LPARAM) {
+    if !relative() || !connected() {
+        return;
+    }
+    let mut ri = RAWINPUT::default();
+    let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+    let n = unsafe {
+        GetRawInputData(HRAWINPUT(lparam.0 as *mut _), RID_INPUT, Some(&mut ri as *mut _ as *mut _), &mut size, std::mem::size_of::<RAWINPUTHEADER>() as u32)
+    };
+    if n == u32::MAX || n == 0 || ri.header.dwType != RIM_TYPEMOUSE.0 {
+        return;
+    }
+    let m = unsafe { ri.data.mouse };
+    // Absolute devices (pen tablets, remote sessions) have no counts to forward.
+    if m.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 != 0 {
+        return;
+    }
+    for msg in input::mouse_deltas(m.lLastX as i64, m.lLastY as i64) {
+        send(msg);
+    }
+}
+
+fn wheel_from_touchpad() -> bool {
+    let mut src = INPUT_MESSAGE_SOURCE::default();
+    unsafe { GetCurrentInputMessageSource(&mut src) }.is_ok() && src.deviceType.0 & IMDT_TOUCHPAD.0 != 0
 }
 
 /// A Glide menu (context or system menu) is open: the LL hook lets keys through to it.
@@ -833,7 +1022,16 @@ fn set_focus_state(hwnd: HWND, active: bool) {
         if !STATE.with(|s| s.borrow().kb_released) {
             install_hook();
         }
+        // Lock keys may have changed while another window had the keyboard.
+        sync_locks(true);
+        unsafe {
+            SetTimer(Some(hwnd), DESKTOP_TIMER, 500, None);
+        }
     } else {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), DESKTOP_TIMER);
+        }
+        set_relative(hwnd, false);
         remove_hook();
         release_all(hwnd);
     }
@@ -873,6 +1071,9 @@ fn lparam_xy(lparam: LPARAM) -> (i32, i32) {
 
 /// WM_MOUSEMOVE: the connection bar sees it first; over the tab nothing goes to the Mac.
 fn mouse_move(hwnd: HWND, lparam: LPARAM) {
+    if relative() {
+        return; // motion goes as raw deltas (WM_INPUT)
+    }
     let (x, y) = lparam_xy(lparam);
     let held = STATE.with(|s| s.borrow().buttons_down != 0);
     if !cbar::on_mouse_move(hwnd, x, y, held) {
@@ -897,7 +1098,8 @@ fn button(hwnd: HWND, lparam: LPARAM, b: u8, down: bool) {
     // Connection bar: a press on the tab is ours (left opens the menu); so is its release.
     let (x, y) = lparam_xy(lparam);
     let nothing_held = STATE.with(|s| s.borrow().buttons_down == 0);
-    if down && nothing_held && cbar::hit(hwnd, x, y) {
+    let rel = relative();
+    if down && nothing_held && !rel && cbar::hit(hwnd, x, y) {
         STATE.with(|s| s.borrow_mut().bar_buttons |= 1 << b);
         if b == protocol::MOUSE_LEFT {
             STATE.with(|s| s.borrow_mut().bar_buttons &= !(1 << b)); // the menu loop eats the up
@@ -908,7 +1110,9 @@ fn button(hwnd: HWND, lparam: LPARAM, b: u8, down: bool) {
     if !down && STATE.with(|s| std::mem::take(&mut s.borrow_mut().bar_buttons) & (1 << b) != 0) {
         return;
     }
-    send_move(hwnd, lparam);
+    if !rel {
+        send_move(hwnd, lparam);
+    }
     // Update state first; never hold the RefCell borrow across Win32 calls that may re-enter wndproc.
     let any_down = STATE.with(|s| {
         let mut s = s.borrow_mut();
@@ -1268,6 +1472,7 @@ fn do_action(hwnd: HWND, a: Action) {
                 if STATE.with(|s| s.borrow().focused) {
                     install_hook();
                 }
+                sync_locks(true); // Caps Lock may have changed while Windows had the keyboard
                 toast("Keyboard captured — shortcuts go to the Mac");
             }
             update_title(hwnd);
@@ -1281,6 +1486,17 @@ fn do_action(hwnd: HWND, a: Action) {
             }
         }
         Action::ToggleMute => toggle_mute(hwnd),
+        Action::ToggleRelativeMouse => {
+            if relative() {
+                set_relative(hwnd, false);
+            } else if !connected() {
+                toast("Relative mouse: not connected");
+            } else if !host_has(protocol::INPUT_CAPS_RELATIVE) {
+                toast("Relative mouse needs a newer Glide Host on the Mac");
+            } else {
+                set_relative(hwnd, true);
+            }
+        }
         Action::PullFiles => toast(files::pull()),
         Action::CancelFiles => toast(files::cancel()),
         Action::NextDisplay => cycle_display(1),
@@ -1388,13 +1604,18 @@ fn menu_state() -> menu_model::MenuState {
             files_busy: files::busy(),
             latency_test: sh.latency_test.load(Ordering::Relaxed),
             displays: sh.displays.lock().unwrap().clone(),
+            ctrl_as_cmd: ui().ctrl_as_cmd.load(Ordering::Relaxed),
+            natural_scrolling: ui().natural_scrolling.load(Ordering::Relaxed),
+            relative_mouse: (connected() && sh.input_caps.load(Ordering::Relaxed) & protocol::INPUT_CAPS_RELATIVE != 0).then_some(s.relative),
         }
     })
 }
 
 /// Show the Glide menu (connection bar click, Ctrl+Alt+Shift+Space) and run the choice.
 fn open_menu(hwnd: HWND, anchor: menu::Anchor) {
-    // Held modifiers (e.g. from Ctrl+Alt+Shift+Space) were forwarded: release them on the Mac.
+    // Held modifiers (e.g. from Ctrl+Alt+Shift+Space) were forwarded: release them on the Mac, and
+    // forget them here too: their key-ups go to the menu, never to us.
+    STATE.with(|s| s.borrow_mut().keys.reset());
     if connected() {
         send(ClientMsg::ReleaseAll);
     }
@@ -1473,6 +1694,21 @@ fn run_menu_cmd(hwnd: HWND, c: Cmd) {
                 },
                 _ => select_display(0, &st),
             }
+        }
+        Cmd::ToggleRelativeMouse => do_action(hwnd, Action::ToggleRelativeMouse),
+        Cmd::ToggleCtrlAsCmd => {
+            let on = !ui().ctrl_as_cmd.load(Ordering::Relaxed);
+            // Held keys were sent with the old mapping: release them before switching.
+            release_all(hwnd);
+            ui().ctrl_as_cmd.store(on, Ordering::Relaxed);
+            ui().store.lock().unwrap().update(|c| c.ctrl_as_cmd = on);
+            toast(if on { "Ctrl → Command, Win → Control" } else { "Ctrl → Control, Win → Command" });
+        }
+        Cmd::ToggleNaturalScroll => {
+            let on = !ui().natural_scrolling.load(Ordering::Relaxed);
+            ui().natural_scrolling.store(on, Ordering::Relaxed);
+            ui().store.lock().unwrap().update(|c| c.natural_scrolling = on);
+            toast(if on { "Natural scrolling on (reversed)" } else { "Natural scrolling off" });
         }
         _ => {}
     }
@@ -1710,9 +1946,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             schedule_view_check(hwnd);
             track_normal_rect(hwnd);
             SetTimer(Some(hwnd), PLACEMENT_TIMER, 1000, None);
+            if relative() {
+                confine_cursor(hwnd);
+            }
             LRESULT(0)
         }
         WM_MOVE | WM_DISPLAYCHANGE | WM_EXITSIZEMOVE => {
+            if relative() {
+                confine_cursor(hwnd);
+            }
             schedule_view_check(hwnd);
             track_normal_rect(hwnd);
             SetTimer(Some(hwnd), PLACEMENT_TIMER, 1000, None);
@@ -1721,6 +1963,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_TIMER if wparam.0 == VIEW_TIMER => {
             let _ = KillTimer(Some(hwnd), VIEW_TIMER);
             check_view(hwnd);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == LOCK_TIMER => {
+            let _ = KillTimer(Some(hwnd), LOCK_TIMER);
+            sync_locks(false);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == DESKTOP_TIMER => {
+            check_input_desktop(hwnd);
+            LRESULT(0)
+        }
+        WM_APP_INPUTCAPS => {
+            STATE.with(|s| s.borrow_mut().sent_locks = None);
+            sync_locks(true);
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == PLACEMENT_TIMER => {
@@ -1842,15 +2098,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL if cbar::cursor_hit(hwnd) => LRESULT(0),
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-            let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as f32 / 120.0;
-            if msg == WM_MOUSEWHEEL {
-                // Positive = wheel rotated away from the user = scroll up = dy > 0.
-                send(ClientMsg::MouseWheel { dx: 0.0, dy: delta });
-            } else {
-                // Positive = tilted right = dx > 0.
-                send(ClientMsg::MouseWheel { dx: delta, dy: 0.0 });
-            }
+            // Positive = wheel rotated away from the user (scroll up) / tilted right (scroll right).
+            // Sub-notch deltas come from touchpads and high-resolution wheels (§3.6 Scroll).
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
+            let touchpad = wheel_from_touchpad();
+            let natural = ui().natural_scrolling.load(Ordering::Relaxed);
+            let scroll_msg = host_has(protocol::INPUT_CAPS_SCROLL);
+            let m = STATE.with(|s| s.borrow_mut().wheel.message(delta, msg == WM_MOUSEHWHEEL, touchpad, natural, scroll_msg, now_us()));
+            send(m);
             LRESULT(0)
+        }
+        WM_INPUT => {
+            on_raw_input(lparam);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_SETCURSOR => {
             if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
@@ -1859,7 +2119,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = ScreenToClient(hwnd, &mut pt);
                 let (x, y, w, h) = video_rect(hwnd);
                 let inside = pt.x >= x && pt.x < x + w && pt.y >= y && pt.y < y + h;
-                if inside && !cbar::hit(hwnd, pt.x, pt.y) {
+                if relative() {
+                    SetCursor(None);
+                } else if inside && !cbar::hit(hwnd, pt.x, pt.y) {
                     SetCursor(current_cursor(hwnd));
                 } else {
                     SetCursor(LoadCursorW(None, IDC_ARROW).ok());
@@ -1976,6 +2238,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_APP_DISCONNECTED => {
             // No stuck keys/buttons: drop all local held state (the host side is gone anyway).
+            ui().shared.input_caps.store(0, Ordering::Relaxed);
+            set_relative(hwnd, false);
             release_all(hwnd);
             let host = ui().shared.host_name.lock().unwrap().clone();
             cbar::set_label(hwnd, &format!("{host} — disconnected"));
@@ -1994,11 +2258,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 for (_, c) in s.cursor_cache.drain() {
                     destroy_cursor(c);
                 }
-                s.keys_down.clear();
-                s.swallow_up.clear();
+                s.keys.reset();
+                s.sent_locks = None;
                 s.last_move = None;
                 s.stats_last = None;
             });
+            // InputCaps may have arrived before the connection was published (WM_APP_INPUTCAPS then
+            // found nothing to send on).
+            sync_locks(false);
             // The hello carried the view at connect time; re-check in case the window moved since.
             check_view(hwnd);
             apply_cursor_if_inside(hwnd);
@@ -2309,6 +2576,7 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
     *shared.displays.lock().unwrap() = None; // until this host sends DisplayList (§3.5)
     shared.display_restore_done.store(false, Ordering::Relaxed);
     *shared.display_restoring.lock().unwrap() = None;
+    shared.input_caps.store(0, Ordering::Relaxed); // until this host sends InputCaps
     *shared.clock.lock().unwrap() = Some(conn.clock.clone());
     {
         // Fresh cursor state for the new host session.
@@ -2347,7 +2615,17 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
                 let _ = tx.send(RenderCmd::Config(c));
             }
             NetEvent::Msg(HostMsg::CursorShape { shape_id, w, h, hot_x, hot_y, bgra }) => {
+                // Untrusted: hosts send at most 256x256 (PROTOCOL.md §3); keep the cache bounded.
+                if w > CURSOR_MAX_SIDE || h > CURSOR_MAX_SIDE {
+                    return;
+                }
                 let mut c = shared.cursor.lock().unwrap();
+                if !c.shapes.contains_key(&shape_id)
+                    && (c.shapes.len() >= CURSOR_CACHE_SHAPES
+                        || c.shapes.values().map(|s| s.bgra.len()).sum::<usize>() + bgra.len() > CURSOR_CACHE_BYTES)
+                {
+                    c.shapes.clear();
+                }
                 c.shapes.insert(
                     shape_id,
                     CursorImage { w: w as u32, h: h as u32, hot_x: hot_x as u32, hot_y: hot_y as u32, bgra },
@@ -2381,6 +2659,11 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
                     drop(c);
                     post(hwnd_raw, WM_APP_CURSOR);
                 }
+            }
+            NetEvent::Msg(HostMsg::InputCaps { flags }) => {
+                eprintln!("host input extensions: {flags:#x}");
+                shared.input_caps.store(flags, Ordering::Relaxed);
+                post(hwnd_raw, WM_APP_INPUTCAPS);
             }
             NetEvent::Msg(HostMsg::ClipboardCaps { formats, max_bytes }) => clipboard::enable(sender.clone(), formats, max_bytes),
             NetEvent::Msg(HostMsg::DisplayInfo { preference, mode_w, mode_h, hidpi }) => {
@@ -2537,6 +2820,7 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         displays: Mutex::new(None),
         display_restore_done: AtomicBool::new(false),
         display_restoring: Mutex::new(None),
+        input_caps: AtomicU32::new(0),
     });
     let (render_tx, render_rx) = mpsc::channel::<RenderCmd>();
     let latency_test = opts.latency_test || std::env::var("GLIDE_LATENCY_TEST").is_ok_and(|v| v == "1");
@@ -2550,11 +2834,13 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         config::choose_placement(&opts.store.config, &ms, placement::cursor_monitor_index(&ms))
     };
     let _ = UI.set(UiCtx {
-        ctrl_as_cmd: opts.ctrl_as_cmd,
+        ctrl_as_cmd: AtomicBool::new(opts.ctrl_as_cmd),
+        natural_scrolling: AtomicBool::new(opts.store.config.natural_scrolling),
         render_tx: Mutex::new(render_tx.clone()),
         shared: shared.clone(),
         store: Mutex::new(opts.store),
     });
+    start_input_thread(shared.clone());
     if latency_test {
         set_latency_test(true);
     }

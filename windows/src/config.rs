@@ -66,8 +66,10 @@ pub struct Config {
     pub host: Option<String>,
     /// "fast" | "sharp" | "hybrid"; None = automatic (hybrid if 4:4:4 decode works).
     pub mode: Option<String>,
-    /// Ctrl → Command, Win → Control, Alt → Option.
+    /// Ctrl → Command, Win → Control, Alt → Option (menu → Input; `--no-ctrl-as-cmd`).
     pub ctrl_as_cmd: bool,
+    /// Invert the wheel / touchpad scroll direction sent to the Mac (menu → Input).
+    pub natural_scrolling: bool,
     /// Stats overlay (Ctrl+Alt+Shift+H).
     pub hud: bool,
     /// Connection bar always shown (menu → Pin connection bar).
@@ -113,6 +115,7 @@ impl Default for Config {
             host: None,
             mode: None,
             ctrl_as_cmd: true,
+            natural_scrolling: false,
             hud: false,
             bar_pinned: false,
             audio: true,
@@ -256,6 +259,7 @@ pub fn parse(text: &str) -> Loaded {
     field!(host);
     field!(mode);
     field!(ctrl_as_cmd);
+    field!(natural_scrolling);
     field!(hud);
     field!(bar_pinned);
     field!(audio);
@@ -560,9 +564,7 @@ mod tests {
         assert!(l.warning.is_none());
         assert!(l.needs_save, "missing fields → write them out");
         assert_eq!(l.config, Config::default());
-        let mut c = Config::default();
-        c.hud = true;
-        c.bar_pinned = true;
+        let mut c = Config { hud: true, bar_pinned: true, ..Config::default() };
         c.set_mode(Mode::Sharp);
         c.host = Some("mac.local:7420".into());
         c.clipboard = false;

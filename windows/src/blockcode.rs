@@ -258,7 +258,7 @@ mod tests {
     fn unwrap_picks_nearest() {
         assert_eq!(unwrap32(1000, 1500), 1000);
         let host_now = (7u64 << 32) + 100; // just after a wrap of the low bits
-        let low = (u32::MAX - 50_000) as u32; // drawn 50 ms earlier, before the wrap
+        let low = u32::MAX - 50_000; // drawn 50 ms earlier, before the wrap
         assert_eq!(unwrap32(low, host_now), host_now - 50_101);
         assert_eq!(unwrap32(5, 3), 5); // slightly in the future also works
     }

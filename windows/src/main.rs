@@ -302,6 +302,10 @@ fn main() -> ExitCode {
         if args.bench.is_none() {
             caps |= protocol::CAP_DISPLAYS;
         }
+        // Input extensions (§3.6): the GUI viewer.
+        if args.bench.is_none() {
+            caps |= protocol::CAP_INPUT_EXT;
+        }
     }
     let audio_on = args.audio.unwrap_or(store.config.audio);
     if audio_on {
@@ -475,8 +479,7 @@ mod tests {
 
     #[test]
     fn cli_overrides_config() {
-        let mut c = config::Config::default();
-        c.host = Some("cfg-host".into());
+        let mut c = config::Config { host: Some("cfg-host".into()), ..config::Config::default() };
         c.set_mode(Mode::Fast);
         let a = p(&["--listen", "--mode", "hybrid"]).unwrap();
         assert_eq!(config::resolve_target(a.host.as_deref(), a.listen, &c), TargetSpec::Listen(7420));

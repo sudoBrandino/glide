@@ -31,6 +31,8 @@ public enum WireError: Error, CustomStringConvertible {
     case decryptFailed
     case recordTooLarge(Int)
     case closed
+    /// Well-framed but invalid (e.g. a non-finite input coordinate).
+    case malformed(String)
 
     public var description: String {
         switch self {
@@ -41,6 +43,7 @@ public enum WireError: Error, CustomStringConvertible {
         case .decryptFailed: return "record decryption failed"
         case .recordTooLarge(let n): return "record too large (\(n) bytes)"
         case .closed: return "connection closed"
+        case .malformed(let s): return "malformed message: \(s)"
         }
     }
 }

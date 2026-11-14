@@ -135,6 +135,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the details.
 | Audio (SCK system audio → PCM → WASAPI, jitter buffer) | done (§3.2) |
 | File transfer, both directions (drag & drop, Finder copy + Ctrl+Alt+Shift+V, menu) | done (§6) |
 | Multiple Mac displays: display picker (viewer menu, Ctrl+Alt+Shift+←/→, Mac menu bar), hot-plug fallback, remembered choice | done (§3.5) |
+| Native input: smooth touchpad scrolling, relative mouse for games/3D, lock-key sync, media keys | done (§3.6) |
 | Viewer UX | in progress |
 | Host UX: menu-bar item, automatic display mode, auth-gated session replacement | done |
 | Security v2: Noise XX, key pinning, pairing with a code confirmed on both screens | done (PROTOCOL.md §1–2) |

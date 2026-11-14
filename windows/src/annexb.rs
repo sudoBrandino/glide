@@ -123,7 +123,7 @@ pub fn split_access_units(codec: Codec, data: &[u8]) -> Vec<AccessUnit> {
 /// Lightweight (handles the common profile_tier_level layout with no sub-layers).
 pub fn hevc_sps_info(data: &[u8]) -> Option<(u32, u32, u32, u32)> {
     let sps = nals(data).into_iter().find(|n| !n.is_empty() && hevc_type(n) == 33)?;
-    let rbsp = unescape(&sps[2..]);
+    let rbsp = unescape(sps.get(2..)?); // a truncated NAL has no SPS body
     let mut br = BitReader::new(&rbsp);
     br.skip(4); // sps_video_parameter_set_id
     let max_sub_layers_minus1 = br.bits(3)?;
@@ -162,7 +162,7 @@ pub fn hevc_sps_info(data: &[u8]) -> Option<(u32, u32, u32, u32)> {
         br.ue()?;
         br.ue()?;
     }
-    let bd = br.ue()? + 8;
+    let bd = br.ue()?.checked_add(8)?;
     Some((chroma, bd, w, h))
 }
 
