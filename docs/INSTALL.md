@@ -122,15 +122,22 @@ Run only one host at a time: a second `glide-host` interrupts the first one's sc
 ### 2.3 Grant Screen Recording and Accessibility
 
 The host needs **Screen Recording** to capture the screen and **Accessibility** to inject the
-keyboard and mouse. Grant both to *Glide Host*, not to Terminal:
+keyboard and mouse. Both must be granted to *Glide Host* itself, not to Terminal.
+
+The host started by the LaunchAgent (section 2.2) asks for both the first time it runs: answer
+the system prompts, then turn **Glide Host** on in **System Settings → Privacy & Security →
+Screen Recording** and **→ Accessibility**. If it isn't listed, add it with the **+** button
+(choose `~/Applications/Glide Host.app`).
+
+To bring the prompts back later, launch the app through Launch Services so macOS attributes the
+request to Glide Host:
 
 ```sh
-~/Applications/Glide\ Host.app/Contents/MacOS/glide-host --request-permissions
+open -a ~/Applications/Glide\ Host.app --args --request-permissions
 ```
 
-This opens the system prompts, waits until you have granted both in **System Settings → Privacy
-& Security**, and exits. You can also add *Glide Host* there by hand with the **+** button
-(choose `~/Applications/Glide Host.app`).
+Don't run the binary inside the bundle from a Terminal window for this: macOS would attribute the
+request to Terminal and ask you to grant Terminal access instead.
 
 A new Screen Recording grant only takes effect after the host restarts: menu bar → **Restart
 Glide Host** (the LaunchAgent starts it again).
@@ -220,6 +227,43 @@ Either side can open the connection. The protocol is the same in both directions
   menu. The tray icon has a menu too (Connect, Disconnect, Forget host, Quit).
 
 See the [README](../README.md) for display modes, file transfer and the other features.
+
+### 4.4 The virtual display (on by default)
+
+When a viewer connects, the host creates a **virtual display** with exactly the viewer's pixel
+size and refresh rate and streams it 1:1, which gives the sharpest picture and the lowest latency.
+What you see on the Mac itself:
+
+- **With a monitor attached** (or the lid open), the monitor **mirrors** the virtual display for
+  the length of the session, so it briefly changes resolution when you connect. Your windows,
+  menu bar and Dock stay where they are. About 10 seconds after the viewer disconnects, the
+  mirror ends and the monitor goes back to its own mode. If the monitor's current mode already
+  matches the viewer exactly, Glide streams the monitor directly and creates nothing.
+- **Headless Mac or lid closed:** the virtual display is the Mac's screen while you're connected.
+
+Quitting or restarting Glide Host ends the mirror, puts the monitor's mode back and removes the
+virtual display. Nothing Glide changes survives logging out.
+
+To turn it off: menu bar → **Virtual Display**, or in
+`~/Library/Application Support/Glide/host.json`:
+
+```json
+"virtualDisplay": { "enabled": false }
+```
+
+The menu also offers **Stream the Monitor Instead** (the pre-0.2 behavior: the host switches the
+monitor to a mode that suits the viewer) and **Extend** (the virtual display sits beside the
+monitor instead of being mirrored).
+
+The virtual display uses macOS's `CGVirtualDisplay`, an undocumented API that a macOS update may
+change; if it's unavailable, Glide logs why and streams the monitor. To check it on your Mac
+before connecting (creates a test display for about 20 s; windows may move meanwhile):
+
+```sh
+~/Applications/Glide\ Host.app/Contents/MacOS/glide-host --virtual-display-selftest
+```
+
+Details: [VIRTUAL_DISPLAY.md](VIRTUAL_DISPLAY.md).
 
 ## 5. Update
 
