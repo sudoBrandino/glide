@@ -63,6 +63,12 @@ cmd_check() {
   [[ -n "$(changelog_section "$VERSION" | tr -d '[:space:]')" ]] \
     || die "CHANGELOG.md has no '## [$VERSION]' section with content"
   echo "CHANGELOG.md: [$VERSION] section present"
+  # Releasing from a tag: everything under [Unreleased] must have been folded into [$VERSION],
+  # or the release notes silently miss it.
+  if [[ "${GITHUB_REF:-}" == refs/tags/* || "${GLIDE_RELEASE_STRICT:-0}" == 1 ]]; then
+    [[ -z "$(changelog_section Unreleased | grep -v '^###' | tr -d '[:space:]')" ]] \
+      || die "CHANGELOG.md still has entries under [Unreleased]; fold them into [$VERSION] before tagging"
+  fi
   if [[ "$GLIDE_BUILD_COMMIT" == *-dirty ]]; then
     echo "warning: the working tree has uncommitted changes; artifacts are stamped $GLIDE_BUILD_COMMIT" >&2
   fi
