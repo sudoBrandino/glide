@@ -63,6 +63,12 @@ cmd_check() {
   [[ -n "$(changelog_section "$VERSION" | tr -d '[:space:]')" ]] \
     || die "CHANGELOG.md has no '## [$VERSION]' section with content"
   echo "CHANGELOG.md: [$VERSION] section present"
+  # Releasing from a tag: everything under [Unreleased] must have been folded into [$VERSION],
+  # or the release notes silently miss it.
+  if [[ "${GITHUB_REF:-}" == refs/tags/* || "${GLIDE_RELEASE_STRICT:-0}" == 1 ]]; then
+    [[ -z "$(changelog_section Unreleased | { grep -v '^###' || true; } | tr -d '[:space:]')" ]] \
+      || die "CHANGELOG.md still has entries under [Unreleased]; fold them into [$VERSION] before tagging"
+  fi
   if [[ "$GLIDE_BUILD_COMMIT" == *-dirty ]]; then
     echo "warning: the working tree has uncommitted changes; artifacts are stamped $GLIDE_BUILD_COMMIT" >&2
   fi
@@ -80,8 +86,10 @@ cmd_host() {
   fi
   case "$GLIDE_SIGN_ID" in
     -|"Developer ID Application:"*) ;;
-    *) echo "warning: signing with '$GLIDE_SIGN_ID'. Public releases are signed ad hoc (GLIDE_SIGN_ID=-)" >&2
-       echo "         or with a Developer ID; a development certificate embeds its name in the app." >&2 ;;
+    *) [[ "${GLIDE_RELEASE_CUSTOM_ID:-0}" == 1 ]] || die "GLIDE_SIGN_ID is '$GLIDE_SIGN_ID' (from .dev/build.env?). Public releases
+       are signed ad hoc (GLIDE_SIGN_ID=-) or with a Developer ID; a development certificate embeds
+       its name (often an email address) in the app. Set GLIDE_RELEASE_CUSTOM_ID=1 to use it anyway."
+       echo "warning: signing with '$GLIDE_SIGN_ID' (GLIDE_RELEASE_CUSTOM_ID=1)" >&2 ;;
   esac
   mkdir -p "$OUT"
   if [[ "${GLIDE_SKIP_TESTS:-0}" != 1 ]]; then

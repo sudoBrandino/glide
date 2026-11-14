@@ -16,7 +16,49 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-14
+
+The first public release. Protocol version 2.
+
 ### Added
+
+- **Mac host** (`Glide Host.app`, Swift): ScreenCaptureKit capture, VideoToolbox hardware
+  encoding (HEVC 4:2:0 low latency, HEVC 4:4:4, H.264 fallback) and CGEvent input injection,
+  with the cursor shape sent to the viewer.
+- **Windows viewer** (`glide-client.exe`, Rust): Media Foundation hardware decoding through
+  D3D11, a flip-model swap chain, raw keyboard and mouse capture, and the Mac cursor shown as the
+  native Windows cursor.
+- **Hybrid mode:** HEVC 4:2:0 while the screen changes, then a 4:4:4 refinement layer once it
+  settles, so text is pixel-exact at rest. `fast` (4:2:0 only) and `sharp` (4:4:4 on every
+  frame) are also available. The viewer only offers hybrid and sharp when its GPU decodes the
+  embedded HEVC 4:4:4 test clip.
+- **View size matching:** the host captures at the viewer monitor's physical size and
+  re-captures when the window moves to another monitor, so video is drawn 1:1. An automatic
+  display-mode policy (`crisp`, `retina`, `smooth`, `manual`) picks a matching Mac display mode
+  and restores the previous one after the viewer disconnects.
+- **Either side can connect:** the viewer dials the host (port 7420), or the host dials a viewer
+  running `--listen` (`glide-host --connect`, or `connect` in `host.json`), with automatic
+  redial and reconnect.
+- **Clipboard sync** of text and images in both directions. Clipboard items that password
+  managers mark private are not sent unless you opt in.
+- **Audio:** Mac system audio is played on the PC through a drift-correcting jitter buffer.
+- **File transfer** in both directions: drag and drop, menu pickers, and Finder copy with
+  Ctrl+Alt+Shift+V. Received names are sanitized, nothing is overwritten, every file is verified
+  with SHA-256, and received files are marked as downloaded (macOS quarantine, Windows
+  Mark-of-the-Web).
+- **Host menu bar:** connection state, viewer, stream statistics and latency, Disconnect, Pause,
+  Pair New Viewer…, Paired Viewers, Display Mode, Send Files to Viewer…, Recent Transfers, Open
+  Log, Restart and Quit. The host runs as a per-user LaunchAgent (`tools/install-host.sh`), keeps
+  the system awake while hosting and the display awake during a session.
+- **Viewer UX:** `config.json` settings, a tray icon, a stats overlay (HUD), a connection bar and
+  Glide menu, hotkeys, toasts, borderless fullscreen (F11, Alt+Enter), and window placement
+  remembered per monitor. The window stays open across disconnects and reconnects on its own.
+- **Latency instrumentation:** a per-stage latency breakdown in the HUD, the host log and the
+  menu bar, a glass-to-glass test pattern (`--latency-test`), and `glide-host --encode-bench`.
+- **Release packaging:** a `VERSION` file as the single source of the version,
+  `glide-host --version` and `glide-client --version`, the version in the host menu and the
+  viewer tray menu, and release zips with `SHA256SUMS` built by `tools/release.sh` or the release
+  workflow. See [`docs/INSTALL.md`](docs/INSTALL.md).
 - Multi-monitor: choose which Mac display to stream from the viewer's Glide menu (**Show Mac
   display**) or cycle with **Ctrl+Alt+Shift+→ / ←**; the Mac menu bar has a matching
   **Streamed Display** submenu. The choice is remembered per host and re-selected on reconnect,
@@ -64,13 +106,45 @@ changed for them, not how. Delete empty subsections when the release is cut.
   - See `docs/VIRTUAL_DISPLAY.md`. No protocol change: ClientHello's `max_fps` carries the
     viewer's refresh rate.
 
+### Security
+
+- **Noise XX handshake** (`Noise_XX_25519_ChaChaPoly_SHA256`) between long-term keys: the Mac's in
+  `host-key`, the PC's protected with DPAPI. There are no passwords and no accounts.
+- **Key pinning in both directions.** A viewer is paired once with a 6-digit code that both
+  screens show and the user confirms on both. The viewer refuses a Mac whose key changed
+  ("HOST KEY CHANGED") before revealing its own key.
+- ChaCha20-Poly1305 record layer with per-direction counters. Any decryption failure closes the
+  connection.
+- Pre-authentication limits on both sides: wall-clock deadlines, size-capped records, per-address
+  backoff (1 s to 60 s), at most 4 pending connections on the host (2 per source address), and on
+  the viewer in listen mode an IP allowlist or trust-on-first-use pinning of the host's address.
+- Only an authenticated viewer can replace the active session.
+- Mac host: mouse and wheel messages with invalid numbers (NaN, infinity, absurd wheel
+  deltas) are dropped. Before, a paired viewer could crash the host with one.
+- Viewer: a misbehaving or compromised Mac can no longer exhaust the PC's memory or CPU through
+  rapid file offers with huge path lists, endless new cursor shapes or display names, or a tiny
+  clipboard PNG with a giant embedded colour profile. Oversized cursor shapes are ignored.
+- Both sides: checking a file offer for a name that is both a file and a folder is now
+  O(n log n) instead of building every folder prefix (~1 GB for a hostile 10 000-file offer).
+
 ### Changed
+
 - Volume and mute keys pressed in the viewer now change the PC's volume instead of being sent to
   the Mac (where they had no effect).
 - Received file names: if shortening a very long name would leave a Windows device name such as
   `CON`, it gets a `_` prefix like any other device name (protocol §6.3, new step 5).
 
+These matter only if you ran a development build from before this release (protocol v1):
+
+- Protocol v2 is not compatible with v1. Each side recognizes the other's version and says that
+  the other side needs an update.
+- The v1 password is gone. `host.json` `salt`/`password`, `password.dpapi`, `--password` and
+  `GLIDE_PASSWORD` are ignored (and left in place), and each viewer must be paired once.
+
 ### Fixed
+
+- The host follows the display that is actually live instead of the main display it saw at
+  launch, so input keeps covering the whole screen after the lid closes or a monitor is swapped.
 - The host no longer treats a removed display as online: CoreGraphics returns -1, not 0, for a
   vanished display ID.
 - Mouse: clicks landed up to 1 point up and to the left of the pointer, increasingly toward the
@@ -98,87 +172,6 @@ changed for them, not how. Delete empty subsections when the release is cut.
   and got wrong colours in release builds. `--probe`'s video parameter parser no longer panics
   on a truncated NAL unit.
 
-### Security
-- Mac host: mouse and wheel messages with invalid numbers (NaN, infinity, absurd wheel
-  deltas) are dropped. Before, a paired viewer could crash the host with one.
-- Viewer: a misbehaving or compromised Mac can no longer exhaust the PC's memory or CPU through
-  rapid file offers with huge path lists, endless new cursor shapes or display names, or a tiny
-  clipboard PNG with a giant embedded colour profile. Oversized cursor shapes are ignored.
-- Both sides: checking a file offer for a name that is both a file and a folder is now
-  O(n log n) instead of building every folder prefix (~1 GB for a hostile 10 000-file offer).
-
-## [0.2.0] - 2026-11-14
-
-The first public release. Protocol version 2.
-
-### Added
-
-- **Mac host** (`Glide Host.app`, Swift): ScreenCaptureKit capture, VideoToolbox hardware
-  encoding (HEVC 4:2:0 low latency, HEVC 4:4:4, H.264 fallback) and CGEvent input injection,
-  with the cursor shape sent to the viewer.
-- **Windows viewer** (`glide-client.exe`, Rust): Media Foundation hardware decoding through
-  D3D11, a flip-model swap chain, raw keyboard and mouse capture, and the Mac cursor shown as the
-  native Windows cursor.
-- **Hybrid mode:** HEVC 4:2:0 while the screen changes, then a 4:4:4 refinement layer once it
-  settles, so text is pixel-exact at rest. `fast` (4:2:0 only) and `sharp` (4:4:4 on every
-  frame) are also available. The viewer only offers hybrid and sharp when its GPU decodes the
-  embedded HEVC 4:4:4 test clip.
-- **View size matching:** the host captures at the viewer monitor's physical size and
-  re-captures when the window moves to another monitor, so video is drawn 1:1. An automatic
-  display-mode policy (`crisp`, `retina`, `smooth`, `manual`) picks a matching Mac display mode
-  and restores the previous one after the viewer disconnects.
-- **Either side can connect:** the viewer dials the host (port 7420), or the host dials a viewer
-  running `--listen` (`glide-host --connect`, or `connect` in `host.json`), with automatic
-  redial and reconnect.
-- **Clipboard sync** of text and images in both directions. Clipboard items that password
-  managers mark private are not sent unless you opt in.
-- **Audio:** Mac system audio is played on the PC through a drift-correcting jitter buffer.
-- **File transfer** in both directions: drag and drop, menu pickers, and Finder copy with
-  Ctrl+Alt+Shift+V. Received names are sanitized, nothing is overwritten, every file is verified
-  with SHA-256, and received files are marked as downloaded (macOS quarantine, Windows
-  Mark-of-the-Web).
-- **Host menu bar:** connection state, viewer, stream statistics and latency, Disconnect, Pause,
-  Pair New Viewer…, Paired Viewers, Display Mode, Send Files to Viewer…, Recent Transfers, Open
-  Log, Restart and Quit. The host runs as a per-user LaunchAgent (`tools/install-host.sh`), keeps
-  the system awake while hosting and the display awake during a session.
-- **Viewer UX:** `config.json` settings, a tray icon, a stats overlay (HUD), a connection bar and
-  Glide menu, hotkeys, toasts, borderless fullscreen (F11, Alt+Enter), and window placement
-  remembered per monitor. The window stays open across disconnects and reconnects on its own.
-- **Latency instrumentation:** a per-stage latency breakdown in the HUD, the host log and the
-  menu bar, a glass-to-glass test pattern (`--latency-test`), and `glide-host --encode-bench`.
-- **Release packaging:** a `VERSION` file as the single source of the version,
-  `glide-host --version` and `glide-client --version`, the version in the host menu and the
-  viewer tray menu, and release zips with `SHA256SUMS` built by `tools/release.sh` or the release
-  workflow. See [`docs/INSTALL.md`](docs/INSTALL.md).
-
-### Security
-
-- **Noise XX handshake** (`Noise_XX_25519_ChaChaPoly_SHA256`) between long-term keys: the Mac's in
-  `host-key`, the PC's protected with DPAPI. There are no passwords and no accounts.
-- **Key pinning in both directions.** A viewer is paired once with a 6-digit code that both
-  screens show and the user confirms on both. The viewer refuses a Mac whose key changed
-  ("HOST KEY CHANGED") before revealing its own key.
-- ChaCha20-Poly1305 record layer with per-direction counters. Any decryption failure closes the
-  connection.
-- Pre-authentication limits on both sides: wall-clock deadlines, size-capped records, per-address
-  backoff (1 s to 60 s), at most 4 pending connections on the host (2 per source address), and on
-  the viewer in listen mode an IP allowlist or trust-on-first-use pinning of the host's address.
-- Only an authenticated viewer can replace the active session.
-
-### Changed
-
-These matter only if you ran a development build from before this release (protocol v1):
-
-- Protocol v2 is not compatible with v1. Each side recognizes the other's version and says that
-  the other side needs an update.
-- The v1 password is gone. `host.json` `salt`/`password`, `password.dpapi`, `--password` and
-  `GLIDE_PASSWORD` are ignored (and left in place), and each viewer must be paired once.
-
-### Fixed
-
-- The host follows the display that is actually live instead of the main display it saw at
-  launch, so input keeps covering the whole screen after the lid closes or a monitor is swapped.
-
 ### Known limitations
 
 - Host: macOS 14 or later on Apple silicon only. Viewer: Windows 10/11 x64 only. One viewer at a
@@ -188,6 +181,13 @@ These matter only if you ran a development build from before this release (proto
   Gatekeeper workaround. With an ad-hoc signature, macOS may ask for the privacy permissions again
   after each update.
 - The viewer exe is not code-signed, so Windows SmartScreen warns on first run.
+- The virtual display (on by default) uses `CGVirtualDisplay`, an undocumented macOS API that an
+  update may change; Glide falls back to the physical display if it's unavailable. While a viewer
+  is connected, an attached monitor mirrors the virtual display, so its resolution changes for the
+  session and is restored afterwards. Turn it off in the menu bar or with
+  `"virtualDisplay": {"enabled": false}` ([`docs/VIRTUAL_DISPLAY.md`](docs/VIRTUAL_DISPLAY.md)).
+- A paired Mac that floods the viewer with video-configuration messages can make the viewer
+  unresponsive until it disconnects (see [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)).
 
 [Unreleased]: https://github.com/sudoBrandino/glide/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/sudoBrandino/glide/releases/tag/v0.2.0
