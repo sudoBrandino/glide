@@ -40,6 +40,8 @@ struct HostConfig: Codable {
     var pairedViewers: [PairedViewer]? = nil
     /// File transfer options (HostFiles.swift).
     var files: FileSettings? = nil
+    /// Optional virtual display sized to the viewer (VirtualDisplay.swift, docs/VIRTUAL_DISPLAY.md).
+    var virtualDisplay: VirtualDisplayConfig? = nil
 
     static var dir: URL {
         let base: URL
@@ -95,6 +97,12 @@ func usage() -> Never {
            glide-host --selftest-ui [--out DIR] (print the status menu per state + display-mode picks; no capture)
            glide-host --encode-bench [SECONDS]  (offline VideoToolbox encode timing, normal vs low-latency RC,
                                                 synthetic 2560x1440 desktop content; no capture, no network)
+           glide-host --virtual-display-selftest [--viewer WxH] [--hz N] [--yes]
+                                               (CREATES temporary virtual displays for ~30 s and checks
+                                                creation, HiDPI/1x, resizing, mirroring, removal on release
+                                                and after exit; never touches physical displays' modes or
+                                                arrangement; no capture, no network; docs/VIRTUAL_DISPLAY.md)
+           glide-host --list-display-modes [ID] (print a display's current and usable modes; read-only)
       Latency tuning (env, see docs/LATENCY.md): GLIDE_FPS=N (like --fps), GLIDE_LL=1 (low-latency RC),
       GLIDE_SCK_QUEUE_DEPTH=N (default 5), GLIDE_SCK_INTERVAL=native|fps (minimumFrameInterval)
       --connect: dial out to a client running `glide-client --listen` (reconnects automatically)
@@ -117,6 +125,18 @@ func takeValue(_ flag: String) -> String? {
 if args.contains("-h") || args.contains("--help") { usage() }
 if args.contains("--version") || args.contains("-V") { print(GlideVersion.banner("glide-host")); exit(0) }
 if args.contains("--selftest-ui") { runSelfTestUI(outDir: takeValue("--out")) }  // offscreen; never captures
+if let i = args.firstIndex(of: "--list-display-modes") {  // read-only
+    runListDisplayModes(i + 1 < args.count ? UInt32(args[i + 1]) : nil)
+}
+if args.contains("--virtual-display-selftest-worker") {  // the self-test's child: creates the displays
+    args.removeAll { $0 == "--virtual-display-selftest-worker" }
+    runVirtualDisplaySelfTestWorker(viewer: takeValue("--viewer"), hz: takeValue("--hz").flatMap(Double.init))
+}
+if args.contains("--virtual-display-selftest") {  // explicit only: creates temporary virtual displays
+    args.removeAll { $0 == "--virtual-display-selftest" }
+    let yes = args.contains("--yes")
+    runVirtualDisplaySelfTest(viewer: takeValue("--viewer"), hz: takeValue("--hz").flatMap(Double.init), skipCountdown: yes)
+}
 if let i = args.firstIndex(of: "--encode-bench") {  // offline; never captures or listens
     let secs = i + 1 < args.count ? Double(args[i + 1]) ?? 3 : 3
     runEncodeBench(seconds: secs)
@@ -363,7 +383,7 @@ let sleepAssertion = hostTestMode ? nil : Power.preventSystemSleep()
 if !hostTestMode { log(sleepAssertion != nil ? "power: preventing idle system sleep while the host runs" : "power: could not create sleep assertion") }
 app.setActivationPolicy(.accessory)  // LSUIElement: menu-bar status item only
 let server = try Server(settings: settings)
-if !hostTestMode { DisplayModeController.shared.start() }
+if !hostTestMode { DisplayModeController.shared.start(); VirtualDisplayManager.shared.start() }
 ActiveDisplay.refreshNames()
 if !hostTestMode {
     let ds = ActiveDisplay.displays()
@@ -396,6 +416,27 @@ if let target = connectTarget {
 } else {
     server.start()
 }
-signal(SIGINT) { _ in unlink(PairingController.socketPath); exit(0) }
-signal(SIGTERM) { _ in unlink(PairingController.socketPath); exit(0) }
+// SIGTERM (launchctl, install scripts) and SIGINT: give the Mac its display arrangement back,
+// remove the virtual display and restore the monitor's own mode before exiting (a mirror set whose
+// master vanishes is dissolved by macOS, which can leave the monitor in another mode). Handled on
+// the main queue, where the display state lives; the restore waits up to 1.5 s for the monitor to
+// settle after the mirror ends. A wedged main queue still exits after 10 s (launchd's ExitTimeOut,
+// after which it sends SIGKILL, is 20 s).
+let exitBackstop: TimeInterval = 10
+var signalSources: [DispatchSourceSignal] = []
+for sig in [SIGINT, SIGTERM] {
+    signal(sig, SIG_IGN)
+    let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    src.setEventHandler {
+        unlink(PairingController.socketPath)
+        if !hostTestMode { restoreDisplaysBeforeExit(reason: sig == SIGTERM ? "SIGTERM" : "SIGINT") }
+        exit(0)
+    }
+    src.resume()
+    signalSources.append(src)
+    let backstop = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+    backstop.setEventHandler { DispatchQueue.global().asyncAfter(deadline: .now() + exitBackstop) { exit(0) } }
+    backstop.resume()
+    signalSources.append(backstop)
+}
 app.run()

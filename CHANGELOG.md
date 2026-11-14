@@ -41,6 +41,29 @@ changed for them, not how. Delete empty subsections when the release is cut.
 - Both sides' message decoders are fuzzed on every CI run (`cargo test`, `glide-selftest`), and
   CI now runs `cargo clippy` with warnings as errors and a gitleaks secret scan.
 
+- **Virtual display, on by default:** when a viewer connects, the Mac host creates a virtual monitor
+  with the viewer's exact pixels and monitor refresh rate and streams it 1:1. The Mac no longer
+  renders a 4608 px-wide desktop for ScreenCaptureKit to downscale, a 120/144 Hz viewer gets a
+  120/144 Hz panel (less compositor wait), and your monitor's mode is no longer switched to fit the
+  viewer. A 4K viewer gets a panel that looks like 1920×1080 at HiDPI, and a 1440p viewer gets
+  2560×1440 at 1x. The Display Mode setting still chooses HiDPI or 1x.
+  - **With a monitor attached,** the monitor mirrors the virtual display while the viewer is
+    connected. There is one desktop at the viewer's size, the viewer sees every window, and nothing
+    moves to a hidden screen. Ten seconds after the viewer leaves, the mirror ends, your monitor's
+    own mode comes back, and the virtual display is removed.
+  - **On a headless Mac** it is the only screen and is kept.
+  - **If your monitor already matches the viewer exactly,** Glide streams the monitor.
+  - **Options:** `"whenMonitorAttached": "extend"` (beside your monitor, made main) or `"stream"`
+    (the old behavior), `"lifetime": "always"`, and `"refreshRate"`.
+  - **Opting out:** set `"virtualDisplay": {"enabled": false}` or untick it in the menu. A
+    `--display` pin also turns the default off.
+  - It uses a private macOS API. Glide falls back to the physical display, with a log line and a
+    menu status, if the API is missing or fails.
+  - `glide-host --virtual-display-selftest` checks it on your Mac.
+  - The display picker lists it as "Glide Virtual Display", and **Automatic** means it.
+  - See `docs/VIRTUAL_DISPLAY.md`. No protocol change: ClientHello's `max_fps` carries the
+    viewer's refresh rate.
+
 ### Changed
 - Volume and mute keys pressed in the viewer now change the PC's volume instead of being sent to
   the Mac (where they had no effect).
@@ -48,6 +71,8 @@ changed for them, not how. Delete empty subsections when the release is cut.
   `CON`, it gets a `_` prefix like any other device name (protocol §6.3, new step 5).
 
 ### Fixed
+- The host no longer treats a removed display as online: CoreGraphics returns -1, not 0, for a
+  vanished display ID.
 - Mouse: clicks landed up to 1 point up and to the left of the pointer, increasingly toward the
   right and bottom edges, and the last row and column of the Mac's screen were unreachable (Dock
   autohide at the bottom, hot corners on the right).

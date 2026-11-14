@@ -487,6 +487,7 @@ do {
     try displayTests(vectorsDir: URL(fileURLWithPath: vpath).deletingLastPathComponent())
 } catch { failures += 1; print("  FAIL displays threw \(error)") }
 do { try displayWireTests() } catch { failures += 1; print("  FAIL display wire threw \(error)") }
+do { try virtualDisplayTests() } catch { failures += 1; print("  FAIL virtual display threw \(error)") }
 do {
     let vpath = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "../docs/test-vectors.json"
     try inputTests(vectorsDir: URL(fileURLWithPath: vpath).deletingLastPathComponent())

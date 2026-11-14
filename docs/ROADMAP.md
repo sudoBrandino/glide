@@ -86,7 +86,10 @@ Next:
 - [x] **Security v2** (see the top of this file)
 - [ ] **Virtual display** that matches the viewer (CGVirtualDisplay), for example a 4K monitor →
   1920×1080 HiDPI at 120 Hz. This drops the BetterDisplay dependency and the need to switch modes
-  with `tools/display-mode.swift`.
+  with `tools/display-mode.swift`. It is the default on `feat/virtual-display`, and the main monitor
+  mirrors it during a session ([VIRTUAL_DISPLAY.md](VIRTUAL_DISPLAY.md)). The self-test passes on
+  real hardware (macOS 27.3). It still needs a live session (mirror, restore and reconnect) before
+  it can be marked done.
 - [ ] **UDP video transport with NACK/FEC**, because TCP head-of-line blocking hurts on loss
 - [x] Multi-monitor support and a display picker (PROTOCOL.md §3.5; one display at a time, no spanning)
 - [ ] Glass-to-glass latency measurement on the real LAN

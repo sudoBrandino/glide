@@ -24,6 +24,16 @@ func runSelfTestUI(outDir: String?) -> Never {
         print(line)
     }
 
+    let vd = VirtualDisplayManager.shared
+    vd.loadConfig()
+    let physical = VirtualDisplayManager.physicalDisplays(excluding: nil)
+    print("virtual display: \(vd.active ? "on" : "off") (with a monitor: \(vd.config.monitorMode.rawValue), \(vd.config.alwaysOn ? "always" : "per session")), API \(VirtualDisplayManager.unavailableReason.map { "UNAVAILABLE: \($0)" } ?? "available"), \(physical.count) other display(s); would use:")
+    for (w, h, hz) in [(2560, 1440, 144), (3840, 2160, 120), (1920, 1080, 60), (3440, 1440, 0)] {
+        let p = VirtualDisplayPlan.make(viewerW: w, viewerH: h, preference: dm.settings.preference, highDPIChoice: dm.settings.highDPIChoice, refreshRate: vd.config.refreshRate(viewerHz: hz))
+        print("  viewer \(w)x\(h)@\(hz == 0 ? "?" : "\(hz)") Hz: \(p.map { "\($0)" } ?? "-")")
+    }
+    check(VirtualDisplayConfig().isEnabled && VirtualDisplayConfig().monitorMode == .mirror, "virtual display on by default, monitor mirrors it")
+
     let menu = StatusMenu(actions: .init(), showStatusItem: false)
     let dir = outDir.map { URL(fileURLWithPath: $0, isDirectory: true) }
     if let dir { try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }

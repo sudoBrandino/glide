@@ -334,8 +334,9 @@ final class Session: @unchecked Sendable {
                 HostStatus.shared.fileProgress = { f.engine.progress }
                 HostStatus.shared.files(id: id, true)
             }
-            // Switch the Mac's display mode for this viewer first (if the policy says so), then capture once.
-            DisplayModeController.shared.sessionBegan(id: id, viewW: Int(vw), viewH: Int(vh)) { [weak self] in
+            // Size the virtual display for this viewer (pixels and refresh rate; max_fps is the viewer
+            // monitor's refresh), or switch the Mac's display mode if the policy says so, then capture once.
+            DisplayModeController.shared.sessionBegan(id: id, viewW: Int(vw), viewH: Int(vh), viewerHz: Int(maxFps)) { [weak self] in
                 self?.channel.queue.async {
                     guard let self, !self.ended else { return }
                     self.startStreaming(caps: caps, mode: mode, maxFps: maxFps, viewW: vw)
@@ -443,7 +444,7 @@ final class Session: @unchecked Sendable {
             // monitor is swapped; the display-change observer re-captures).
             let shown = p.options.displayID
             self.inputQueue.async { self.injector.setDisplay(shown) }
-            let mode = CGDisplayCopyDisplayMode(shown)
+            let mode = ActiveDisplay.mode(of: shown)  // also right for Glide's own virtual display
             let native = CGFloat(mode?.pixelWidth ?? Int(cfg.width))
             self.cursor.scale = CGFloat(cfg.scale) * CGFloat(cfg.width) / max(native, 1)
         }

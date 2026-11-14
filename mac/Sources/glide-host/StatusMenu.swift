@@ -54,6 +54,17 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private let restoreNowItem = NSMenuItem(title: "Restore Now", action: #selector(restoreNow), keyEquivalent: "")
     private let displayInfoItem = NSMenuItem()
     private let displayActionItem = NSMenuItem()
+    // Virtual display (VirtualDisplay.swift)
+    private let virtualItem = NSMenuItem(title: "Virtual Display", action: nil, keyEquivalent: "")
+    private let virtualMenu = NSMenu()
+    private let virtualEnableItem = NSMenuItem(title: "Use a Virtual Display Sized to the Viewer", action: #selector(toggleVirtual), keyEquivalent: "")
+    private let virtualMonitorHeader = NSMenuItem(title: "With a Monitor Attached:", action: nil, keyEquivalent: "")
+    private var virtualMonitorItems: [VirtualDisplayMonitorMode: NSMenuItem] = [:]
+    private let virtualAlwaysItem = NSMenuItem(title: "Keep It When No Viewer Is Connected", action: #selector(toggleVirtualAlways), keyEquivalent: "")
+    private let virtualMainItem = NSMenuItem(title: "Make It the Main Display", action: #selector(toggleVirtualMain), keyEquivalent: "")
+    private let virtualRemoveItem = NSMenuItem(title: "Remove Virtual Display Now", action: #selector(removeVirtual), keyEquivalent: "")
+    private let virtualStatusItem = NSMenuItem()
+    private let virtualKeepItem = NSMenuItem()
     // File transfer (§6)
     private let sendFilesItem = NSMenuItem(title: "Send Files to Viewer…", action: #selector(sendFiles), keyEquivalent: "")
     private let fileProgressItem = NSMenuItem()
@@ -140,6 +151,33 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         for i in [displayInfoItem, displayActionItem] { i.isEnabled = false; displayMenu.addItem(i) }
         displayItem.submenu = displayMenu
         menu.addItem(displayItem)
+
+        virtualMenu.autoenablesItems = false
+        virtualEnableItem.target = self
+        virtualMenu.addItem(virtualEnableItem)
+        virtualMenu.addItem(.separator())
+        virtualMonitorHeader.isEnabled = false
+        virtualMenu.addItem(virtualMonitorHeader)
+        for m in VirtualDisplayMonitorMode.allCases {
+            let i = NSMenuItem(title: Self.monitorModeTitle(m), action: #selector(chooseMonitorMode(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = m.rawValue
+            i.indentationLevel = 1
+            virtualMonitorItems[m] = i
+            virtualMenu.addItem(i)
+        }
+        virtualMainItem.indentationLevel = 2
+        virtualMainItem.target = self
+        virtualMenu.addItem(virtualMainItem)
+        virtualMenu.addItem(.separator())
+        virtualAlwaysItem.target = self
+        virtualMenu.addItem(virtualAlwaysItem)
+        virtualMenu.addItem(.separator())
+        for i in [virtualStatusItem, virtualKeepItem] { i.isEnabled = false; virtualMenu.addItem(i) }
+        virtualRemoveItem.target = self
+        virtualMenu.addItem(virtualRemoveItem)
+        virtualItem.submenu = virtualMenu
+        menu.addItem(virtualItem)
 
         menu.addItem(.separator())
         add("Open Log", #selector(openLog))
@@ -251,15 +289,35 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             restoreNowItem.title = "Restore \(r) Now"
             restoreNowItem.isHidden = false
         } else { restoreNowItem.isHidden = true }
-        if let m = CGDisplayCopyDisplayMode(ActiveDisplay.current()) {
-            let info = DisplayModeInfo(m)
-            displayInfoItem.title = "Mac display: " + (info.hiDPI ? "looks like \(info.width)×\(info.height) (HiDPI, \(info.pixelWidth)×\(info.pixelHeight) px)" : "\(info.width)×\(info.height) (1x)") + String(format: " @ %.0f Hz", m.refreshRate)
+        if let info = dm.currentMode() {
+            let which = ActiveDisplay.isVirtual(dm.displayID) ? "Virtual display" : "Mac display"
+            displayInfoItem.title = "\(which): " + (info.hiDPI ? "looks like \(info.width)×\(info.height) (HiDPI, \(info.pixelWidth)×\(info.pixelHeight) px)" : "\(info.width)×\(info.height) (1x)") + String(format: " @ %.0f Hz", info.refreshRate)
         } else { displayInfoItem.title = "Mac display: unknown" }
         var action = dm.lastAction.map { "Last: \($0)" } ?? dm.describeChoice().map { "This viewer: \($0)" }
         if dm.userOverride { action = "Changed manually — automatic paused until next session" }
         displayActionItem.title = action ?? ""
         displayActionItem.isHidden = action == nil
         displayItem.title = "Display Mode: \(Self.prefTitle(st.preference))"
+
+        // Virtual display submenu
+        let vd = VirtualDisplayManager.shared
+        vd.loadConfig()
+        let vc = vd.config
+        virtualEnableItem.state = vc.isEnabled ? .on : .off
+        virtualEnableItem.toolTip = "Glide creates a virtual monitor with the viewer's exact pixels and refresh rate and streams it 1:1 instead of this Mac's screen (docs/VIRTUAL_DISPLAY.md). On by default."
+        for (m, i) in virtualMonitorItems { i.state = vc.monitorMode == m ? .on : .off; i.isEnabled = vc.isEnabled }
+        virtualMonitorHeader.isHidden = false
+        virtualMainItem.state = vc.wantsMain ? .on : .off
+        virtualMainItem.isEnabled = vc.isEnabled && vc.monitorMode == .extend
+        virtualMainItem.isHidden = vc.monitorMode != .extend
+        virtualAlwaysItem.state = vc.alwaysOn ? .on : .off
+        virtualAlwaysItem.isEnabled = vc.isEnabled
+        virtualStatusItem.title = "Status: " + vd.statusLine
+        virtualKeepItem.title = vc.alwaysOn ? "Kept while Glide runs (hidden behind the monitor when idle)" : "Removed \(Int(vc.keepAlive)) s after the viewer disconnects (kept if it is the only display)"
+        virtualKeepItem.isHidden = !vc.isEnabled
+        virtualRemoveItem.isHidden = !(vd.exists && !vd.sessionHoldsIt)
+        virtualItem.title = "Virtual Display: " + (vd.active ? (vd.exists ? "On" : "Automatic") : "Off")
+
         refreshDisplays(sessionActive: s.viewer != nil)
     }
 
@@ -276,7 +334,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         guard sig != shownDisplays else { return }
         shownDisplays = sig
         streamedMenu.removeAllItems()
-        let def = NSMenuItem(title: "Default — \(ActiveDisplay.pinned != nil ? "Pinned (--display)" : "Main Display")", action: #selector(chooseDisplay(_:)), keyEquivalent: "")
+        let defName = ActiveDisplay.virtualDisplay.map { _ in VirtualDisplayManager.displayName } ?? (ActiveDisplay.pinned != nil ? "Pinned (--display)" : "Main Display")
+        let def = NSMenuItem(title: "Automatic — \(defName)", action: #selector(chooseDisplay(_:)), keyEquivalent: "")
         def.target = self; def.tag = 0; def.state = selected == nil ? .on : .off; def.isEnabled = sessionActive
         streamedMenu.addItem(def)
         streamedMenu.addItem(.separator())
@@ -478,6 +537,40 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         refresh()
     }
 
+    @objc private func toggleVirtual() {
+        let vd = VirtualDisplayManager.shared
+        vd.setEnabled(!vd.config.isEnabled)
+        refresh()
+    }
+
+    @objc private func chooseMonitorMode(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let m = VirtualDisplayMonitorMode(rawValue: raw) else { return }
+        VirtualDisplayManager.shared.setMonitorMode(m)
+        refresh()
+    }
+
+    static func monitorModeTitle(_ m: VirtualDisplayMonitorMode) -> String {
+        switch m {
+        case .mirror: return "Monitor Mirrors It (One Desktop)"
+        case .extend: return "Extend: Place It Beside the Monitor"
+        case .stream: return "Stream the Monitor Instead"
+        }
+    }
+
+    @objc private func toggleVirtualAlways() {
+        let vd = VirtualDisplayManager.shared
+        vd.setAlwaysOn(!vd.config.alwaysOn)
+        refresh()
+    }
+
+    @objc private func toggleVirtualMain() {
+        let vd = VirtualDisplayManager.shared
+        vd.setMakeMain(!vd.config.wantsMain)
+        refresh()
+    }
+
+    @objc private func removeVirtual() { VirtualDisplayManager.shared.removeNow(); refresh() }
+
     @objc private func restoreNow() { DisplayModeController.shared.restoreNow(reason: "menu"); refresh() }
 
     @objc private func openLog() {
@@ -517,18 +610,19 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     @objc private func restart() {
         log("menu: restart (launchd relaunches the host)")
+        restoreDisplaysBeforeExit(reason: "restart")
         exit(0)
     }
 
     @objc private func quit() {
-        DisplayModeController.shared.restoreNow(reason: "quit")
+        restoreDisplaysBeforeExit(reason: "quit")
         log("menu: quit")
         exit(0)
     }
 
     @objc private func quitUntilLogin() {
         guard let label = launchdLabel else { quit(); return }
-        DisplayModeController.shared.restoreNow(reason: "quit until next login")
+        restoreDisplaysBeforeExit(reason: "quit until next login")
         log("menu: quit until next login (launchctl bootout gui/\(getuid())/\(label))")
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
