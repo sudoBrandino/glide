@@ -490,9 +490,18 @@ unsafe fn firewall_exe(h: HWND, ctx: &Ctx) -> PathBuf {
     }
 }
 
+/// Windows PowerShell by its full path in the system folder, never through the search path (the
+/// current or the exe's folder could hold a planted powershell.exe, and one call is elevated).
+fn powershell_path() -> PathBuf {
+    let mut buf = [0u16; 260];
+    let n = unsafe { windows::Win32::System::SystemInformation::GetSystemDirectoryW(Some(&mut buf)) } as usize;
+    let sys = if n > 0 && n < buf.len() { PathBuf::from(String::from_utf16_lossy(&buf[..n])) } else { PathBuf::from(r"C:\Windows\System32") };
+    sys.join(r"WindowsPowerShell\v1.0\powershell.exe")
+}
+
 fn run_firewall_check(exe: &Path) -> Option<FirewallStatus> {
     use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new("powershell.exe")
+    let out = std::process::Command::new(powershell_path())
         .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &logic::ps_encode(&logic::firewall_check_script(&exe.to_string_lossy()))])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -514,12 +523,13 @@ unsafe fn allow_in_firewall(h: HWND, ctx: &Ctx) {
         "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {}",
         logic::ps_encode(&logic::firewall_allow_script(&exe.to_string_lossy(), ctx.init.port))
     ));
+    let ps = wide(&powershell_path().to_string_lossy());
     let mut sei = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS,
         hwnd: h,
         lpVerb: w!("runas"),
-        lpFile: w!("powershell.exe"),
+        lpFile: PCWSTR(ps.as_ptr()),
         lpParameters: PCWSTR(params.as_ptr()),
         nShow: SW_HIDE.0,
         ..Default::default()

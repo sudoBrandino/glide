@@ -81,9 +81,20 @@ pub fn local_ipv4_toward(toward: Option<&str>) -> Option<std::net::Ipv4Addr> {
     }
 }
 
-/// `'...'` PowerShell literal.
+/// `'...'` PowerShell literal. PowerShell treats the typographic quotes U+2018–U+201B as single
+/// quotes too, so each of them is doubled as well (doubling keeps the character itself); without
+/// that, a folder name with ’ could end the literal early in the elevated firewall script.
 pub fn ps_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
 }
 
 /// `powershell -EncodedCommand` argument: base64 of the UTF-16LE script (no quoting issues).
@@ -239,6 +250,10 @@ mod tests {
         // UTF-16LE: "a" = 61 00
         assert_eq!(ps_encode("a"), "YQA=");
         assert_eq!(ps_quote("C:\\O'Brien\\glide.exe"), "'C:\\O''Brien\\glide.exe'");
+        // Typographic single quotes end a PowerShell literal too: doubled, so they stay data.
+        assert_eq!(ps_quote("C:\\O\u{2019}Brien"), "'C:\\O\u{2019}\u{2019}Brien'");
+        assert_eq!(ps_quote("a\u{2018}b\u{201A}c\u{201B}d"), "'a\u{2018}\u{2018}b\u{201A}\u{201A}c\u{201B}\u{201B}d'");
+        assert_eq!(ps_quote("x'; calc; '"), "'x''; calc; '''");
         let s = firewall_allow_script("C:\\x\\glide-client.exe", 7420);
         assert!(s.starts_with("$p='C:\\x\\glide-client.exe';"));
         assert!(s.contains("-LocalPort 7420 -Profile Private,Domain -Action Allow"));
