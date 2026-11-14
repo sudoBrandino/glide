@@ -287,6 +287,9 @@ in place (unused) so a rollback to v1 binaries still works.
 | `0x14` | ReleaseAll | (none) — host releases every held key/button |
 | `0x15` | ViewSize | `u16 view_w`, `u16 view_h` — physical pixels of the monitor/area the viewer will present on (the window's current monitor in fullscreen). Sent whenever it changes (window moved to another monitor, display mode change). The host re-captures so the encoded width ≤ `view_w` and follows with `VideoConfig` + keyframe |
 | `0x16` | SetDisplayPreference | `u8 mode` — Mac display-mode preference for this session, see §3.3 |
+| `0x17` | Scroll | `u8 flags`, `f32 dx`, `f32 dy` — wheel/touchpad scroll with its source, see §3.6 (only after `InputCaps` bit0) |
+| `0x18` | MouseDelta | `i16 dx`, `i16 dy` — relative pointer motion, see §3.6 (only after `InputCaps` bit1) |
+| `0x19` | KeyExtra | `u8 kind`, then a kind-specific body: lock-key state or a consumer (media) key, see §3.6 (only after `InputCaps` bit2/bit3) |
 | `0x1A` | SelectDisplay | `u32 display_id` — which Mac display to stream (0 = the host's default), see §3.5 |
 | `0x20` | RequestKeyframe | (none) |
 | `0x21` | SetMode | `u8 mode` (0 fast, 1 sharp), `u32 bitrate_kbps` (0 = auto), `u8 max_fps` (0 = keep) |
@@ -299,8 +302,8 @@ in place (unused) so a rollback to v1 binaries still works.
 
 `codec_caps` bits (despite the name, a general capability mask): bits 0–7 are video codecs —
 `0` HEVC 4:2:0, `1` HEVC 4:4:4, `2` H.264 4:2:0; bits 8+ are non-video features — `8` clipboard
-sync (§5), `9` audio PCM, `10` audio Opus (reserved) (§3.2), `11` file transfer (§6), `13` display selection (§3.5).
-Hosts ignore bits they don't know;
+sync (§5), `9` audio PCM, `10` audio Opus (reserved) (§3.2), `11` file transfer (§6), `12` input
+extensions (§3.6), `13` display selection (§3.5). Hosts ignore bits they don't know;
 codec selection looks at bits 0–7 only.
 `mode`: `0` fast (4:2:0 only), `1` sharp (4:4:4 every frame), `2` **hybrid** (4:2:0 while the screen
 changes + a 4:4:4 refinement layer once it settles; see §3.1). Hybrid requires `codec_caps` bit 1;
@@ -308,6 +311,12 @@ the host falls back to fast otherwise. Viewers that support it should default to
 
 Modifier remapping (e.g. Windows Ctrl → Mac Command) is the **client's** job:
 the host injects exactly the HID usages it receives.
+
+`MouseMove` coordinates span the edges of the captured display, not the centers of its edge
+pixels: `x = 0` is the left edge and `x = 1` the right edge, so the host maps `x · width` (in its
+own units, e.g. points), clamped inside the display. Viewers send the center of the pixel under
+the pointer within the drawn video rectangle, `(px + 0.5) / rect_width` (likewise for `y`),
+clamped to 0..1 when the pointer is over a letterbox bar.
 
 ### Host → Client
 
@@ -326,6 +335,8 @@ the host injects exactly the HID usages it receives.
 | `0x41` | CursorPos | `f32 x`, `f32 y` (normalized), `u8 visible` |
 | `0x42` | CursorShape | `u32 shape_id`, `u16 w`, `u16 h`, `u16 hot_x`, `u16 hot_y`, then `w*h*4` bytes BGRA, straight (non-premultiplied) alpha, top-down rows |
 | `0x43` | CursorShapeRef | `u32 shape_id` — switch to a previously sent shape |
+| `0x44` | InputCaps | `u32 flags` — which §3.6 input messages the host accepts (only to clients with caps bit 12) |
+| `0x45` | — | reserved for §3.6 |
 | `0x50` | Clipboard | clipboard snapshot, see §5 (only to clients with caps bit 8) |
 | `0x51` | ClipboardCaps | `u32 formats`, `u32 max_bytes` — see §5 (only to clients with caps bit 8) |
 | `0x60` | AudioConfig | see §3.2 (only to clients with caps bit 9) |
@@ -590,6 +601,92 @@ DisplayList {streamed 1, selected 0, [id 1 "Built-in Retina Display" main|builti
      10060000 4ea00000 00000000 1700 4275696c742d696e20526574696e6120446973706c6179
 ```
 
+## 3.6 Input extensions (v1.7)
+
+Optional input messages for native-feeling control: scrolling that keeps its source (touchpad
+or wheel), relative pointer motion for games and 3D apps, lock-key sync and media keys. They are
+negotiated, so old peers on either side lose nothing:
+
+- The viewer sets `codec_caps` bit **12** in `ClientHello` when it implements this section.
+- A host that implements it answers such a viewer with **`InputCaps` (`0x44`)** once, after
+  `ServerHello` (next to `ClipboardCaps` / `FileCaps`). It never sends `InputCaps` to a viewer
+  without bit 12. `0x45` is reserved.
+- The viewer sends `0x17`–`0x19` **only** for features whose `InputCaps` bit is set. Without
+  `InputCaps` (an older host) it keeps using `MouseWheel` / `Key` as before. (An older host logs
+  and drops an unknown message after authentication, but viewers must not rely on that.)
+
+`InputCaps` flags (viewers ignore bits they don't know; hosts set only what they implement):
+
+| bit | feature | message |
+|----|----|----|
+| 0 | scroll with source | `0x17` Scroll |
+| 1 | relative pointer motion | `0x18` MouseDelta |
+| 2 | lock-key state | `0x19` kind 0 |
+| 3 | consumer (media) keys | `0x19` kind 1 |
+
+### `0x17` Scroll (C→H)
+
+`u8 flags`, `f32 dx`, `f32 dy`. The deltas have the units and signs of `MouseWheel` (`0x12`):
+notches, 1.0 = one detent = Windows `WHEEL_DELTA` 120, `dy > 0` scrolls up, `dx > 0` scrolls
+right. They describe the scroll the user wants: a viewer-side "natural scrolling" option is
+applied by the viewer before sending. `flags` bit0 **precise**: the source is continuous (a
+precision touchpad or a high-resolution wheel) rather than a notched wheel. Other bits are 0 and
+ignored. A viewer that negotiated bit0 sends `Scroll` instead of `MouseWheel`.
+
+The host should inject:
+- **discrete** (bit0 = 0): a line-based mouse-wheel scroll, 3 lines per notch (the Windows
+  default), so applications apply their own wheel behavior (for example smooth-scroll animation);
+- **precise** (bit0 = 1): pixel scrolling (48 px per notch) as a gesture: the first event after
+  a pause begins it, later events continue it, and the host ends it after about 100 ms without a
+  precise event (or when a discrete scroll, `ReleaseAll` or a disconnect intervenes).
+
+For `MouseWheel` from viewers without this section, hosts may infer the source: whole-notch deltas
+are discrete, fractional ones precise.
+
+### `0x18` MouseDelta (C→H)
+
+`i16 dx`, `i16 dy`: relative motion in device counts, without pointer acceleration (Windows raw
+input), `+x` right, `+y` down. The viewer sends it only while its relative ("pointer lock") mode
+is on, which hides and confines its local cursor; larger motions are split over several messages.
+The host moves its pointer by (`dx`, `dy`) points from where it is, clamped to the display, and
+reports the unclamped motion as the event's delta, so applications that read deltas (games, 3D
+viewports) keep turning at the screen edge. Buttons and scrolling keep using `0x11`/`0x12`/`0x17`.
+A later `MouseMove` returns to absolute positioning.
+
+### `0x19` KeyExtra (C→H)
+
+`u8 kind`, then:
+
+| kind | name | body |
+|----|----|----|
+| 0 | LockState | `u8 locks` — bit0 Caps Lock on, bit1 Num Lock on, bit2 Scroll Lock on |
+| 1 | ConsumerKey | `u16 usage` (USB HID Consumer page `0x0C`), `u8 down` (1/0) |
+
+Hosts ignore kinds they don't know.
+
+- **LockState** is the viewer's absolute lock-key state. With bit2 negotiated the viewer leaves
+  the Caps Lock and Num Lock keys to its own OS (so its LEDs and state stay right) instead of
+  forwarding them as `Key`, and sends `LockState` after `InputCaps`, whenever it regains focus and
+  whenever a lock key changes. The host applies Caps Lock to the key events it injects. A Mac has
+  no Num Lock or Scroll Lock, so a Mac host ignores those bits (the viewer sends navigation usages
+  for keypad keys while Num Lock is off).
+- **ConsumerKey** carries media keys that have no Keyboard-page usage: `0xCD` Play/Pause, `0xB5`
+  Next track, `0xB6` Previous track, `0xB7` Stop, `0xE2` Mute, `0xE9` Volume up, `0xEA` Volume
+  down, `0x6F` Brightness up, `0x70` Brightness down. Hosts ignore other usages. (Keyboard-page
+  Mute / Volume up / Volume down, `0x7F`–`0x81`, sent as `Key` by any viewer, are the same keys.)
+
+Reference encodings (`docs/input-vectors.json`, generated by `tools/mock_host.py --input-vectors`;
+`glide-selftest`, `cargo test` and `mock_host.py --selftest` check them):
+
+```
+InputCaps {0x0f}                          44 0f000000
+Scroll {precise, dx 0, dy 0.25}           17 01 00000000 0000803e
+Scroll {discrete, dx -1, dy 0}            17 00 000080bf 00000000
+MouseDelta {dx 5, dy -3}                  18 0500 fdff
+KeyExtra LockState {caps}                 19 00 01
+KeyExtra ConsumerKey {0xcd play, down}    19 01 cd00 01
+```
+
 ## 4. Test vectors
 
 - `docs/noise-vectors.json`: the official Noise_XX_25519_ChaChaPoly_SHA256 vectors (cacophony,
@@ -603,6 +700,9 @@ DisplayList {streamed 1, selected 0, [id 1 "Built-in Retina Display" main|builti
   implementation (`GLIDE_REGEN_VECTORS=1 cargo test rust_transcript`).
 - `docs/display-vectors.json`: §3.5 message encodings and identity-matching cases, generated by
   `tools/mock_host.py --display-vectors`; CI regenerates and compares it.
+- `docs/file-transfer-vectors.json` (§6) and `docs/input-vectors.json` (§3.6): message encodings
+  (and, for files, name-sanitizer cases) generated by `tools/mock_host.py --file-vectors` /
+  `--input-vectors`; CI regenerates the input vectors and runs `mock_host.py --selftest`.
 
 Swift replays both transcripts as host and as viewer byte for byte; Rust replays the Python one;
 `tools/gen_vectors.py --check docs/test-vectors-rust.json` replays the Rust one in Python.
