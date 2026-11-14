@@ -19,6 +19,10 @@
 #define VOS_NT_WINDOWS32  0x40004L
 #define VFT_APP           0x1L
 
+// GLIDE_VER_* come from the crate version (VERSION file): build.rs writes glide_version.h into
+// OUT_DIR, which is on the include path for both windres and rc.exe.
+#include "glide_version.h"
+
 #define IDI_GLIDE        1
 #define IDD_PAIR         102
 #define IDC_PAIR_ICON    1100
@@ -46,8 +50,8 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     0,1,0,0
-PRODUCTVERSION  0,1,0,0
+FILEVERSION     GLIDE_VER_MAJOR,GLIDE_VER_MINOR,GLIDE_VER_PATCH,0
+PRODUCTVERSION  GLIDE_VER_MAJOR,GLIDE_VER_MINOR,GLIDE_VER_PATCH,0
 FILEOS          VOS_NT_WINDOWS32
 FILETYPE        VFT_APP
 BEGIN
@@ -57,11 +61,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Glide"
             VALUE "FileDescription", "Glide remote desktop viewer"
-            VALUE "FileVersion", "0.1.0"
+            VALUE "FileVersion", GLIDE_VER_STR
             VALUE "InternalName", "glide-client"
             VALUE "OriginalFilename", "glide-client.exe"
             VALUE "ProductName", "Glide"
-            VALUE "ProductVersion", "0.1.0"
+            VALUE "ProductVersion", GLIDE_VER_STR
         END
     END
     BLOCK "VarFileInfo"

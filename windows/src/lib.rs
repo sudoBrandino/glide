@@ -25,6 +25,7 @@ pub mod noise;
 pub mod peers;
 pub mod protocol;
 pub mod util;
+pub mod version;
 
 #[cfg(test)]
 pub(crate) mod testhost;

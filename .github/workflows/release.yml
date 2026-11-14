@@ -1,0 +1,239 @@
+name: Release
+
+# Builds the release artifacts and attaches them to a DRAFT GitHub Release; a maintainer reviews
+# and publishes it by hand. Same steps as tools/release.sh (see docs/INSTALL.md, CONTRIBUTING.md).
+#
+# - Push a tag vX.Y.Z (must equal the VERSION file, on a commit in main): build, attest, draft.
+# - Run it by hand (workflow_dispatch) for a dry run: build only, artifacts on the run page.
+#   Pull requests that touch the release tooling get the same dry run.
+#
+# Optional repository secrets for a Developer ID signed and notarized Mac app. Without them the
+# app is signed ad hoc, as with tools/make-host-app.sh.
+#   MACOS_SIGN_P12           base64 of a .p12 holding the "Developer ID Application" cert + key
+#   MACOS_SIGN_P12_PASSWORD  its password
+#   MACOS_SIGN_ID            the identity, e.g. "Developer ID Application: Name (TEAMID)"
+#   MACOS_NOTARY_APPLE_ID, MACOS_NOTARY_TEAM_ID, MACOS_NOTARY_PASSWORD (app-specific password):
+#                            also notarize and staple (needs the three above)
+#
+# Third-party actions are pinned to commit SHAs, as in ci.yml. No caches: release builds start
+# clean so nothing a pull-request build wrote can reach a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - VERSION
+      - tools/release.sh
+      - tools/version.sh
+      - tools/make-host-app.sh
+      - .github/workflows/release.yml
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    name: Check version, changelog and vectors
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Version and changelog
+        id: v
+        run: |
+          tools/release.sh check
+          echo "version=$(tools/version.sh)" >> "$GITHUB_OUTPUT"
+      - name: Tag matches VERSION and is on main
+        if: github.event_name == 'push'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          v="$(tools/version.sh)"
+          if [ "$TAG" != "v$v" ]; then
+            echo "::error::tag $TAG does not match VERSION ($v); expected v$v"; exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag $TAG points at $GITHUB_SHA, which is not on main"; exit 1
+          fi
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Test vectors (Python reference)
+        run: |
+          pip install cryptography
+          python3 tools/glide_noise.py
+          python3 tools/gen_vectors.py "$RUNNER_TEMP/v.json"
+          cmp "$RUNNER_TEMP/v.json" docs/test-vectors.json
+          python3 tools/gen_vectors.py --check docs/test-vectors-rust.json
+
+  host:
+    name: Mac host (Glide Host.app)
+    needs: check
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      GLIDE_RELEASE_OUT: ${{ github.workspace }}/out
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcode-select -p
+          swift --version
+      - name: Import Developer ID certificate (optional)
+        env:
+          P12: ${{ secrets.MACOS_SIGN_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+          SIGN_ID: ${{ secrets.MACOS_SIGN_ID }}
+        run: |
+          if [ -z "$P12" ] || [ -z "$SIGN_ID" ]; then
+            echo "No Developer ID secrets: the app is signed ad hoc."
+            exit 0
+          fi
+          KC="$RUNNER_TEMP/glide-sign.keychain-db"
+          KC_PASSWORD="$(openssl rand -hex 24)"
+          security create-keychain -p "$KC_PASSWORD" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$KC_PASSWORD" "$KC"
+          printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/sign.p12"
+          security import "$RUNNER_TEMP/sign.p12" -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/sign.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PASSWORD" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$KC"
+          {
+            echo "GLIDE_SIGN_ID=$SIGN_ID"
+            echo "GLIDE_HARDENED_RUNTIME=1"
+          } >> "$GITHUB_ENV"
+      - name: Build, test and zip
+        run: tools/release.sh host
+      - name: Notarize and staple (optional)
+        env:
+          APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+        run: |
+          if [ "${GLIDE_HARDENED_RUNTIME:-0}" != 1 ] || [ -z "$APPLE_ID" ] || [ -z "$TEAM_ID" ] || [ -z "$NOTARY_PASSWORD" ]; then
+            echo "Not notarizing (needs the Developer ID and notary secrets)."
+            exit 0
+          fi
+          ZIP="$(ls "$GLIDE_RELEASE_OUT"/Glide-Host-*-macos-*.zip)"
+          xcrun notarytool submit "$ZIP" --apple-id "$APPLE_ID" --team-id "$TEAM_ID" \
+            --password "$NOTARY_PASSWORD" --wait --timeout 30m
+          WORK="$RUNNER_TEMP/staple"
+          rm -rf "$WORK" && mkdir -p "$WORK"
+          ditto -x -k "$ZIP" "$WORK"
+          xcrun stapler staple "$WORK/Glide Host.app"
+          rm -f "$ZIP"
+          ditto -c -k --sequesterRsrc --keepParent "$WORK/Glide Host.app" "$ZIP"
+          spctl -a -vv -t exec "$WORK/Glide Host.app"
+      - name: Remove signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/glide-sign.keychain-db" 2>/dev/null || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-host
+          path: out/Glide-Host-*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  viewer:
+    name: Windows viewer (glide-client.exe)
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GLIDE_RELEASE_OUT: ${{ github.workspace }}/out
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install MinGW-w64
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64 zip
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-gnu
+      - name: Test, cross-build and zip
+        run: tools/release.sh viewer
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-viewer
+          path: out/Glide-Viewer-*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Checksums, notes and draft release
+    needs: [check, host, viewer]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write      # create the draft release
+      id-token: write      # build provenance attestation (tag pushes only)
+      attestations: write
+    env:
+      GLIDE_RELEASE_OUT: ${{ github.workspace }}/out
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: out
+          merge-multiple: true
+      - name: Release notes and SHA256SUMS
+        run: |
+          tools/release.sh notes
+          tools/release.sh sums
+          ls -l out
+          cat out/RELEASE_NOTES.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: glide-${{ needs.check.outputs.version }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Attest build provenance
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/Glide-*.zip
+      - name: Create or update the draft release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          files=(out/Glide-*.zip out/SHA256SUMS)
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$state" != "true" ]; then
+              echo "::error::release $TAG is already published; not touching it"; exit 1
+            fi
+            gh release edit "$TAG" --notes-file out/RELEASE_NOTES.md
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            pre=()
+            case "$VERSION" in *-*) pre=(--prerelease) ;; esac
+            gh release create "$TAG" "${files[@]}" --draft --verify-tag "${pre[@]}" \
+              --title "Glide $VERSION" --notes-file out/RELEASE_NOTES.md
+          fi
+          echo "Draft release $TAG is ready for review: publish it from the Releases page." >> "$GITHUB_STEP_SUMMARY"

@@ -34,6 +34,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install cryptography
+      - name: Version consistency (VERSION, Cargo.toml, Version.swift) and changelog entry
+        run: tools/release.sh check
       - name: Regenerate and compare
         run: |
           python3 tools/glide_noise.py                                # official Noise vectors

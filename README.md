@@ -50,8 +50,9 @@ NVIDIA-GPU Windows PC). It works well there and has had little testing elsewhere
 - **LAN only.** There is no relay or NAT traversal, and the transport is TCP.
 - The wire protocol is at version 2 and may still change in incompatible ways. Both sides detect a
   version mismatch and say so.
-- There are no signed or notarized releases. You build the host yourself; the viewer exe is also
-  available as a CI artifact.
+- Releases are on the [Releases page](https://github.com/sudoBrandino/glide/releases): a Mac app
+  signed ad hoc (not notarized) and an unsigned viewer exe. See [`docs/INSTALL.md`](docs/INSTALL.md)
+  to install them, or build both yourself as described below.
 
 See the feature table below and [`docs/ROADMAP.md`](docs/ROADMAP.md) for what is planned.
 
@@ -59,6 +60,8 @@ See the feature table below and [`docs/ROADMAP.md`](docs/ROADMAP.md) for what is
 
 | | |
 |---|---|
+| [`docs/INSTALL.md`](docs/INSTALL.md) | Installing a release: Gatekeeper, permissions, firewall, pairing, troubleshooting |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed in each release |
 | [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | Wire protocol (normative) |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Pipelines, hybrid/canvas model, threading |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | What's done and what's next |
@@ -179,6 +182,9 @@ A block-code test pattern measures true glass-to-glass latency. See
 [`docs/LATENCY.md`](docs/LATENCY.md); the live LAN glass-to-glass run is still pending.
 
 ## Install and run
+
+To install a prebuilt release instead of building from source, follow
+[`docs/INSTALL.md`](docs/INSTALL.md).
 
 ### Requirements
 

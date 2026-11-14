@@ -89,6 +89,7 @@ func usage() -> Never {
            glide-host --paired              (list paired viewers)
            glide-host --unpair NAME|KEY     (remove a paired viewer: name, key or fingerprint prefix)
            glide-host --identity            (print this Mac's key fingerprint)
+           glide-host --version             (print the version and protocol version)
            glide-host --request-permissions (prompt for Screen Recording + Accessibility, wait, exit)
            glide-host --set-connect HOST[:PORT] (save the default dial-out target in host.json)
            glide-host --selftest-ui [--out DIR] (print the status menu per state + display-mode picks; no capture)
@@ -114,6 +115,7 @@ func takeValue(_ flag: String) -> String? {
     return v
 }
 if args.contains("-h") || args.contains("--help") { usage() }
+if args.contains("--version") || args.contains("-V") { print(GlideVersion.banner("glide-host")); exit(0) }
 if args.contains("--selftest-ui") { runSelfTestUI(outDir: takeValue("--out")) }  // offscreen; never captures
 if let i = args.firstIndex(of: "--encode-bench") {  // offline; never captures or listens
     let secs = i + 1 < args.count ? Double(args[i + 1]) ?? 3 : 3
@@ -147,6 +149,7 @@ for legacy in ["--password", "--password-file", "--set-password-file"] where arg
 
 var config = HostConfig.load()
 if let v = takeValue("--set-connect") { config.connect = v; config.save(); print("saved connect target \(v)"); exit(0) }
+log("starting \(GlideVersion.banner("glide-host")) (pid \(getpid()))")
 if config.password != nil || config.salt != nil || ProcessInfo.processInfo.environment["GLIDE_PASSWORD"] != nil {
     log("config: the v1 password (host.json salt/password, $GLIDE_PASSWORD) is no longer used — viewers pair with this Mac instead; host.json keeps it for a rollback to v1")
 }
