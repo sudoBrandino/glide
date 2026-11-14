@@ -302,6 +302,10 @@ fn main() -> ExitCode {
         if args.bench.is_none() {
             caps |= protocol::CAP_DISPLAYS;
         }
+        // Input extensions (§3.6): the GUI viewer.
+        if args.bench.is_none() {
+            caps |= protocol::CAP_INPUT_EXT;
+        }
     }
     let audio_on = args.audio.unwrap_or(store.config.audio);
     if audio_on {
