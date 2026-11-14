@@ -133,7 +133,7 @@ To bring the prompts back later, launch the app through Launch Services so macOS
 request to Glide Host:
 
 ```sh
-open -a ~/Applications/Glide\ Host.app --args --request-permissions
+open -n -a ~/Applications/Glide\ Host.app --args --request-permissions
 ```
 
 Don't run the binary inside the bundle from a Terminal window for this: macOS would attribute the
