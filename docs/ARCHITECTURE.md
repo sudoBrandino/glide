@@ -22,11 +22,13 @@ capture ─► diff ─► encode ─► record layer ─► TCP ─► record l
 | Host | `glide-host/Encoder.swift` | VideoToolbox compression sessions (HEVC 4:2:0 or 4:4:4, H.264). |
 | Host | `glide-host/CursorMonitor.swift`, `InputInjector.swift` | Cursor shape and position out, CGEvent injection in. |
 | Host | `glide-host/Power.swift` | Sleep and display-sleep assertions, display wake on input. |
+| Host | `glide-host/ActiveDisplay.swift`, `GlideCore/Displays.swift` | Which display is served (PROTOCOL.md §3.5): the session's selection by identity, else the `--display` pin, else the main display; the display list. Capture, input, display-mode policy and the menu resolve it on use. |
 | Host | `GlideCore/FileNames.swift`, `FileTransfer.swift` | File transfer (PROTOCOL.md §6): name sanitizer, receiver, sender, `FileTransferEngine`. |
 | Host | `glide-host/HostFiles.swift` | Per-session file transfer wiring (chunk pacing on `bytesInFlight`, Finder pasteboard pull), notifications. |
 | Viewer | `windows/src/{protocol,crypto,net}.rs` | Codec, crypto and TCP transport. These are platform independent and unit-tested on Linux, macOS and Windows. |
 | Viewer | `windows/src/{hid,annexb,bench}.rs` | Scancode → HID table, Annex-B splitter, the headless benchmark. |
 | Viewer | `windows/src/files.rs`, `win/files.rs` | File transfer: platform-independent service + Win32 drag & drop / notifications. |
+| Viewer | `windows/src/displays.rs` | Mac display picker logic (§3.5): identity matching, cycling, remembered display, toasts. |
 | Viewer | `windows/src/win/*` | Windows only: D3D11 device, Media Foundation decoders, renderer, window and input, cursor, `--probe`. |
 
 ## Host video pipeline
@@ -149,6 +151,12 @@ identically:
 - **Capture failures:** capture start retries every 2 s while the display is asleep, locked or
   reconfiguring, and the session stays up meanwhile. Display-mode changes such as a HiDPI switch
   trigger a debounced re-capture with a new `VideoConfig`.
+- **Which display:** the one `ActiveDisplay` resolves at each capture start, never a cached ID.
+  A viewer (`SelectDisplay`) or the Mac's menu bar can select another display for the session; the
+  same re-capture path then moves video and input to it, and `DisplayModeController` restores the
+  old display's mode and applies its policy to the new one. When the selected display goes away
+  the next re-capture falls back to the default display, and returns when it comes back
+  (`DisplayChanged` tells the viewer why).
 
 ### Connection management
 

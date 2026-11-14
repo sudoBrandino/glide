@@ -133,6 +133,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the details.
 | Clipboard sync (text + images, both directions) | done |
 | Audio (SCK system audio → PCM → WASAPI, jitter buffer) | done (§3.2) |
 | File transfer, both directions (drag & drop, Finder copy + Ctrl+Alt+Shift+V, menu) | done (§6) |
+| Multiple Mac displays: display picker (viewer menu, Ctrl+Alt+Shift+←/→, Mac menu bar), hot-plug fallback, remembered choice | done (§3.5) |
 | Viewer UX | in progress |
 | Host UX: menu-bar item, automatic display mode, auth-gated session replacement | done |
 | Security v2: Noise XX, key pinning, pairing with a code confirmed on both screens | done (PROTOCOL.md §1–2) |
@@ -248,7 +249,10 @@ The host's key is `host-key` in the same folder (0600; created on first start). 
 - `--fps N` (default 60)
 - `--bitrate-kbps N` (0 means automatic)
 - `--max-width PX` (default 3840)
-- `--display ID`
+- `--display ID`: the default display to stream (a `CGDirectDisplayID`; the host logs the list at
+  startup). Without it the host streams the current main display. A viewer can pick another
+  display for its session (Glide menu → Show Mac display, Ctrl+Alt+Shift+←/→), and so can the Mac's
+  menu bar (Streamed Display); see PROTOCOL.md §3.5.
 
 **For development**, without the app bundle:
 

@@ -71,7 +71,10 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   "file_max_total_bytes": 8589934592,
   "file_max_files": 10000,
   "last_monitor": "\\.\DISPLAY1",
-  "windows": { "\\.\DISPLAY1": { "x": 0, "y": 0, "w": 2400, "h": 1400, "maximized": false, "fullscreen": true, "mon_w": 3840, "mon_h": 2160 } }
+  "windows": { "\\.\DISPLAY1": { "x": 0, "y": 0, "w": 2400, "h": 1400, "maximized": false, "fullscreen": true, "mon_w": 3840, "mon_h": 2160 } },
+  "last_display": {         // Mac display picked in the viewer, per target, by identity (PROTOCOL.md §3.5)
+    "listen:7420": { "id": 5, "vendor": 4268, "model": 16999, "serial": 825380938, "name": "DELL U2723QE" }
+  }
 }
 ```
 
@@ -159,6 +162,7 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   | Ctrl+Alt+Shift+V | paste files copied in Finder: asks the Mac (`FilePull`) and saves them to `download_dir` |
   | Ctrl+Alt+Shift+X | cancel the running file transfer(s) |
   | Ctrl+Alt+Shift+L | latency test on/off: read the host's test pattern (`glide-probe --pattern-only`) back from the picture; switching it off writes a JSON report to `%TEMP%` ([`docs/LATENCY.md`](../docs/LATENCY.md)) |
+  | Ctrl+Alt+Shift+→ / ← | show the next / previous Mac display (left to right), if the Mac has several. Also Glide menu → Show Mac display. The choice is remembered per host and re-selected on reconnect |
   | Ctrl+Alt+Shift+Space | open the Glide menu at the mouse pointer |
 
   While the window has focus and the keyboard is captured, a low-level keyboard hook sends Win, Alt+Tab, Alt+Space and similar keys to the host.
