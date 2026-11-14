@@ -1,44 +1,74 @@
 import Foundation
 
-// Pure logic for the optional virtual display (docs/VIRTUAL_DISPLAY.md). The CoreGraphics side
-// lives in glide-host/VirtualDisplay.swift; everything here is unit-tested in glide-selftest.
+// Pure logic for the virtual display (docs/VIRTUAL_DISPLAY.md). The CoreGraphics side lives in
+// glide-host/VirtualDisplay.swift; everything here is unit-tested in glide-selftest.
+
+/// What Glide does with the virtual display while a physical monitor is attached
+/// (host.json `virtualDisplay.whenMonitorAttached`).
+public enum VirtualDisplayMonitorMode: String, CaseIterable, Sendable {
+    /// Default. While a viewer is connected the main monitor mirrors the virtual display: one
+    /// desktop, every window visible to the viewer, nothing moves between screens.
+    case mirror
+    /// The virtual display is an extra monitor beside the physical one (made main if `makeMain`).
+    case extend
+    /// No virtual display while a monitor is attached: stream the monitor (the display-mode policy
+    /// may switch its mode, as before). The virtual display is only used when there is no monitor.
+    case stream
+}
 
 /// host.json `"virtualDisplay"`. Every field is optional; out-of-range numbers are clamped and an
-/// unknown `lifetime` means the default, so a typo in a value never disables the rest of host.json
+/// unknown string means the default, so a typo in a value never disables the rest of host.json
 /// (a wrong JSON type still does, as for every other section).
 public struct VirtualDisplayConfig: Codable, Equatable, Sendable {
-    /// Master switch (default false).
+    /// Master switch (default **true**: the virtual display is Glide's native path).
     public var enabled: Bool?
-    /// "session" (default): exists while a viewer is connected, plus `keepAliveSeconds`.
-    /// "always": created at launch and kept while the host runs.
+    /// "session" (default): created when a viewer connects, removed after it leaves (plus
+    /// `keepAliveSeconds`) unless it is the Mac's only display. "always": created at launch and kept.
     public var lifetime: String?
-    /// Seconds to keep the display after the viewer disconnects, so a reconnect does not reshuffle
-    /// windows (default 30, 0 = remove at once, capped at 24 h).
+    /// Seconds after a disconnect before Glide restores the arrangement and removes the display, so
+    /// a reconnect does not reshuffle anything (default 10, 0 = at once, capped at 24 h).
     public var keepAliveSeconds: Double?
-    /// Make the virtual display the main display (menu bar, new windows) while it exists (default false).
+    /// "mirror" (default) | "extend" | "stream"; see `VirtualDisplayMonitorMode`.
+    public var whenMonitorAttached: String?
+    /// "extend" only: make the virtual display the main display (menu bar, Dock, new windows) while
+    /// it is streamed (default true).
     public var makeMain: Bool?
-    /// Refresh rate of the virtual panel in Hz (default 60, 24...240). Glide's own capture rate is
-    /// still capped by --fps / GLIDE_FPS.
+    /// Panel refresh rate in Hz (24...240). Unset (default): the viewer's monitor refresh rate from
+    /// ClientHello `max_fps`, or 120 Hz if the viewer doesn't say.
     public var refreshRate: Double?
     /// Fixed panel size in pixels, used instead of the viewer's ViewSize (both must be set).
     /// Also the size an always-on display starts with before any viewer has connected.
     public var width: Int?
     public var height: Int?
 
-    public init(enabled: Bool? = nil, lifetime: String? = nil, keepAliveSeconds: Double? = nil, makeMain: Bool? = nil,
-                refreshRate: Double? = nil, width: Int? = nil, height: Int? = nil) {
+    public init(enabled: Bool? = nil, lifetime: String? = nil, keepAliveSeconds: Double? = nil, whenMonitorAttached: String? = nil,
+                makeMain: Bool? = nil, refreshRate: Double? = nil, width: Int? = nil, height: Int? = nil) {
         self.enabled = enabled; self.lifetime = lifetime; self.keepAliveSeconds = keepAliveSeconds
-        self.makeMain = makeMain; self.refreshRate = refreshRate; self.width = width; self.height = height
+        self.whenMonitorAttached = whenMonitorAttached; self.makeMain = makeMain; self.refreshRate = refreshRate
+        self.width = width; self.height = height
     }
 
-    public static let defaultKeepAlive: Double = 30
+    public static let defaultKeepAlive: Double = 10
     public static let defaultSize = (w: 1920, h: 1080)
+    /// Refresh rate when neither host.json nor the viewer gives one.
+    public static let defaultRefreshRate: Double = 120
 
-    public var isEnabled: Bool { enabled ?? false }
+    public var isEnabled: Bool { enabled ?? true }
+    /// Enabled in host.json explicitly (not just by default). A `--display` pin turns the default off.
+    public var explicitlyEnabled: Bool { enabled == true }
     public var alwaysOn: Bool { lifetime?.lowercased() == "always" }
     public var keepAlive: Double { min(max(keepAliveSeconds ?? Self.defaultKeepAlive, 0), 86_400) }
-    public var wantsMain: Bool { makeMain ?? false }
-    public var hz: Double { min(max(refreshRate ?? 60, 24), 240) }
+    public var monitorMode: VirtualDisplayMonitorMode {
+        whenMonitorAttached.flatMap { VirtualDisplayMonitorMode(rawValue: $0.lowercased()) } ?? .mirror
+    }
+    public var wantsMain: Bool { makeMain ?? true }
+    /// The panel refresh rate: host.json if set, else the viewer's monitor (ClientHello `max_fps`,
+    /// 0 = unknown), else 120 Hz. Always 24...240.
+    public func refreshRate(viewerHz: Int?) -> Double {
+        if let r = refreshRate, r.isFinite { return min(max(r, 24), 240) }
+        if let v = viewerHz, v >= 24 { return Double(min(v, 240)) }
+        return Self.defaultRefreshRate
+    }
     /// The fixed panel size, if both dimensions are sane.
     public var fixedSize: (w: Int, h: Int)? {
         guard let w = width, let h = height, w >= 640, h >= 480, w <= 7680, h <= 4320 else { return nil }
@@ -57,6 +87,10 @@ public struct VirtualDisplayPlan: Equatable, Sendable, CustomStringConvertible {
     /// The concrete style this plan implements (crisp, retina or smooth).
     public var style: DisplayModePreference
 
+    public init(modeWidth: Int, modeHeight: Int, hiDPI: Bool, refreshRate: Double, style: DisplayModePreference) {
+        self.modeWidth = modeWidth; self.modeHeight = modeHeight; self.hiDPI = hiDPI; self.refreshRate = refreshRate; self.style = style
+    }
+
     /// The mode macOS should end up in: looks-like size in points, backing size in pixels.
     public var expected: DisplayModeInfo {
         let s = hiDPI ? 2 : 1
@@ -68,6 +102,9 @@ public struct VirtualDisplayPlan: Equatable, Sendable, CustomStringConvertible {
     /// Largest backing size the planner produces (wider smooth plans fall back to retina).
     public static let maxBackingWidth = 7680
     public static let maxBackingHeight = 4320
+    /// The smallest pixel limits a display is created with ("6K"), so moving the viewer to a bigger
+    /// monitor re-applies settings instead of re-creating the display.
+    public static let generousLimit = (w: 6144, h: 3456)
 
     /// The plan for a viewer showing `viewerW` x `viewerH` pixels. `manual` is treated like
     /// `automatic` (a new virtual display needs some mode; Glide just never changes it afterwards).
@@ -93,8 +130,7 @@ public struct VirtualDisplayPlan: Equatable, Sendable, CustomStringConvertible {
         }
     }
 
-    /// maxPixelsWide/High for a new display serving this viewer: big enough for every style
-    /// (crisp, retina, smooth), so a preference change re-applies settings instead of re-creating.
+    /// The backing size every style (crisp, retina, smooth) needs for this viewer.
     public static func maxPixels(viewerW: Int, viewerH: Int, highDPIChoice: HighDPIViewerChoice, refreshRate: Double) -> (w: Int, h: Int) {
         var w = 0, h = 0
         for p in [DisplayModePreference.crisp, .retina, .smooth] {
@@ -102,6 +138,13 @@ public struct VirtualDisplayPlan: Equatable, Sendable, CustomStringConvertible {
             w = max(w, e.pixelWidth); h = max(h, e.pixelHeight)
         }
         return (w, h)
+    }
+
+    /// maxPixelsWide/High for a new display: every style for this viewer, and at least 6K, so the
+    /// one display Glide keeps serves later viewers and style changes by re-applying settings.
+    public static func creationLimits(viewerW: Int, viewerH: Int, highDPIChoice: HighDPIViewerChoice) -> (w: Int, h: Int) {
+        let need = maxPixels(viewerW: viewerW, viewerH: viewerH, highDPIChoice: highDPIChoice, refreshRate: 60)
+        return (min(max(need.w, generousLimit.w), maxBackingWidth), min(max(need.h, generousLimit.h), maxBackingHeight))
     }
 
     /// Whether this plan can be applied to a display created with these limits.
@@ -114,27 +157,41 @@ public struct VirtualDisplayPlan: Equatable, Sendable, CustomStringConvertible {
     public var sizeInMillimeters: (w: Double, h: Double) {
         (Double(modeWidth) * 25.4 / 110, Double(modeHeight) * 25.4 / 110)
     }
+
+    /// A physical display already in exactly this mode (same points and pixels) can be streamed
+    /// 1:1 without a virtual display or any mode switch.
+    public func matches(_ physical: DisplayModeInfo?) -> Bool {
+        physical.map { $0.sameSize(expected) } ?? false
+    }
 }
 
 /// When the virtual display exists. Pure state machine; the host feeds it events and performs the
-/// returned action. Times are seconds on any monotonic clock.
+/// returned action. Times are seconds on any monotonic clock. `onlyDisplay`: the virtual display is
+/// the Mac's only display (headless or lid closed without a monitor), so it is never removed when
+/// idle.
 public struct VirtualDisplayLifecycle: Equatable, Sendable {
     public enum Phase: Equatable, Sendable {
         /// No display.
         case off
         /// A viewer is connected and using it.
         case inUse
-        /// The viewer left; removed at `until` unless one reconnects.
+        /// The viewer left; idle at `until` unless one reconnects.
         case lingering(until: Double)
-        /// Always-on, no viewer.
+        /// Kept with no viewer (always-on, or the Mac's only display); arrangement restored.
         case standby
     }
 
     public enum Action: Equatable, Sendable {
         case none
+        /// Create it for the connecting viewer, then set up the streaming arrangement.
         case create
+        /// It exists: size it for the connecting viewer and set up the streaming arrangement.
+        case resume
+        /// Restore the Mac's arrangement, keep the display.
+        case standby
+        /// Restore the Mac's arrangement, then remove the display.
         case destroy
-        /// Call `timerFired(now:)` at this time.
+        /// Call `timerFired(now:onlyDisplay:)` at this time.
         case scheduleTimer(at: Double)
     }
 
@@ -162,31 +219,34 @@ public struct VirtualDisplayLifecycle: Equatable, Sendable {
         guard enabled else { return .none }
         let wasOff = phase == .off
         phase = .inUse
-        return wasOff ? .create : .none  // lingering/standby: reuse it (no window reshuffle)
+        return wasOff ? .create : .resume  // lingering/standby: reuse it (no window reshuffle)
     }
 
-    public mutating func sessionEnded(now: Double) -> Action {
+    public mutating func sessionEnded(now: Double, onlyDisplay: Bool) -> Action {
         sessionActive = false
         guard phase == .inUse else { return .none }
-        if alwaysOn { phase = .standby; return .none }
         if keepAlive > 0 {
             phase = .lingering(until: now + keepAlive)
             return .scheduleTimer(at: now + keepAlive)
         }
-        phase = .off
-        return .destroy
+        return idle(onlyDisplay: onlyDisplay)
     }
 
     /// A timer scheduled earlier fired. Stale timers (a viewer came back, or a newer linger
     /// started) are ignored.
-    public mutating func timerFired(now: Double) -> Action {
+    public mutating func timerFired(now: Double, onlyDisplay: Bool) -> Action {
         guard case let .lingering(until) = phase, now >= until - 0.05 else { return .none }
+        return idle(onlyDisplay: onlyDisplay)
+    }
+
+    private mutating func idle(onlyDisplay: Bool) -> Action {
+        if alwaysOn || onlyDisplay { phase = .standby; return .standby }
         phase = .off
         return .destroy
     }
 
     /// Settings changed (menu or host.json).
-    public mutating func configure(enabled: Bool, alwaysOn: Bool, keepAlive: Double, now: Double) -> Action {
+    public mutating func configure(enabled: Bool, alwaysOn: Bool, keepAlive: Double, onlyDisplay: Bool) -> Action {
         self.enabled = enabled; self.alwaysOn = alwaysOn; self.keepAlive = keepAlive
         if !enabled {
             guard phase != .off else { return .none }
@@ -198,12 +258,12 @@ public struct VirtualDisplayLifecycle: Equatable, Sendable {
             if sessionActive { phase = .inUse; return .create }
             if alwaysOn { phase = .standby; return .create }
             return .none
-        case .standby where !alwaysOn:
+        case .standby where !alwaysOn && !onlyDisplay:
             phase = .off
             return .destroy
         case .lingering where alwaysOn:
             phase = .standby
-            return .none
+            return .standby
         default:
             return .none
         }
@@ -221,6 +281,42 @@ public struct VirtualDisplayLifecycle: Equatable, Sendable {
     public mutating func lost() { phase = .off }
 }
 
+/// How the virtual display sits among the Mac's displays while it is streamed.
+public enum VirtualDisplayTopology: Equatable, Sendable {
+    /// No other display: it is the Mac's screen (and main) by itself.
+    case alone
+    /// `physical` (the main monitor) mirrors the virtual display, which is at (0,0): one desktop.
+    case mirror(physical: UInt32)
+    /// Beside the other displays; `main`: translated to (0,0) so it is the main display.
+    case extend(main: Bool)
+
+    /// One online display as CoreGraphics reports it.
+    public struct Display: Equatable, Sendable {
+        public var id: UInt32
+        /// The display it mirrors (0 = none).
+        public var mirrorOf: UInt32
+        public init(id: UInt32, mirrorOf: UInt32 = 0) { self.id = id; self.mirrorOf = mirrorOf }
+    }
+
+    /// The arrangement for streaming `virtual`. `main` is the main display right now.
+    public static func choose(mode: VirtualDisplayMonitorMode, makeMain: Bool, virtual: UInt32, main: UInt32, displays: [Display]) -> VirtualDisplayTopology {
+        let others = displays.filter { $0.id != virtual }
+        guard !others.isEmpty else { return .alone }
+        guard mode == .mirror else { return .extend(main: makeMain) }
+        // Already set up (a reconnect): keep the monitor that mirrors us.
+        if let m = others.first(where: { $0.mirrorOf == virtual }) { return .mirror(physical: m.id) }
+        // Mirror the main monitor, unless the user already mirrors displays (their setup wins).
+        guard let target = others.first(where: { $0.id == main }) ?? others.first(where: { $0.mirrorOf == 0 }),
+              target.mirrorOf == 0, !others.contains(where: { $0.mirrorOf == target.id }) else { return .extend(main: makeMain) }
+        return .mirror(physical: target.id)
+    }
+
+    /// Whether a virtual display should be created at all with these physical displays online.
+    public static func wantsVirtual(mode: VirtualDisplayMonitorMode, physicalDisplays: Int) -> Bool {
+        mode != .stream || physicalDisplays == 0
+    }
+}
+
 /// Display arrangement helpers (global display coordinates, points).
 public enum VirtualDisplayArrangement {
     /// Origins that make `target` the main display (macOS: the display at (0,0)) by translating
@@ -228,5 +324,17 @@ public enum VirtualDisplayArrangement {
     public static func makingMain(_ target: UInt32, origins: [UInt32: (x: Double, y: Double)]) -> [UInt32: (x: Double, y: Double)]? {
         guard let t = origins[target] else { return nil }
         return origins.mapValues { (x: $0.x - t.x, y: $0.y - t.y) }
+    }
+}
+
+extension DisplayModeInfo {
+    /// Parses the machine-readable line of `glide-host --list-display-modes ID`
+    /// ("current: 1280x720 px=2560x1440 hz=120"), which reports the mode from another process:
+    /// CoreGraphics reports no mode for a virtual display to the process that created it.
+    public static func parseListing(_ listing: String) -> DisplayModeInfo? {
+        guard let line = listing.split(separator: "\n").first(where: { $0.hasPrefix("current: ") }) else { return nil }
+        let nums = line.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+        guard nums.count >= 5, nums[0] > 0, nums[1] > 0, nums[2] > 0, nums[3] > 0 else { return nil }
+        return DisplayModeInfo(width: nums[0], height: nums[1], pixelWidth: nums[2], pixelHeight: nums[3], refreshRate: Double(nums[4]))
     }
 }

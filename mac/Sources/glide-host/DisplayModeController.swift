@@ -114,7 +114,7 @@ final class DisplayModeController: @unchecked Sendable {
 
     /// A viewer authenticated. Switches the mode if the policy says so, then calls `then` (on main)
     /// once the display has settled.
-    func sessionBegan(id: Int, viewW: Int, viewH: Int, then: @escaping () -> Void) {
+    func sessionBegan(id: Int, viewW: Int, viewH: Int, viewerHz: Int, then: @escaping () -> Void) {
         DispatchQueue.main.async { [self] in
             pendingRestore?.cancel(); pendingRestore = nil
             viewDebounce?.cancel(); viewDebounce = nil
@@ -122,9 +122,10 @@ final class DisplayModeController: @unchecked Sendable {
             sessionPreference = nil
             userOverride = false
             viewer = (viewW, viewH)
-            // The virtual display (if enabled) is created first, sized to this viewer; once it is
-            // online it is `displayID` and the policy below applies to it like to any display.
-            VirtualDisplayManager.shared.sessionBegan { [self] _ in
+            // The virtual display (on by default) is created first, sized to this viewer's pixels
+            // and refresh rate; once it is online it is `displayID` and the policy below applies to
+            // it like to any display.
+            VirtualDisplayManager.shared.sessionBegan(viewerHz: viewerHz) { [self] _ in
                 guard owner == id else { return }
                 trackedDisplay = displayID
                 tracker.reset(current: currentMode())
@@ -284,11 +285,42 @@ final class DisplayModeController: @unchecked Sendable {
         restore(reason: "virtual display takes over")
     }
 
+    /// A monitor is about to mirror the virtual display (macOS gives a mirror slave a matching
+    /// mode): remember its own mode, persisted, so it comes back even after a crash (startup restore).
+    func rememberBeforeMirror(_ display: CGDirectDisplayID) {
+        loadSettings()
+        guard settings.restore == nil || settings.restoreDisplay == display, let m = currentMode(of: display) else { return }
+        guard settings.restore != m || settings.restoreDisplay != display else { return }
+        persist { $0.restore = m; $0.restoreDisplay = display }
+        log("display: remembering display \(display)'s mode \(m) while it mirrors the virtual display")
+    }
+
+    /// The mode remembered for `display` (rememberBeforeMirror or an earlier switch), if any.
+    func rememberedMode(of display: CGDirectDisplayID) -> DisplayModeInfo? {
+        settings.restoreDisplay == display ? settings.restore : nil
+    }
+
+    /// The mirror ended: give the monitor its own mode back if macOS didn't (this is the user's
+    /// mode, so it is restored regardless of "restore on disconnect").
+    func restoreAfterMirror(_ display: CGDirectDisplayID) {
+        guard settings.restore != nil, settings.restoreDisplay == display else { return }
+        restore(reason: "mirror ended")
+    }
+
+    /// `display` currently mirrors Glide's virtual display: its mode follows the mirror, so a
+    /// restore must wait for the mirror to end (VirtualDisplayManager calls restoreAfterMirror).
+    private func heldByMirror(_ display: CGDirectDisplayID) -> Bool {
+        if VirtualDisplayManager.shared.mirroredPhysical == display { return true }
+        guard let v = ActiveDisplay.virtualDisplay else { return false }
+        return CGDisplayMirrorsDisplay(display) == v
+    }
+
     private func restore(reason: String) {
         pendingRestore?.cancel(); pendingRestore = nil
         guard let r = settings.restore else { return }
         // The display Glide switched, which need not be the one served now (§3.5 selection).
         let target = settings.restoreDisplay ?? displayID
+        if heldByMirror(target) { log("display: display \(target) mirrors the virtual display; restoring \(r) when the mirror ends"); return }
         setRestoreTarget(nil)
         if ActiveDisplay.isVirtual(target) {  // a saved mode belongs to a physical display
             log("display: not restoring \(r) onto the virtual display; dropped"); return
@@ -394,6 +426,8 @@ final class DisplayModeController: @unchecked Sendable {
     }
 
     private func setRestoreTarget(_ m: DisplayModeInfo?) {
+        // A monitor mirroring the virtual display keeps its remembered mode until the mirror ends.
+        if m == nil, let rd = settings.restoreDisplay, heldByMirror(rd) { return }
         let d = m == nil ? nil : UInt32(trackedDisplay)
         guard settings.restore != m || settings.restoreDisplay != d else { return }
         persist { $0.restore = m; $0.restoreDisplay = d }

@@ -98,9 +98,10 @@ func usage() -> Never {
            glide-host --encode-bench [SECONDS]  (offline VideoToolbox encode timing, normal vs low-latency RC,
                                                 synthetic 2560x1440 desktop content; no capture, no network)
            glide-host --virtual-display-selftest [--viewer WxH] [--hz N] [--yes]
-                                               (CREATES a temporary virtual display for ~20 s and checks
-                                                creation, HiDPI/1x, resizing and removal; may move windows;
-                                                no capture, no network; docs/VIRTUAL_DISPLAY.md)
+                                               (CREATES temporary virtual displays for ~30 s and checks
+                                                creation, HiDPI/1x, resizing, mirroring, removal on release
+                                                and after exit; never touches physical displays' modes or
+                                                arrangement; no capture, no network; docs/VIRTUAL_DISPLAY.md)
            glide-host --list-display-modes [ID] (print a display's current and usable modes; read-only)
       Latency tuning (env, see docs/LATENCY.md): GLIDE_FPS=N (like --fps), GLIDE_LL=1 (low-latency RC),
       GLIDE_SCK_QUEUE_DEPTH=N (default 5), GLIDE_SCK_INTERVAL=native|fps (minimumFrameInterval)
@@ -127,7 +128,11 @@ if args.contains("--selftest-ui") { runSelfTestUI(outDir: takeValue("--out")) } 
 if let i = args.firstIndex(of: "--list-display-modes") {  // read-only
     runListDisplayModes(i + 1 < args.count ? UInt32(args[i + 1]) : nil)
 }
-if args.contains("--virtual-display-selftest") {  // explicit only: creates a temporary virtual display
+if args.contains("--virtual-display-selftest-worker") {  // the self-test's child: creates the displays
+    args.removeAll { $0 == "--virtual-display-selftest-worker" }
+    runVirtualDisplaySelfTestWorker(viewer: takeValue("--viewer"), hz: takeValue("--hz").flatMap(Double.init))
+}
+if args.contains("--virtual-display-selftest") {  // explicit only: creates temporary virtual displays
     args.removeAll { $0 == "--virtual-display-selftest" }
     let yes = args.contains("--yes")
     runVirtualDisplaySelfTest(viewer: takeValue("--viewer"), hz: takeValue("--hz").flatMap(Double.init), skipCountdown: yes)
@@ -411,6 +416,24 @@ if let target = connectTarget {
 } else {
     server.start()
 }
-signal(SIGINT) { _ in unlink(PairingController.socketPath); exit(0) }
-signal(SIGTERM) { _ in unlink(PairingController.socketPath); exit(0) }
+// SIGTERM (launchctl, install scripts) and SIGINT: give the Mac its display arrangement back and
+// remove the virtual display before exiting (a mirror set whose master vanishes is dissolved by
+// macOS, which can leave the monitor in another mode). Handled on the main queue, where the
+// virtual display's state lives; a wedged main queue still exits after 3 s.
+var signalSources: [DispatchSourceSignal] = []
+for sig in [SIGINT, SIGTERM] {
+    signal(sig, SIG_IGN)
+    let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    src.setEventHandler {
+        unlink(PairingController.socketPath)
+        if !hostTestMode { VirtualDisplayManager.shared.shutdown(reason: sig == SIGTERM ? "SIGTERM" : "SIGINT") }
+        exit(0)
+    }
+    src.resume()
+    signalSources.append(src)
+    let backstop = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+    backstop.setEventHandler { DispatchQueue.global().asyncAfter(deadline: .now() + 3) { exit(0) } }
+    backstop.resume()
+    signalSources.append(backstop)
+}
 app.run()

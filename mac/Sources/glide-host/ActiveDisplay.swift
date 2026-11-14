@@ -6,9 +6,12 @@ import GlideCore
 /// The display Glide serves, and the Mac's display list (PROTOCOL.md §3.5).
 ///
 /// Resolution order: the active session's selection (by identity, so a re-plugged monitor with a
-/// new ID is followed), else Glide's own virtual display while it exists (VirtualDisplay.swift),
-/// else the `--display` pin while that display is online, otherwise whatever is the main display
-/// right now. Works for any `CGDirectDisplayID`.
+/// new ID is followed), else Glide's own virtual display while it is online (VirtualDisplay.swift;
+/// the viewer's "Automatic"), else the `--display` pin while that display is online, otherwise
+/// whatever is the main display right now. Works for any `CGDirectDisplayID`. A `--display` pin
+/// turns the virtual display's default off (VirtualDisplayManager.active), so the pin only loses to
+/// the virtual display when host.json enables it explicitly. A monitor that mirrors the virtual
+/// display is not listed, so a remembered selection of it falls back to the virtual display.
 ///
 /// Never cache a display ID across a session. IDs go stale when the lid closes or a monitor is
 /// swapped, and CoreGraphics keeps answering for an offline ID (CGDisplayBounds returns its last
@@ -89,9 +92,14 @@ enum ActiveDisplay {
         let main = CGMainDisplayID()
         let def = preferredDefault().flatMap { p in ids.contains(p) && isOnline(p) ? p : nil } ?? main
         var out: [DisplayDescriptor] = []
+        let virtual = virtualDisplay
         for id in ids.prefix(Int(n)) where isOnline(id) {
-            // A hardware mirror set is one picture: list only its master.
+            // A mirror set is one picture: list only its master (while a monitor mirrors Glide's
+            // virtual display, only the virtual display is listed).
             if CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay { continue }
+            // A Glide virtual display that isn't served (left by an earlier process, or waiting for
+            // the displays to wake before it is removed) is not a display to pick.
+            if id != virtual && VirtualDisplayManager.isGlideDisplay(id) { continue }
             let b = CGDisplayBounds(id)
             let mode = mode(of: id)  // CoreGraphics reports no modes for our own virtual display
             let w = mode?.width ?? Int(b.width), h = mode?.height ?? Int(b.height)
@@ -107,7 +115,8 @@ enum ActiveDisplay {
                 width: UInt16(clamping: w), height: UInt16(clamping: h), pixelWidth: UInt16(clamping: pw), pixelHeight: UInt16(clamping: ph),
                 refresh: hz.isFinite ? UInt16(clamping: Int(hz.rounded())) : 0,
                 vendor: CGDisplayVendorNumber(id), model: CGDisplayModelNumber(id), serial: CGDisplaySerialNumber(id),
-                name: names[id] ?? (CGDisplayIsBuiltin(id) != 0 ? "Built-in Display" : "Display \(id)")))
+                // AppKit doesn't list our own virtual display in this process, so name it here.
+                name: id == virtual ? VirtualDisplayManager.displayName : names[id] ?? (CGDisplayIsBuiltin(id) != 0 ? "Built-in Display" : "Display \(id)")))
         }
         return DisplaySelection.ordered(out)
     }
@@ -128,8 +137,8 @@ enum ActiveDisplay {
     static func descriptor(_ id: CGDirectDisplayID) -> DisplayDescriptor? { displays().first { $0.id == id } }
 
     /// The current mode of `id`. CoreGraphics reports no modes for a virtual display to the process
-    /// that created it, so for Glide's own display this is the mode it configured (and verified via
-    /// NSScreen); see docs/VIRTUAL_DISPLAY.md.
+    /// that created it, so for Glide's own display this is the mode it configured and read back
+    /// (CGDisplayBounds + a child process); see docs/VIRTUAL_DISPLAY.md.
     static func mode(of id: CGDirectDisplayID) -> DisplayModeInfo? {
         lock.lock()
         let v = virtualID == id ? virtualModeInfo : nil

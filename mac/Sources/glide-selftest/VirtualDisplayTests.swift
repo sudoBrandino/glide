@@ -61,55 +61,108 @@ func virtualDisplayTests() throws {
           "vd limits: viewer moves 1440p -> 4K: needs re-creating (3840 px backing > 3408 limit)")
     check(plan(.crisp, 1920, 1080)!.fits(maxPixelsWide: lim4k.w, maxPixelsHigh: lim4k.h), "vd limits: smaller viewer re-applies")
 
-    // Keep-alive state machine.
+    // Generous creation limits: the one display Glide keeps serves bigger viewers without re-creating.
+    let cl1440 = VirtualDisplayPlan.creationLimits(viewerW: 2560, viewerH: 1440, highDPIChoice: .retina)
+    check(cl1440.w == 6144 && cl1440.h == 3456, "vd limits: created with at least 6K (6144x3456) limits")
+    check(r4k!.fits(maxPixelsWide: cl1440.w, maxPixelsHigh: cl1440.h) && c4k!.fits(maxPixelsWide: cl1440.w, maxPixelsHigh: cl1440.h)
+          && plan(.smooth, 3840, 2160)!.fits(maxPixelsWide: cl1440.w, maxPixelsHigh: cl1440.h),
+          "vd limits: a display created for 1440p takes a 4K viewer (crisp/retina/smooth) by re-applying settings")
+    let cl8k = VirtualDisplayPlan.creationLimits(viewerW: 7680, viewerH: 4320, highDPIChoice: .retina)
+    check(cl8k.w == 7680 && cl8k.h == 4320, "vd limits: capped at 7680x4320")
+
+    // A monitor already in exactly the viewer's mode is streamed 1:1 instead.
+    check(plan(.automatic, 2560, 1440)!.matches(one(2560, 1440)) && !plan(.automatic, 2560, 1440)!.matches(hi(2304, 1296))
+          && !plan(.automatic, 2560, 1440)!.matches(nil), "vd match: physical 2560x1440 1x matches a 1440p viewer; 4608 px HiDPI doesn't")
+    check(plan(.retina, 2560, 1440)!.matches(hi(1280, 720)) && !plan(.retina, 2560, 1440)!.matches(one(2560, 1440)),
+          "vd match: HiDPI style must match too")
+
+    // Lifecycle: created per session, kept through short reconnects, idle -> removed unless it is
+    // the only display (headless) or always-on.
     var l = VirtualDisplayLifecycle()
     check(l.sessionBegan() == .none && !l.exists, "vd life: disabled -> nothing")
-    l = VirtualDisplayLifecycle(enabled: true, keepAlive: 30)
+    l = VirtualDisplayLifecycle(enabled: true, keepAlive: 10)
     check(l.launched() == .none, "vd life: per-session display not created at launch")
     check(l.sessionBegan() == .create && l.phase == .inUse, "vd life: session -> create")
-    check(l.sessionEnded(now: 100) == .scheduleTimer(at: 130) && l.phase == .lingering(until: 130), "vd life: disconnect -> keep 30 s")
-    check(l.timerFired(now: 120) == .none && l.exists, "vd life: early timer ignored")
-    check(l.timerFired(now: 130) == .destroy && l.phase == .off, "vd life: keep-alive expired -> destroy")
-    _ = l.sessionBegan(); _ = l.sessionEnded(now: 200)
-    check(l.sessionBegan() == .none && l.phase == .inUse, "vd life: reconnect within keep-alive reuses the display")
-    check(l.timerFired(now: 230) == .none && l.exists, "vd life: stale timer after reconnect ignored")
-    check(l.sessionEnded(now: 240) == .scheduleTimer(at: 270), "vd life: second disconnect re-arms")
-    check(l.timerFired(now: 230) == .none && l.timerFired(now: 270) == .destroy, "vd life: only the newest deadline destroys")
+    check(l.sessionEnded(now: 100, onlyDisplay: false) == .scheduleTimer(at: 110) && l.phase == .lingering(until: 110), "vd life: disconnect -> keep 10 s")
+    check(l.timerFired(now: 105, onlyDisplay: false) == .none && l.exists, "vd life: early timer ignored")
+    check(l.timerFired(now: 110, onlyDisplay: false) == .destroy && l.phase == .off, "vd life: idle with a monitor -> restore arrangement, remove")
+    _ = l.sessionBegan(); _ = l.sessionEnded(now: 200, onlyDisplay: false)
+    check(l.sessionBegan() == .resume && l.phase == .inUse, "vd life: reconnect within keep-alive resumes the same display")
+    check(l.timerFired(now: 210, onlyDisplay: false) == .none && l.exists, "vd life: stale timer after reconnect ignored")
+    check(l.sessionEnded(now: 240, onlyDisplay: false) == .scheduleTimer(at: 250), "vd life: second disconnect re-arms")
+    check(l.timerFired(now: 210, onlyDisplay: false) == .none && l.timerFired(now: 250, onlyDisplay: false) == .destroy, "vd life: only the newest deadline acts")
+    var h = VirtualDisplayLifecycle(enabled: true, keepAlive: 10)
+    _ = h.sessionBegan(); _ = h.sessionEnded(now: 0, onlyDisplay: true)
+    check(h.timerFired(now: 10, onlyDisplay: true) == .standby && h.phase == .standby, "vd life: headless (only display) -> kept on standby")
+    check(h.sessionBegan() == .resume, "vd life: headless reconnect resumes")
+    check(h.configure(enabled: true, alwaysOn: false, keepAlive: 10, onlyDisplay: true) == .none, "vd life: settings change keeps a headless display")
     var z = VirtualDisplayLifecycle(enabled: true, keepAlive: 0)
     _ = z.sessionBegan()
-    check(z.sessionEnded(now: 1) == .destroy && !z.exists, "vd life: keepAlive 0 -> destroy at once")
+    check(z.sessionEnded(now: 1, onlyDisplay: false) == .destroy && !z.exists, "vd life: keepAlive 0 -> idle at once")
     var a = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
     check(a.launched() == .create && a.phase == .standby, "vd life: always-on -> create at launch")
-    check(a.sessionBegan() == .none && a.phase == .inUse, "vd life: always-on session reuses it")
-    check(a.sessionEnded(now: 5) == .none && a.phase == .standby, "vd life: always-on stays after disconnect")
+    check(a.sessionBegan() == .resume && a.phase == .inUse, "vd life: always-on session resumes it")
+    check(a.sessionEnded(now: 5, onlyDisplay: false) == .scheduleTimer(at: 15), "vd life: always-on keeps the streaming arrangement for keep-alive")
+    check(a.timerFired(now: 15, onlyDisplay: false) == .standby && a.phase == .standby, "vd life: always-on idle -> standby (hidden), not removed")
     check(a.removeRequested() == .destroy && !a.exists, "vd life: remove now (no viewer)")
     var m = VirtualDisplayLifecycle(enabled: true)
     _ = m.sessionBegan()
     check(m.removeRequested() == .none && m.exists, "vd life: remove now ignored while a viewer uses it")
-    check(m.configure(enabled: false, alwaysOn: false, keepAlive: 30, now: 0) == .destroy && !m.exists, "vd life: disabled mid-session -> destroy")
-    check(m.sessionEnded(now: 1) == .none, "vd life: disconnect after disabling -> nothing")
+    check(m.configure(enabled: false, alwaysOn: false, keepAlive: 10, onlyDisplay: false) == .destroy && !m.exists, "vd life: disabled mid-session -> destroy")
+    check(m.sessionEnded(now: 1, onlyDisplay: false) == .none, "vd life: disconnect after disabling -> nothing")
     var e = VirtualDisplayLifecycle()
     _ = e.sessionBegan()
-    check(e.configure(enabled: true, alwaysOn: false, keepAlive: 30, now: 0) == .create && e.phase == .inUse, "vd life: enabled mid-session -> create now")
+    check(e.configure(enabled: true, alwaysOn: false, keepAlive: 10, onlyDisplay: false) == .create && e.phase == .inUse, "vd life: enabled mid-session -> create now")
     var n = VirtualDisplayLifecycle()
-    check(n.configure(enabled: true, alwaysOn: false, keepAlive: 30, now: 0) == .none, "vd life: enabled with no viewer -> wait for one")
-    check(n.configure(enabled: true, alwaysOn: true, keepAlive: 30, now: 0) == .create && n.phase == .standby, "vd life: always-on switched on -> create")
-    check(n.configure(enabled: true, alwaysOn: false, keepAlive: 30, now: 0) == .destroy, "vd life: always-on switched off with no viewer -> destroy")
+    check(n.configure(enabled: true, alwaysOn: false, keepAlive: 10, onlyDisplay: false) == .none, "vd life: enabled with no viewer -> wait for one")
+    check(n.configure(enabled: true, alwaysOn: true, keepAlive: 10, onlyDisplay: false) == .create && n.phase == .standby, "vd life: always-on switched on -> create")
+    check(n.configure(enabled: true, alwaysOn: false, keepAlive: 10, onlyDisplay: false) == .destroy, "vd life: always-on switched off with no viewer -> destroy")
     var g = VirtualDisplayLifecycle(enabled: true)
-    _ = g.sessionBegan(); _ = g.sessionEnded(now: 0)
-    check(g.configure(enabled: true, alwaysOn: true, keepAlive: 30, now: 1) == .none && g.phase == .standby && g.timerFired(now: 30) == .none,
-          "vd life: always-on while lingering -> kept, timer ignored")
+    _ = g.sessionBegan(); _ = g.sessionEnded(now: 0, onlyDisplay: false)
+    check(g.configure(enabled: true, alwaysOn: true, keepAlive: 10, onlyDisplay: false) == .standby && g.phase == .standby && g.timerFired(now: 30, onlyDisplay: false) == .none,
+          "vd life: always-on while lingering -> standby now, timer ignored")
     var f = VirtualDisplayLifecycle(enabled: true)
     _ = f.sessionBegan(); f.lost()
-    check(!f.exists && f.sessionEnded(now: 0) == .none && f.sessionBegan() == .create, "vd life: failed/lost -> retried next session")
+    check(!f.exists && f.sessionEnded(now: 0, onlyDisplay: false) == .none && f.sessionBegan() == .create, "vd life: failed/lost/skipped -> retried next session")
 
-    // host.json parsing: defaults, clamps, unknown strings.
+    // Arrangement while streaming.
+    typealias D = VirtualDisplayTopology.Display
+    let V: UInt32 = 10, OMEN: UInt32 = 2, BUILTIN: UInt32 = 1
+    check(VirtualDisplayTopology.choose(mode: .mirror, makeMain: true, virtual: V, main: V, displays: [D(id: V)]) == .alone, "vd topology: headless -> alone")
+    check(VirtualDisplayTopology.choose(mode: .mirror, makeMain: true, virtual: V, main: OMEN, displays: [D(id: OMEN), D(id: V)]) == .mirror(physical: OMEN),
+          "vd topology: a monitor -> it mirrors the virtual display (default)")
+    check(VirtualDisplayTopology.choose(mode: .mirror, makeMain: true, virtual: V, main: V, displays: [D(id: OMEN, mirrorOf: V), D(id: V)]) == .mirror(physical: OMEN),
+          "vd topology: reconnect keeps the monitor that mirrors it")
+    check(VirtualDisplayTopology.choose(mode: .mirror, makeMain: true, virtual: V, main: OMEN, displays: [D(id: BUILTIN), D(id: OMEN), D(id: V)]) == .mirror(physical: OMEN),
+          "vd topology: two monitors -> only the main one mirrors it")
+    check(VirtualDisplayTopology.choose(mode: .mirror, makeMain: true, virtual: V, main: OMEN, displays: [D(id: BUILTIN, mirrorOf: OMEN), D(id: OMEN), D(id: V)]) == .extend(main: true),
+          "vd topology: the user already mirrors displays -> extend instead (their setup wins)")
+    check(VirtualDisplayTopology.choose(mode: .extend, makeMain: true, virtual: V, main: OMEN, displays: [D(id: OMEN), D(id: V)]) == .extend(main: true)
+          && VirtualDisplayTopology.choose(mode: .extend, makeMain: false, virtual: V, main: OMEN, displays: [D(id: OMEN), D(id: V)]) == .extend(main: false),
+          "vd topology: extend (main or not)")
+    check(!VirtualDisplayTopology.wantsVirtual(mode: .stream, physicalDisplays: 1) && VirtualDisplayTopology.wantsVirtual(mode: .stream, physicalDisplays: 0)
+          && VirtualDisplayTopology.wantsVirtual(mode: .mirror, physicalDisplays: 2), "vd topology: \"stream\" uses the monitor, the virtual display only headless")
+
+    // host.json parsing: defaults (on, mirror, viewer's refresh), clamps, unknown strings.
     let d = try JSONDecoder().decode(VirtualDisplayConfig.self, from: Data("{}".utf8))
-    check(!d.isEnabled && !d.alwaysOn && d.keepAlive == 30 && d.hz == 60 && !d.wantsMain && d.fixedSize == nil, "vd config: defaults (off, per session, 30 s, 60 Hz)")
-    let c = try JSONDecoder().decode(VirtualDisplayConfig.self, from: Data(#"{"enabled":true,"lifetime":"Always","keepAliveSeconds":-5,"refreshRate":500,"width":100,"height":50,"future":1}"#.utf8))
-    check(c.isEnabled && c.alwaysOn && c.keepAlive == 0 && c.hz == 240 && c.fixedSize == nil, "vd config: clamps and ignores unknown keys")
-    let fx = try JSONDecoder().decode(VirtualDisplayConfig.self, from: Data(#"{"lifetime":"weekly","width":2560,"height":1440,"refreshRate":120}"#.utf8))
-    check(!fx.alwaysOn && fx.fixedSize.map { $0 == (2560, 1440) } == true && fx.hz == 120, "vd config: fixed size, unknown lifetime -> per session")
+    check(d.isEnabled && !d.explicitlyEnabled && !d.alwaysOn && d.keepAlive == 10 && d.monitorMode == .mirror && d.wantsMain && d.fixedSize == nil,
+          "vd config: defaults (on, per session, 10 s, monitor mirrors it)")
+    check(d.refreshRate(viewerHz: 144) == 144 && d.refreshRate(viewerHz: 60) == 60 && d.refreshRate(viewerHz: 0) == 120 && d.refreshRate(viewerHz: nil) == 120
+          && d.refreshRate(viewerHz: 10) == 120 && d.refreshRate(viewerHz: 360) == 240, "vd config: refresh = viewer's monitor (max_fps), else 120 Hz, 24...240")
+    let off = try JSONDecoder().decode(VirtualDisplayConfig.self, from: Data(#"{"enabled":false}"#.utf8))
+    check(!off.isEnabled, "vd config: opt-out")
+    let c = try JSONDecoder().decode(VirtualDisplayConfig.self, from: Data(#"{"enabled":true,"lifetime":"Always","keepAliveSeconds":-5,"refreshRate":500,"width":100,"height":50,"whenMonitorAttached":"EXTEND","makeMain":false,"future":1}"#.utf8))
+    check(c.isEnabled && c.explicitlyEnabled && c.alwaysOn && c.keepAlive == 0 && c.refreshRate(viewerHz: 60) == 240 && c.fixedSize == nil
+          && c.monitorMode == .extend && !c.wantsMain, "vd config: clamps, case-insensitive, ignores unknown keys; host.json refresh beats the viewer's")
+    let fx = try JSONDecoder().decode(VirtualDisplayConfig.self, from: Data(#"{"lifetime":"weekly","width":2560,"height":1440,"refreshRate":120,"whenMonitorAttached":"sideways"}"#.utf8))
+    check(!fx.alwaysOn && fx.fixedSize.map { $0 == (2560, 1440) } == true && fx.refreshRate(viewerHz: 60) == 120 && fx.monitorMode == .mirror,
+          "vd config: fixed size; unknown lifetime/monitor mode -> defaults")
+
+    // Read-back of the virtual display's mode from a child process (--list-display-modes).
+    let listing = "display 10: main no, builtin no, bounds -1280,0 1280x720 pt\ncurrent: 1280x720 px=2560x1440 hz=120\nusable modes: 14\n"
+    let parsed = DisplayModeInfo.parseListing(listing)
+    check(parsed.map { $0.sameSize(hi(1280, 720)) && $0.refreshRate == 120 } == true, "vd readback: parses the child's current mode")
+    check(DisplayModeInfo.parseListing("display 10: not online") == nil && DisplayModeInfo.parseListing("current: unknown") == nil, "vd readback: no mode -> nil")
 
     // Making a display main keeps the arrangement (translation).
     let o = VirtualDisplayArrangement.makingMain(2, origins: [1: (0, 0), 2: (-1920, 0), 3: (2560, -200)])
