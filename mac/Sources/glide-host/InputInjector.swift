@@ -36,6 +36,11 @@ final class InputInjector {
         case "jis": source?.keyboardType = 42; iso = false
         default: iso = nil
         }
+        // Tuning without a rebuild: GLIDE_SCROLL_LINES (lines per wheel notch, default 3) and
+        // GLIDE_SCROLL_PIXELS (pixels per notch of touchpad / hi-res scrolling, default 48).
+        let env = ProcessInfo.processInfo.environment
+        if let v = env["GLIDE_SCROLL_LINES"].flatMap(Double.init), v > 0, v <= 50 { scroller.linesPerNotch = v }
+        if let v = env["GLIDE_SCROLL_PIXELS"].flatMap(Double.init), v > 0, v <= 1000 { scroller.pixelsPerNotch = v }
     }
 
     func setDisplay(_ id: CGDirectDisplayID) { displayID = id }
