@@ -487,5 +487,6 @@ do {
     try displayTests(vectorsDir: URL(fileURLWithPath: vpath).deletingLastPathComponent())
 } catch { failures += 1; print("  FAIL displays threw \(error)") }
 do { try displayWireTests() } catch { failures += 1; print("  FAIL display wire threw \(error)") }
+do { try virtualDisplayTests() } catch { failures += 1; print("  FAIL virtual display threw \(error)") }
 print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)
