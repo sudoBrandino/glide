@@ -309,6 +309,11 @@ the host falls back to fast otherwise. Viewers that support it should default to
 Modifier remapping (e.g. Windows Ctrl → Mac Command) is the **client's** job:
 the host injects exactly the HID usages it receives.
 
+Input values are untrusted: a `MouseMove` or `MouseWheel` with a NaN or infinite `f32`, a
+`MouseMove` coordinate outside ±1000 or a `MouseWheel` delta outside ±10000 notches is malformed,
+and the host drops the message (it logs it; the session continues). Finite coordinates outside
+0..1 are clamped to the display.
+
 ### Host → Client
 
 | type | name | payload |
