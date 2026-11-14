@@ -29,7 +29,9 @@ there.
 
 ## Security model
 
-The design is specified in [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §1–2. In short:
+The design is specified in [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §1–2. What it protects and what
+it doesn't (a compromised endpoint, the trust placed in the LAN, dial-out mode) is in
+[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md). In short:
 
 - Each side has a long-term X25519 key. The handshake is `Noise_XX_25519_ChaChaPoly_SHA256`.
 - A viewer is paired with a host once, with a 6-digit code that the user confirms on both screens.
