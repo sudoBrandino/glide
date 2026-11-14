@@ -536,13 +536,14 @@ Rules:
 - **Default display.** Without a selection the host streams its default: its configured display
   (`glide-host --display ID`) while that is online, otherwise the current main display. It
   re-resolves on every capture start, never caching an ID.
-- **List.** The host sends `DisplayList` once after `ServerHello` (after `DisplayInfo`) and again
-  whenever its content changes: a display appears or goes away, a mode/arrangement changes, or the
+- **List.** The host sends `DisplayList` once after `ServerHello`, before the first `VideoFrame`,
+  and again whenever its content changes: a display appears or goes away, a mode/arrangement changes, or the
   streamed display changes. It lists the online, non-mirrored displays (at most 32) ordered by `x`,
   then `y`, then `id` (left to right), so "next display" is the one to the right. `streamed_id` is
   the display being captured; `selected_id` is the session's selection (0 = none, following the
-  default). `streamed_id` may be missing from the list (e.g. the only display is asleep); viewers
-  must cope.
+  default; while the selected display is away it keeps the selection's last id, which is then
+  not in the list). `streamed_id` may be missing from the list too (e.g. the only display is
+  asleep); viewers must cope.
 - **Selecting.** `SelectDisplay(id)` selects display `id` for the rest of the session (0 clears the
   selection). The host does not persist it. If `id` is not in its current list the host answers
   `DisplayChanged(streamed, 1, id)` and changes nothing. Otherwise it re-captures that display
@@ -551,8 +552,9 @@ Rules:
   the previous display its pre-session mode back. Selecting the display already streamed answers
   `DisplayChanged(id, 0, id)` without re-capturing.
 - **Order after a switch:** `VideoConfig` (+ `SharpLayerConfig`), `DisplayList`, `DisplayChanged`,
-  `DisplayInfo` (now describing the new display), then the keyframe. A viewer can therefore name
-  the new display from the list it just received.
+  then the keyframe of the new capture. A viewer can therefore name the new display from the list
+  it just received. A `DisplayInfo` describing the new display's mode follows (it may arrive after
+  the keyframe).
 - **Hot-plug.** When the selected display goes away the host falls back to the default display
   and sends `DisplayChanged(default, 2, selected)`. It keeps the selection's identity (vendor,
   model, serial, name) for the rest of the session: when a display with that identity comes back

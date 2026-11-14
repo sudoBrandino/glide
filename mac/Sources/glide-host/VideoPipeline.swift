@@ -126,7 +126,11 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         // Re-resolve on every (re)start: the display from the last start may be gone (lid closed).
         let want = ActiveDisplay.current()
-        guard let display = content.displays.first(where: { $0.displayID == want }) ?? content.displays.first else {
+        // ScreenCaptureKit may not list a display CoreGraphics already reports (just plugged in, or a
+        // virtual display being set up): fall back to the default display, then to any.
+        let def = ActiveDisplay.defaultDisplay()
+        guard let display = content.displays.first(where: { $0.displayID == want }) ?? content.displays.first(where: { $0.displayID == def })
+                ?? content.displays.first else {
             throw NSError(domain: "Glide", code: 1, userInfo: [NSLocalizedDescriptionKey: "no display to capture"])
         }
         if display.displayID != options.displayID { log("capture: display \(options.displayID) -> \(display.displayID)") }

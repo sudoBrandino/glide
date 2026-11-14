@@ -26,6 +26,8 @@ public struct CodecCaps: OptionSet, Sendable {
     public static let audioOpus = CodecCaps(rawValue: 1 << 10)
     /// File transfer, both directions (§6).
     public static let files = CodecCaps(rawValue: 1 << 11)
+    /// Display selection: DisplayList / DisplayChanged / SelectDisplay (§3.5).
+    public static let displays = CodecCaps(rawValue: 1 << 13)
 }
 
 /// One file of a FileOffer (PROTOCOL.md §6). `path` is '/'-separated and relative; receivers sanitize it.
@@ -273,6 +275,8 @@ public enum ClientMessage {
     case latencyReport(LatencyReport)
     /// Mac display-mode preference for this session (`DisplayModePreference.wireValue`, §3.3).
     case setDisplayPreference(mode: UInt8)
+    /// §3.5: stream display `id` (0 = the host's default).
+    case selectDisplay(id: UInt32)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -297,6 +301,7 @@ public enum ClientMessage {
             w.u8(0x82); w.u16(r.samples); w.u8(r.flags)
             for v in [r.hostUs, r.networkUs, r.queueUs, r.decodeUs, r.renderUs, r.scanoutUs, r.totalUs, r.groundTruthUs] { w.u32(v) }
         case let .setDisplayPreference(m): w.u8(0x16); w.u8(m)
+        case let .selectDisplay(id): w.u8(0x1A); w.u32(id)
         }
         return w.data
     }
@@ -328,6 +333,7 @@ public enum ClientMessage {
             return .latencyReport(LatencyReport(samples: n, flags: f, hostUs: try r.u32(), networkUs: try r.u32(), queueUs: try r.u32(), decodeUs: try r.u32(),
                                                 renderUs: try r.u32(), scanoutUs: try r.u32(), totalUs: try r.u32(), groundTruthUs: try r.u32()))
         case 0x16: return .setDisplayPreference(mode: try r.u8())
+        case 0x1A: return .selectDisplay(id: try r.u32())
         default: throw WireError.unknownMessage(t)
         }
     }
@@ -359,6 +365,10 @@ public enum HostMessage {
     /// Current display preference (`DisplayModePreference.wireValue`) and mode: "looks like" size in
     /// points, `hidpi` = Retina backing (§3.3). Sent after ServerHello and whenever it changes.
     case displayInfo(preference: UInt8, modeW: UInt16, modeH: UInt16, hidpi: Bool)
+    /// §3.5 (caps bit 13 only): the Mac's displays in list order; `selected` 0 = following the default.
+    case displayList(streamed: UInt32, selected: UInt32, displays: [DisplayDescriptor])
+    /// §3.5 (caps bit 13 only): `reason` is a `DisplayChangeReason` raw value.
+    case displayChanged(id: UInt32, reason: UInt8, requested: UInt32)
 
     public var encoded: Data {
         var w = ByteWriter()
@@ -392,6 +402,12 @@ public enum HostMessage {
         case let .file(m): return m.encoded
         case let .frameTiming(ft): w.u8(0x81); ft.write(&w)
         case let .displayInfo(p, mw, mh, hi): w.u8(0x05); w.u8(p); w.u16(mw); w.u16(mh); w.u8(hi ? 1 : 0)
+        case let .displayList(streamed, selected, ds):
+            w.u8(0x06); w.u32(streamed); w.u32(selected)
+            let list = ds.prefix(255)
+            w.u8(UInt8(list.count))
+            for d in list { d.write(&w) }
+        case let .displayChanged(id, reason, requested): w.u8(0x07); w.u32(id); w.u8(reason); w.u32(requested)
         }
         return w.data
     }
@@ -428,6 +444,10 @@ public enum HostMessage {
         case 0x70...0x79: return .file(try FileMessage.read(type: t, &r))
         case 0x81: return .frameTiming(try FrameTiming.read(&r))
         case 0x05: return .displayInfo(preference: try r.u8(), modeW: try r.u16(), modeH: try r.u16(), hidpi: try r.u8() != 0)
+        case 0x06:
+            let streamed = try r.u32(), selected = try r.u32(), n = Int(try r.u8())
+            return .displayList(streamed: streamed, selected: selected, displays: try (0..<n).map { _ in try DisplayDescriptor.read(&r) })
+        case 0x07: return .displayChanged(id: try r.u32(), reason: try r.u8(), requested: try r.u32())
         default: throw WireError.unknownMessage(t)
         }
     }

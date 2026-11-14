@@ -39,6 +39,14 @@ final class Session: @unchecked Sendable {
     private var clipboard: ClipboardSync?
     /// Created at auth if the viewer advertised file transfer (caps bit 11) and it's enabled.
     private var files: SessionFiles?
+    /// The viewer set caps bit 13: DisplayList / DisplayChanged / SelectDisplay (PROTOCOL.md §3.5).
+    private var displaysEnabled = false
+    private let displayLock = NSLock()
+    /// The display the viewer was last told it sees; nil until the first capture.
+    private var announcedDisplay: CGDirectDisplayID?
+    /// A switch we asked for (SelectDisplay / menu bar), reported once its capture starts.
+    private var pendingSwitch: (reason: DisplayChangeReason, requested: UInt32)?
+    private var lastDisplayList: Data?
     var onEnd: ((Session) -> Void)?
     /// Called (on the session queue) once a paired viewer sent a valid ClientHello, before
     /// streaming starts. Until then the session must not affect any other session.
@@ -251,6 +259,7 @@ final class Session: @unchecked Sendable {
         if let o = displayObserver { NotificationCenter.default.removeObserver(o) }
         if let o = preferenceObserver { NotificationCenter.default.removeObserver(o) }
         displayRestart?.cancel()
+        ActiveDisplay.clearSelection(owner: id)
         cursor.stop()
         clipboard?.stop(); clipboard = nil
         files?.stop(); files = nil
@@ -312,6 +321,7 @@ final class Session: @unchecked Sendable {
             Power.wakeDisplay()
             displayAssertion = Power.preventDisplaySleep()
             log("session \(id): '\(name)' (\(GlideHandshake.fingerprint(viewerKey ?? Data()))) authenticated from \(peer) (proto v\(version), view \(vw)x\(vh), caps \(caps.rawValue), mode \(mode), fps \(maxFps))")
+            displaysEnabled = caps.contains(.displays)
             if caps.contains(.clipboard) {
                 clipboard = ClipboardSync(sessionId: id, syncConcealed: settings.clipboardSyncConcealed) { [weak self] c in self?.send(.clipboard(c)) }
             }
@@ -381,6 +391,7 @@ final class Session: @unchecked Sendable {
         case let .setDisplayPreference(m):
             guard let p = DisplayModePreference(wire: m) else { log("session \(id): unknown display preference \(m)"); return }
             DisplayModeController.shared.setSessionPreference(id: id, p) { [weak self] _ in self?.sendDisplayInfo() }
+        case let .selectDisplay(d): selectDisplay(d, by: .selected)
         case .hello, .pairConfirm: break
         }
     }
@@ -419,6 +430,8 @@ final class Session: @unchecked Sendable {
                 self.send(.videoConfig(cfg))
                 if let sharpCfg { self.send(.sharpLayerConfig(sharpCfg)) }
             }
+            // Still on the pipeline queue, so this goes out before the first frame of the capture.
+            self.displayCaptured(p.options.displayID)
             HostStatus.shared.video(id: self.id, config: cfg, hybrid: sharpCfg != nil)
             // Cursor bitmaps are in encoded pixels: backing scale x (encoded width / native width).
             // Input maps onto the display actually being captured (it changes when the lid closes or a
@@ -519,16 +532,105 @@ final class Session: @unchecked Sendable {
         }
         displayObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             self?.sendDisplayInfo()
+            ActiveDisplay.refreshNames()
+            self?.sendDisplayList()  // a display came or went, or a mode/arrangement changed (deduplicated)
             guard let self, let p = self.pipeline, !self.ended else { return }
-            self.displayRestart?.cancel()
-            let work = DispatchWorkItem { [weak self] in
-                guard let self, !self.ended else { return }
-                log("session \(self.id): display configuration changed -> re-capturing")
-                Task { await p.stop(); await self.captureLoop(p) }
-            }
-            self.displayRestart = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)  // debounce mode-switch churn
+            // Debounce mode-switch churn. The restart re-resolves the display: a selected display that
+            // went away falls back to the default, and one that came back is captured again (§3.5).
+            self.scheduleRecapture(p, after: 1.0, why: "display configuration changed")
         }
+    }
+
+    /// Main queue. Restarts capture after `delay` (replacing a pending restart).
+    private func scheduleRecapture(_ p: VideoPipeline, after delay: TimeInterval, why: String) {
+        displayRestart?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.ended else { return }
+            log("session \(self.id): \(why) -> re-capturing")
+            Task { await p.stop(); await self.captureLoop(p) }
+        }
+        displayRestart = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    // MARK: Multiple displays (PROTOCOL.md §3.5)
+
+    /// Stream display `display` (0 = the default) for the rest of this session. `reason`: .selected
+    /// (the viewer's SelectDisplay) or .host (the menu bar). Any thread.
+    func selectDisplay(_ display: UInt32, by reason: DisplayChangeReason) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.authed, !self.ended else { return }
+            ActiveDisplay.refreshNames()
+            var identity: DisplayIdentity?
+            if display != 0 {
+                guard let d = ActiveDisplay.descriptor(display) else {
+                    log("session \(self.id): display \(display) is not available; staying on \(ActiveDisplay.current())")
+                    if self.displaysEnabled {
+                        let now = self.displayLock.withLock { self.announcedDisplay } ?? ActiveDisplay.current()
+                        self.send(.displayChanged(id: now, reason: DisplayChangeReason.unavailable.rawValue, requested: display))
+                    }
+                    return
+                }
+                identity = d.identity
+            }
+            ActiveDisplay.select(identity, owner: self.id)
+            let target = ActiveDisplay.current()
+            log("session \(self.id): \(reason == .host ? "Mac menu" : "viewer") selected \(identity.map { "display \(display) “\($0.name)”" } ?? "the default display") -> streaming \(target)")
+            guard let p = self.pipeline else { return }  // not capturing yet: the first capture uses it
+            let shown = self.displayLock.withLock { self.announcedDisplay }
+            if target == shown {
+                self.sendDisplayList()  // selected_id changed
+                if self.displaysEnabled { self.send(.displayChanged(id: target, reason: reason.rawValue, requested: display)) }
+                return
+            }
+            self.displayLock.withLock { self.pendingSwitch = (reason, display) }
+            // Restore the old display's mode, apply the policy to the new one, then capture it once.
+            DisplayModeController.shared.servedDisplayChanged { [weak self] _ in
+                self?.scheduleRecapture(p, after: 0, why: "display \(target) selected")
+            }
+        }
+    }
+
+    /// Pipeline queue, on every capture (re)start right after its VideoConfig: if the captured
+    /// display changed, tell the viewer which one it sees now (DisplayList, then DisplayChanged).
+    /// Input follows the captured display via `injector.setDisplay` in onConfig.
+    private func displayCaptured(_ shown: CGDirectDisplayID) {
+        let (prev, pending) = displayLock.withLock { () -> (CGDirectDisplayID?, (reason: DisplayChangeReason, requested: UInt32)?) in
+            let prev = announcedDisplay, pending = pendingSwitch
+            announcedDisplay = shown
+            pendingSwitch = nil
+            return (prev, pending)
+        }
+        let ds = ActiveDisplay.displays()
+        let name = ds.first { $0.id == shown }?.name ?? "display \(shown)"
+        guard prev != nil else { sendDisplayList(); return }  // first capture of the session
+        guard prev != shown || pending != nil else { return }
+        let sel = ActiveDisplay.selection
+        var reason = pending?.reason ?? DisplaySelection.unrequestedReason(selection: sel, now: shown, displays: ds)
+        var requested = pending?.requested ?? (reason == .fallback ? (sel?.id ?? 0) : reason == .restored ? shown : 0)
+        if let pending, pending.requested != 0, prev == shown {
+            reason = .unavailable  // capture couldn't get the requested display
+            requested = pending.requested
+        }
+        log("session \(id): now streaming display \(shown) “\(name)” (was \(prev.map(String.init) ?? "-"), \(reason))")
+        sendDisplayList()
+        if displaysEnabled { send(.displayChanged(id: shown, reason: reason.rawValue, requested: requested)) }
+        sendDisplayInfo()
+    }
+
+    /// DisplayList (§3.5) if the viewer supports it and it changed since the last one. Any thread.
+    private func sendDisplayList() {
+        guard displaysEnabled, helloSent, !ended else { return }
+        let ds = ActiveDisplay.displays()
+        let streamed = displayLock.withLock { announcedDisplay } ?? ActiveDisplay.current()
+        let sel = ActiveDisplay.selection
+        let msg = HostMessage.displayList(streamed: streamed, selected: sel.map { $0.match(in: ds) ?? $0.id } ?? 0, displays: ds).encoded
+        let changed = displayLock.withLock { () -> Bool in
+            guard msg != lastDisplayList else { return false }
+            lastDisplayList = msg
+            return true
+        }
+        if changed { channel.send(msg) }
     }
 
     /// DisplayInfo (§3.3): current preference + mode, sent after ServerHello and whenever it changes.
