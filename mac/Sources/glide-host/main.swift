@@ -420,7 +420,9 @@ if let target = connectTarget {
 // remove the virtual display and restore the monitor's own mode before exiting (a mirror set whose
 // master vanishes is dissolved by macOS, which can leave the monitor in another mode). Handled on
 // the main queue, where the display state lives; the restore waits up to 1.5 s for the monitor to
-// settle after the mirror ends. A wedged main queue still exits after 6 s.
+// settle after the mirror ends. A wedged main queue still exits after 10 s (launchd's ExitTimeOut,
+// after which it sends SIGKILL, is 20 s).
+let exitBackstop: TimeInterval = 10
 var signalSources: [DispatchSourceSignal] = []
 for sig in [SIGINT, SIGTERM] {
     signal(sig, SIG_IGN)
@@ -433,7 +435,7 @@ for sig in [SIGINT, SIGTERM] {
     src.resume()
     signalSources.append(src)
     let backstop = DispatchSource.makeSignalSource(signal: sig, queue: .global())
-    backstop.setEventHandler { DispatchQueue.global().asyncAfter(deadline: .now() + 6) { exit(0) } }
+    backstop.setEventHandler { DispatchQueue.global().asyncAfter(deadline: .now() + exitBackstop) { exit(0) } }
     backstop.resume()
     signalSources.append(backstop)
 }

@@ -220,6 +220,16 @@ public struct VirtualDisplayLifecycle: Equatable, Sendable {
     public private(set) var keepAlive: Double = VirtualDisplayConfig.defaultKeepAlive
     /// A create is in flight (between `.create` and `created()` / `lost()`).
     public private(set) var creating = false
+    /// Resumes in flight (`.resume`: arranging and sizing the existing display for a viewer, until
+    /// its mode is read back): connecting viewers are answered when they finish, not before.
+    public private(set) var resuming = 0
+    /// Displays changed while a create was in flight: re-evaluated once it finishes
+    /// (`takeDisplaysChangedDuringCreate`), not dropped.
+    public private(set) var displaysChangedDuringCreate = false
+
+    /// Owed answers to connecting viewers can be given now: no create or resume is in flight
+    /// (each answers them itself when it finishes).
+    public var mayAnswer: Bool { !creating && resuming == 0 }
 
     public init(enabled: Bool = false, alwaysOn: Bool = false, keepAlive: Double = VirtualDisplayConfig.defaultKeepAlive) {
         self.enabled = enabled; self.alwaysOn = alwaysOn; self.keepAlive = keepAlive
@@ -242,7 +252,23 @@ public struct VirtualDisplayLifecycle: Equatable, Sendable {
         let wasOff = phase == .off
         phase = .inUse
         if wasOff { creating = true; return .create }
-        return creating ? .awaitCreation : .resume  // lingering/standby: reuse it (no window reshuffle)
+        if creating { return .awaitCreation }
+        resuming += 1
+        return .resume  // lingering/standby: reuse it (no window reshuffle)
+    }
+
+    /// The host resumes the existing display for a viewer (`.resume`, or a creation that reused a
+    /// display and found a viewer waiting).
+    public mutating func resumeStarted() { resuming += 1 }
+
+    /// A resume finished (its mode is read back) or was superseded.
+    public mutating func resumeFinished() { resuming = max(0, resuming - 1) }
+
+    /// Whether displays changed during the create that just finished (and forgets it): the host
+    /// then re-runs its display-change handling with the displays online now.
+    public mutating func takeDisplaysChangedDuringCreate() -> Bool {
+        defer { displaysChangedDuringCreate = false }
+        return displaysChangedDuringCreate
     }
 
     public mutating func sessionEnded(now: Double, onlyDisplay: Bool, wanted: Bool = true) -> Action {
@@ -284,7 +310,10 @@ public struct VirtualDisplayLifecycle: Equatable, Sendable {
     /// re-hides behind the (new) main monitor; "stream" with a monitor removes an idle one. A
     /// connected viewer keeps it.
     public mutating func displaysChanged(onlyDisplay: Bool, wanted: Bool = true) -> Action {
-        guard enabled, !creating else { return .none }
+        guard enabled else { return .none }
+        // Decided once the create finishes, with the displays online then (a monitor plugged in
+        // mid-create must still remove an idle "stream" display).
+        if creating { displaysChangedDuringCreate = true; return .none }
         switch phase {
         case .standby:
             if onlyDisplay || (alwaysOn && wanted) { return .standby }
@@ -311,6 +340,8 @@ public struct VirtualDisplayLifecycle: Equatable, Sendable {
 
     private mutating func off() -> Action {
         creating = false
+        resuming = 0
+        displaysChangedDuringCreate = false
         guard phase != .off else { return .none }
         phase = .off
         return .destroy
@@ -349,7 +380,14 @@ public struct VirtualDisplayLifecycle: Equatable, Sendable {
 
     /// Creation failed, or the system terminated the display: back to off (the next session or
     /// settings change tries again).
-    public mutating func lost() { phase = .off; creating = false }
+    public mutating func lost() { phase = .off; creating = false; resuming = 0; displaysChangedDuringCreate = false }
+
+    /// Hiding the idle display failed (the transaction was refused): retry after this many seconds,
+    /// `attempt` counting from 1; nil after the last (the next display change tries again).
+    public static func standbyRetryDelay(attempt: Int) -> Double? {
+        let delays: [Double] = [2, 5, 15]
+        return attempt >= 1 && attempt <= delays.count ? delays[attempt - 1] : nil
+    }
 }
 
 /// How the virtual display sits among the Mac's displays (host state; `VirtualDisplayTopology` is

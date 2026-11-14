@@ -140,10 +140,18 @@ What Glide does about it:
 - Before releasing, Glide always ends the mirror explicitly and restores your monitor's mode. That
   includes Quit, Restart, `SIGTERM` (`launchctl`, install scripts) and `SIGINT`: Glide ends the
   mirror and removes the display first, waits about 1.5 s for macOS to give the monitor a mode of
-  its own (a restore before that is undone by macOS), restores the saved mode synchronously, clears
-  `display.restore`, and only then exits. A mode Glide switched on a monitor it streamed directly
-  (virtual display off) is restored on exit too. If ending the mirror fails, Glide still forgets
-  the mirror (removing the display ends it) and restores the monitor's mode.
+  its own (a restore before that is undone by macOS), restores the saved mode synchronously, and
+  only then exits. The wait runs from the last time the monitor stopped mirroring, so a Quit right
+  after a session ended still waits out the rest of the 1.5 s. `display.restore` is cleared only
+  once the switch succeeded; a failed switch is retried at the next start. A wedged main queue
+  still exits 10 s after the signal (launchd sends `SIGKILL` after 20 s). A mode Glide switched on
+  a monitor it streamed directly (virtual display off) is restored on exit too.
+- If ending the mirror fails, Glide still forgets the mirror (removing the display ends it) and
+  restores the monitor's mode once it settles. While every display sleeps, removal is deferred, so
+  the monitor stays a mirror slave: Glide then keeps the saved mode and restores it after the
+  displays wake and the display is really gone. A monitor that mirrors **any** Glide display (ours,
+  or one macOS kept after an earlier process exited while the displays slept) is never restored
+  until that mirror ends.
 - At startup and before creating a display, Glide looks for a leftover Glide display (same
   vendor/product). If one exists, it wakes the displays (a connecting session wakes them anyway),
   waits up to 3 s for macOS to finish the removal, and then uses serial 2 if serial 1 is still
@@ -210,6 +218,16 @@ physical display is touched:
   mirrored a 60 Hz virtual display comes back at 165/240 Hz. If that rate no longer exists, the same
   size at the closest rate is used.
 - Settings applied to a mirror slave take effect only once it is master again.
+- **macOS's own mode change after the mirror ends is not a manual change.** About 1.5 s after the
+  mirror ends, macOS switches the monitor to its persisted mode. Glide records when each mirror
+  ends (`MirrorSettle`) and, until the mirror-ended restore has run plus a 1 s grace (at most 10 s),
+  treats mode changes on that monitor as macOS settling it (logged as `settled to … after the
+  mirror ended`). Other restores of that monitor (the session's restore-on-disconnect, for
+  example) wait for the mirror-ended one, because a restore before macOS settles is undone. If
+  macOS changes the monitor again after the restore, Glide re-applies it once, 1 s later.
+- A mode saved before a mirror (`display.restoreFromMirror`) is your monitor's own mode. It is
+  restored regardless of "restore on disconnect" and is never dropped as a manual change. A manual
+  change only drops a restore saved by Glide's own mode switch (virtual display off).
 
 ## Display changes
 
@@ -227,6 +245,12 @@ unplugged, lid opened or closed):
   back in its mirror set when the lid opens): while idle, Glide ends that mirror and restores the
   monitor's mode; while streaming with `"mirror"`, it takes the monitor as the streaming mirror.
 - A connected viewer keeps the display; the changes above apply when it is idle.
+- **Changes while the display is being created** are recorded and handled once the creation
+  finishes, with the displays online then. An always-on display with `"stream"` that was being
+  created headless when a monitor was plugged in is removed, not left on standby.
+- If hiding the idle display behind the monitor is refused (`mirror` → `hidden`), Glide ends the
+  mirror instead (the monitor gets its mode back) and retries the hide after 2, 5 and 15 s, then
+  at the next display change.
 
 ## How it fits in
 
@@ -235,13 +259,16 @@ unplugged, lid opened or closed):
   - `VirtualDisplayPlan`: the mode for a viewer, the 6K creation limits, and the "monitor already
     matches" check.
   - `VirtualDisplayLifecycle`: create, resume, standby and destroy; what a finished creation
-    sets up (decided by the phase when it finishes, not when it started); display changes;
-    "stream" with a monitor (`wanted`).
+    sets up (decided by the phase when it finishes, not when it started); display changes, and
+    those that arrive during a creation; "stream" with a monitor (`wanted`); when connecting
+    viewers may be answered (`mayAnswer`: no creation or resume in flight); the standby retry.
   - `VirtualDisplayTopology`: mirror, extend or alone.
   - `VirtualDisplayLayout`: the arrangement, and `reconcile` for displays that went offline or came
     back mirroring.
   - `ModeRestore` and `DisplaySettings`: which display a saved mode belongs to (by identity),
-    whether a mirror may save one, and the restore match (size and refresh rate).
+    whether a mirror may save one, the restore match (size and refresh rate), what a manual mode
+    change does (`manualChange`), when a monitor is held by a mirror, and the exit wait.
+  - `MirrorSettle`: monitors that just stopped mirroring (macOS settling vs. manual changes).
   - `DisplayModeInfo.parseListing`: the child read-back.
 - `CGlideVirtualDisplay` is a small Objective-C target that wraps the private classes (see "API
   surface").
@@ -266,6 +293,11 @@ Sequence on connect:
    its mode back.
 6. The streaming arrangement is set up: the monitor mirrors it, or it extends.
 7. `ActiveDisplay.current()` returns it, and capture starts.
+
+A kept (idle, hidden) display is resumed the same way: out of the hidden mirror, sized for the
+viewer, its planned mode published to capture at once, the mode read back, then a
+screen-parameters notification so capture uses it. The viewer is answered only once that is done;
+a display change in the meantime doesn't answer it early.
 
 A viewer that connects while the display is still being created (an always-on display right after
 launch, for example after Restart or a launchd relaunch with the viewer reconnecting) waits for
@@ -404,6 +436,27 @@ stand-in's persisted mode instead of its previous one, which the test reports as
 - Arrangement changes are `.forSession` and end at logout. Your monitor's mode is restored when
   the mirror ends, on Quit, Restart and termination signals, and at the next host start after a
   crash.
+
+### Checking the restore in the log
+
+The host log (the LaunchAgent's log file, else `~/Library/Logs/glide-host.log`) shows, at the end of a session:
+
+```
+virtual display: display 2 no longer mirrors it
+display: display 2 settled to 3840x2160 @ 165 Hz after the mirror ended (macOS, not a manual change)
+display: restored 3840x2160 @ 165 Hz on display 2 (mirror ended)
+```
+
+The last line ends in `(already in that mode; mirror ended)` when macOS already put the mode back,
+and the `settled` line is missing if macOS made no change. On Quit or `SIGTERM`:
+
+```
+display: quit: restoring the displays before exiting
+display: waiting 1.5 s for display 2 to settle after the mirror before restoring 3840x2160
+display: restored 3840x2160 @ 165 Hz on display 2 (quit)
+```
+
+A mode saved before a mirror is never followed by `dropping pending restore`.
 
 ## References
 

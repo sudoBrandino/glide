@@ -22,11 +22,16 @@ public struct DisplaySettings: Codable, Equatable, Sendable {
     public var restoreDisplay: UInt32?
     /// The display `restore` belongs to, by §3.5 identity (vendor/model/serial).
     public var restoreIdentity: DisplayIdentity?
+    /// `restore` was saved before the monitor mirrored the virtual display: it is the monitor's own
+    /// mode, restored regardless of "restore on disconnect" and never dropped as a manual change.
+    public var restoreFromMirror: Bool?
 
     public init(mode: String? = nil, highDPIViewer: String? = nil, restoreOnDisconnect: Bool? = nil,
-                restore: DisplayModeInfo? = nil, restoreDisplay: UInt32? = nil, restoreIdentity: DisplayIdentity? = nil) {
+                restore: DisplayModeInfo? = nil, restoreDisplay: UInt32? = nil, restoreIdentity: DisplayIdentity? = nil,
+                restoreFromMirror: Bool? = nil) {
         self.mode = mode; self.highDPIViewer = highDPIViewer; self.restoreOnDisconnect = restoreOnDisconnect
         self.restore = restore; self.restoreDisplay = restoreDisplay; self.restoreIdentity = restoreIdentity
+        self.restoreFromMirror = restoreFromMirror
     }
 
     public var preference: DisplayModePreference { mode.flatMap { DisplayModePreference(rawValue: $0.lowercased()) } ?? .automatic }
@@ -112,4 +117,99 @@ public enum ModeRestore {
     public static func sameRate(_ a: Double, _ b: Double) -> Bool {
         a <= 0 || b <= 0 || abs(a - b) <= refreshTolerance
     }
+
+    /// What a mode change Glide didn't make (DisplayChangeTracker `.manual`) on the served display does.
+    public enum ManualChange: Equatable, Sendable {
+        /// The display just stopped mirroring the virtual display: macOS is giving it a mode of its
+        /// own. Not the user; accept the new mode and change nothing.
+        case settling
+        /// No viewer and nothing saved: nothing to do.
+        case ignore
+        /// A viewer is connected: stop auto-switching for this session; drop the saved restore
+        /// unless it came from a mirror.
+        case pauseSession(dropRestore: Bool)
+        /// No viewer: the user picked a mode; the saved one (from Glide's own switch) is dropped.
+        case dropRestore
+        /// No viewer: keep the saved mode (it is the monitor's own, saved before it mirrored).
+        case keepRestore
+    }
+
+    public static func manualChange(settling: Bool, viewerConnected: Bool, restorePending: Bool, restoreFromMirror: Bool) -> ManualChange {
+        if settling { return .settling }
+        if viewerConnected { return .pauseSession(dropRestore: restorePending && !restoreFromMirror) }
+        guard restorePending else { return .ignore }
+        return restoreFromMirror ? .keepRestore : .dropRestore
+    }
+
+    /// What a viewer disconnecting does with a saved restore: a mirror's saved mode is the monitor's
+    /// own and always comes back (restoreAfterMirror; the scheduled restore waits for the mirror).
+    public static func onSessionEnd(restoreEnabled: Bool, userOverride: Bool, restoreFromMirror: Bool) -> Bool {
+        restoreFromMirror || (restoreEnabled && !userOverride)
+    }
+
+    /// How long the exit restore waits for a monitor whose mirror ended at `unmirroredAt`, so that
+    /// macOS's own mode change after the mirror doesn't undo it. Never more than `afterMirrorSettle`.
+    public static func exitWait(unmirroredAt: TimeInterval?, now: TimeInterval) -> TimeInterval {
+        guard let at = unmirroredAt else { return 0 }
+        return min(afterMirrorSettle, max(0, at + afterMirrorSettle - now))
+    }
+
+    /// A monitor that mirrors a display with Glide's virtual-display identity (ours, or one whose
+    /// removal macOS deferred while the displays slept) has its mode set by the mirror: a restore
+    /// must wait until that mirror ends. `mirrorOf` is CGDisplayMirrorsDisplay (0 = none).
+    public static func heldByMirror(recordedMirror: Bool, mirrorOf: UInt32, mirrorIsGlide: Bool) -> Bool {
+        recordedMirror || (mirrorOf != 0 && mirrorIsGlide)
+    }
+}
+
+/// Monitors whose mirror of the virtual display just ended. macOS gives such a monitor a mode of its
+/// own about `afterMirrorSettle` later; that change is not the user's, and a restore before it is
+/// undone. From `mirrorEnded` until the mirror-ended restore ran (plus `grace`), mode changes on the
+/// display are not manual and other restores wait for that one.
+public struct MirrorSettle: Equatable, Sendable {
+    /// After the mirror-ended restore ran: macOS may still deliver the change it made.
+    public static let grace: TimeInterval = 1
+    /// Never waits longer than this for the mirror-ended restore (it is always scheduled, but a
+    /// stuck run loop must not silence manual-change detection for good).
+    public static let maxWait: TimeInterval = 10
+
+    private struct Entry: Equatable, Sendable {
+        var endedAt: TimeInterval
+        /// When the mirror-ended restore ran (nil: still due).
+        var restoredAt: TimeInterval?
+    }
+    private var entries: [UInt32: Entry] = [:]
+    /// The most recent mirror end (for the exit restore's wait).
+    public private(set) var lastDisplay: UInt32?
+    public private(set) var lastEndedAt: TimeInterval?
+
+    public init() {}
+
+    public mutating func mirrorEnded(_ display: UInt32, at now: TimeInterval) {
+        entries[display] = Entry(endedAt: now, restoredAt: nil)
+        lastDisplay = display
+        lastEndedAt = now
+    }
+
+    /// The mirror-ended restore for `display` ran (whatever it did).
+    public mutating func restoreRan(_ display: UInt32, at now: TimeInterval) {
+        guard entries[display] != nil else { return }
+        entries[display]?.restoredAt = now
+    }
+
+    /// The mirror-ended restore is still due: other restores of `display` wait for it.
+    public func awaitingRestore(_ display: UInt32, now: TimeInterval) -> Bool {
+        guard let e = entries[display], e.restoredAt == nil else { return false }
+        return now < e.endedAt + Self.maxWait
+    }
+
+    /// Mode changes on `display` now are macOS settling it after the mirror, not the user.
+    public func isSettling(_ display: UInt32, now: TimeInterval) -> Bool {
+        guard let e = entries[display] else { return false }
+        if let r = e.restoredAt { return now < r + Self.grace }
+        return now < e.endedAt + Self.maxWait
+    }
+
+    /// When `display` last stopped mirroring, if it did.
+    public func endedAt(_ display: UInt32) -> TimeInterval? { entries[display]?.endedAt }
 }

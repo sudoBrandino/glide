@@ -301,6 +301,112 @@ func virtualDisplayTests() throws {
     check(try JSONDecoder().decode(DisplaySettings.self, from: Data("{}".utf8)) == DisplaySettings(), "display settings: empty -> defaults")
     check(ModeRestore.afterMirrorSettle > 0 && ModeRestore.afterMirrorSettle <= 2, "restore: exit waits at most ~1.5 s for a monitor that just stopped mirroring")
 
+    // Re-review #1: macOS's own mode change after un-mirroring is not a manual change, and a
+    // restore saved before a mirror is never dropped as one.
+    let mirrored = md(1920, 1080, 120, hi: true), persisted = md(3840, 2160, 165)
+    var tr = DisplayChangeTracker(current: nil)
+    var ms = MirrorSettle()
+    ms.mirrorEnded(OMEN, at: 100)                 // release() un-mirrored the OMEN
+    tr.reset(current: mirrored)                   // followServedDisplay: served display virtual -> OMEN, still the mirrored mode
+    let verdict = tr.observe(current: persisted, now: 101.5)   // macOS applies the OMEN's persisted mode ~1.5 s later
+    check(verdict == .manual, "mirror settle: the tracker alone calls macOS's post-mirror switch manual (the reported bug)")
+    check(ModeRestore.manualChange(settling: ms.isSettling(OMEN, now: 101.5), viewerConnected: false, restorePending: true, restoreFromMirror: true) == .settling,
+          "mirror settle: ... but within the settle window it is macOS settling, not manual -> the saved restore survives")
+    check(ms.awaitingRestore(OMEN, now: 101.4), "mirror settle: other restores wait for restoreAfterMirror (a restore now would be undone)")
+    ms.restoreRan(OMEN, at: 101.5)
+    check(!ms.awaitingRestore(OMEN, now: 101.6) && ms.isSettling(OMEN, now: 102.4) && !ms.isSettling(OMEN, now: 102.6),
+          "mirror settle: after restoreAfterMirror ran, a 1 s grace, then manual changes count again")
+    check(!ms.isSettling(BUILTIN, now: 101) && !ms.awaitingRestore(BUILTIN, now: 101) && ms.endedAt(BUILTIN) == nil,
+          "mirror settle: other displays unaffected")
+    var stuck = MirrorSettle()
+    stuck.mirrorEnded(OMEN, at: 0)
+    check(stuck.isSettling(OMEN, now: 9.9) && !stuck.isSettling(OMEN, now: 10.1) && !stuck.awaitingRestore(OMEN, now: 10.1),
+          "mirror settle: bounded (10 s) even if restoreAfterMirror never ran")
+    stuck.restoreRan(BUILTIN, at: 1)
+    check(stuck.endedAt(BUILTIN) == nil, "mirror settle: restoreRan for a display that never mirrored is a no-op")
+    stuck.mirrorEnded(OMEN, at: 20)
+    check(stuck.awaitingRestore(OMEN, now: 21) && stuck.lastDisplay == OMEN && stuck.lastEndedAt == 20, "mirror settle: a new mirror end re-arms it")
+    check(ModeRestore.manualChange(settling: false, viewerConnected: false, restorePending: true, restoreFromMirror: true) == .keepRestore,
+          "manual change: no viewer, mirror-saved restore -> kept (it is the monitor's own mode)")
+    check(ModeRestore.manualChange(settling: false, viewerConnected: false, restorePending: true, restoreFromMirror: false) == .dropRestore,
+          "manual change: no viewer, restore from Glide's own switch -> dropped (the user picked a mode)")
+    check(ModeRestore.manualChange(settling: false, viewerConnected: false, restorePending: false, restoreFromMirror: false) == .ignore,
+          "manual change: no viewer, nothing saved -> nothing")
+    check(ModeRestore.manualChange(settling: false, viewerConnected: true, restorePending: true, restoreFromMirror: false) == .pauseSession(dropRestore: true)
+          && ModeRestore.manualChange(settling: false, viewerConnected: true, restorePending: true, restoreFromMirror: true) == .pauseSession(dropRestore: false)
+          && ModeRestore.manualChange(settling: false, viewerConnected: true, restorePending: false, restoreFromMirror: false) == .pauseSession(dropRestore: false),
+          "manual change: viewer connected -> auto-switching paused; only a non-mirror restore is dropped")
+    check(ModeRestore.manualChange(settling: true, viewerConnected: true, restorePending: true, restoreFromMirror: false) == .settling,
+          "manual change: settling wins even mid-session (re-create un-mirrors while a viewer is connected)")
+    check(ModeRestore.onSessionEnd(restoreEnabled: false, userOverride: false, restoreFromMirror: true)
+          && ModeRestore.onSessionEnd(restoreEnabled: true, userOverride: true, restoreFromMirror: true)
+          && ModeRestore.onSessionEnd(restoreEnabled: true, userOverride: false, restoreFromMirror: false)
+          && !ModeRestore.onSessionEnd(restoreEnabled: false, userOverride: false, restoreFromMirror: false)
+          && !ModeRestore.onSessionEnd(restoreEnabled: true, userOverride: true, restoreFromMirror: false),
+          "session end: a mirror's saved mode always comes back; Glide's own switch follows restore-on-disconnect")
+    let mirS = DisplaySettings(restore: persisted, restoreDisplay: 2, restoreIdentity: omen, restoreFromMirror: true)
+    check(try JSONDecoder().decode(DisplaySettings.self, from: JSONEncoder().encode(mirS)).restoreFromMirror == true
+          && (try JSONDecoder().decode(DisplaySettings.self, from: Data(oldJSON.utf8))).restoreFromMirror == nil,
+          "display settings: restoreFromMirror round-trips; older files decode without it")
+
+    // Re-review #3: a monitor still mirroring any Glide display (ours, or one macOS kept while the
+    // displays sleep) is held; a monitor mirroring the user's own monitor isn't.
+    check(ModeRestore.heldByMirror(recordedMirror: true, mirrorOf: 0, mirrorIsGlide: false), "held by mirror: Glide's recorded mirror")
+    check(ModeRestore.heldByMirror(recordedMirror: false, mirrorOf: 11, mirrorIsGlide: true),
+          "held by mirror: failed un-mirror (arrangement forgotten) while still a slave of a Glide display -> held, the saved mode is kept")
+    check(!ModeRestore.heldByMirror(recordedMirror: false, mirrorOf: BUILTIN, mirrorIsGlide: false) && !ModeRestore.heldByMirror(recordedMirror: false, mirrorOf: 0, mirrorIsGlide: true),
+          "held by mirror: the user's own mirror set, or no mirror -> not held")
+
+    // Re-review #6: the exit restore waits from the last un-mirror, at most afterMirrorSettle.
+    check(ModeRestore.exitWait(unmirroredAt: nil, now: 50) == 0, "exit wait: never mirrored -> restore at once")
+    check(ModeRestore.exitWait(unmirroredAt: 50, now: 50) == 1.5, "exit wait: un-mirrored by the shutdown itself -> full 1.5 s")
+    check(abs(ModeRestore.exitWait(unmirroredAt: 49, now: 50) - 0.5) < 1e-9, "exit wait: session ended 1 s before Quit -> the remaining 0.5 s (not 0)")
+    check(ModeRestore.exitWait(unmirroredAt: 40, now: 50) == 0 && ModeRestore.exitWait(unmirroredAt: 60, now: 50) == 1.5,
+          "exit wait: long settled -> 0; never more than 1.5 s")
+
+    // Re-review #2: a viewer is answered only once resume() finished setting the display up.
+    var rs = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    _ = rs.launched(); _ = rs.created()
+    check(rs.mayAnswer, "vd resume: idle standby -> answers allowed")
+    check(rs.sessionBegan() == .resume && rs.resuming == 1 && !rs.mayAnswer,
+          "vd resume: viewer connects to the hidden display -> no answer (e.g. from a display change's .none) until resume finishes")
+    check(rs.displaysChanged(onlyDisplay: false) == .none && !rs.mayAnswer, "vd resume: display change during the resume -> still waiting")
+    rs.resumeFinished()
+    check(rs.mayAnswer && rs.resuming == 0, "vd resume: finished -> answered")
+    rs.resumeFinished()
+    check(rs.resuming == 0, "vd resume: an extra finish never goes negative")
+    _ = rs.sessionEnded(now: 0, onlyDisplay: false); _ = rs.timerFired(now: 10, onlyDisplay: false)
+    _ = rs.sessionBegan()
+    check(rs.configure(enabled: false, alwaysOn: true, keepAlive: 10, onlyDisplay: false) == .destroy && rs.mayAnswer,
+          "vd resume: disabled mid-resume -> destroyed, the viewer is answered (physical display)")
+    var rc = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    _ = rc.launched()
+    check(rc.sessionBegan() == .awaitCreation && rc.resuming == 0 && !rc.mayAnswer, "vd resume: during a create -> the create answers")
+    rc.resumeStarted()  // the creation found a viewer waiting and resumes it
+    _ = rc.created()
+    check(!rc.mayAnswer, "vd resume: create done but its resume still running -> not yet")
+    rc.lost()
+    check(rc.mayAnswer, "vd resume: lost -> answered")
+
+    // Re-review #5: display changes during a create are deferred to its end, not dropped.
+    var dc = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    check(dc.launched(wanted: true) == .create, "vd create race: always-on + stream, launched headless -> create")
+    check(dc.displaysChanged(onlyDisplay: false, wanted: false) == .none && dc.displaysChangedDuringCreate, "vd create race: monitor plugged in mid-create -> recorded")
+    check(dc.created() == .standby && dc.takeDisplaysChangedDuringCreate() && !dc.takeDisplaysChangedDuringCreate(),
+          "vd create race: create finishes -> host told to re-evaluate (once)")
+    check(dc.displaysChanged(onlyDisplay: false, wanted: false) == .destroy && !dc.exists, "vd create race: ... re-evaluated -> discarded, not left on standby")
+    var dl = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    _ = dl.launched(); _ = dl.displaysChanged(onlyDisplay: false); dl.lost()
+    check(!dl.displaysChangedDuringCreate, "vd create race: a failed create forgets it")
+    var dq = VirtualDisplayLifecycle(enabled: true, alwaysOn: true)
+    _ = dq.launched(); _ = dq.created()
+    check(dq.displaysChanged(onlyDisplay: false) == .standby && !dq.displaysChangedDuringCreate, "vd create race: not recorded outside a create")
+
+    // Re-review #4: a refused hide is retried with backoff, then left to the next display change.
+    check(VirtualDisplayLifecycle.standbyRetryDelay(attempt: 1) == 2 && VirtualDisplayLifecycle.standbyRetryDelay(attempt: 2) == 5
+          && VirtualDisplayLifecycle.standbyRetryDelay(attempt: 3) == 15 && VirtualDisplayLifecycle.standbyRetryDelay(attempt: 4) == nil
+          && VirtualDisplayLifecycle.standbyRetryDelay(attempt: 0) == nil, "vd standby: hide retried after 2, 5, 15 s, then on the next display change")
+
     // host.json parsing: defaults (on, mirror, viewer's refresh), clamps, unknown strings.
     let d = try JSONDecoder().decode(VirtualDisplayConfig.self, from: Data("{}".utf8))
     check(d.isEnabled && !d.explicitlyEnabled && !d.alwaysOn && d.keepAlive == 10 && d.monitorMode == .mirror && d.wantsMain && d.fixedSize == nil,
