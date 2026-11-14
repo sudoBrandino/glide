@@ -81,7 +81,39 @@ Never edit a vectors file by hand to make a test pass.
   placeholder addresses such as `192.168.1.50` in examples and tests.
 - Changes to capture, encode, decode or present paths should say how you measured them
   (see [`docs/LATENCY.md`](docs/LATENCY.md)).
+- Add a line for user-visible changes under `[Unreleased]` in [`CHANGELOG.md`](CHANGELOG.md).
 - Pull requests are squash-merged.
+
+## Versions and releases
+
+The version lives in the `VERSION` file. `windows/Cargo.toml` and
+`mac/Sources/GlideCore/Version.swift` carry copies that `tools/version.sh check` keeps in step
+(CI runs it, and `cargo test` fails on a mismatch). Never edit the copies by hand:
+
+```sh
+tools/version.sh               # print the version
+tools/version.sh set 0.3.0     # update VERSION and every copy
+```
+
+To cut a release (maintainers):
+
+1. On `main`, set the version (`tools/version.sh set X.Y.Z`), move the `[Unreleased]` entries
+   in `CHANGELOG.md` under a new `## [X.Y.Z] - YYYY-MM-DD` heading, update the links at the
+   bottom, and merge that through a pull request.
+2. Optionally build locally first: `tools/release.sh` writes both zips, `RELEASE_NOTES.md` and
+   `SHA256SUMS` to `dist/release/X.Y.Z/`. It runs the host selftest and `cargo test` first, and
+   reads `.dev/build.env` like the other packaging scripts. Leave `GLIDE_BUNDLE_ID` at its default
+   for a public build.
+3. Tag the merge commit and push the tag:
+   `git tag -a vX.Y.Z -m "Glide X.Y.Z" && git push origin vX.Y.Z`. The
+   [release workflow](.github/workflows/release.yml) checks that the tag matches `VERSION` and is
+   on `main`, builds and tests both artifacts, and creates a **draft** GitHub Release with the
+   notes from `CHANGELOG.md`.
+4. Download the draft's files, check them (see [`docs/INSTALL.md`](docs/INSTALL.md)), and publish
+   the draft on the Releases page.
+
+Running the workflow by hand (Actions → Release → Run workflow) is a dry run: it builds everything
+and attaches the files to the run, but creates no release.
 
 ## License
 

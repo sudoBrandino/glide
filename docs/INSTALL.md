@@ -1,0 +1,280 @@
+# Installing Glide
+
+This guide is for testers who install a prebuilt release from the
+[Releases page](https://github.com/sudoBrandino/glide/releases). To build from source, see the
+[README](../README.md#install-and-run) and [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+Glide has two parts:
+
+| Part | Runs on | Release file |
+|---|---|---|
+| **Host** (`Glide Host.app`) | The Mac you want to control: macOS 14 or later, Apple silicon | `Glide-Host-<version>-macos-arm64.zip` |
+| **Viewer** (`glide-client.exe`) | The Windows PC you control it from: Windows 10/11 x64 | `Glide-Viewer-<version>-windows-x64.zip` |
+
+The host and the viewer must be the same release, or at least speak the same protocol version.
+`glide-host --version` and `glide-client.exe --version` print both.
+
+**Before you start:**
+
+- Both machines must be on the same LAN. Glide has no relay, and it uses TCP port 7420 by default.
+- The PC needs a GPU that decodes HEVC in hardware, plus the "HEVC Video Extensions" from the
+  Microsoft Store.
+  Hybrid and sharp mode need HEVC 4:4:4 decoding, which recent NVIDIA and Intel GPUs have. On
+  other GPUs, Glide uses `fast` mode (4:2:0 only).
+- Intel Macs are not supported. The x86_64 host compiles, but Intel Macs have no hardware
+  HEVC 4:4:4 encoder, and the host doesn't fall back to fast mode on its own yet.
+
+## Contents
+
+1. [Verify the download](#1-verify-the-download)
+2. [Install the host on the Mac](#2-install-the-host-on-the-mac)
+3. [Install the viewer on the PC](#3-install-the-viewer-on-the-pc)
+4. [Pair and connect](#4-pair-and-connect)
+5. [Update](#5-update)
+6. [Uninstall](#6-uninstall)
+7. [Troubleshooting](#7-troubleshooting)
+
+## 1. Verify the download
+
+Each release has a `SHA256SUMS` file. Download it into the same folder as the zips, then run:
+
+```sh
+# Mac (reports "OK" for each file you downloaded)
+shasum -a 256 -c SHA256SUMS --ignore-missing
+```
+
+```powershell
+# Windows PowerShell: compare the hash with the matching line in SHA256SUMS
+Get-FileHash .\Glide-Viewer-0.2.0-windows-x64.zip -Algorithm SHA256
+```
+
+Releases built by GitHub Actions also carry a build provenance attestation. If you have the
+GitHub CLI, `gh attestation verify <zip> --repo sudoBrandino/glide` checks that the file was
+built from this repository by the release workflow.
+
+## 2. Install the host on the Mac
+
+### 2.1 Unzip and clear the quarantine flag
+
+The app is **signed ad hoc and not notarized** by Apple. macOS blocks such an app when it was
+downloaded with a browser: it says the app "is damaged" or that Apple "could not verify" it. To
+allow it, remove the quarantine flag that the browser added:
+
+```sh
+cd ~/Downloads
+ditto -x -k Glide-Host-0.2.0-macos-arm64.zip .      # or double-click the zip in Finder
+xattr -dr com.apple.quarantine "Glide Host.app"
+mkdir -p ~/Applications
+mv "Glide Host.app" ~/Applications/
+```
+
+Install it to **`~/Applications`** (the Applications folder in your home folder), which is where
+the LaunchAgent below expects it. Only run `xattr` on files you have verified (step 1).
+
+### 2.2 Start it at login (LaunchAgent)
+
+The host runs in the background as a per-user LaunchAgent: it starts at login and restarts if it
+exits. No administrator rights are needed. Pick one of the two ways below.
+
+**Option A: from a source checkout.** If you have cloned the repository, put the release app
+where the install script looks for it, and run the script:
+
+```sh
+cd glide                                            # your clone, at the release tag
+mkdir -p dist && ditto -x -k ~/Downloads/Glide-Host-0.2.0-macos-arm64.zip dist/
+xattr -dr com.apple.quarantine "dist/Glide Host.app"
+tools/install-host.sh                               # copies it to ~/Applications and starts it
+```
+
+**Option B: by hand.** This creates the same LaunchAgent as `tools/install-host.sh`. The label
+must be the app's bundle identifier, `io.github.sudobrandino.glide.host`:
+
+```sh
+LABEL=io.github.sudobrandino.glide.host
+APP="$HOME/Applications/Glide Host.app"
+mkdir -p ~/Library/LaunchAgents ~/Library/Logs
+cat > ~/Library/LaunchAgents/$LABEL.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$APP/Contents/MacOS/glide-host</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/glide-host.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/glide-host.log</string>
+</dict>
+</plist>
+EOF
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/$LABEL.plist
+```
+
+A Glide icon appears in the menu bar. The log is `~/Library/Logs/glide-host.log`; the first line
+of each start names the version (`starting glide-host 0.2.0 (…), protocol v2`).
+
+Run only one host at a time: a second `glide-host` interrupts the first one's screen capture.
+
+### 2.3 Grant Screen Recording and Accessibility
+
+The host needs **Screen Recording** to capture the screen and **Accessibility** to inject the
+keyboard and mouse. Grant both to *Glide Host*, not to Terminal:
+
+```sh
+~/Applications/Glide\ Host.app/Contents/MacOS/glide-host --request-permissions
+```
+
+This opens the system prompts, waits until you have granted both in **System Settings → Privacy
+& Security**, and exits. You can also add *Glide Host* there by hand with the **+** button
+(choose `~/Applications/Glide Host.app`).
+
+A new Screen Recording grant only takes effect after the host restarts: menu bar → **Restart
+Glide Host** (the LaunchAgent starts it again).
+
+### 2.4 Mac firewall
+
+If the macOS firewall is on (System Settings → Network → Firewall) and the viewer connects to the
+Mac, macOS asks whether *Glide Host* may accept incoming connections. Allow it. If the Mac dials
+out instead (see [4.2](#42-choose-who-connects)), nothing listens on the Mac and no rule is needed.
+
+## 3. Install the viewer on the PC
+
+1. Unzip `Glide-Viewer-0.2.0-windows-x64.zip` (right-click → **Extract All…**) into a folder
+   that will stay put, for example `%LOCALAPPDATA%\Glide`. Firewall rules are tied to the exe's
+   path, so don't run it from the Downloads folder or from inside the zip.
+2. Run `glide-client.exe`. It is a single self-contained file; nothing else is installed.
+
+**SmartScreen.** The exe is not code-signed, so the first run may show "Windows protected your
+PC". Click **More info → Run anyway**. You can also clear the download mark before the first run:
+right-click the exe → **Properties** → tick **Unblock** → OK, or in PowerShell:
+
+```powershell
+Unblock-File "$env:LOCALAPPDATA\Glide\glide-client.exe"
+```
+
+**Firewall.** With no arguments the viewer *listens* on TCP port 7420 and waits for the Mac to
+connect. The first time, Windows Defender Firewall asks whether to allow it. Allow it on
+**Private** networks only. For a tighter rule that admits only your Mac (run in an elevated
+PowerShell, with your path and the Mac's address):
+
+```powershell
+New-NetFirewallRule -DisplayName "Glide viewer (from the Mac only)" -Direction Inbound `
+  -Program "$env:LOCALAPPDATA\Glide\glide-client.exe" -Protocol TCP -LocalPort 7420 `
+  -RemoteAddress 192.168.1.50 -Action Allow -Profile Private
+```
+
+If the viewer connects to the Mac instead, it needs no inbound rule.
+
+When you double-click the exe, its console window closes and messages are not shown. To see them,
+run it from a Command Prompt or PowerShell window. `glide-client.exe --help` lists every option,
+and [`windows/README.md`](../windows/README.md) documents the config file and all flags.
+
+Settings are in `%APPDATA%\Glide\config.json`, which is created on first run. The tray icon →
+**Open config file** opens it.
+
+## 4. Pair and connect
+
+### 4.1 Pair once
+
+There are no passwords. Each viewer is paired with the Mac once, by comparing a 6-digit code:
+
+1. On the Mac: menu bar → **Pair New Viewer…**. This opens a 2-minute pairing window. (Without a
+   menu bar, for example over SSH: `~/Applications/Glide\ Host.app/Contents/MacOS/glide-host --pair`.)
+2. Start the viewer, or let it reconnect (see [4.2](#42-choose-who-connects)). A dialog on the PC
+   shows a 6-digit code, and the Mac shows a code in an alert.
+3. If the two codes match, confirm on **both** sides. If they don't, cancel: something else
+   answered.
+
+The keys are now pinned on both sides, and later connections need no interaction. Without a
+screen on the Mac, run `glide-host --pair` and then, once the PC shows the code,
+`glide-host --pair-code NNNNNN`; the host checks the code itself.
+
+### 4.2 Choose who connects
+
+Either side can open the connection. The protocol is the same in both directions. Below,
+`glide-host` stands for `~/Applications/Glide\ Host.app/Contents/MacOS/glide-host`.
+
+| Mode | Mac (host) | PC (viewer) | Use when |
+|---|---|---|---|
+| **Mac dials the PC** | `glide-host --set-connect PC-ADDRESS:7420`, then menu bar → Restart Glide Host | Run `glide-client.exe` with no arguments: it listens on 7420 | The PC must not be reachable from other machines, or only Mac → PC connections are allowed |
+| **PC dials the Mac** | Nothing to do: by default the host listens on 7420 | `glide-client.exe MAC-ADDRESS` (or set `"host": "MAC-ADDRESS:7420"` in `config.json`) | The PC can reach the Mac |
+
+- `--set-connect` saves the target in `~/Library/Application Support/Glide/host.json`
+  (`"connect"`). The host redials every 2 seconds while disconnected. To go back to listening,
+  remove `"connect"` from `host.json` and restart the host.
+- In listen mode the viewer accepts only the first Mac that pairs with it (it pins that address),
+  or the addresses in `"allowed_peers"` in `config.json`.
+- The viewer keeps its window open across disconnects and reconnects on its own.
+
+### 4.3 Using it
+
+- **F11** or **Alt+Enter**: borderless fullscreen.
+- Ctrl is sent as Cmd by default, so Ctrl+C copies on the Mac. `--no-ctrl-as-cmd` turns this off.
+- The clipboard (text and images), Mac audio and files dragged onto the window work out of the
+  box. Received files land in `~/Downloads/Glide` on the Mac and `Downloads\Glide` on the PC.
+- **Ctrl+Alt+Shift+H** shows the stats overlay, and **Ctrl+Alt+Shift+Space** opens the Glide
+  menu. The tray icon has a menu too (Connect, Disconnect, Forget host, Quit).
+
+See the [README](../README.md) for display modes, file transfer and the other features.
+
+## 5. Update
+
+1. Mac: unzip the new app and clear its quarantine flag ([2.1](#21-unzip-and-clear-the-quarantine-flag)).
+   Quit the old host (menu bar → **Quit Until Next Login**, which unloads the LaunchAgent),
+   replace `~/Applications/Glide Host.app`, and load the agent again:
+   `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.sudobrandino.glide.host.plist`
+   (or log out and back in). With a source checkout, `tools/install-host.sh` as in Option A does
+   all of this.
+2. Because the app is signed ad hoc, macOS treats each release as a new app and may ignore the
+   old permissions. If capture or input stops working, remove *Glide Host* from **Screen
+   Recording** and **Accessibility** in System Settings (the **−** button), then repeat
+   [2.3](#23-grant-screen-recording-and-accessibility).
+3. PC: close the viewer and replace `glide-client.exe` at the same path, so firewall rules keep
+   applying.
+
+Pairings and settings survive updates.
+
+## 6. Uninstall
+
+**Mac.** With a source checkout, `tools/install-host.sh --uninstall` does the first three lines:
+
+```sh
+launchctl bootout gui/$(id -u)/io.github.sudobrandino.glide.host
+rm -f ~/Library/LaunchAgents/io.github.sudobrandino.glide.host.plist
+rm -rf ~/Applications/Glide\ Host.app
+# Optional: settings, this Mac's key and the paired viewers; the log; the privacy grants
+rm -rf ~/Library/Application\ Support/Glide ~/Library/Logs/glide-host.log
+tccutil reset ScreenCapture io.github.sudobrandino.glide.host
+tccutil reset Accessibility io.github.sudobrandino.glide.host
+```
+
+**PC.** Quit the viewer (tray → **Quit Glide**), delete its folder, and optionally delete
+`%APPDATA%\Glide` (settings, this PC's key, the pinned Mac key) and any firewall rule you added.
+
+## 7. Troubleshooting
+
+Look at the logs first: on the Mac, menu bar → **Open Log** (`~/Library/Logs/glide-host.log`); on
+the PC, run `glide-client.exe` from a terminal to see its messages.
+
+| Symptom | What to do |
+|---|---|
+| macOS says *Glide Host* "is damaged" or "can't be opened" | The quarantine flag is still set: `xattr -dr com.apple.quarantine ~/Applications/Glide\ Host.app` ([2.1](#21-unzip-and-clear-the-quarantine-flag)) |
+| No menu-bar icon | Check that the agent is loaded: `launchctl print gui/$(id -u)/io.github.sudobrandino.glide.host`. Read the log for errors |
+| Black screen, or "Screen recording NOT granted" in the log | Grant Screen Recording ([2.3](#23-grant-screen-recording-and-accessibility)), then **Restart Glide Host**. After an update, remove and re-add the grant |
+| The picture works but the mouse and keyboard don't | Grant Accessibility to *Glide Host* ([2.3](#23-grant-screen-recording-and-accessibility)) |
+| "capture unavailable" in the log | The display is asleep, locked or being reconfigured. The host wakes it and retries every 2 s |
+| Viewer: "Not paired" or "doesn't recognize this PC" | Open the pairing window on the Mac (**Pair New Viewer…**). The viewer keeps retrying |
+| Viewer: "HOST KEY CHANGED" | The Mac presented a different key from the one you paired. If you reset or reinstalled the Mac's Glide settings, use tray → **Forget host (unpair)…** and pair again. Otherwise, treat it as an impersonation attempt |
+| A message about protocol v1, or "unsupported protocol version" | The other side runs an older build. Install the same release on both |
+| The viewer waits forever ("Waiting for host on port 7420…") | It is in listen mode. Either set the Mac to dial it (`--set-connect`), or start the viewer with the Mac's address. Check the Windows firewall rule |
+| Can't connect to the Mac | Check the address and that port 7420 is reachable (`Test-NetConnection MAC-ADDRESS -Port 7420` in PowerShell), and the macOS firewall ([2.4](#24-mac-firewall)) |
+| No hybrid or sharp mode, or no picture at all | Install the HEVC Video Extensions. `glide-client.exe --probe` prints what the GPU can decode |
+| Blurry picture | See *Blurry picture* in the README's [Troubleshooting](../README.md#troubleshooting) section |
+
+When you report a bug, include `glide-host --version`, `glide-client.exe --version`, the Mac and
+GPU models, and the relevant log lines. Report security problems privately, as described in
+[SECURITY.md](../SECURITY.md).
