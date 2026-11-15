@@ -53,6 +53,12 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ### Fixed
 
+- A Glide Host opened from Finder or the Dock was taken for the login item (macOS sets the same
+  variable for both), so a new download opened next to a running host quit after a minute instead
+  of offering to replace it, and Restart / Quit Until Next Login assumed launchd would restart it.
+- After an update, macOS refused to start the login item (it is tied to the exact build). Opening
+  the new Glide Host now registers it again, and the login item takes over.
+
 - Updating by dragging a new Glide Host over the running one and opening it now restarts into
   the new version. Before, the host stopped and nothing started again. The old LaunchAgents are
   removed only once the new copy is in place, and a failed copy puts the old app back.
@@ -93,6 +99,11 @@ changed for them, not how. Delete empty subsections when the release is cut.
 - The release workflow loads the signing identity only for tag pushes, not for pull requests.
 
 ### Changed
+
+- Releases are signed with the project's self-signed certificate ("Glide Release Signing")
+  instead of ad hoc, so the Screen Recording and Accessibility grants survive updates. The first
+  update to such a build asks for them once more. `tools/make-host-app.sh` can sign from a separate
+  keychain (`GLIDE_SIGN_KEYCHAIN`).
 
 - The LaunchAgent keeps the host running only while the app exists (`KeepAlive` `PathState`):
   deleting the app no longer leaves launchd retrying in the background. Run the installer once

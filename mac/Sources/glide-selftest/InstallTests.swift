@@ -6,6 +6,12 @@ import GlideCore
 
 /// Every role at launch, and the `instance` reply round trip (the bundle's version has a space).
 func instanceRoleTests() {
+    // Login item / LaunchAgent vs an app opened by hand (Launch Services sets XPC_SERVICE_NAME too).
+    check(HostInstance.launchdLabel(xpcServiceName: "io.github.sudobrandino.glide.host") == "io.github.sudobrandino.glide.host", "launchd: login item label")
+    check(HostInstance.launchdLabel(xpcServiceName: "com.example.old.glide.host") == "com.example.old.glide.host", "launchd: script LaunchAgent label")
+    check(HostInstance.launchdLabel(xpcServiceName: "application.io.github.sudobrandino.glide.host.220495140.220495149") == nil, "launchd: opened from Finder is not a launchd job")
+    check(HostInstance.launchdLabel(xpcServiceName: "0") == nil && HostInstance.launchdLabel(xpcServiceName: "") == nil && HostInstance.launchdLabel(xpcServiceName: nil) == nil, "launchd: none")
+
     print("host instance roles:")
     let me = "/Applications/Glide Host.app", v = "0.3.0 (abc1234)"
     let token = HostInstance.versionToken(v)

@@ -48,9 +48,16 @@ No Terminal needed. Both apps have a setup window that walks through everything 
    - **Pair a Viewer…**, then connect from the PC: both screens show the same code; confirm on
      both.
 
-The window opens again by itself while something is missing (each new build needs the two
-permissions again), and any time from the menu bar icon → **Set Up Glide Host…**. Opening a newer
-download while Glide Host runs offers to replace it, keeping the settings and pairings.
+The window opens again by itself while something is missing, and any time from the menu bar icon →
+**Set Up Glide Host…**. Opening a newer download while Glide Host runs offers to replace it,
+keeping the settings and pairings.
+
+**Signing.** Releases are signed with the project's own certificate, "Glide Release Signing", so
+macOS keeps the Screen Recording and Accessibility grants from one release to the next. (Builds
+signed ad hoc, as pull-request builds are, need both again after every update.) It is not an Apple
+Developer ID, so Gatekeeper still asks once, on the first launch. After an update, open Glide Host
+once if it doesn't start at login by itself: macOS ties the login item to the exact build, and
+opening the new one registers it again (replacing it from the setup window does this for you).
 
 **Windows**
 

@@ -89,7 +89,9 @@ cmd_host() {
        GLIDE_RELEASE_CUSTOM_ID=1 to build with it anyway."
   fi
   case "$GLIDE_SIGN_ID" in
-    -|"Developer ID Application:"*) ;;
+    # "Glide Release Signing": the project's self-signed certificate (no personal details in it);
+    # it keeps macOS privacy grants across releases. See docs/INSTALL.md "Signing".
+    -|"Developer ID Application:"*|"Glide Release Signing") ;;
     *) [[ "${GLIDE_RELEASE_CUSTOM_ID:-0}" == 1 ]] || die "GLIDE_SIGN_ID is '$GLIDE_SIGN_ID' (from .dev/build.env?). Public releases
        are signed ad hoc (GLIDE_SIGN_ID=-) or with a Developer ID; a development certificate embeds
        its name (often an email address) in the app. Set GLIDE_RELEASE_CUSTOM_ID=1 to use it anyway."
