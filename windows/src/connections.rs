@@ -15,7 +15,7 @@
 //! (`PLATFORM_MAC`); other platforms are kept as-is in the file (so a newer viewer's entries survive a
 //! round trip) but shown as unavailable and never activated.
 
-use crate::config::{pin_fallback, pin_target, Config, TargetSpec};
+use crate::config::{pin_target, Config, TargetSpec};
 use serde::{Deserialize, Serialize};
 
 /// A Glide host on a Mac (the only platform this viewer can connect to).
@@ -81,10 +81,11 @@ impl SavedConnection {
     pub fn pin_key(&self, listen_port: u16) -> String {
         pin_target(&self.target(listen_port))
     }
-    /// The pinned host's name and pairing date, if this connection is paired.
+    /// The pinned host's name and pairing date, if this connection is paired. Only its own pin
+    /// counts: the listen-mode fallback (`config::pin_fallback`) belongs to whichever Mac paired
+    /// while this PC was listening, and `sync_from_host` hands it to that Mac's connection.
     pub fn pairing<'a>(&self, c: &'a Config) -> Option<&'a crate::config::PinnedHost> {
-        let t = self.target(c.listen_port);
-        c.pin_entry(&pin_target(&t), pin_fallback(&t).as_deref()).map(|(_, p)| p)
+        c.pin_entry(&self.pin_key(c.listen_port), None).map(|(_, p)| p)
     }
     /// "192.168.1.20" or "Waits for the Mac".
     pub fn address_label(&self) -> String {
@@ -253,18 +254,6 @@ pub fn remove(c: &mut Config, id: &str) -> Option<Removed> {
         out.unpaired = c.pinned_hosts.remove(&key).is_some();
         c.last_display.remove(&key);
     }
-    // A viewer paired while listening keeps that pin under "listen:PORT" and `pairing` falls
-    // back to it, so it must go too unless another connection still depends on it: a
-    // listen-only one (its own key), or one with an address that has no pin of its own yet.
-    if let Some(f) = pin_fallback(&s.target(c.listen_port)) {
-        let needed = c.connections.iter().any(|o| {
-            let t = o.target(c.listen_port);
-            pin_target(&t) == f || (pin_fallback(&t).as_deref() == Some(f.as_str()) && !c.pinned_hosts.contains_key(&pin_target(&t)))
-        });
-        if !needed && c.pinned_hosts.remove(&f).is_some() {
-            out.unpaired = true;
-        }
-    }
     if c.active_connection.as_deref() == Some(id) {
         out.was_active = true;
         c.active_connection = None;
@@ -281,12 +270,8 @@ pub fn remove(c: &mut Config, id: &str) -> Option<Removed> {
 /// Forget the pairing of a saved connection (it pairs again on the next connect).
 pub fn unpair(c: &mut Config, id: &str) -> bool {
     let Some(s) = get(c, id) else { return false };
-    let t = s.target(c.listen_port);
-    let mut any = c.pinned_hosts.remove(&pin_target(&t)).is_some();
-    if let Some(f) = pin_fallback(&t) {
-        any |= c.pinned_hosts.remove(&f).is_some();
-    }
-    any
+    let key = s.pin_key(c.listen_port);
+    c.pinned_hosts.remove(&key).is_some()
 }
 
 /// Make `id` the active connection and mirror it into `host` / `accept_incoming`. Returns
@@ -330,6 +315,10 @@ pub fn sync_from_host(c: &mut Config) -> bool {
     if active(c).is_none() {
         c.active_connection = None;
     }
+    // Listening before this `host` appeared (no connection yet, or a listen-only one): a Mac
+    // paired then is pinned under "listen:PORT", and this address is that Mac's (Set up after
+    // pairing from the Mac, or a viewer upgraded from before saved connections).
+    let was_listening = active(c).is_none_or(|s| s.address.trim().is_empty());
     let host = c.host.as_deref().map(str::trim).filter(|h| !h.is_empty()).map(str::to_string);
     let same = |a: &str, b: &str| crate::net::parse_addr(a.trim()).eq_ignore_ascii_case(&crate::net::parse_addr(b.trim()));
     match host {
@@ -347,11 +336,16 @@ pub fn sync_from_host(c: &mut Config) -> bool {
             } else {
                 // New address: a new saved connection, named after the paired Mac if known.
                 let key = pin_target(&TargetSpec::Connect(h.clone()));
-                let name = c.pinned_hosts.get(&key).map(|p| p.name.trim().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| h.clone());
+                let listen = format!("listen:{}", c.listen_port);
+                let pin = c.pinned_hosts.get(&key).or(if was_listening { c.pinned_hosts.get(&listen) } else { None });
+                let name = pin.map(|p| p.name.trim().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| h.clone());
                 let name = unique_name(c, &name);
                 let s = SavedConnection { id: next_id(c), name, address: h, accept_incoming: accept, ..Default::default() };
                 c.active_connection = Some(s.id.clone());
                 c.connections.push(s);
+            }
+            if was_listening {
+                adopt_listen_pin(c);
             }
         }
         None => {
@@ -362,6 +356,28 @@ pub fn sync_from_host(c: &mut Config) -> bool {
         }
     }
     before != (c.connections.clone(), c.active_connection.clone())
+}
+
+/// Give the listen-mode pin ("listen:PORT") to the active connection: copied to its own key if
+/// it has none, then dropped unless a listen-only connection still uses it. Otherwise every Mac
+/// with "Let the Mac connect" on would inherit it as `pin_fallback` and be refused (wrong key).
+fn adopt_listen_pin(c: &mut Config) {
+    let listen = format!("listen:{}", c.listen_port);
+    let Some(pin) = c.pinned_hosts.get(&listen).cloned() else { return };
+    let Some(key) = active(c).filter(|s| !s.address.trim().is_empty()).map(|s| s.pin_key(c.listen_port)) else { return };
+    c.pinned_hosts.entry(key).or_insert(pin);
+    let lp = c.listen_port;
+    if !c.connections.iter().any(|s| s.is_supported() && s.pin_key(lp) == listen) {
+        c.pinned_hosts.remove(&listen);
+        c.last_display.remove(&listen);
+    }
+}
+
+/// Whether the running viewer should still consult the listen-mode fallback pin for
+/// `pin_target`: only when no saved connection is in use for it (a host on the command line).
+/// Saved connections carry their own pins (`adopt_listen_pin`).
+pub fn use_pin_fallback(c: &Config, pin_target: &str) -> bool {
+    active(c).is_none_or(|s| s.pin_key(c.listen_port) != pin_target)
 }
 
 fn unique_name(c: &Config, base: &str) -> String {
@@ -625,37 +641,6 @@ mod tests {
     }
 
     #[test]
-    fn remove_forgets_listen_fallback_pin_unless_still_needed() {
-        let mut c = Config::default();
-        add(&mut c, &draft("Studio", "192.168.1.20")).unwrap();
-        add(&mut c, &draft("Laptop", "10.0.0.5")).unwrap();
-        // Paired while listening, then the address was entered (app copies the pin across).
-        pin(&mut c, "listen:7420", "Studio");
-        pin(&mut c, "192.168.1.20:7420", "Studio");
-        pin(&mut c, "10.0.0.5:7420", "Laptop");
-        // The laptop has its own pin, so nothing else needs the fallback.
-        assert!(remove(&mut c, "c1").unwrap().unpaired);
-        assert!(!c.pinned_hosts.contains_key("listen:7420"));
-        assert!(get(&c, "c2").unwrap().pairing(&c).is_some());
-
-        // An address-bearing connection without its own pin still relies on the fallback.
-        let mut c = Config::default();
-        add(&mut c, &draft("Studio", "192.168.1.20")).unwrap();
-        add(&mut c, &draft("Other", "10.0.0.5")).unwrap();
-        pin(&mut c, "listen:7420", "Studio");
-        remove(&mut c, "c1").unwrap();
-        assert!(c.pinned_hosts.contains_key("listen:7420"));
-
-        // So does a listen-only connection.
-        let mut c = Config::default();
-        add(&mut c, &draft("Studio", "192.168.1.20")).unwrap();
-        add(&mut c, &draft("Wait", "")).unwrap();
-        pin(&mut c, "listen:7420", "Studio");
-        remove(&mut c, "c1").unwrap();
-        assert!(c.pinned_hosts.contains_key("listen:7420"));
-    }
-
-    #[test]
     fn switching_to_unpaired_mac_resets_tofu_admission_only() {
         let mut c = Config::default();
         add(&mut c, &draft("Studio", "192.168.1.20")).unwrap();
@@ -760,13 +745,41 @@ mod tests {
     }
 
     #[test]
-    fn listen_fallback_pin_counts_as_paired() {
+    fn listen_pin_goes_to_the_mac_set_up_after_it_not_to_every_mac() {
+        // Paired while listening, then the Mac's address entered in Set up.
         let mut c = Config::default();
-        add(&mut c, &draft("Studio", "192.168.1.20")).unwrap();
         pin(&mut c, "listen:7420", "Studio");
+        c.host = Some("192.168.1.20".into());
+        assert!(sync_from_host(&mut c));
+        assert_eq!(active(&c).unwrap().name, "Studio");
+        assert!(c.pinned_hosts.contains_key("192.168.1.20:7420"));
+        assert!(!c.pinned_hosts.contains_key("listen:7420"), "no longer a fallback for other Macs");
+        assert!(use_pin_fallback(&c, "10.0.0.5:7420"), "a CLI host keeps the legacy behaviour");
+        assert!(!use_pin_fallback(&c, "192.168.1.20:7420"));
+        // A second Mac added later is not paired, and unpairing it leaves Studio's pin alone.
+        add(&mut c, &draft("Laptop", "10.0.0.5")).unwrap();
+        assert!(get(&c, "c2").unwrap().pairing(&c).is_none());
+        assert!(!unpair(&mut c, "c2"));
         assert!(get(&c, "c1").unwrap().pairing(&c).is_some());
         assert!(unpair(&mut c, "c1"));
         assert!(c.pinned_hosts.is_empty());
+    }
+
+    #[test]
+    fn listen_pin_kept_for_a_listen_only_connection() {
+        let mut c = Config::default();
+        add(&mut c, &draft("Wait", "")).unwrap();
+        pin(&mut c, "listen:7420", "Studio");
+        assert!(get(&c, "c1").unwrap().pairing(&c).is_some());
+        c.host = Some("192.168.1.20".into());
+        sync_from_host(&mut c);
+        assert!(c.pinned_hosts.contains_key("listen:7420"));
+        assert!(c.pinned_hosts.contains_key("192.168.1.20:7420"));
+        // Switching between saved Macs never moves pins.
+        add(&mut c, &draft("Laptop", "10.0.0.5")).unwrap();
+        c.host = Some("10.0.0.5".into());
+        sync_from_host(&mut c);
+        assert!(!c.pinned_hosts.contains_key("10.0.0.5:7420"));
     }
 
     #[test]

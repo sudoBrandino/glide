@@ -93,6 +93,9 @@ saves the choice and restarts the viewer onto it (like **Connect** in the setup 
   `host` written by the setup dialog, by hand or by an older viewer is added to (or updates) the
   list when the config loads. A session started with a host on the command line doesn't change
   the list.
+- Pairing is per connection. A Mac paired while this PC was only listening is pinned under
+  `listen:PORT`; when its address is then entered (Set up, or an upgrade from an older viewer)
+  that pin moves to the new connection, so other saved Macs don't inherit it.
 - Test hook (`--features test-hooks` builds only): `GLIDE_CONNS_DUMP=x.bmp` saves a capture of the
   Connections window after about 0.5 s and closes it.
 

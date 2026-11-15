@@ -351,7 +351,9 @@ fn main() -> ExitCode {
     }
     let target = config::resolve_target(args.host.as_deref(), args.listen, args.no_listen, &store.config);
     let pin_target = config::pin_target(&target);
-    let pin_fallback = config::pin_fallback(&target);
+    // Saved connections carry their own pins; the listen-mode fallback only still applies to a
+    // target that isn't one (a host on the command line).
+    let pin_fallback = config::pin_fallback(&target).filter(|_| glide::connections::use_pin_fallback(&store.config, &pin_target));
     if args.forget_host {
         match store.forget_host(&pin_target) {
             Some(p) => eprintln!("forgot host key {} for {pin_target} ({})", p.key, p.name),
