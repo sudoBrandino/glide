@@ -387,7 +387,8 @@ viewer gets 2560×1440 at 1x. The **Display mode** policy above decides HiDPI or
 While the session lasts, your main monitor **mirrors** the virtual display. There is one desktop
 at the viewer's size, with every window on it. When the viewer has been gone 10 s, the mirror ends,
 your monitor's own mode comes back, and the virtual display is removed. On a Mac without a monitor
-it is the only screen and is kept. `"whenMonitorAttached": "extend"` puts it beside your monitor
+it is the only screen and is kept. A laptop with the lid open and no monitor is left alone: Glide
+streams its built-in display as it is. `"whenMonitorAttached": "extend"` puts it beside your monitor
 instead, and `"stream"` streams the monitor as before. Opt out with `"enabled": false` or the menu.
 It uses a private CoreGraphics API and falls back to the physical display if that fails. Check it
 with `glide-host --virtual-display-selftest`. See

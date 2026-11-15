@@ -40,6 +40,17 @@ When the viewer disconnects, Glide waits `keepAliveSeconds` (10 s) in case it re
 ends the mirror, gives your monitor its own mode back (same size **and refresh rate**), and removes
 the virtual display. Every arrangement change is made `.forSession`, so nothing survives logout.
 
+**A laptop with the lid open and no external monitor** (the built-in panel is the only screen):
+Glide leaves the panel alone. It creates no virtual display, doesn't switch the panel's mode, and
+streams it as it is, scaled to the viewer (a 16:10 panel shows with thin bars on a 16:9 viewer).
+Mirroring would give the panel the viewer's size and shape, which looks wrong on a laptop. This is
+the default's laptop case; set `whenMonitorAttached` explicitly (for example to `"mirror"` in the
+menu or host.json) to use that mode with the lid open too. If the lid opens during a session that
+uses the virtual display, the panel comes back as its own screen and the session keeps the virtual
+display until the viewer leaves. If the lid closes during a session that streams the panel, Glide
+creates the virtual display for that session (the same happens with `"stream"` when the monitor is
+unplugged).
+
 **Without a monitor** (headless, or a laptop with the lid closed and no external display): the
 virtual display is the Mac's only screen, so it is the main display by itself. It is kept when the
 viewer disconnects, because removing the Mac's only screen would leave it with none. If a monitor
@@ -72,7 +83,6 @@ Sleep: a session keeps the displays awake (as before). When idle, the displays s
 ```json
 "virtualDisplay": {
   "enabled": true,
-  "whenMonitorAttached": "mirror",
   "lifetime": "session",
   "keepAliveSeconds": 10
 }
@@ -81,7 +91,7 @@ Sleep: a session keeps the displays awake (as before). When idle, the displays s
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Master switch. `false` opts out. A `--display N` pin also turns the default off; set `true` explicitly to use both. |
-| `whenMonitorAttached` | `"mirror"` | `"mirror"`: the main monitor mirrors the virtual display while a viewer is connected. `"extend"`: the virtual display sits beside your monitors. `"stream"`: no virtual display while a monitor is attached, always-on included (the old behavior). |
+| `whenMonitorAttached` | unset | Unset: `"mirror"`, except that a laptop whose only screen is its built-in panel streams the panel as it is. `"mirror"`: the main monitor mirrors the virtual display while a viewer is connected. `"extend"`: the virtual display sits beside your monitors. `"stream"`: no virtual display while a monitor is attached, always-on included (the old behavior). |
 | `makeMain` | `true` | `"extend"` only: make the virtual display the main display (menu bar, Dock, new windows) while it is streamed. |
 | `lifetime` | `"session"` | `"session"`: created when a viewer connects, removed `keepAliveSeconds` after it leaves (kept while it is the only display). `"always"`: created at launch and kept; when idle it hides behind your main monitor (it mirrors it), so it adds no invisible desktop area. Not with `"stream"` while a monitor is attached. |
 | `keepAliveSeconds` | `10` | After a disconnect, keep the streaming arrangement this long, so a quick reconnect changes nothing. `0` = at once. |

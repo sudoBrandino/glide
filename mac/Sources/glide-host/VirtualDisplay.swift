@@ -121,10 +121,11 @@ final class VirtualDisplayManager: @unchecked Sendable {
             guard active else { log("virtual display: off; Glide streams the physical display"); return }
             log("virtual display: on (\(config.alwaysOn ? "always on" : "created per session, removed \(Int(config.keepAlive)) s after the viewer leaves")"
                 + ", with a monitor: \(config.monitorMode.rawValue)\(config.monitorMode == .extend && config.wantsMain ? " (main)" : "")"
+                + (config.explicitMonitorMode == nil ? "; a laptop's built-in display alone is streamed as it is" : "")
                 + ", \(config.refreshRate.map { "\(Int($0)) Hz" } ?? "viewer's refresh rate")\(config.fixedSize.map { ", fixed \($0.w)x\($0.h)" } ?? ""))")
             if let why = Self.unavailableReason { log("virtual display: UNAVAILABLE (\(why)); Glide will use the physical display") }
             let wanted = self.wanted
-            if config.alwaysOn && !wanted { log("virtual display: not created at launch: \(Self.streamReason)") }
+            if config.alwaysOn && !wanted { log("virtual display: not created at launch: \(streamReason)") }
             perform(lifecycle.launched(wanted: wanted), reason: "always on")
         }
     }
@@ -142,8 +143,8 @@ final class VirtualDisplayManager: @unchecked Sendable {
         let a = lifecycle.sessionBegan(wanted: wanted)
         if lifecycle.enabled && !wanted {
             // "stream" with a monitor attached: no virtual display at all, even an always-on one.
-            skippedReason = Self.streamReason
-            log("virtual display: not used for this viewer: \(Self.streamReason)")
+            skippedReason = streamReason
+            log("virtual display: not used for this viewer: \(streamReason)")
             perform(a, reason: "\"stream\" with a monitor attached")
             ready(false)
             return
@@ -314,11 +315,28 @@ final class VirtualDisplayManager: @unchecked Sendable {
                 reason: reason)
     }
 
-    static let streamReason = "a monitor is attached and whenMonitorAttached is \"stream\""
+    /// Why a connecting viewer gets the physical display when `wanted` is false.
+    private var streamReason: String {
+        streamsBuiltInAsIs ? "the built-in display is the only screen (lid open): streaming it as it is, without changing it"
+            : "a monitor is attached and whenMonitorAttached is \"stream\""
+    }
+
+    /// Built-in panel or not, for each physical display online now.
+    private var physicalBuiltIn: [Bool] {
+        Self.physicalDisplays(excluding: displayID).map { CGDisplayIsBuiltin($0) != 0 }
+    }
+
+    /// The monitor mode in effect with the displays online now (GlideCore, unit-tested): the
+    /// default mirror becomes "stream" on a laptop whose only screen is its built-in panel.
+    private var monitorMode: VirtualDisplayMonitorMode { config.monitorMode(physicalBuiltIn: physicalBuiltIn) }
+
+    /// The laptop default is in effect: the built-in panel is streamed as it is, and its mode must
+    /// not be switched to fit the viewer either (DisplayModeController).
+    var streamsBuiltInAsIs: Bool { active && config.streamsBuiltInAsIs(physicalBuiltIn: physicalBuiltIn) }
 
     /// A virtual display is wanted with the displays online now: not with "stream" and a monitor.
     private var wanted: Bool {
-        VirtualDisplayTopology.wantsVirtual(mode: config.monitorMode, physicalDisplays: Self.physicalDisplays(excluding: displayID).count)
+        VirtualDisplayTopology.wantsVirtual(mode: monitorMode, physicalDisplays: Self.physicalDisplays(excluding: displayID).count)
     }
 
     /// Why a connecting viewer should get the physical display instead (nil: use the virtual one).
@@ -730,7 +748,7 @@ final class VirtualDisplayManager: @unchecked Sendable {
             let others = Self.onlineDisplays().filter { $0 != v && !Self.isGlideDisplay($0) }.map {
                 VirtualDisplayTopology.Display(id: $0, mirrorOf: CGDisplayMirrorsDisplay($0))
             }
-            for fix in VirtualDisplayLayout.reconcile(arrangement, virtual: v, streaming: lifecycle.phase == .inUse, mode: config.monitorMode, displays: others) {
+            for fix in VirtualDisplayLayout.reconcile(arrangement, virtual: v, streaming: lifecycle.phase == .inUse, mode: monitorMode, displays: others) {
                 switch fix {
                 case let .forget(p):
                     let was = arrangement
@@ -789,7 +807,7 @@ final class VirtualDisplayManager: @unchecked Sendable {
         // While hidden, the virtual display mirrors the monitor; plan as if it didn't.
         let main = mainPhysical() ?? CGMainDisplayID()
         let unhidden = displays.map { $0.id == v ? VirtualDisplayTopology.Display(id: v) : $0 }
-        switch VirtualDisplayTopology.choose(mode: config.monitorMode, makeMain: config.wantsMain, virtual: v, main: main, displays: unhidden) {
+        switch VirtualDisplayTopology.choose(mode: monitorMode, makeMain: config.wantsMain, virtual: v, main: main, displays: unhidden) {
         case .alone: return .none
         case let .mirror(p): return .mirror(physical: p)
         case let .extend(makeMain): return makeMain ? .extendMain(previousMain: main) : .none
