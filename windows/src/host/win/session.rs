@@ -12,7 +12,6 @@ use super::cursor::{self, CursorShared};
 use super::encoder::{self, Encoder};
 use super::hr;
 use super::inject::Injector;
-use crate::crypto::CryptoError;
 use crate::handshake::fingerprint;
 use crate::host::auth::Authed;
 use crate::host::input::PxRect;
@@ -142,13 +141,13 @@ fn receive(
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let mut r = &stream;
-    let mut buf = Vec::new();
+    let mut reader = crate::host::stream::RecordReader::default();
     let mut ignored: HashSet<&'static str> = HashSet::new();
     let mut dropped = 0u32;
     while !stop.load(Ordering::SeqCst) {
-        let pt = match opener.read_record(&mut r, &mut buf) {
-            Ok(pt) => pt,
-            Err(CryptoError::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+        let pt = match reader.poll(&mut r, &mut opener) {
+            Ok(Some(pt)) => pt,
+            Ok(None) => continue, // read timeout: check the stop flag; framing progress is kept
             Err(e) => {
                 if !stop.load(Ordering::SeqCst) {
                     log(&format!("session {id}: connection closed: {e}"));

@@ -177,14 +177,16 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if let Some(what) = &args.unpair {
-        let mut c = cfg;
-        let removed = c.remove(what);
+        // Locked read-modify-write: a running glide-host may be pairing at the same time.
+        let removed = match TrustStore::new(Some(cfg_path.clone()), cfg).remove(what) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("glide-host: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
         if removed.is_empty() {
             eprintln!("glide-host: no paired Mac named or keyed {what:?}");
-            return ExitCode::FAILURE;
-        }
-        if let Err(e) = c.save(&cfg_path) {
-            eprintln!("glide-host: {e}");
             return ExitCode::FAILURE;
         }
         for v in removed {

@@ -186,29 +186,62 @@ impl TrustStore {
 
     /// Pins a viewer (and saves host.json).
     pub fn add(&self, name: &str, key: &[u8; 32]) -> Result<(), String> {
-        let mut c = self.current();
-        c.add(name, key, SystemTime::now());
-        if let Some(p) = &self.path {
-            c.save(p)?;
-        }
-        *self.mem.lock().unwrap() = c;
-        Ok(())
+        self.update(|c| {
+            c.add(name, key, SystemTime::now());
+            ((), true)
+        })
     }
-}
 
-impl TrustStore {
     /// Unpairs viewers by name or key (and saves host.json); returns the removed entries.
     pub fn remove(&self, what: &str) -> Result<Vec<PairedViewer>, String> {
-        let mut c = self.current();
-        let removed = c.remove(what);
-        if !removed.is_empty() {
+        self.update(|c| {
+            let removed = c.remove(what);
+            let changed = !removed.is_empty();
+            (removed, changed)
+        })
+    }
+
+    /// Read-modify-write of host.json under an interprocess lock (`host.json.lock`), so pairing
+    /// here, the tray / console, and `glide-host --unpair` in another process never lose each
+    /// other's changes. `f` returns (result, changed); the file is written only when changed. A
+    /// host.json that can't be read is an error (never replaced with the last good copy).
+    fn update<T>(&self, f: impl FnOnce(&mut HostConfig) -> (T, bool)) -> Result<T, String> {
+        let _lock = match &self.path {
+            Some(p) => Some(lock_config(p)?),
+            None => None,
+        };
+        let mut mem = self.mem.lock().unwrap();
+        let mut c = match &self.path {
+            Some(p) => HostConfig::load(p)?,
+            None => mem.clone(),
+        };
+        let (r, changed) = f(&mut c);
+        if changed {
             if let Some(p) = &self.path {
                 c.save(p)?;
             }
-            *self.mem.lock().unwrap() = c;
         }
-        Ok(removed)
+        *mem = c;
+        Ok(r)
     }
+}
+
+/// Takes the exclusive interprocess lock that guards changes to `config` (a sidecar
+/// `<config>.lock`: LockFileEx on Windows, flock elsewhere). Released when the file is dropped.
+pub fn lock_config(config: &Path) -> Result<std::fs::File, String> {
+    if let Some(d) = config.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    let path = config.with_extension("json.lock");
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    f.lock().map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+    Ok(f)
 }
 
 /// The two confirmations a pairing needs: the PC user (dialog) and the viewer (PairConfirm).
@@ -436,6 +469,39 @@ mod tests {
         std::fs::write(&path, "{broken").unwrap();
         assert!(HostConfig::load(&path).is_err());
         assert!(!t.is_paired(&[3; 32]));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Concurrent read-modify-writes from separate stores (as separate processes would be) on
+    /// one host.json: none is lost, and a remove never brings back or drops another's entry.
+    #[test]
+    fn concurrent_updates_from_separate_stores_are_not_lost() {
+        let dir = tmpdir("trust-race");
+        let path = dir.join(CONFIG_FILE);
+        TrustStore::new(Some(path.clone()), HostConfig::default()).add("victim", &[0xEE; 32]).unwrap();
+        let mut hs = Vec::new();
+        for t in 0..8u8 {
+            let path = path.clone();
+            hs.push(std::thread::spawn(move || {
+                let store = TrustStore::new(Some(path), HostConfig::default());
+                for i in 0..10u8 {
+                    store.add(&format!("mac-{t}-{i}"), &[t * 16 + i + 1; 32]).unwrap();
+                }
+                if t == 0 {
+                    store.remove("victim").unwrap();
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        let c = HostConfig::load(&path).unwrap();
+        assert_eq!(c.paired_viewers.len(), 80, "lost updates: {:?}", c.paired_viewers.iter().map(|v| &v.name).collect::<Vec<_>>());
+        assert!(!c.is_paired(&[0xEE; 32]), "a removed key came back");
+        // A corrupt host.json is refused, not replaced.
+        std::fs::write(&path, "{broken").unwrap();
+        assert!(TrustStore::new(Some(path.clone()), HostConfig::default()).add("x", &[1; 32]).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
         let _ = std::fs::remove_dir_all(&dir);
     }

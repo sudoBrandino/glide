@@ -3,7 +3,7 @@
 //! session (ServerHello + Pong only, no capture or input; runs on any OS).
 
 use super::auth::Authed;
-use crate::crypto::Sealer;
+use crate::crypto::{CryptoError, Opener, Sealer, MAX_RECORD, MIN_RECORD};
 use crate::net::Sender;
 use crate::protocol::{ClientMsg, Codec, HostMsg, VideoConfig};
 use std::io::Read;
@@ -115,6 +115,50 @@ pub fn sender(stream: &TcpStream, sealer: Sealer) -> std::io::Result<Sender> {
     Ok(Sender::with_writer(Box::new(w), Some(closer), sealer))
 }
 
+/// Reads records from a socket that has a read timeout (so the caller can poll a stop flag)
+/// without losing framing: bytes of a partly received length prefix or body are kept across
+/// timeouts, and only complete records are decrypted.
+#[derive(Default)]
+pub struct RecordReader {
+    buf: Vec<u8>,
+    filled: usize,
+}
+
+impl RecordReader {
+    /// The next record's plaintext; `Ok(None)` when the read timed out (state kept, call again).
+    pub fn poll<R: Read>(&mut self, r: &mut R, opener: &mut Opener) -> Result<Option<Vec<u8>>, CryptoError> {
+        loop {
+            let want = if self.filled < 4 {
+                4
+            } else {
+                let n = u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
+                if !(MIN_RECORD..=MAX_RECORD).contains(&n) {
+                    return Err(CryptoError::BadRecordLength(n));
+                }
+                4 + n
+            };
+            if want > 4 && self.filled == want {
+                self.filled = 0;
+                let pt = opener.open(&self.buf[4..want]);
+                if self.buf.len() > 1 << 20 {
+                    self.buf = Vec::new(); // don't keep a huge buffer after one large record
+                }
+                return pt.map(Some);
+            }
+            if self.buf.len() < want {
+                self.buf.resize(want, 0);
+            }
+            match r.read(&mut self.buf[self.filled..want]) {
+                Ok(0) => return Err(CryptoError::Io(std::io::ErrorKind::UnexpectedEof.into())),
+                Ok(k) => self.filled += k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Ok(None),
+                Err(e) => return Err(CryptoError::Io(e)),
+            }
+        }
+    }
+}
+
 /// One streaming session at a time: a newly authenticated viewer replaces the current one
 /// (like the Mac host). `enter` stops the previous session and waits until it has released
 /// capture and input.
@@ -130,15 +174,24 @@ struct SlotState {
 }
 
 impl SessionSlot {
-    /// Takes the slot for session `id`; returns its stop flag. Blocks (at most `wait`) until the
-    /// previous holder called `leave`.
+    /// Takes the slot for session `id`; returns its stop flag. Stops whoever holds the slot and
+    /// waits (at most `wait` in all) until it called `leave`. Replacements are serialized: when
+    /// several wait at once, each one that finds another (newer) holder stops that one too, so
+    /// after a timeout the slot is only ever taken from a session whose stop flag is set.
     pub fn enter(&self, id: u64, wait: Duration) -> Arc<AtomicBool> {
-        let g = self.state.lock().unwrap();
-        if let Some((old, stop)) = &g.current {
-            super::log(&format!("session {id} replaces session {old}"));
-            stop.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + wait;
+        let mut g = self.state.lock().unwrap();
+        while let Some((old, stop)) = g.current.clone() {
+            if !stop.swap(true, Ordering::SeqCst) {
+                super::log(&format!("session {id} replaces session {old}"));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                super::log(&format!("session {old} didn't stop in time; session {id} takes over"));
+                break;
+            }
+            g = self.freed.wait_timeout_while(g, deadline - now, |s| s.current.as_ref().is_some_and(|(c, _)| *c == old)).unwrap().0;
         }
-        let (mut g, _) = self.freed.wait_timeout_while(g, wait, |s| s.current.is_some()).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         g.current = Some((id, stop.clone()));
         stop
@@ -175,13 +228,11 @@ pub fn run_test_session(a: Authed, host_name: &str, stop: Arc<AtomicBool>) {
     super::log(&format!("session {conn_id}: TEST MODE: sent ServerHello only"));
     let mut r = &stream;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let mut buf = Vec::new();
+    let mut reader = RecordReader::default();
     while !stop.load(Ordering::SeqCst) {
-        let pt = match opener.read_record(&mut r, &mut buf) {
-            Ok(pt) => pt,
-            Err(crate::crypto::CryptoError::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                continue;
-            }
+        let pt = match reader.poll(&mut r, &mut opener) {
+            Ok(Some(pt)) => pt,
+            Ok(None) => continue,
             Err(e) => {
                 super::log(&format!("session {conn_id}: closed: {e}"));
                 break;
@@ -284,5 +335,108 @@ mod tests {
         slot.leave(2);
         let s3 = slot.enter(3, Duration::from_millis(10));
         assert!(!s3.load(Ordering::SeqCst));
+    }
+
+    /// Two sessions replace the current one at the same time: the slot ends with exactly one
+    /// live (not stopped) session, and it is the one holding the slot.
+    #[test]
+    fn concurrent_replacements_leave_one_live_session() {
+        let slot = Arc::new(SessionSlot::default());
+        // A session leaves the slot 50 ms after it is told to stop.
+        let run = |slot: Arc<SessionSlot>, id: u64, stop: Arc<AtomicBool>| {
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                slot.leave(id);
+            })
+        };
+        let s1 = slot.enter(1, Duration::from_secs(1));
+        let mut threads = vec![run(slot.clone(), 1, s1)];
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let entering: Vec<_> = [2u64, 3]
+            .into_iter()
+            .map(|id| {
+                let (slot, barrier) = (slot.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (id, slot.enter(id, Duration::from_millis(600)))
+                })
+            })
+            .collect();
+        let entered: Vec<(u64, Arc<AtomicBool>)> = entering.into_iter().map(|h| h.join().unwrap()).collect();
+        let live: Vec<u64> = entered.iter().filter(|(_, s)| !s.load(Ordering::SeqCst)).map(|(id, _)| *id).collect();
+        let current = slot.state.lock().unwrap().current.as_ref().map(|(id, _)| *id);
+        assert_eq!(live.len(), 1, "live sessions {live:?}, slot holder {current:?}");
+        assert_eq!(current, Some(live[0]));
+        for (id, s) in entered {
+            threads.push(run(slot.clone(), id, s));
+        }
+        slot.stop_current();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert!(slot.state.lock().unwrap().current.is_none());
+    }
+
+    /// A reader that returns the script's chunks in order (`Err` = that error kind).
+    struct Script(std::collections::VecDeque<Result<Vec<u8>, std::io::ErrorKind>>);
+    impl Read for Script {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front() {
+                None => Ok(0),
+                Some(Err(k)) => Err(k.into()),
+                Some(Ok(mut c)) => {
+                    let n = c.len().min(out.len());
+                    out[..n].copy_from_slice(&c[..n]);
+                    if n < c.len() {
+                        self.0.push_front(Ok(c.split_off(n)));
+                    }
+                    Ok(n)
+                }
+            }
+        }
+    }
+
+    /// Read timeouts in the middle of a length prefix or a body don't lose framing.
+    #[test]
+    fn record_reader_keeps_framing_across_timeouts() {
+        let key = [7u8; 32];
+        let mut sealer = Sealer::new(&key);
+        let msgs: Vec<Vec<u8>> = vec![b"one".to_vec(), vec![0xAB; 3000], b"three".to_vec()];
+        let wire: Vec<u8> = msgs.iter().flat_map(|m| sealer.seal(m)).collect();
+        // 1–3 byte chunks with a timeout (and an EINTR) after every chunk.
+        let mut script = std::collections::VecDeque::new();
+        let mut i = 0;
+        let mut n = 1;
+        while i < wire.len() {
+            let end = (i + n).min(wire.len());
+            script.push_back(Ok(wire[i..end].to_vec()));
+            script.push_back(Err(if n == 2 { std::io::ErrorKind::Interrupted } else { std::io::ErrorKind::TimedOut }));
+            script.push_back(Err(std::io::ErrorKind::WouldBlock));
+            i = end;
+            n = n % 3 + 1;
+        }
+        let mut r = Script(script);
+        let mut opener = Opener::new(&key);
+        let mut reader = RecordReader::default();
+        let mut got = Vec::new();
+        let mut timeouts = 0;
+        loop {
+            match reader.poll(&mut r, &mut opener) {
+                Ok(Some(pt)) => got.push(pt),
+                Ok(None) => timeouts += 1,
+                Err(CryptoError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(got, msgs);
+        assert!(timeouts > 100);
+        // A bad length prefix is an error, not a hang.
+        let mut r = Script(vec![Ok(vec![1, 0]), Err(std::io::ErrorKind::TimedOut), Ok(vec![0, 0])].into());
+        let mut reader = RecordReader::default();
+        assert!(matches!(reader.poll(&mut r, &mut opener), Ok(None)));
+        assert!(matches!(reader.poll(&mut r, &mut opener), Err(CryptoError::BadRecordLength(1))));
     }
 }

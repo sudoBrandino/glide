@@ -312,6 +312,8 @@ fn accept_inner(s: &TcpStream, peer: IpAddr, ctx: &HostCtx, id: u64) -> Result<A
             }
             Claim::Granted => {}
         }
+        // Frees the pairing slot on every exit from here on (errors, `?`, panics).
+        let mut slot = PairingSlotGuard { window: &ctx.window, id, paired: false };
         let code = sas_text(sas_code(&est.handshake_hash, &info.nonce, &n_h));
         super::log(&format!("conn {id}: pairing with “{name}” ({fp}) at {peer}; code {code}"));
         let req = PairRequest {
@@ -321,22 +323,18 @@ fn accept_inner(s: &TcpStream, peer: IpAddr, ctx: &HostCtx, id: u64) -> Result<A
             host_fingerprint: ctx.identity.fingerprint(),
             peer: peer.to_string(),
         };
-        let r = pairing(s, ctx, id, req, &mut sealer, opener, n_h);
-        match r {
-            Ok(o) => {
-                opener = o;
-                ctx.trust.add(&name, &vkey).map_err(|e| err(format!("cannot save host.json: {e}")))?;
-                ctx.window.release(id, true);
-                super::log(&format!("conn {id}: paired viewer “{name}” ({fp})"));
-                send(s, &mut sealer, &HostMsg::AuthResult { code: AUTH_OK })?;
-                paired_now = true;
-                hello_until = Instant::now() + ctx.preauth_timeout;
-            }
-            Err(f) => {
-                ctx.window.release(id, false);
-                return Err(f);
-            }
+        // The slot guard releases the claim if this (or anything below) fails.
+        opener = pairing(s, ctx, id, req, &mut sealer, opener, n_h)?;
+        if let Err(e) = ctx.trust.add(&name, &vkey) {
+            super::log(&format!("conn {id}: cannot save host.json, so “{name}” is not paired: {e}"));
+            return Err(reject(&mut sealer, AUTH_DECLINED));
         }
+        slot.paired = true;
+        drop(slot);
+        super::log(&format!("conn {id}: paired viewer “{name}” ({fp})"));
+        send(s, &mut sealer, &HostMsg::AuthResult { code: AUTH_OK })?;
+        paired_now = true;
+        hello_until = Instant::now() + ctx.preauth_timeout;
     } else if !ctx.trust.is_paired(&vkey) {
         super::log(&format!("conn {id}: rejected unknown viewer “{name}” ({fp}) from {peer}"));
         return Err(reject(&mut sealer, AUTH_UNKNOWN_VIEWER));
@@ -349,6 +347,19 @@ fn accept_inner(s: &TcpStream, peer: IpAddr, ctx: &HostCtx, id: u64) -> Result<A
         }
         Ok(m) => Err(err(format!("expected ClientHello, got {}", short(&m)))),
         Err(e) => Err(err(format!("bad message instead of ClientHello: {e}"))),
+    }
+}
+
+/// Releases connection `id`'s claim on the pairing window when dropped; `paired` closes the window.
+struct PairingSlotGuard<'a> {
+    window: &'a PairingWindow,
+    id: u64,
+    paired: bool,
+}
+
+impl Drop for PairingSlotGuard<'_> {
+    fn drop(&mut self) {
+        self.window.release(self.id, self.paired);
     }
 }
 
@@ -636,6 +647,30 @@ mod tests {
         assert_eq!(out.err(), Some(Failure::Rejected(AUTH_DECLINED)));
         assert!(!ctx.trust.is_paired(&viewer.public()));
         assert!(ctx.window.is_open(Instant::now()), "a failed pairing leaves the window open");
+    }
+
+    /// host.json can't be saved: the viewer is told no, and the pairing slot is freed (the next
+    /// pairing attempt is not answered with AUTH_BUSY).
+    #[test]
+    fn save_failure_frees_the_pairing_slot() {
+        let blocker = std::env::temp_dir().join(format!("glide-host-savefail-{}-{:?}", std::process::id(), thread::current().id()));
+        std::fs::write(&blocker, b"a file, not a folder").unwrap();
+        let s = Arc::new(Script { answer: Some(true), delay: Duration::from_millis(50), asked: Mutex::new(vec![]) });
+        let trust = TrustStore::new(Some(blocker.join("host.json")), HostConfig::default());
+        let ctx = Arc::new(HostCtx::new(Identity::generate(), trust, s.clone()));
+        ctx.open_pairing(Duration::from_secs(120));
+        let viewer = Identity::generate();
+        let (r, out) = run(&ctx, &viewer_auth(&viewer, None, TestUi::new(true)));
+        assert!(r.is_err());
+        assert_eq!(out.err(), Some(Failure::Rejected(AUTH_DECLINED)));
+        assert_eq!(ctx.window.claim(12345, Instant::now()), Claim::Granted, "the pairing slot stayed held");
+        ctx.window.release(12345, false);
+        // A second attempt (past the failure backoff) reaches the PC prompt again, not AUTH_BUSY.
+        *ctx.backoff.lock().unwrap() = Backoff::default();
+        let (_, out) = run(&ctx, &viewer_auth(&Identity::generate(), None, TestUi::new(true)));
+        assert_eq!(out.err(), Some(Failure::Rejected(AUTH_DECLINED)));
+        assert_eq!(s.asked.lock().unwrap().len(), 2);
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]
