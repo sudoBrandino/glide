@@ -24,7 +24,7 @@ func instanceRoleTests() {
     check(decide(same) == .showRunning, "opened by hand, same app running -> show its window")
     check(decide(same, path: me + "/") == .showRunning, "same app, path spelled with a trailing slash")
     check(decide(old) == .installer, "opened by hand, old version at the same path (replaced on disk) -> installer")
-    check(decide(.init(version: token, agent: false, path: "/Users/x/Downloads/Glide Host.app")) == .installer, "same version, another copy -> installer")
+    check(decide(.init(version: token, agent: false, path: "/Users/you/Downloads/Glide Host.app")) == .installer, "same version, another copy -> installer")
     check(decide(nil) == .installer, "opened by hand, a host too old to say -> installer")
     check(decide(launchd: true, old) == .askHandoff, "login item, host opened by hand -> ask it to hand over")
     check(decide(launchd: true, .init(version: "0.2.0", agent: true, path: me)) == .waitThenExit, "login item, another launchd job -> wait and exit")
@@ -34,7 +34,7 @@ func instanceRoleTests() {
 /// Installing over a running host ends with exactly one host: the new version.
 func installPlanTests() {
     print("host install / takeover:")
-    let app = "/Applications/Glide Host.app", dl = "/Users/x/Downloads/Glide Host.app"
+    let app = "/Applications/Glide Host.app", dl = "/Users/you/Downloads/Glide Host.app"
     check(HostInstance.installPlan(destination: app, bundlePath: app, otherHostRunning: true) == .restartInPlace,
           "dragged over the running host's app -> restart in place (no copy, no 'already installed' error)")
     check(HostInstance.installPlan(destination: app, bundlePath: app + "/", otherHostRunning: true) == .restartInPlace, "in place, path normalized")
@@ -45,7 +45,7 @@ func installPlanTests() {
     let id = "io.github.sudobrandino.glide.host"
     check(HostInstance.keepsAgent(label: id, program: app + "/Contents/MacOS/glide-host", bundleID: id, installedApp: app),
           "the script's LaunchAgent for the installed copy is kept (it starts the new version)")
-    check(!HostInstance.keepsAgent(label: id, program: "/Users/x/Applications/Glide Host.app/Contents/MacOS/glide-host", bundleID: id, installedApp: app),
+    check(!HostInstance.keepsAgent(label: id, program: "/Users/you/Applications/Glide Host.app/Contents/MacOS/glide-host", bundleID: id, installedApp: app),
           "a LaunchAgent starting another copy is removed")
     check(!HostInstance.keepsAgent(label: "com.example.glide.host", program: app + "/Contents/MacOS/glide-host", bundleID: id, installedApp: app),
           "a LaunchAgent under an earlier bundle id is removed")
@@ -78,7 +78,7 @@ func installPlanTests() {
           "an old host that won't die -> fail (it keeps running, error shown)")
     check(run(launchd: true, [(0, old), (0.25, .nothing), (3, old), (3.25, .nothing), (7.5, .nothing), (8, new)]) == [.showNew],
           "the gone-timer restarts if a host shows up again")
-    check(run(launchd: false, [(0, .host(.init(version: token, agent: false, path: "/Users/x/Glide Host.app"))), (4, .host(.init(version: token, agent: false, path: "/Users/x/Glide Host.app")))]) == [.forceQuit],
+    check(run(launchd: false, [(0, .host(.init(version: token, agent: false, path: "/Users/you/Glide Host.app"))), (4, .host(.init(version: token, agent: false, path: "/Users/you/Glide Host.app")))]) == [.forceQuit],
           "the same version from another path is not the new host")
     check(run(launchd: true, [(0, old), (0.25, .nothing), (4.5, .host(nil)), (4.6, new)]) == [.showNew],
           "a host answering before it can say what it is (after the old one went) is not terminated")

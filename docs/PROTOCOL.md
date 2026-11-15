@@ -21,7 +21,9 @@ listen and dial at the same time, and whichever direction the network allows con
 - The **host** listens (port 7420). Once it knows the viewer's address
   (`glide-host --connect VIEWER[:PORT]`, `connect` in host.json, or its setup window) it also
   dials it, redialing every 2 s while disconnected (backing off to 60 s while the viewer keeps
-  refusing it, see §2.5). Its dialer stays idle while a viewer that dialed in is connected.
+  refusing it, see §2.5). Its dialer stays idle while a viewer that dialed in is connected, and
+  while it has no paired viewer and the pairing window is closed (opening the window dials at
+  once).
   `"listen": false` (or `--no-listen`) with a viewer address turns listening off.
 - The **viewer** given the host's address (command line or config `host`) dials it and also
   listens (config `accept_incoming`, default on; `--no-listen` = dial only). Without an address
@@ -188,13 +190,21 @@ Reference bytes: `AuthResult{1}` = `08 01`, `PairConfirm{1}` = `0a 01`, `PairRev
 - **Viewer identity:** `identity.dpapi` next to `config.json` (DPAPI `CryptProtectData`, current
   user, extra entropy). Created on first use; an undecryptable file is an error, not replaced.
 - **Viewer pins:** `config.json` `"pinned_hosts": {target: {"key", "name", "paired"}}` where
-  `target` is `host:port` (lowercase, default port added) when dialing or `listen:PORT` in listen
-  mode. Tray *Forget host (unpair)…* or `--forget-host` removes it.
+  `target` is `host:port` (lowercase, default port added) when the viewer knows the host's address
+  (for connections in both directions), or `listen:PORT` in listen-only mode; with an address and
+  no pin under it, a `listen:PORT` pin is used and copied to the address. Tray *Forget host
+  (unpair)…* or `--forget-host` removes it.
 
 Rules:
 
 1. Viewer, after msg2: if a key is pinned for the target and differs → abort before msg3
-   ("HOST KEY CHANGED"). Unpinned → msg3 with the pair request bit.
+   ("HOST KEY CHANGED"). Unpinned → msg3 with the pair request bit, but only if msg2 says the
+   host's pairing window is open; otherwise the viewer closes without msg3 and says to open
+   *Pair New Viewer* on the Mac. A viewer that did not dial (the host connected to it) accepts a
+   pairing only during its **inbound pairing window**: 15 minutes from start, from opening or
+   closing its setup dialog, from *Forget host*, or from the tray's *Allow the Mac to pair*; one
+   successful pairing closes it. Outside it, an unpinned inbound connection is closed after msg2
+   with no prompt.
 2. Viewer pair request bit = no pin for this target, **or** the host answered AuthResult 1 earlier
    in this process (it forgot us): then pairing runs again, still requiring the pinned host key.
 3. Host, after msg3: pair request → pairing (§2.4) if the window is open (else 2, or 5 if busy).
@@ -232,7 +242,11 @@ to the users. (Same structure as ZRTP's hash commitment / Bluetooth numeric comp
 
 **Confirmation.** The viewer shows a dialog with the code and both key fingerprints
 (fingerprint = first 8 bytes of SHA-256(public key) in hex, `aaaa bbbb cccc dddd`) and buttons
-*Codes Match — Pair* / *Cancel*. The Mac confirms either in a menu-bar alert (same buttons) or by
+*Codes Match — Pair* / *Cancel*. On both sides **Cancel is the default** (Return/Escape), the
+confirm button is enabled only 1 s after the prompt appears, and the prompt does not take keyboard
+focus from another app (the viewer flashes its taskbar button; the Mac alert floats on top). The
+viewer's prompt names the address the connection actually came from. The Mac confirms either in a
+menu-bar alert (same buttons) or by
 **typing** the code the PC shows (`glide-host --pair` in a terminal, or `glide-host --pair-code
 NNNNNN`); a typed code is compared by the host, so a mismatch declines (AuthResult 3).
 
@@ -255,10 +269,22 @@ refused with HostPreamble status 3 for 1 s, doubling to 60 s; a successful sessi
 and opening the pairing window clears all of it (the viewer being paired may have been refused a
 moment ago). When the host dials out, its redial interval backs off the same way (2 s → 60 s)
 while the viewer keeps refusing it, and opening the pairing window redials immediately.
-The viewer's listen mode keeps its own backoff and IP allowlist (`allowed_peers`, TOFU-pinned
-IP; `windows/src/peers.rs`) in front of the handshake.
+Sessions the host dialed are never charged to the inbound limiter (its own failed dials must not
+refuse the viewer when it dials in).
 
-Rejections are logged; the host's menu shows the last one ("Rejected unknown viewer “X” (ip)",
+The viewer keeps its own per-address backoff and IP allowlist (`allowed_peers`, TOFU-pinned IP;
+`windows/src/peers.rs`) in front of the handshake for connections it accepts. Answers that prove
+a real host (AuthResult 1, 2 and 5), the viewer declining to pair because the host's window is
+closed, and a connection closed before the host sent a byte (left over in the accept queue) are
+not counted; handshake errors, timeouts, key mismatches and AuthResult 3/4 are. If `allowed_peers`
+holds only the TOFU-pinned IP and a host key is pinned, a connection from a new address (the Mac
+got a new DHCP lease) is still admitted, under a stricter backoff, and must present the pinned
+key before msg3; after an authenticated session the pin moves to the new address. A CIDR entry or
+several entries keep the strict allowlist. Refusals show in the viewer's status line.
+
+Rejections are logged (before authentication through a per-address limiter: routine connection
+lines and security events such as unknown viewers or pair requests have separate budgets, with a
+summary of what was suppressed); the host's menu shows the last one ("Rejected unknown viewer “X” (ip)",
 with a repeat count). No dialog appears for them.
 
 ### 2.6 Version detection
