@@ -426,6 +426,10 @@ pub fn accept_admitted_within(
             }
             Err(e) => {
                 let e = match e {
+                    // The deadline fired and shut the socket down: whatever the read reports (a
+                    // timeout on macOS/Windows, end of file on Linux, which would read as "v1
+                    // host"), the peer was too slow. Always a failed attempt.
+                    _ if timed_out => ConnectError::Protocol(format!("handshake timed out after {deadline:?}")),
                     // Not the address pinned for the Mac and not its key: just some other host,
                     // not a reason for a "HOST KEY CHANGED" alarm.
                     ConnectError::HostKeyChanged { presented, .. } if roaming => ConnectError::Protocol(format!(
