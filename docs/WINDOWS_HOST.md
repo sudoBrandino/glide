@@ -29,6 +29,19 @@ Capabilities the programs don't implement are simply not advertised (`codec_caps
 `ClipboardCaps`, `FileCaps`), so the existing negotiation keeps each side from sending what the
 other can't handle.
 
+## Known limits on the Windows host
+
+- **Secure desktop:** UAC prompts and the lock screen can't be seen or controlled. Capturing them
+  needs a service running as SYSTEM; the host logs and retries until the normal desktop returns.
+- **Elevated windows:** Windows blocks input to windows running as administrator unless
+  `glide-host.exe` itself runs elevated.
+- **Primary display only**, and whole frames are encoded when the screen changes (no dirty-rect
+  patches yet).
+- Cursor shapes are scaled to encoded pixels, as the Mac host does.
+
+See [`windows/README.md`](../windows/README.md) for `glide-host.exe` flags, the tray menu and the
+console commands.
+
 ## Ports
 
 The Windows host listens on **TCP 7421** by default, not 7420. A PC that also runs the Windows

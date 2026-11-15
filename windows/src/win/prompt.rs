@@ -52,6 +52,7 @@ pub struct PairText {
 
 struct Ctx {
     t: PairText,
+    title: String,
     cancel: Arc<AtomicBool>,
     answer: bool,
     icons: Vec<HICON>,
@@ -77,10 +78,15 @@ pub fn app_icon(size: i32) -> Option<HICON> {
 /// Returns Ok(false) on Cancel or when `cancel` is set (the host ended the pairing).
 /// Err if the dialog resource is missing.
 pub fn ask_pairing(owner: Option<HWND>, t: PairText, cancel: Arc<AtomicBool>) -> Result<bool, String> {
+    ask_pairing_titled(owner, t, cancel, "Glide — Pair with Mac")
+}
+
+/// `ask_pairing` with another window title (the Windows host's prompt pairs with a Mac viewer).
+pub fn ask_pairing_titled(owner: Option<HWND>, t: PairText, cancel: Arc<AtomicBool>, title: &str) -> Result<bool, String> {
     if cancel.load(Ordering::SeqCst) {
         return Ok(false);
     }
-    let mut ctx = Ctx { t, cancel, answer: false, icons: Vec::new(), font: None };
+    let mut ctx = Ctx { t, title: title.to_string(), cancel, answer: false, icons: Vec::new(), font: None };
     let r = unsafe {
         let hinst = GetModuleHandleW(None).map_err(|e| e.to_string())?;
         DialogBoxParamW(Some(HINSTANCE(hinst.0)), PCWSTR(IDD_PAIR as usize as *const u16), owner, Some(dlg_proc), LPARAM(&mut ctx as *mut Ctx as isize))
@@ -128,7 +134,7 @@ unsafe extern "system" fn dlg_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         WM_INITDIALOG => {
             SetWindowLongPtrW(h, GWLP_USERDATA, lp.0);
             let ctx = &mut *(lp.0 as *mut Ctx);
-            let _ = SetWindowTextW(h, PCWSTR(wide("Glide — Pair with Mac").as_ptr()));
+            let _ = SetWindowTextW(h, PCWSTR(wide(&ctx.title).as_ptr()));
             let _ = SetDlgItemTextW(h, IDC_PAIR_TEXT, PCWSTR(wide(&ctx.t.text).as_ptr()));
             let _ = SetDlgItemTextW(h, IDC_PAIR_CODE, PCWSTR(wide(&ctx.t.code).as_ptr()));
             let _ = SetDlgItemTextW(h, IDC_PAIR_DETAIL, PCWSTR(wide(&ctx.t.detail).as_ptr()));

@@ -14,6 +14,9 @@ are native:
   swap chain, raw keyboard and mouse capture, and the host cursor shown as the native Windows
   cursor.
 
+**New (preview):** the reverse direction, a Mac controlling a Windows PC, with `glide-host.exe`
+on the PC and `glide-viewer` on the Mac. See [`docs/WINDOWS_HOST.md`](docs/WINDOWS_HOST.md).
+
 ## Why
 
 General-purpose remote desktops trade text sharpness for motion, or the other way round. Glide
@@ -46,6 +49,8 @@ Glide is a young project that its author uses daily on one hardware pair (Apple 
 NVIDIA-GPU Windows PC). It works well there and has had little testing elsewhere.
 
 - **Supported:** macOS 14+ on Apple silicon as the host, Windows 10/11 x64 as the viewer.
+- **Preview:** Windows 10/11 x64 as the host with macOS 14+ as the viewer (video, input and
+  cursor only so far; not yet tested on real hardware).
 - **Not supported:** any other host or viewer platform, and more than one viewer at a time.
 - **LAN only.** There is no relay or NAT traversal, and the transport is TCP. Either side may
   start the connection (both listen and dial), so one allowed direction between two network
@@ -68,6 +73,7 @@ See the feature table below and [`docs/ROADMAP.md`](docs/ROADMAP.md) for what is
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Pipelines, hybrid/canvas model, threading |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | What's done and what's next |
 | [`docs/LATENCY.md`](docs/LATENCY.md) | Latency breakdown, glass-to-glass test, tuning results |
+| [`docs/WINDOWS_HOST.md`](docs/WINDOWS_HOST.md) | The reverse direction: controlling a Windows PC from a Mac (preview) |
 | [`docs/VIRTUAL_DISPLAY.md`](docs/VIRTUAL_DISPLAY.md) | The virtual display Glide streams by default: behavior, measured macOS findings, opt-out, self-test |
 | [`windows/README.md`](windows/README.md) | Viewer reference: all flags, env vars, headless modes |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to build, test and send changes |

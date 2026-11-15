@@ -16,6 +16,15 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ## [Unreleased]
 
+### Added
+
+- **Control a Windows PC from a Mac (preview).** Glide now works in the other direction too: run
+  `glide-host.exe` on the PC and `glide-viewer` on the Mac. It pairs the same way (a 6-digit code
+  confirmed on both screens) and streams hardware H.264/HEVC with keyboard, mouse and the PC's
+  cursor. Command, Control and Option on the Mac map to Control, Windows and Alt on the PC. The PC
+  listens on port 7421, so it can run next to the existing viewer. Audio, clipboard, file transfer
+  and the sharp 4:4:4 layer are not in this direction yet. See `docs/WINDOWS_HOST.md`.
+
 ## [0.3.1] - 2026-11-15
 
 Fixes from a fresh-install test on a MacBook. Protocol version 2 (unchanged). Screen Recording and

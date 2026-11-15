@@ -19,6 +19,7 @@ The wire protocol is defined in `../docs/PROTOCOL.md`.
 | `src/annexb.rs`, `src/bench.rs` | Annex-B access-unit splitting, and the headless benchmark driver. |
 | `src/setup.rs` | Setup logic, platform independent: install folder, "offer to install?", Mac address check and port test, this PC's address, the firewall PowerShell (check + elevated allow). |
 | `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain, text panels), `app` (window, input, cursor, fullscreen, hotkeys, the session loop incl. both mode), `clipboard` (clipboard listener/apply), `files` (drag & drop, notifications, open folder), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`, `dpapi` (identity key encryption), `prompt` (pairing dialog), `setup` (setup dialog, self-install, firewall, start at sign-in), `placement` (monitors), `tray`. |
+| `src/host/`, `src/bin/glide-host.rs` | **glide-host.exe**, the Windows host (a Mac controls this PC, see below). Platform independent and unit-tested: `trust` (host.json, pairing window, host key), `auth` (host side of the handshake, pairing, rate limiting; tested end to end against the viewer's `net::Connection`), `stream` (validated viewer messages), `input` (HID → scancode, wheel, absolute mouse), `video` (sizes, codec, bitrate, Annex-B, cursor bitmaps). Windows only, `src/host/win/`: `capture` (DXGI Desktop Duplication), `convert` (D3D11 video processor, BGRA → NV12), `encoder` (Media Foundation H.264/HEVC MFT), `inject` (SendInput), `cursor`, `confirm` (pairing dialog), `tray`, `session`. |
 | `res/`, `build.rs` | Icon, manifest (themed controls, PerMonitorV2), pairing dialog and version info, linked into the exe: MinGW `windres` for the GNU target, `rc.exe` (via `embed-resource`) for MSVC. Regenerate the icon with `../tools/make_icon.py`. |
 | `assets/` | Small clips embedded in the exe for `--probe`. Regenerate them with `../tools/make_streams.sh --clips-only`. |
 
@@ -349,6 +350,62 @@ With the default config and no address this listens on port 7420. Then pair: on 
   - `GLIDE_TEST_SEND_FILES=C:\a.bin;C:\folder` sends these to the host once it sent `FileCaps` (drag & drop can't be scripted over SSH). Point `download_dir` into a test folder (config in `GLIDE_CONFIG_DIR`).
   - `GLIDE_PAIR_CONFIRM=yes|no` answers the pairing dialog once its confirm button is enabled (about 1.3 s; and the `--bench` console prompt); `GLIDE_PROMPT_DUMP=x.bmp` captures the dialog first.
   - `GLIDE_NO_TRAY=1` skips the tray icon.
+
+## glide-host.exe: control this PC from a Mac
+
+`glide-host.exe` is the reverse direction (`../docs/WINDOWS_HOST.md`): the PC is the **host** (Noise responder)
+and a Mac running Glide Viewer controls it. Same wire protocol (`../docs/PROTOCOL.md`), fast mode only:
+hardware H.264, or HEVC when the viewer decodes it, 4:2:0, keyboard, mouse, wheel, cursor shape and position,
+Ping/Pong. Not yet: hybrid/sharp 4:4:4, audio, clipboard, file transfer, display picker, input extensions
+(none of them is advertised), dial-out (the host only listens).
+
+```
+glide-host.exe [--port N] [--bind ADDR] [--pair] [--name NAME] [--bitrate KBPS] [--test-mode]
+glide-host.exe --paired | --unpair NAME|KEY | --identity | --version
+```
+
+| flag | |
+|---|---|
+| `--port N` | TCP port (default **7421**, so it doesn't collide with the viewer's 7420; host.json `"port"`) |
+| `--bind ADDR` | listen address (default `0.0.0.0` and `[::]`; host.json `"bind"`) |
+| `--pair` | open the pairing window for 2 minutes at start |
+| `--name NAME` | name shown on the Mac (default the computer name; host.json `"name"`) |
+| `--bitrate KBPS` | fixed bitrate (default automatic: about 0.13 bit/pixel/frame, ≈ 29 Mbps H.264 at 1440p60, 6–80 Mbps) |
+| `--test-mode` | handshake + ServerHello + Pong only: no capture, no input (diagnostics; also runs on Linux/macOS) |
+| `--paired` / `--unpair NAME\|KEY` | list / remove paired Macs and exit (a running host ends that Mac's session within 2 s) |
+| `--identity` | print this PC's key fingerprint and exit |
+
+**Pairing.** Open the pairing window (tray icon → *Pair New Mac…*, type `pair` in the console, or start with
+`--pair`), then connect from the Mac. The PC shows the 6-digit code, both key fingerprints and the Mac's address
+in the pairing dialog (Cancel is the default; *Codes Match — Pair* is enabled after 1 s); the Mac shows the same
+code. Both users must confirm within 60 s. Without an interactive desktop (SSH) the console asks instead: type
+the code the Mac shows, or `no`. One successful pairing closes the window.
+
+**While running.** Tray icon: *Pair New Mac…*, *Paired Macs* ▸ *Remove…*, *Open config file*, *Quit Glide
+Host*. Console commands: `pair`, `paired`, `unpair NAME|KEY`, `quit`. Logs go to the console (stderr). One
+session at a time; a newly authenticated Mac replaces the current one. Failed handshakes and rejected viewers
+back off per address (1 s doubling to 60 s, HostPreamble status 3); opening the pairing window clears that.
+
+**Files.** `%APPDATA%\Glide\host.json` (`pairedViewers` `[{name, key, paired}]`, `port`, `bind`, `name`; other
+keys are kept) and `%APPDATA%\Glide\host-identity.dpapi` (this PC's X25519 key, DPAPI current user; an
+unreadable file is an error, never replaced: delete it to make the PC a new, unpaired host). `GLIDE_CONFIG_DIR`
+uses another folder.
+
+**Pipeline.** DXGI Desktop Duplication of the primary monitor (re-created after `DXGI_ERROR_ACCESS_LOST`) → our
+own BGRA copy → D3D11 video processor scales to the encoded size (width ≤ min(monitor, viewer `view_w`, 3840),
+aspect kept, even) and converts to NV12 BT.709 limited → Media Foundation encoder MFT (hardware first, on the
+capture GPU; the Microsoft software MFT as fallback), low-latency, no B-frames, CBR, keyframes on demand, Annex-B
+with parameter sets in-band. Frames go out only when the screen changes (or on a keyframe request / new
+configuration), at most the viewer's `max_fps`, one at a time. `VideoConfig.scale` is the monitor's DPI scale.
+Input uses SendInput (scancodes; absolute mouse over the captured monitor; X buttons; wheel in 1/120 notches).
+The cursor is polled at ~120 Hz and sent as shape (cached per cursor handle) + position. The process is
+per-monitor-DPI aware.
+
+**Limits.** A normal user process can't see or control the **secure desktop**: UAC prompts, the lock screen and
+the sign-in screen. While one is up the stream pauses (capture fails with an access error) and input is ignored;
+glide-host logs it, retries every 0.5 s and resumes on its own. Input into windows of elevated programs is also
+blocked unless glide-host runs elevated. Windows Firewall must allow inbound TCP 7421 (Private network). Not yet
+tested on real hardware: rotated monitors, every vendor's encoder MFT.
 
 ## Testing without the Mac host
 
