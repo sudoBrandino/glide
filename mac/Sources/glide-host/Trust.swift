@@ -113,6 +113,8 @@ final class PairingController: NSObject, @unchecked Sendable {
     private let lock = NSLock()
     private var pending: PendingPairing?
     private var alert: NSAlert?
+    /// Escape → Cancel while the alert is key (the Cancel button already has Return).
+    private var keyMonitor: Any?
     private var expiry: DispatchWorkItem?
     /// `glide-host --pair` clients waiting for events.
     private var watchers: [ControlClientRef] = []
@@ -199,37 +201,67 @@ final class PairingController: NSObject, @unchecked Sendable {
     var pendingCode: UInt32? { lock.lock(); defer { lock.unlock() }; return pending?.code }
 
     // MARK: Alert (menu-bar app; non-modal so the host keeps running)
+    //
+    // Any LAN peer can raise this alert while the pairing window is open, so it must never be
+    // confirmed by accident (THREAT_MODEL.md): it floats above other windows but doesn't activate
+    // the app or take key focus, so keystrokes meant for another app never reach it; Return and
+    // Escape mean Cancel once it is focused; and the confirm button only works after it has been
+    // on screen for `confirmDelay`, so a click already on its way lands on nothing.
 
-    /// Builds the alert (also used by --selftest-ui).
+    static let cancelIndex = 0, confirmIndex = 1
+    /// Seconds the confirm button stays disabled after the alert appears.
+    static let confirmDelay: TimeInterval = 1
+
+    /// Builds the alert (also used by --selftest-ui): buttons[cancelIndex] = Cancel (the default:
+    /// Return, focus ring), buttons[confirmIndex] = "Codes Match — Pair" (no key equivalent,
+    /// disabled until `showAlert` arms it).
     static func makeAlert(name: String, fingerprint: String, address: String, code: UInt32) -> NSAlert {
         let a = NSAlert()
         a.alertStyle = .warning
         a.messageText = "Pair “\(name)” with this Mac?"
-        a.informativeText = "Only continue if the PC shows exactly the same code. Confirm on the PC as well.\n\nViewer key: \(fingerprint)\nFrom: \(address)\n\nIf the codes differ, click Cancel: someone may be intercepting the connection."
+        a.informativeText = "Only continue if the PC shows exactly the same code. Confirm on the PC as well.\n\nViewer key: \(fingerprint)\nFrom: \(address)\n\nIf the PC shows a different code or none at all, click Cancel: another device on the network may be trying to pair, or intercepting the connection."
         let label = NSTextField(labelWithString: GlideHandshake.sasText(code))
         label.font = .monospacedDigitSystemFont(ofSize: 36, weight: .semibold)
         label.alignment = .center
         label.frame = NSRect(x: 0, y: 0, width: 260, height: 48)
         a.accessoryView = label
-        a.addButton(withTitle: "Codes Match — Pair")
-        a.addButton(withTitle: "Cancel")
+        let cancel = a.addButton(withTitle: "Cancel")
+        let confirm = a.addButton(withTitle: "Codes Match — Pair")
+        cancel.keyEquivalent = "\r"
+        confirm.keyEquivalent = ""
+        confirm.isEnabled = false
+        a.window.initialFirstResponder = cancel
         return a
     }
 
     private func showAlert(_ p: PendingPairing) {
         closeAlert()
         let a = Self.makeAlert(name: p.viewerName, fingerprint: p.viewerFingerprint, address: p.address, code: p.code)
-        a.buttons[0].target = self; a.buttons[0].action = #selector(matchClicked); a.buttons[0].tag = p.sessionId
-        a.buttons[1].target = self; a.buttons[1].action = #selector(cancelClicked); a.buttons[1].tag = p.sessionId
+        let cancel = a.buttons[Self.cancelIndex], confirm = a.buttons[Self.confirmIndex]
+        cancel.target = self; cancel.action = #selector(cancelClicked); cancel.tag = p.sessionId
+        confirm.target = self; confirm.action = #selector(matchClicked); confirm.tag = p.sessionId
         a.layout()
-        a.window.level = .floating
-        a.window.center()
-        NSApp.activate(ignoringOtherApps: true)
-        a.window.makeKeyAndOrderFront(nil)
+        let w = a.window
+        w.level = .floating
+        w.collectionBehavior.formUnion([.canJoinAllSpaces, .fullScreenAuxiliary])
+        (w as? NSPanel)?.hidesOnDeactivate = false
+        w.center()
+        // Shown, not focused: no NSApp.activate, no makeKey. The user clicks it to answer.
+        w.orderFrontRegardless()
         alert = a
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self, weak w] e in
+            guard let w, e.window === w, e.keyCode == 53 /* Escape */ else { return e }
+            self?.answer(false, via: "menu-bar alert (Escape)", sessionId: p.sessionId)
+            return nil
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.confirmDelay) { [weak self, weak a] in
+            guard let self, let a, self.alert === a else { return }
+            a.buttons[Self.confirmIndex].isEnabled = true
+        }
     }
 
     private func closeAlert() {
+        if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
         alert?.window.orderOut(nil)
         alert = nil
     }

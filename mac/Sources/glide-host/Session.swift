@@ -85,6 +85,12 @@ final class Session: @unchecked Sendable {
     }
     /// Ended without ever streaming (handshake/auth failed): the dialer backs off.
     var failedAuth: Bool { !authed }
+    /// The host dialed this connection (Server.dial). Set before `start()`. Outbound sessions stay
+    /// out of the inbound rate limiter: the dialer has its own backoff, and charging the PC's
+    /// address for our own failed dials would refuse the PC when it dials in (PROTOCOL.md §2.5).
+    var outbound = false
+    /// Counts a failed attempt against the peer's address (inbound connections only).
+    private func chargeFailure() { if !outbound { PairingController.shared.backoff.failed(address) } }
 
     func start() {
         channel.connection.stateUpdateHandler = { [weak self] st in
@@ -104,7 +110,7 @@ final class Session: @unchecked Sendable {
             guard let self else { return }
             if let err, !self.authed {
                 log("session \(self.id): closed during \(self.phase) from \(self.peer): \(err)")
-                if self.phase == .handshake || self.phase == .awaitHello { PairingController.shared.backoff.failed(self.address) }
+                if self.phase == .handshake || self.phase == .awaitHello { self.chargeFailure() }
             } else if let err {
                 log("session \(self.id): closed: \(err)")
             }
@@ -130,7 +136,7 @@ final class Session: @unchecked Sendable {
                 return
             }
             log("session \(self.id): no \(what) within \(Int(seconds))s from \(self.peer); closing")
-            PairingController.shared.backoff.failed(self.address)
+            self.chargeFailure()
             self.end()
         }
     }
@@ -140,9 +146,10 @@ final class Session: @unchecked Sendable {
     private func runHandshake() {
         let pc = PairingController.shared
         let addr = address
+        let outbound = outbound
         channel.acceptHandshake(identity: settings.identity, admission: { [weak self] in
             if self?.isPaused() == true { return (GlideHandshake.statusPaused, 0) }
-            if let left = pc.backoff.blocked(addr) {
+            if !outbound, let left = pc.backoff.blocked(addr) {
                 log("session \(self?.id ?? 0): \(addr) is rate-limited (\(Int(left.rounded(.up))) s left); refusing")
                 return (GlideHandshake.statusRateLimited, 0)
             }
@@ -160,7 +167,7 @@ final class Session: @unchecked Sendable {
             case .failure(let e):
                 // EOF right after msg2 = the viewer didn't like our key (pinned to another host key).
                 log("session \(self.id): handshake with \(self.peer) failed: \(e)")
-                pc.backoff.failed(addr)
+                self.chargeFailure()
                 self.end()
             case .success(let acc):
                 self.accepted(acc)
@@ -238,7 +245,7 @@ final class Session: @unchecked Sendable {
             pc.window.release(id, paired: false)
             pc.finished(sessionId: id, result: "failed \(code)")
         }
-        pc.backoff.failed(address)
+        chargeFailure()
         phase = .rejected  // ignore whatever else arrives (e.g. a pipelined ClientHello) until flushed
         channel.send(HostMessage.authResult(code).encoded) { [weak self] _ in
             self?.channel.queue.async { self?.end() }
