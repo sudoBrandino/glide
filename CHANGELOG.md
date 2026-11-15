@@ -16,6 +16,13 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-14
+
+Setup without Terminal, connections in either direction, and the fixes from a full-codebase
+review. Protocol version 2 (unchanged; the pairing and backoff rules in `docs/PROTOCOL.md` §2.3–2.5
+changed). Updating from 0.2.0 asks for Screen Recording and Accessibility once more, because
+releases are now signed with the project's own certificate; after that the grants carry over.
+
 ### Added
 
 - **Setup without Terminal.** The Mac host ships as a `.dmg`: drag Glide Host to Applications and
@@ -283,5 +290,6 @@ These matter only if you ran a development build from before this release (proto
 - A paired Mac that floods the viewer with video-configuration messages can make the viewer
   unresponsive until it disconnects (see [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)).
 
-[Unreleased]: https://github.com/sudoBrandino/glide/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/sudoBrandino/glide/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/sudoBrandino/glide/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sudoBrandino/glide/releases/tag/v0.2.0
