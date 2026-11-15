@@ -101,8 +101,10 @@ if [[ -n "${GLIDE_SIGN_KEYCHAIN:-}" ]]; then
   SIGN_FLAGS+=(--keychain "$GLIDE_SIGN_KEYCHAIN")
   # Sign by the certificate's SHA-1 rather than its name: a self-signed certificate isn't trusted,
   # and codesign's lookup by name doesn't find untrusted identities on every macOS version.
+  # GLIDE_SIGN_ID may be the name or already the SHA-1 (either case).
   _id_hash="$(security find-identity -p codesigning "$GLIDE_SIGN_KEYCHAIN" \
-    | awk -v name="\"$SIGN_ID\"" 'index($0, name) { print $2; exit }')"
+    | awk -v name="\"$SIGN_ID\"" -v id="$(printf '%s' "$SIGN_ID" | tr '[:lower:]' '[:upper:]')" \
+        'index($0, name) || toupper($2) == id { print $2; exit }')"
   if [[ -z "$_id_hash" ]]; then
     echo "no signing identity \"$SIGN_ID\" in $GLIDE_SIGN_KEYCHAIN; it holds:" >&2
     security find-identity -p codesigning "$GLIDE_SIGN_KEYCHAIN" >&2
