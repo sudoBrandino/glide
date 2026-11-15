@@ -8,8 +8,10 @@ name: Release
 #   Pull requests that touch the release tooling get the same dry run.
 #
 # Optional repository secrets for a Developer ID signed and notarized Mac app. Without them the
-# app is signed ad hoc, as with tools/make-host-app.sh.
-#   MACOS_SIGN_P12           base64 of a .p12 holding the "Developer ID Application" cert + key
+# app is signed ad hoc, as with tools/make-host-app.sh. They are only loaded for tag pushes: dry
+# runs and pull requests (whose tools/*.sh may be edited) always build ad hoc, so no branch's
+# scripts ever run with the signing keychain unlocked.
+#   MACOS_SIGN_P12          base64 of a .p12 holding the "Developer ID Application" cert + key
 #   MACOS_SIGN_P12_PASSWORD  its password
 #   MACOS_SIGN_ID            the identity, e.g. "Developer ID Application: Name (TEAMID)"
 #   MACOS_NOTARY_APPLE_ID, MACOS_NOTARY_TEAM_ID, MACOS_NOTARY_PASSWORD (app-specific password):
@@ -98,7 +100,8 @@ jobs:
           sw_vers
           xcode-select -p
           swift --version
-      - name: Import Developer ID certificate (optional)
+      - name: Import Developer ID certificate (optional, tag pushes only)
+        if: github.event_name == 'push'
         env:
           P12: ${{ secrets.MACOS_SIGN_P12 }}
           P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
@@ -125,7 +128,8 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Build, test and zip
         run: tools/release.sh host
-      - name: Notarize and staple (optional)
+      - name: Notarize and staple (optional, tag pushes only)
+        if: github.event_name == 'push'
         env:
           APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
           TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}

@@ -4,22 +4,30 @@ Glide viewer installer and setup assistant for Windows 10/11 (x64).
   irm https://raw.githubusercontent.com/sudoBrandino/glide/main/install.ps1 | iex
 
 It downloads the latest release, checks it against SHA256SUMS, installs glide-client.exe (in
-the folder an existing viewer already uses, so firewall rules keep applying), asks which side
-connects, offers a Windows Firewall rule, adds Start menu (and optionally sign-in) shortcuts and
-starts the viewer for pairing. Run it again to update. No administrator rights are needed except
-for the optional firewall rule, which asks for them separately.
+the folder an existing viewer already uses, so firewall rules keep applying), asks for the Mac's
+address and whether the Mac may connect to this PC, saves both in the viewer's settings
+(%APPDATA%\Glide\config.json, like the viewer's own setup window), offers a Windows Firewall rule,
+adds a Start menu shortcut, optionally starts the viewer at sign-in, and starts it for pairing.
+Run it again to update. No administrator rights are needed except for the optional firewall rule,
+which asks for them separately.
+
+The viewer dials the Mac when it knows the Mac's address, and also listens on TCP port 7420 so
+the Mac can connect to it (unless that is turned off). Whichever direction the network allows
+connects.
 
 Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in one line:
-  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/sudoBrandino/glide/main/install.ps1))) -Listen
+  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/sudoBrandino/glide/main/install.ps1))) -Mac 192.168.1.50
   -Version X.Y.Z   install that release instead of the latest one
   -Zip PATH        install from a downloaded Glide-Viewer zip instead of downloading
   -Dir PATH        install folder (default: the current viewer's folder, else %LOCALAPPDATA%\Glide)
-  -Mac ADDRESS     this PC connects to the Mac at ADDRESS
-  -Listen          the Mac connects to this PC (glide-client.exe --listen)
-  -Yes             unattended: no questions, no firewall rule, don't start the viewer
+  -Mac ADDRESS     the Mac's address: the viewer dials it, and also lets the Mac connect
+  -NoListen        with -Mac: dial only, the viewer doesn't listen (config "accept_incoming": false)
+  -Listen          forget the Mac's address: the viewer only waits for the Mac to connect
+  -Yes             unattended: no questions, keep the connection settings unless -Mac or -Listen
+                   says otherwise, no firewall rule, don't start the viewer
   -NoLaunch        don't start the viewer at the end
-  -Uninstall       remove the viewer and its shortcuts (-Purge also removes the settings, this
-                   PC's key and the pairing in %APPDATA%\Glide)
+  -Uninstall       remove the viewer, its shortcut and its sign-in entry (-Purge also removes the
+                   settings, this PC's key and the pairing in %APPDATA%\Glide)
 #>
 
 # Everything runs in a child scope, parameters included: with `irm | iex` this script runs inside
@@ -32,6 +40,7 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
         [string]$Zip,
         [string]$Dir,
         [string]$Mac,
+        [switch]$NoListen,
         [switch]$Listen,
         [switch]$Yes,
         [switch]$NoLaunch,
@@ -48,9 +57,15 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
     $Port = 7420
     $ExeName = 'glide-client.exe'
     $ShortcutName = 'Glide Viewer.lnk'
+    $FirewallRule = 'Glide Viewer'          # the same name the viewer's setup window uses
     $StartMenu = Join-Path ([Environment]::GetFolderPath('Programs')) $ShortcutName
+    # Older versions of this script started the viewer at sign-in with a Startup folder shortcut;
+    # now it is the same HKCU Run value the viewer's setup window writes.
     $Startup = Join-Path ([Environment]::GetFolderPath('Startup')) $ShortcutName
+    $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $RunValue = 'Glide Viewer'
     $ConfigDir = Join-Path $env:APPDATA 'Glide'
+    $ConfigFile = Join-Path $ConfigDir 'config.json'
     $state = @{ Step = 0 }
     $Interactive = -not $Yes
 
@@ -103,8 +118,22 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
         return @($Address, $Port)
     }
 
-    # Single-quoted PowerShell literal, for the elevated firewall command.
-    function Quote([string]$Text) { "'" + $Text.Replace("'", "''") + "'" }
+    # Single-quoted PowerShell literal. PowerShell also ends a literal at the typographic quotes
+    # U+2018..U+201B, so those are doubled too (doubling keeps the character), like ps_quote in
+    # windows/src/setup.rs: a folder such as C:\Users\O<U+2019>Brien stays data.
+    function Quote([string]$Text) { "'" + ($Text -replace '([''\u2018-\u201B])', '$1$1') + "'" }
+
+    # Run a script elevated (Windows asks for administrator rights). The full path, so no
+    # powershell.exe from the current folder or PATH is picked up, and -EncodedCommand (base64 of
+    # UTF-16LE), so nothing in the script is re-parsed or has its spaces collapsed on the way.
+    # Returns the exit code; throws when the user declines.
+    function Invoke-Elevated([string]$Script) {
+        $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("`$ErrorActionPreference = 'Stop'; $Script"))
+        $p = Start-Process -FilePath $powershell -Verb RunAs -Wait -PassThru -WindowStyle Hidden `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded)
+        return $p.ExitCode
+    }
 
     function Get-ShortcutInfo([string]$Path) {
         if (-not (Test-Path $Path)) { return $null }
@@ -112,14 +141,68 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
         return @{ Target = $lnk.TargetPath; Arguments = $lnk.Arguments }
     }
 
-    function Set-Shortcut([string]$Path, [string]$Target, [string]$Arguments) {
+    # No arguments: the viewer's settings say where to connect.
+    function Set-Shortcut([string]$Path, [string]$Target) {
         New-Item -ItemType Directory -Force -Path (Split-Path $Path) | Out-Null
         $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut($Path)
         $lnk.TargetPath = $Target
-        $lnk.Arguments = $Arguments
+        $lnk.Arguments = ''
         $lnk.WorkingDirectory = Split-Path $Target
         $lnk.Description = 'Glide viewer: control your Mac'
         $lnk.Save()
+    }
+
+    # The exe the sign-in entry starts (the Run value holds it in double quotes), or $null.
+    function Get-RunExe {
+        try { $v = (Get-ItemProperty -Path $RunKey -Name $RunValue -ErrorAction Stop).$RunValue } catch { return $null }
+        if ($v -match '^"([^"]+)"') { return $Matches[1] }
+        return $v
+    }
+
+    function Get-Autostart { return [bool](Get-RunExe) -or (Test-Path $Startup) }
+
+    function Set-Autostart([bool]$On, [string]$Exe) {
+        # An older Startup shortcut may carry old arguments, and two entries would start it twice.
+        if (Test-Path $Startup) { Remove-Item $Startup -Force }
+        if ($On) {
+            New-ItemProperty -Path $RunKey -Name $RunValue -Value ('"' + $Exe + '"') -PropertyType String -Force | Out-Null
+        } else {
+            Remove-ItemProperty -Path $RunKey -Name $RunValue -ErrorAction SilentlyContinue
+        }
+    }
+
+    # The viewer's settings. Unknown keys are kept as they are; a file that isn't a JSON object is
+    # moved to config.json.bad, as the viewer itself does.
+    function Read-ViewerConfig {
+        if (-not (Test-Path -LiteralPath $ConfigFile)) { return [pscustomobject]@{ version = 1 } }
+        $obj = $null
+        try { $obj = [IO.File]::ReadAllText($ConfigFile) | ConvertFrom-Json } catch { $obj = $null }
+        if ($obj -is [Management.Automation.PSCustomObject]) { return $obj }
+        Move-Item -LiteralPath $ConfigFile -Destination "$ConfigFile.bad" -Force
+        Warn "$ConfigFile was not valid; moved it to config.json.bad"
+        return [pscustomobject]@{ version = 1 }
+    }
+
+    function Get-ConfigValue($Config, [string]$Name) {
+        if ($Config.PSObject.Properties[$Name]) { return $Config.$Name }
+        return $null
+    }
+
+    # $null removes the key (the viewer then uses its default).
+    function Set-ConfigValue($Config, [string]$Name, $Value) {
+        if ($null -eq $Value) { $Config.PSObject.Properties.Remove($Name); return }
+        if ($Config.PSObject.Properties[$Name]) { $Config.$Name = $Value }
+        else { $Config | Add-Member -NotePropertyName $Name -NotePropertyValue $Value }
+    }
+
+    # UTF-8 without a byte order mark (the viewer's JSON parser rejects one), written to a temp
+    # file and renamed over the old one.
+    function Save-ViewerConfig($Config) {
+        New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+        $json = ConvertTo-Json -InputObject $Config -Depth 32
+        $tmpFile = "$ConfigFile.tmp"
+        [IO.File]::WriteAllText($tmpFile, $json + "`n", (New-Object Text.UTF8Encoding $false))
+        Move-Item -LiteralPath $tmpFile -Destination $ConfigFile -Force
     }
 
     # Program paths of firewall rules for glide-client.exe (reading them needs no elevation).
@@ -141,8 +224,9 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
         } catch { @() }
     }
 
-    # Where an existing viewer lives: the running one, a firewall rule, a shortcut, or the default.
-    # Downloads and temp folders don't count: the viewer shouldn't live there (docs/INSTALL.md).
+    # Where an existing viewer lives: the running one, a firewall rule, a shortcut, the sign-in
+    # entry, or the default. Downloads and temp folders don't count: the viewer shouldn't live
+    # there (docs/INSTALL.md).
     function Find-InstallDir {
         $candidates = @()
         $running = Get-Process -Name 'glide-client' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -152,6 +236,8 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
             $info = Get-ShortcutInfo $s
             if ($info -and $info.Target) { $candidates += $info.Target }
         }
+        $runExe = Get-RunExe
+        if ($runExe) { $candidates += $runExe }
         $avoid = @((Join-Path $env:USERPROFILE 'Downloads'), [IO.Path]::GetTempPath().TrimEnd('\'))
         foreach ($c in $candidates) {
             if (-not $c -or -not (Test-Path $c)) { continue }
@@ -179,6 +265,51 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
                 Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } |
                 ForEach-Object { $_.IPv4Address.IPAddress } | Select-Object -First 1
         } catch { $null }
+    }
+
+    # Let the Mac in through Windows Firewall: check the rules for the exe, and offer one
+    # elevated step that removes Block rules (Windows adds them when its own prompt is
+    # cancelled; Block beats Allow) and adds an Allow rule for Private networks.
+    function Set-FirewallRule([string]$Exe, [int]$ListenPort) {
+        $rules = Get-ViewerRules $Exe
+        $blocking = @($rules | Where-Object { $_.Action -eq 'Block' })
+        $allowing = @($rules | Where-Object { $_.Action -eq 'Allow' -and "$($_.Profile)" -match 'Any|Private' })
+        try {
+            if (@(Get-NetConnectionProfile -ErrorAction Stop | Where-Object { $_.NetworkCategory -eq 'Public' }).Count -gt 0) {
+                Warn 'This network is set to Public in Windows. Rules for Private networks do not apply there:'
+                Warn 'set it to Private (Settings -> Network) if the Mac should connect to this PC.'
+            }
+        } catch { }
+        if ($blocking.Count -gt 0) {
+            Warn "Windows Firewall blocks the viewer: $(($blocking | ForEach-Object { $_.DisplayName }) -join ', ')"
+        }
+        if ($allowing.Count -gt 0 -and $blocking.Count -eq 0) {
+            Ok 'a Windows Firewall rule already lets the Mac connect on Private networks'
+            return
+        }
+        if (-not $Interactive) {
+            Info 'No firewall rule added (-Yes). Windows asks on the first connection from the Mac.'
+            return
+        }
+        Info 'Windows Firewall has to let the Mac in. Changing it needs administrator rights (Windows asks).'
+        $question = if ($blocking.Count -gt 0) { 'Remove the blocking rules and allow the viewer (Private networks only)?' } else { 'Add a firewall rule for the viewer (Private networks only)?' }
+        if (-not (Confirm $question $true)) {
+            Info 'No firewall rule. Windows asks on the first connection from the Mac instead.'
+            return
+        }
+        $remote = Ask "Only allow the Mac's IP address? (Enter for any address on Private networks)" ''
+        $cmd = "`$p = $(Quote $Exe); " +
+            "Get-NetFirewallApplicationFilter -Program `$p -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { `$_.Direction -eq 'Inbound' -and `$_.Action -eq 'Block' } | Remove-NetFirewallRule; " +
+            "Get-NetFirewallRule -DisplayName $(Quote $FirewallRule) -ErrorAction SilentlyContinue | Remove-NetFirewallRule; " +
+            "New-NetFirewallRule -DisplayName $(Quote $FirewallRule) -Direction Inbound -Program `$p -Protocol TCP -LocalPort $ListenPort -Action Allow -Profile Private"
+        if ($remote) { $cmd += " -RemoteAddress $(Quote $remote)" }
+        $cmd += ' | Out-Null'
+        try {
+            $code = Invoke-Elevated $cmd
+            if ($code -eq 0) { Ok 'added the firewall rule' } else { Warn "the firewall command failed (exit $code)" }
+        } catch {
+            Warn 'no firewall rule (administrator rights declined). Windows asks on the first connection instead.'
+        }
     }
 
     function Install-Viewer {
@@ -249,95 +380,94 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
             if ($old) { Ok "updated $old -> $new" } else { Ok "installed $new ($source)" }
             Info $exe
 
-            # 3. Which side connects.
+            # 3. The connection, saved in the viewer's settings (the viewer's setup window edits
+            # the same two values: "host" and "accept_incoming").
+            $config = Read-ViewerConfig
+            # Older versions of this script put the Mac's address (or --listen) on the shortcut.
+            $legacy = ''
             $existing = Get-ShortcutInfo $StartMenu
-            $viewerArgs = $null
-            if ($Mac) {
-                $viewerArgs = $Mac
-            } elseif ($Listen) {
-                $viewerArgs = '--listen'
-            } elseif ($Interactive) {
-                Step 'How should the PC and the Mac connect?'
-                Info "1) This PC connects to the Mac (the Mac listens on port $Port)"
-                Info '2) The Mac connects to this PC (the viewer listens; use this when the Mac can'
-                Info '   reach the PC but not the other way round)'
-                $default = '1'
-                if ($existing -and $existing.Arguments -match '--listen') { $default = '2' }
-                $choice = Ask 'Choose 1 or 2:' $default
-                if ($choice -eq '2') {
-                    $viewerArgs = '--listen'
-                } else {
-                    $prev = if ($existing -and $existing.Arguments -and $existing.Arguments -notmatch '^--') { $existing.Arguments } else { '' }
-                    $addr = Ask "The Mac's address (name or IP, optionally :port):" $prev
-                    if (-not $addr) { throw 'no address given' }
-                    $viewerArgs = $addr
-                }
-            } elseif ($existing) {
-                $viewerArgs = $existing.Arguments
-            } else {
-                $viewerArgs = ''
-            }
+            if ($existing -and $existing.Arguments -and $existing.Arguments.Trim() -notmatch '^-') { $legacy = ($existing.Arguments.Trim() -split '\s+')[0] }
+            $savedHost = [string](Get-ConfigValue $config 'host')
+            $currentHost = if ($savedHost.Trim()) { $savedHost.Trim() } else { $legacy }
+            $savedAccept = Get-ConfigValue $config 'accept_incoming'
+            $currentAccept = if ($savedAccept -is [bool]) { $savedAccept } else { $true }
+            $listenPort = $Port
+            $savedPort = (Get-ConfigValue $config 'listen_port') -as [int]
+            if ($savedPort -gt 0 -and $savedPort -le 65535) { $listenPort = $savedPort }
 
-            if ($viewerArgs -eq '--listen') {
-                Ok "the viewer waits for the Mac on port $Port"
-                $ip = Get-LocalAddress
-                Info ("On the Mac, choose 'This Mac connects to the PC' in the setup, with this PC's address" + $(if ($ip) { ": $ip" } else { '.' }))
-                $rules = Get-ViewerRules $exe
-                $blocking = @($rules | Where-Object { $_.Action -eq 'Block' })
-                $allowing = @($rules | Where-Object { $_.Action -eq 'Allow' -and "$($_.Profile)" -match 'Any|Private' })
-                if ($blocking.Count -gt 0) {
-                    # Windows adds these when its first-run prompt is cancelled; Block beats Allow.
-                    Warn "Windows Firewall blocks the viewer: $(($blocking | ForEach-Object { $_.DisplayName }) -join ', ')"
+            $macAddress = $currentHost
+            $accept = $currentAccept
+            if ($Mac) {
+                $macAddress = $Mac.Trim()
+                $accept = -not $NoListen
+            } elseif ($Listen) {
+                $macAddress = ''
+            } elseif ($NoListen) {
+                if (-not $currentHost) { throw "-NoListen needs the Mac's address (-Mac)" }
+                $accept = $false
+            } elseif ($Interactive) {
+                Step 'Connecting to the Mac'
+                Info "The viewer dials the Mac when it knows the Mac's address, and can also let the Mac"
+                Info 'connect to this PC. One direction that your network allows is enough.'
+                $question = if ($currentHost) { "The Mac's address (name or IP, optionally :port; - for none):" } else { "The Mac's address (optional; name or IP, optionally :port):" }
+                while ($true) {
+                    $answer = Ask $question $currentHost
+                    $macAddress = if ($answer -eq '-') { '' } else { $answer }
+                    if ($macAddress -notmatch '[\s/\\]') { break }
+                    Warn "'$macAddress' is not an address: use the Mac's IP address or name, for example 192.168.1.50"
                 }
-                if ($allowing.Count -gt 0 -and $blocking.Count -eq 0) {
-                    Ok 'a Windows Firewall rule already admits the viewer on Private networks'
-                } elseif ($Interactive) {
-                    Info 'Windows Firewall has to let the Mac in. Changing it needs administrator rights (Windows asks).'
-                    $question = if ($blocking.Count -gt 0) { 'Remove the blocking rules and allow the viewer (Private networks only)?' } else { 'Add a firewall rule for the viewer (Private networks only)?' }
-                    if (Confirm $question $true) {
-                        $remote = Ask "Only allow the Mac's IP address? (Enter for any address on Private networks)" ''
-                        $cmd = ''
-                        if ($blocking.Count -gt 0) {
-                            $cmd = "Get-NetFirewallApplicationFilter -Program $(Quote $exe) | Get-NetFirewallRule | Where-Object { `$_.Direction -eq 'Inbound' -and `$_.Action -eq 'Block' } | Remove-NetFirewallRule; "
-                        }
-                        $cmd += "New-NetFirewallRule -DisplayName 'Glide viewer' -Direction Inbound -Program $(Quote $exe) -Protocol TCP -LocalPort $Port -Action Allow -Profile Private"
-                        if ($remote) { $cmd += " -RemoteAddress $(Quote $remote)" }
-                        try {
-                            $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -WindowStyle Hidden `
-                                -ArgumentList @('-NoProfile', '-Command', $cmd)
-                            if ($p.ExitCode -eq 0) { Ok 'added the firewall rule' } else { Warn "the firewall command failed (exit $($p.ExitCode))" }
-                        } catch {
-                            Warn 'no firewall rule (administrator rights declined). Windows asks on the first connection instead.'
-                        }
-                    }
+                if ($macAddress) {
+                    $accept = Confirm 'Also let the Mac connect to this PC (needs a Windows Firewall rule)?' $currentAccept
                 }
-            } elseif ($viewerArgs) {
-                Ok "the viewer connects to $viewerArgs"
-                $hp = Split-HostPort $viewerArgs
+            }
+            if ($macAddress -match '[\s/\\]') { throw "'$macAddress' is not an address: use the Mac's IP address or name, for example 192.168.1.50" }
+            if (-not $macAddress) { $accept = $true }   # without the address the viewer can only wait for the Mac
+
+            Set-ConfigValue $config 'host' $(if ($macAddress) { $macAddress } else { $null })
+            Set-ConfigValue $config 'accept_incoming' ([bool]$accept)
+            Save-ViewerConfig $config
+            Ok "saved in $ConfigFile"
+
+            if ($macAddress) {
+                Ok "the viewer dials the Mac at $macAddress"
+                $hp = Split-HostPort $macAddress
                 if (Test-Port $hp[0] $hp[1]) {
                     Ok "the Mac answers on port $($hp[1])"
+                } elseif ($accept) {
+                    Info "Nothing answers at $($hp[0]):$($hp[1]) yet. The viewer keeps trying, and the Mac can connect to this PC."
                 } else {
                     Warn "nothing answers at $($hp[0]):$($hp[1]) yet. Is Glide Host running on the Mac (menu bar icon)?"
                     Warn 'The viewer keeps retrying, so it connects once the host is reachable.'
                 }
             }
+            if ($accept) {
+                if ($macAddress) { Ok "the viewer also listens on port $listenPort, so the Mac can connect to this PC" }
+                else { Ok "the viewer waits for the Mac to connect on port $listenPort" }
+                $ip = Get-LocalAddress
+                Info ("If only the Mac can reach this PC, enter this PC's address in Glide Host's setup window on the Mac" + $(if ($ip) { ": $ip" } else { '.' }))
+                Set-FirewallRule $exe $listenPort
+            } else {
+                Ok 'the viewer only dials; it does not listen'
+            }
 
-            # 4. Shortcuts.
-            Set-Shortcut $StartMenu $exe $viewerArgs
-            Ok "Start menu: Glide Viewer$(if ($viewerArgs) { " ($viewerArgs)" })"
-            $startupDefault = ($viewerArgs -eq '--listen') -or (Test-Path $Startup)
-            if (Confirm 'Start the viewer when you sign in to Windows?' $startupDefault) {
-                Set-Shortcut $Startup $exe $viewerArgs
+            # 4. Shortcut and sign-in entry, both without arguments.
+            Set-Shortcut $StartMenu $exe
+            Ok 'Start menu: Glide Viewer'
+            $autostartNow = Get-Autostart
+            if (Confirm 'Start the viewer when you sign in to Windows?' ($autostartNow -or $accept)) {
+                Set-Autostart $true $exe
                 Ok 'starts at sign-in'
-            } elseif (Test-Path $Startup) {
-                Remove-Item $Startup -Force
+            } elseif ($autostartNow) {
+                Set-Autostart $false $exe
                 Ok 'no longer starts at sign-in'
             }
 
             # 5. Start it; pairing happens in the viewer.
             if (-not $NoLaunch -and $Interactive -and (Confirm 'Start the viewer now?' $true)) {
-                if ($viewerArgs) { Start-Process -FilePath $exe -ArgumentList $viewerArgs -WorkingDirectory $target }
-                else { Start-Process -FilePath $exe -WorkingDirectory $target }
+                # Without the Mac's address, --listen says what the settings say; started without
+                # arguments, a viewer that isn't paired yet would open its setup window first.
+                if ($macAddress) { Start-Process -FilePath $exe -WorkingDirectory $target }
+                else { Start-Process -FilePath $exe -ArgumentList @('--listen', "$listenPort") -WorkingDirectory $target }
                 Ok 'started'
                 Info 'First connection: the PC and the Mac both show a 6-digit code. If they match,'
                 Info 'confirm on both. On the Mac: menu bar -> Glide -> Pair New Viewer... (or glide-setup).'
@@ -346,7 +476,7 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
             Write-Host ''
             Write-Host "Glide viewer is set up." -ForegroundColor Green
             Info "Viewer:   $exe"
-            Info "Settings: $ConfigDir\config.json (tray icon -> Open config file)"
+            Info "Settings: $ConfigFile (Glide menu or tray icon -> Set up...)"
             Info 'Run this installer again to update or change the connection.'
         } finally {
             Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
@@ -370,6 +500,7 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
             Ok "removed $exe"
         }
         foreach ($s in @($StartMenu, $Startup)) { if (Test-Path $s) { Remove-Item $s -Force; Ok "removed $s" } }
+        if (Get-RunExe) { Set-Autostart $false $exe; Ok 'removed the sign-in entry' }
         if ((Get-ViewerRules $exe).Count -gt 0) {
             Info "A firewall rule still names $exe. Remove it in an administrator PowerShell with:"
             Info "  Get-NetFirewallApplicationFilter -Program $(Quote $exe) | Get-NetFirewallRule | Remove-NetFirewallRule"
@@ -384,6 +515,7 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
 
     try {
         if ($Mac -and $Listen) { throw '-Mac and -Listen exclude each other' }
+        if ($NoListen -and $Listen) { throw '-NoListen and -Listen exclude each other' }
         if ($Uninstall) { Uninstall-Viewer } else { Install-Viewer }
     } catch {
         Write-Host ''

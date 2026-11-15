@@ -15,15 +15,22 @@ of §2 as "legacy, removed".
 
 ## 0. Connection direction
 
-Either side may open the TCP connection; the protocol after connect is identical.
+Either side may open the TCP connection; the protocol after connect is identical. Both sides
+listen and dial at the same time, and whichever direction the network allows connects:
 
-- **Viewer dials** (default): host listens (`glide-host`), viewer connects.
-- **Host dials** (`glide-host --connect VIEWER[:PORT]`, viewer runs `--listen`): for networks
-  that only allow host→viewer connections (e.g. a locked-down admin VLAN). The host redials
-  every 2 s while disconnected (backing off to 60 s while the viewer keeps refusing it, see §2.5).
+- The **host** listens (port 7420). Once it knows the viewer's address
+  (`glide-host --connect VIEWER[:PORT]`, `connect` in host.json, or its setup window) it also
+  dials it, redialing every 2 s while disconnected (backing off to 60 s while the viewer keeps
+  refusing it, see §2.5). Its dialer stays idle while a viewer that dialed in is connected.
+  `"listen": false` (or `--no-listen`) with a viewer address turns listening off.
+- The **viewer** given the host's address (command line or config `host`) dials it and also
+  listens (config `accept_incoming`, default on; `--no-listen` = dial only). Without an address
+  (`--listen [PORT]`, or no `host` in the config) it only listens.
+- Dial-only on one side needs listening on the other: for networks that only allow
+  host→viewer connections (e.g. a locked-down admin VLAN), the viewer listens and the host dials.
 
-In both cases the **viewer** writes first and is the Noise **initiator**; the host is the
-**responder**.
+There is one session at a time. Whichever side dialed, the **viewer** writes first and is the
+Noise **initiator**; the host is the **responder**.
 
 ## 1. Handshake
 

@@ -1,7 +1,10 @@
 #!/bin/bash
 # shellcheck disable=SC2016  # the bash -c snippets get their values as positional arguments
 # Exercises install.sh without touching this Mac's real Glide setup: a throwaway home folder,
-# config folder and bundle id, and --no-start, so no LaunchAgent is ever loaded.
+# config folder, stand-in for /Applications and bundle id, and --no-start, so no LaunchAgent is
+# ever loaded. The fake app's binary is the real glide-host, so install.sh asks it for its login
+# item status (read only, for the fake bundle id); the login item that gets turned off below
+# belongs to a stub script.
 #   tools/test-install.sh [PATH-TO-glide-host]   (default: mac/.build/release/glide-host)
 # The binary only has to answer --set-connect; the app bundle around it is assembled here.
 set -euo pipefail
@@ -11,8 +14,8 @@ BIN="${1:-$ROOT/mac/.build/release/glide-host}"
 LABEL="org.example.installtest.glide.host"   # ends in .glide.host like the real ones
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
-export HOME="$T/home" GLIDE_HOST_CONFIG_DIR="$T/cfg" NO_COLOR=1
-mkdir -p "$HOME"
+export HOME="$T/home" GLIDE_HOST_CONFIG_DIR="$T/cfg" GLIDE_APPLICATIONS_DIR="$T/sysapps" NO_COLOR=1
+mkdir -p "$HOME" "$GLIDE_APPLICATIONS_DIR"
 fails=0
 pass() { echo "ok   $*"; }
 fail() { echo "FAIL $*"; fails=$((fails + 1)); }
@@ -38,9 +41,12 @@ codesign --force --sign - --identifier "$LABEL" "$SRC" 2>/dev/null
 APP="$HOME/Applications/Glide Host.app"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 connect() { plutil -extract connect raw -o - "$GLIDE_HOST_CONFIG_DIR/host.json" 2>/dev/null || true; }
+listen() { plutil -extract listen raw -o - "$GLIDE_HOST_CONFIG_DIR/host.json" 2>/dev/null || true; }
+no_stage() { ! compgen -G "$1/.glide-install.*" >/dev/null; }
 
 check "--help prints the usage" bash -c '"$0/install.sh" --help | grep -q -- "--connect HOST"' "$ROOT"
 check "conflicting options are refused" bash -c '! "$0/install.sh" --connect a --listen >/dev/null 2>&1' "$ROOT"
+check "--no-listen without --connect is refused" bash -c '! "$0/install.sh" --no-listen >/dev/null 2>&1' "$ROOT"
 
 check "install from an app folder" run --yes --no-start --app "$SRC" --connect 127.0.0.1:9
 check "  app copied to ~/Applications" test -x "$APP/Contents/MacOS/glide-host"
@@ -49,14 +55,40 @@ check "  LaunchAgent label is the bundle id" test "$(plutil -extract Label raw -
 check "  KeepAlive tied to the binary (PathState)" \
   bash -c '/usr/libexec/PlistBuddy -c "Print :KeepAlive:PathState" "$0" | grep -qxF "    $1/Contents/MacOS/glide-host = true"' "$PLIST" "$APP"
 check "  connect target saved" test "$(connect)" == "127.0.0.1:9"
+check "  the host still listens" test -z "$(listen)"
+check "  no staging folder left" no_stage "$HOME/Applications"
 check "  agent not loaded (--no-start)" bash -c '! launchctl print "gui/$(id -u)/$0" >/dev/null 2>&1' "$LABEL"
+
+check "reinstall with --connect --no-listen" run --yes --no-start --app "$SRC" --connect 127.0.0.1:9 --no-listen
+check "  listening switched off" test "$(listen)" == false
+check "  host.json is still JSON" test "$(head -c 1 "$GLIDE_HOST_CONFIG_DIR/host.json")" == "{"
+check "--yes keeps the connection settings" run --yes --no-start --app "$SRC"
+check "  still dial only" test "$(listen)" == false
+check "  still dials the PC" test "$(connect)" == "127.0.0.1:9"
 
 check "reinstall with --listen" run --yes --no-start --app "$SRC" --listen
 check "  says reinstalling" grep -q "reinstalling Glide Host 9.9.9" "$T/out"
 check "  connect target removed" test -z "$(connect)"
+check "  listening switched back on" test -z "$(listen)"
 
 check "--app naming the installed app sets it up in place" run --yes --no-start --app "$APP"
 check "  app still there" test -x "$APP/Contents/MacOS/glide-host"
+
+# A copy that fails halfway must leave the installed app as it was (copy aside, then swap).
+mkdir -p "$T/shim"
+cat > "$T/shim/ditto" <<'SH'
+#!/bin/bash
+for a in "$@"; do case "$a" in */.glide-install.*) echo "ditto: simulated failure" >&2; exit 1 ;; esac; done
+exec /usr/bin/ditto "$@"
+SH
+chmod +x "$T/shim/ditto"
+echo keep > "$APP/Contents/Resources/marker"
+check "a failed copy stops the install" \
+  bash -c '! PATH="$0:$PATH" "$1" --yes --no-start --app "$2" >/dev/null 2>&1' "$T/shim" "$ROOT/install.sh" "$SRC"
+check "  installed app untouched" test -f "$APP/Contents/Resources/marker"
+check "  no staging folder left" no_stage "$HOME/Applications"
+check "a working copy replaces it" run --yes --no-start --app "$SRC"
+check "  new app in place" test ! -e "$APP/Contents/Resources/marker"
 
 OTHER="$HOME/Library/LaunchAgents/com.example.old.glide.host.plist"
 cp "$PLIST" "$OTHER"
@@ -74,6 +106,30 @@ check "glide-setup inside the app installs in place" \
   bash -c '"$0/Contents/Resources/glide-setup" --yes --no-start >/dev/null 2>&1' "$APP"
 check "  agent points into that app" \
   test "$(plutil -extract ProgramArguments.0 raw -o - "$PLIST")" == "$(realpath "$APP")/Contents/MacOS/glide-host"
+
+# The setup window installs to /Applications and may register a login item with the same launchd
+# label as the LaunchAgent. The installer updates that copy and lets the LaunchAgent take over.
+SYSAPP="$GLIDE_APPLICATIONS_DIR/Glide Host.app"
+rm -rf "$APP"
+ditto "$SRC" "$SYSAPP"
+cat > "$SYSAPP/Contents/MacOS/glide-host" <<STUB
+#!/bin/sh
+case "\$*" in
+  "--login-item status") echo "login-item=on" ;;
+  "--login-item off") echo off >> "$T/login-item.log"; echo "login-item=off" ;;
+esac
+STUB
+check "an app in /Applications is updated there" run --yes --no-start --app "$SRC"
+check "  replaced in /Applications" cmp -s "$SYSAPP/Contents/MacOS/glide-host" "$SRC/Contents/MacOS/glide-host"
+check "  no second copy in ~/Applications" test ! -e "$APP"
+check "  its login item turned off" grep -qx off "$T/login-item.log"
+check "  agent points into /Applications" \
+  test "$(plutil -extract ProgramArguments.0 raw -o - "$PLIST")" == "$SYSAPP/Contents/MacOS/glide-host"
+check "  no staging folder left" no_stage "$GLIDE_APPLICATIONS_DIR"
+check "--dir still picks the folder" run --yes --no-start --app "$SRC" --dir "$HOME/Applications"
+check "  app in ~/Applications" test -x "$APP/Contents/MacOS/glide-host"
+check "  says the other copy is there" grep -qF "another copy is at $SYSAPP" "$T/out"
+rm -rf "$SYSAPP"
 
 check "uninstall --purge" run --uninstall --purge
 check "  app removed" test ! -e "$APP"

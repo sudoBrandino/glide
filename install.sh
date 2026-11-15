@@ -4,17 +4,23 @@
 #   curl -fsSL https://raw.githubusercontent.com/sudoBrandino/glide/main/install.sh | bash
 #
 # Run it in a terminal and it walks through everything: download and verify the release, install
-# Glide Host.app and its LaunchAgent, grant Screen Recording and Accessibility, choose which side
-# connects, and pair the PC. Run it again at any time to update, re-check the permissions, change
+# Glide Host.app and its LaunchAgent, grant Screen Recording and Accessibility, set up the
+# connection and pair the PC. Run it again at any time to update, re-check the permissions, change
 # the connection or pair another viewer. Homebrew installs it as `glide-setup`; source checkouts
 # reach it through tools/install-host.sh. No administrator rights are needed.
+#
+# The host always listens on TCP port 7420, so the PC can connect to it. Given the PC's address,
+# it also dials the PC; whichever direction the network allows connects.
 #
 # Options (pass them after `bash -s --` when piping from curl):
 #   --version X.Y.Z        install that release instead of the latest one
 #   --app PATH             install this Glide Host.app, or a release .zip, instead of downloading
-#   --dir DIR              where to put the app (default: ~/Applications)
-#   --connect HOST[:PORT]  the Mac dials the viewer at HOST (the viewer runs --listen)
-#   --listen               the viewer dials the Mac (the Mac listens on port 7420)
+#   --dir DIR              where to put the app (default: where Glide Host.app is now, in
+#                          /Applications or ~/Applications; else ~/Applications)
+#   --connect HOST[:PORT]  the PC's address: the Mac dials it as well as listening
+#   --no-listen            with --connect: the Mac only dials, nothing listens on it
+#                          (host.json "listen": false)
+#   --listen               forget the PC's address: the Mac only listens and the PC dials it
 #   --yes, -y              unattended: no questions, keep the current connection settings, skip
 #                          the permission and pairing steps
 #   --no-start             install without starting the host
@@ -24,7 +30,8 @@
 #   --label ID             LaunchAgent label for --uninstall when the app is already gone
 #   -h, --help
 #
-# Environment: GLIDE_REPO (default sudoBrandino/glide), NO_COLOR, GLIDE_HOST_CONFIG_DIR (tests).
+# Environment: GLIDE_REPO (default sudoBrandino/glide), NO_COLOR, GLIDE_HOST_CONFIG_DIR and
+# GLIDE_APPLICATIONS_DIR (tests: stand in for the settings folder and /Applications).
 #
 # Everything runs from main() at the bottom, so a download that stops halfway runs nothing.
 # Keep this file compatible with macOS's /bin/bash 3.2.
@@ -35,6 +42,7 @@ GLIDE_REPO="${GLIDE_REPO:-sudoBrandino/glide}"
 DEFAULT_LABEL="io.github.sudobrandino.glide.host"
 DEFAULT_PORT=7420
 MIN_MACOS=14
+SYS_APPS="${GLIDE_APPLICATIONS_DIR:-/Applications}"
 
 # ---------------------------------------------------------------------------------------------
 # Output and questions
@@ -83,10 +91,15 @@ confirm() {
 # ---------------------------------------------------------------------------------------------
 # Helpers
 
-TMP=""
+TMP="" STAGE=""
 cleanup() {
   perm_stop 2>/dev/null || true   # Ctrl+C while waiting for the permissions
   [[ -n "$TMP" && -d "$TMP" ]] && rm -rf "$TMP"
+  if [[ -n "$STAGE" && -d "$STAGE" ]]; then
+    # Stopped between moving the old app aside and moving the new one in: put the old one back.
+    [[ ! -e "$APP" && -d "$STAGE/previous" ]] && mv "$STAGE/previous" "$APP" 2>/dev/null
+    rm -rf "$STAGE"
+  fi
   return 0
 }
 trap cleanup EXIT
@@ -126,8 +139,8 @@ port_open() { /usr/bin/nc -z -G 3 "${1%:*}" "${1##*:}" >/dev/null 2>&1; }
 # ---------------------------------------------------------------------------------------------
 # Options
 
-OPT_VERSION="" OPT_APP="" OPT_DIR="" OPT_CONNECT="" OPT_LISTEN=0 OPT_YES=0 OPT_NO_START=0
-OPT_REPLACE_OTHER=0 OPT_UNINSTALL=0 OPT_PURGE=0 OPT_LABEL=""
+OPT_VERSION="" OPT_APP="" OPT_DIR="" OPT_CONNECT="" OPT_LISTEN=0 OPT_NO_LISTEN=0 OPT_YES=0
+OPT_NO_START=0 OPT_REPLACE_OTHER=0 OPT_UNINSTALL=0 OPT_PURGE=0 OPT_LABEL=""
 
 usage() {
   if [[ -f "$0" ]]; then sed -n '2,/^# Environment/p' "$0" | sed -e 's/^# \{0,1\}//' -e '$d'
@@ -143,6 +156,7 @@ parse_args() {
       --dir) OPT_DIR="${2:?--dir needs a path}"; shift ;;
       --connect) OPT_CONNECT="${2:?--connect needs HOST[:PORT]}"; shift ;;
       --listen) OPT_LISTEN=1 ;;
+      --no-listen) OPT_NO_LISTEN=1 ;;
       -y|--yes) OPT_YES=1 ;;
       --no-start) OPT_NO_START=1 ;;
       --replace-other) OPT_REPLACE_OTHER=1 ;;
@@ -155,6 +169,7 @@ parse_args() {
     shift
   done
   [[ -n "$OPT_CONNECT" && $OPT_LISTEN == 1 ]] && die "--connect and --listen exclude each other"
+  [[ $OPT_NO_LISTEN == 1 && -z "$OPT_CONNECT" ]] && die "--no-listen needs --connect (the Mac has to listen or dial)"
   [[ -n "$OPT_APP" && -n "$OPT_VERSION" ]] && die "--app and --version exclude each other"
   return 0
 }
@@ -210,7 +225,7 @@ obtain_app() {
 }
 
 download_release() {
-  local tag="" ver="" name="" want="" got="" base=""
+  local tag="" ver="" name="" want="" got="" base="" err=""
   step "Downloading Glide Host"
   command -v curl >/dev/null || die "curl is missing"
   if [[ -n "$OPT_VERSION" ]]; then
@@ -237,12 +252,16 @@ download_release() {
   got="$(shasum -a 256 "$TMP/$name" | awk '{ print $1 }')"
   [[ "$got" == "$want" ]] || die "checksum mismatch for $name (expected $want, got $got). Not installing."
   ok "checksum matches SHA256SUMS"
+  # Optional (it needs the GitHub CLI, signed in), but once it can run, a failure stops the install.
   if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
-    if gh attestation verify "$TMP/$name" --repo "$GLIDE_REPO" >/dev/null 2>&1; then
+    if err="$(gh attestation verify "$TMP/$name" --repo "$GLIDE_REPO" 2>&1 >/dev/null)"; then
       ok "build provenance verified: built from $GLIDE_REPO by its release workflow"
     else
-      warn "no valid build provenance attestation (gh attestation verify failed)"
+      printf '%s\n' "$err" | tail -5 | sed 's/^/      /' >&2
+      die "the build provenance check of $name failed (gh attestation verify, above). Not installing."
     fi
+  else
+    info "${D}build provenance not checked (needs the GitHub CLI, signed in: gh auth login)${N}"
   fi
   ditto -x -k "$TMP/$name" "$TMP/unzip" || die "could not unzip $name"
   SRC_APP="$TMP/unzip/Glide Host.app"
@@ -250,23 +269,56 @@ download_release() {
   SRC_DESC="release v$ver"
 }
 
+# The installed Glide Host.app with this bundle id (LABEL), if any: the one its LaunchAgent runs,
+# else the one in /Applications (where the .dmg and the app's own Install put it), else the one
+# in ~/Applications.
+existing_app() {
+  local a="" from_agent=""
+  from_agent="$(plutil -extract ProgramArguments.0 raw -o - "$PLIST" 2>/dev/null || true)"
+  from_agent="${from_agent%/Contents/MacOS/glide-host}"
+  [[ "$from_agent" == */"Glide Host.app" ]] || from_agent=""
+  for a in "$from_agent" "$SYS_APPS/Glide Host.app" "$HOME/Applications/Glide Host.app"; do
+    if [[ -n "$a" && -x "$a/Contents/MacOS/glide-host" && "$(plist_get "$a" CFBundleIdentifier)" == "$LABEL" ]]; then
+      printf '%s' "$a"; return 0
+    fi
+  done
+  return 0
+}
+
+# Is APP registered as a login item (Start at Login in its setup window, SMAppService)? That job
+# has the bundle id as its launchd label, like the LaunchAgent this script writes. Hosts before
+# 0.3 have no --login-item (they print their usage instead): never a login item.
+login_item_on() {
+  local out=""
+  [[ -x "$1/Contents/MacOS/glide-host" ]] || return 1
+  out="$("$1/Contents/MacOS/glide-host" --login-item status 2>/dev/null || true)"
+  grep -qxE 'login-item=(on|needsApproval)' <<<"$out"
+}
+
 # Fills LABEL, NEW_VERSION, APP, PLIST from the app to install.
-LABEL="" NEW_VERSION="" APP="" PLIST="" OLD_VERSION="" IN_PLACE=0
+LABEL="" NEW_VERSION="" APP="" PLIST="" OLD_VERSION="" IN_PLACE=0 FOUND_APP=""
 inspect_app() {
   LABEL="$(plist_get "$SRC_APP" CFBundleIdentifier)"
   NEW_VERSION="$(plist_get "$SRC_APP" CFBundleShortVersionString)"
   [[ -n "$LABEL" && -x "$SRC_APP/Contents/MacOS/glide-host" ]] || die "$SRC_APP is not a Glide Host app"
   codesign --verify --strict "$SRC_APP" 2>/dev/null || die "$SRC_APP has a broken code signature; not installing it"
+  PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
   if [[ -n "$SELF_APP" && "$SRC_APP" == "$SELF_APP" && -z "$OPT_DIR" ]]; then
     IN_PLACE=1; APP="$SRC_APP"
   else
-    APP="${OPT_DIR:-$HOME/Applications}/Glide Host.app"
+    if [[ -n "$OPT_DIR" ]]; then
+      APP="$OPT_DIR/Glide Host.app"
+    else
+      # Update the copy that is installed (for example the one the .dmg put in /Applications)
+      # instead of adding a second one under the same launchd label.
+      FOUND_APP="$(existing_app)"
+      APP="${FOUND_APP:-$HOME/Applications/Glide Host.app}"
+    fi
     # --app naming the installed app itself: copying it over itself would delete it first.
     if [[ -d "$APP" && "$(cd "$SRC_APP" && pwd -P)" == "$(cd "$APP" && pwd -P)" ]]; then
       IN_PLACE=1; APP="$SRC_APP"
     fi
   fi
-  PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
   [[ -d "$APP" ]] && OLD_VERSION="$(plist_get "$APP" CFBundleShortVersionString)"
   if [[ $IN_PLACE == 1 ]]; then
     ok "Glide Host $NEW_VERSION at $APP"
@@ -276,6 +328,9 @@ inspect_app() {
     ok "updating Glide Host $OLD_VERSION → $NEW_VERSION ($SRC_DESC)"
   else
     ok "installing Glide Host $NEW_VERSION ($SRC_DESC)"
+  fi
+  if [[ $IN_PLACE != 1 && -n "$FOUND_APP" && "$FOUND_APP" != "$HOME/Applications/Glide Host.app" ]]; then
+    info "into $(dirname "$APP"), where it is installed now (--dir picks another folder)"
   fi
   return 0
 }
@@ -307,14 +362,44 @@ remove_other_agents() {
 
 install_files() {
   step "Installing"
-  local label_x="" app_x="" home_x=""
+  local label_x="" app_x="" home_x="" parent="" a="" seen=":"
   mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+  if [[ $IN_PLACE != 1 ]]; then
+    # Copy next to the destination first, then swap it in with two renames: a copy that fails
+    # (disk full, no permission) leaves the installed app and its running host untouched.
+    parent="$(dirname "$APP")"
+    mkdir -p "$parent" 2>/dev/null || true
+    [[ -d "$parent" && -w "$parent" ]] || die "can't write to $parent (it belongs to another user?). Install as that user, or pass --dir."
+    STAGE="$(mktemp -d "$parent/.glide-install.XXXXXX")" || die "can't write to $parent"
+    # ditto keeps the bundle's symlinks, extended attributes and code signature intact.
+    ditto "$SRC_APP" "$STAGE/new" || die "could not copy the app to $parent; the installed one is unchanged"
+  fi
+  # A login item (the setup window's Start at Login) and this script's LaunchAgent would be two
+  # launchd jobs with the same label: the LaunchAgent takes over. Other copies lose theirs too, so
+  # only one host starts at login.
+  for a in "$APP" "$SYS_APPS/Glide Host.app" "$HOME/Applications/Glide Host.app"; do
+    [[ "$seen" == *":$a:"* ]] && continue
+    seen="$seen$a:"
+    if login_item_on "$a"; then
+      info "$a starts at login as a login item (Start at Login in its setup window)."
+      "$a/Contents/MacOS/glide-host" --login-item off >/dev/null 2>&1 \
+        || die "could not turn that login item off. Turn off Start at Login in Glide Host's setup window, then run this again."
+      ok "removed the login item: the LaunchAgent below starts the host instead"
+    fi
+    if [[ "$a" != "$APP" && -d "$a" ]]; then
+      warn "another copy is at $a; it doesn't start at login. Delete it if you don't use it."
+    fi
+  done
   stop_agent "$LABEL"
   if [[ $IN_PLACE != 1 ]]; then
-    mkdir -p "$(dirname "$APP")"
-    rm -rf "$APP"
-    # ditto keeps the bundle's symlinks, extended attributes and code signature intact.
-    ditto "$SRC_APP" "$APP"
+    if [[ -e "$APP" ]]; then
+      mv "$APP" "$STAGE/previous" || die "could not move the old $APP aside"
+    fi
+    if ! mv "$STAGE/new" "$APP"; then
+      [[ -d "$STAGE/previous" ]] && mv "$STAGE/previous" "$APP"
+      die "could not move the new app into place; the old one is back"
+    fi
+    rm -rf "$STAGE"; STAGE=""
     ok "$APP"
   fi
   # Releases are signed ad hoc and not notarized: a quarantine flag (set by browsers and by
@@ -442,58 +527,69 @@ permissions() {
   fi
 }
 
+# The host always listens on port 7420 (unless "listen": false with a PC address); with the PC's
+# address it also dials the PC. One direction that the network allows is enough.
 connection() {
-  local current="" mode="" addr="" ip="" bin="$APP/Contents/MacOS/glide-host" cfg=""
+  local current="" addr="" listen=1 was_listening=1 ip="" bin="$APP/Contents/MacOS/glide-host" cfg=""
   cfg="$(config_dir)/host.json"
   current="$(config_get connect)"
+  [[ -n "$current" && "$(config_get listen)" == false ]] && was_listening=0
+  addr="$current" listen=$was_listening
+  step "Connecting the PC"
   if [[ -n "$OPT_CONNECT" ]]; then
-    mode=dial addr="$(with_port "$OPT_CONNECT")"
+    addr="$(with_port "$OPT_CONNECT")" listen=1
+    [[ $OPT_NO_LISTEN == 1 ]] && listen=0
   elif [[ $OPT_LISTEN == 1 ]]; then
-    mode=listen
+    addr="" listen=1
   elif [[ $INTERACTIVE == 1 ]]; then
-    step "How should the Mac and the PC connect?"
-    info "1) The PC connects to this Mac ${D}(the Mac listens on port $DEFAULT_PORT)${N}"
-    info "2) This Mac connects to the PC ${D}(the PC runs glide-client --listen; use this when the${N}"
-    info "   ${D}Mac can reach the PC but not the other way round)${N}"
-    [[ -n "$current" ]] && info "${D}Now: the Mac dials $current.${N}"
-    ask "Choose 1 or 2:" "$([[ -n "$current" ]] && echo 2 || echo 1)"
+    info "The PC connects to this Mac on port $DEFAULT_PORT. If your network only lets the Mac reach"
+    info "the PC, also enter the PC's address: then the Mac dials it as well."
+    ask "The PC's address (optional; name or IP, optionally :port${current:+; - for none}):" "$current"
     case "$REPLY" in
-      2) mode=dial
-         ask "The PC's address (name or IP, optionally :port):" "$current"
-         [[ -n "$REPLY" ]] || die "no address given"
-         addr="$(with_port "$REPLY")" ;;
-      *) mode=listen ;;
+      -|"") addr="" listen=1 ;;
+      *) addr="$(with_port "$REPLY")"
+         if confirm "Let the PC connect to this Mac too (listen on port $DEFAULT_PORT)?" "$([[ $was_listening == 1 ]] && echo y || echo n)"; then
+           listen=1
+         else
+           listen=0
+         fi ;;
     esac
-  else
-    mode=keep
   fi
 
-  case "$mode" in
-    dial)
-      if [[ "$addr" != "$current" ]]; then
-        "$bin" --set-connect "$addr" >/dev/null || die "could not save the connect target"
-      fi
-      ok "the Mac dials $addr and retries every 2 s while disconnected"
-      if port_open "$addr"; then
-        ok "a viewer is answering at $addr"
-      else
-        warn "nothing answers at $addr yet: on the PC, start glide-client.exe --listen and allow it"
-        warn "through Windows Firewall. Glide keeps trying, so it connects once the viewer runs."
-      fi
-      VIEWER_HINT="glide-client.exe --listen" ;;
-    listen)
-      if [[ -n "$current" ]]; then
-        plutil -remove connect "$cfg" >/dev/null 2>&1 && chmod 600 "$cfg"
-        ok "the Mac no longer dials $current"
-      fi
-      ip="$(lan_address)"
-      ok "the Mac listens on port $DEFAULT_PORT${ip:+ at $ip}"
-      VIEWER_HINT="glide-client.exe ${ip:-MAC-ADDRESS}" ;;
-    keep)
-      ip="$(lan_address)"
-      if [[ -n "$current" ]]; then VIEWER_HINT="glide-client.exe --listen"
-      else VIEWER_HINT="glide-client.exe ${ip:-MAC-ADDRESS}"; fi ;;
-  esac
+  if [[ "$addr" != "$current" ]]; then
+    if [[ -n "$addr" ]]; then
+      "$bin" --set-connect "$addr" >/dev/null || die "could not save the PC's address"
+    else
+      plutil -remove connect "$cfg" >/dev/null 2>&1 && chmod 600 "$cfg"
+      ok "the Mac no longer dials $current"
+    fi
+  fi
+  if [[ -n "$addr" && $listen == 0 ]]; then
+    plutil -replace listen -bool NO "$cfg" >/dev/null 2>&1 || die "could not save \"listen\": false in $cfg"
+    chmod 600 "$cfg"
+  elif [[ -f "$cfg" ]] && plutil -extract listen raw -o - "$cfg" >/dev/null 2>&1; then
+    plutil -remove listen "$cfg" >/dev/null 2>&1 && chmod 600 "$cfg"
+  fi
+
+  ip="$(lan_address)"
+  if [[ $listen == 1 ]]; then
+    ok "the Mac listens on port $DEFAULT_PORT${ip:+ at $ip}: the PC can connect to it"
+    VIEWER_HINT="glide-client.exe ${ip:-MAC-ADDRESS}"
+  else
+    ok "nothing listens on the Mac (host.json \"listen\": false): only the Mac connects"
+    VIEWER_HINT="glide-client.exe --listen"
+  fi
+  if [[ -n "$addr" ]]; then
+    ok "the Mac also dials the PC at $addr, every 2 s while disconnected"
+    if port_open "$addr"; then
+      ok "a viewer is answering at $addr"
+    elif [[ $listen == 0 ]]; then
+      warn "nothing answers at $addr yet: on the PC, the viewer must run with \"Let the Mac connect to"
+      warn "this PC\" on and be allowed through Windows Firewall. Glide keeps trying."
+    else
+      info "${D}nothing answers at $addr yet; Glide keeps trying, and the PC can connect to the Mac.${N}"
+    fi
+  fi
 }
 
 HOST_STARTED=0
@@ -531,7 +627,8 @@ pairing() {
     confirm "Pair another viewer now?" n || return 0
   else
     info "The PC has to be paired once: both screens show a 6-digit code and you confirm it."
-    info "On the PC, start the viewer:  ${B}${VIEWER_HINT}${N}"
+    info "On the PC, start the viewer and enter this Mac's address in its setup window, or run:"
+    info "  ${B}${VIEWER_HINT}${N}"
     info "${D}(Not set up yet? In PowerShell: irm https://raw.githubusercontent.com/$GLIDE_REPO/main/install.ps1 | iex)${N}"
     confirm "Open the pairing window now?" y || return 0
   fi
@@ -543,7 +640,7 @@ summary() {
   info "App:      $APP"
   info "Log:      ~/Library/Logs/glide-host.log (menu bar → Open Log)"
   info "Settings: $(config_dir)/host.json"
-  info "PC:       ${VIEWER_HINT:-glide-client.exe MAC-ADDRESS}"
+  info "PC:       ${VIEWER_HINT:-glide-client.exe MAC-ADDRESS} (or the viewer's setup window)"
   if [[ -n "$SELF_APP" ]]; then
     info "Run ${B}glide-setup${N} again to change the connection or pair another viewer."
   else
@@ -568,7 +665,7 @@ uninstall() {
     rm -f "$f"
     ok "removed LaunchAgent $l"
     [[ -n "$app" ]] || app="${OPT_DIR:-$HOME/Applications}/Glide Host.app"
-    [[ -d "$app" || -n "$OPT_DIR" ]] || app="/Applications/Glide Host.app"
+    [[ -d "$app" || -n "$OPT_DIR" ]] || app="$SYS_APPS/Glide Host.app"
     if [[ -d "$app" ]]; then
       # The login item the app's setup window registers (stops that host too). Hosts before 0.3
       # don't know the flag; nothing to undo there.
