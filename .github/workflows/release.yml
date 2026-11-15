@@ -147,6 +147,9 @@ jobs:
           security import "$RUNNER_TEMP/self-sign.p12" -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign
           rm -f "$RUNNER_TEMP/self-sign.p12"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PASSWORD" "$KC" >/dev/null
+          # shellcheck disable=SC2046  # the list is space-separated paths, as codesign expects
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          security find-identity -p codesigning "$KC"
           {
             echo "GLIDE_SIGN_ID=Glide Release Signing"
             echo "GLIDE_SIGN_KEYCHAIN=$KC"
