@@ -17,6 +17,9 @@ public actor SerialGate {
         if waiters.isEmpty { busy = false } else { waiters.removeFirst().resume() }
     }
 
+    /// Operations waiting for their turn (not counting the one running), for tests.
+    public var queued: Int { waiters.count }
+
     public func run<T>(_ op: @Sendable () async throws -> T) async rethrows -> T {
         await acquire()
         defer { release() }

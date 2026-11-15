@@ -99,7 +99,6 @@ private func captureLifecycleTests() {
         await withTaskGroup(of: Void.self) { g in
             for i in 0..<4 {
                 g.addTask {
-                    try? await Task.sleep(nanoseconds: UInt64(i) * 10_000_000)  // ask in order 0, 1, 2, 3
                     await gate.run {
                         active.update { $0 += 1 }
                         maxActive.update { $0 = max($0, active.get()) }
@@ -109,6 +108,9 @@ private func captureLifecycleTests() {
                         active.update { $0 -= 1 }
                     }
                 }
+                // Ask in order 0, 1, 2, 3: wait until this call is running (0) or queued (1-3)
+                // before making the next. Sleeps alone don't order tasks on a busy machine.
+                while await (i == 0 ? trace.get().isEmpty : gate.queued < i) { await Task.yield() }
             }
         }
     }
