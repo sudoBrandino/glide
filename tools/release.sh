@@ -219,7 +219,7 @@ cmd_notes() {
       if [[ "$z" == *.dmg ]]; then
         echo "| \`$(basename "$z")\` | **Mac host, start here:** open it, drag Glide Host to Applications, open it; its setup window does the rest. $desc |"
       else
-        echo "| \`$(basename "$z")\` | Mac host as a zip (install script, Homebrew), $desc. Signed ad hoc, not notarized |"
+        echo "| \`$(basename "$z")\` | Mac host as a zip (install script, Homebrew), $desc. Not notarized |"
       fi
     done
     echo "| \`$VIEWER_ZIP\` | Windows viewer: \`glide-client.exe\`, Windows 10/11 x64 |"
