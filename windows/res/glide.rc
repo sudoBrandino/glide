@@ -18,6 +18,14 @@
 #define ES_AUTOHSCROLL    0x80
 #define WS_BORDER         0x00800000L
 #define WS_GROUP          0x00020000L
+#define SS_NOPREFIX       0x80
+#define WS_VSCROLL        0x00200000L
+#define LVS_REPORT        0x1
+#define LVS_SINGLESEL     0x4
+#define LVS_SHOWSELALWAYS 0x8
+#define LVS_NOSORTHEADER  0x8000
+#define CBS_DROPDOWN      0x2
+#define CBS_AUTOHSCROLL   0x40
 #define IDOK              1
 #define IDCANCEL          2
 #define VOS_NT_WINDOWS32  0x40004L
@@ -47,6 +55,24 @@
 #define IDC_SU_INSTALL   1210
 #define IDC_SU_INSTALL_NOTE 1211
 #define IDC_SU_ADDR_LABEL 1212
+#define IDD_CONNS        104
+#define IDC_CN_SEARCH    1300
+#define IDC_CN_LIST      1301
+#define IDC_CN_ADD       1302
+#define IDC_CN_EDIT      1303
+#define IDC_CN_DUPLICATE 1304
+#define IDC_CN_REMOVE    1305
+#define IDC_CN_UNPAIR    1306
+#define IDC_CN_STATUS    1307
+#define IDD_CONN_EDIT    105
+#define IDC_CE_NAME      1400
+#define IDC_CE_ADDR      1401
+#define IDC_CE_TEST      1402
+#define IDC_CE_TEST_RESULT 1403
+#define IDC_CE_GROUP     1404
+#define IDC_CE_ACCEPT    1405
+#define IDC_CE_FAVORITE  1406
+#define IDC_CE_ERROR     1407
 
 IDI_GLIDE ICON "glide.ico"
 1 24 "glide.manifest"
@@ -93,6 +119,49 @@ BEGIN
     LTEXT           "", IDC_SU_INSTALL_NOTE, 22, 205, 268, 18
     DEFPUSHBUTTON   "&Connect", IDOK, 184, 228, 52, 14, WS_TABSTOP | WS_GROUP
     PUSHBUTTON      "Cancel", IDCANCEL, 240, 228, 50, 14, WS_TABSTOP
+END
+
+// Connections (win/connections.rs): search, the saved Macs (report list view, grouped at runtime
+// when there is more than one group), actions on the right, a status line for the selection.
+// Connect is IDOK (Enter / double-click), Close is IDCANCEL (Esc). Keep this file ASCII.
+IDD_CONNS DIALOGEX 0, 0, 400, 260
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | DS_SETFOREGROUND | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "Glide: Connections"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    EDITTEXT        IDC_CN_SEARCH, 10, 8, 200, 14, ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP | WS_GROUP
+    CONTROL         "", IDC_CN_LIST, "SysListView32", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_BORDER | WS_TABSTOP, 10, 26, 312, 192
+    DEFPUSHBUTTON   "&Connect", IDOK, 330, 26, 60, 14, WS_TABSTOP | WS_GROUP
+    PUSHBUTTON      "&Add...", IDC_CN_ADD, 330, 48, 60, 14, WS_TABSTOP
+    PUSHBUTTON      "&Edit...", IDC_CN_EDIT, 330, 66, 60, 14, WS_TABSTOP
+    PUSHBUTTON      "D&uplicate", IDC_CN_DUPLICATE, 330, 84, 60, 14, WS_TABSTOP
+    PUSHBUTTON      "&Remove", IDC_CN_REMOVE, 330, 106, 60, 14, WS_TABSTOP
+    PUSHBUTTON      "U&npair", IDC_CN_UNPAIR, 330, 124, 60, 14, WS_TABSTOP
+    LTEXT           "", IDC_CN_STATUS, 10, 223, 312, 30, SS_NOPREFIX
+    PUSHBUTTON      "Close", IDCANCEL, 330, 238, 60, 14, WS_TABSTOP | WS_GROUP
+END
+
+// Add / edit one connection (win/connections.rs). Titles, cue banners and results are set at
+// runtime. Keep this file ASCII.
+IDD_CONN_EDIT DIALOGEX 0, 0, 280, 196
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Glide: Connection"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT           "&Name:", -1, 10, 8, 120, 10
+    EDITTEXT        IDC_CE_NAME, 10, 19, 260, 14, ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP | WS_GROUP
+    LTEXT           "&Address of the Mac:", -1, 10, 38, 120, 10
+    EDITTEXT        IDC_CE_ADDR, 10, 49, 202, 14, ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP | WS_GROUP
+    PUSHBUTTON      "&Test", IDC_CE_TEST, 218, 49, 52, 14, WS_TABSTOP
+    LTEXT           "", IDC_CE_TEST_RESULT, 10, 66, 260, 18, SS_NOPREFIX
+    LTEXT           "&Group (optional):", -1, 10, 87, 120, 10
+    COMBOBOX        IDC_CE_GROUP, 10, 98, 260, 90, CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP | WS_GROUP
+    AUTOCHECKBOX    "&Let the Mac connect to this PC", IDC_CE_ACCEPT, 10, 119, 260, 12, WS_TABSTOP | WS_GROUP
+    AUTOCHECKBOX    "&Favorite (listed first)", IDC_CE_FAVORITE, 10, 134, 260, 12, WS_TABSTOP | WS_GROUP
+    LTEXT           "", IDC_CE_ERROR, 10, 151, 260, 18, SS_NOPREFIX
+    DEFPUSHBUTTON   "&Save", IDOK, 162, 174, 52, 14, WS_TABSTOP | WS_GROUP
+    PUSHBUTTON      "Cancel", IDCANCEL, 218, 174, 52, 14, WS_TABSTOP
 END
 
 VS_VERSION_INFO VERSIONINFO
