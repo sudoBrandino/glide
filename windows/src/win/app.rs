@@ -311,6 +311,12 @@ pub(super) fn store_snapshot() -> Store {
     ui().store.lock().unwrap().clone()
 }
 
+/// Pin-store key of the target this viewer is running with (may be a command-line override of
+/// the saved active connection).
+pub(super) fn running_pin_target() -> String {
+    ui().shared.pin_target.clone()
+}
+
 /// Change and save the live config (setup dialog).
 pub(super) fn update_store(f: impl FnOnce(&mut config::Config)) {
     ui().store.lock().unwrap().update(f);

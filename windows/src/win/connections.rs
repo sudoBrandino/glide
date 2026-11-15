@@ -61,12 +61,23 @@ const RESTART_NOTE: &str = "Glide will reconnect when you close this window.";
 /// Errors are shown to the user.
 pub fn switch_to(hwnd: HWND, id: &str) {
     let mut res = Ok(false);
-    super::app::update_store(|c| res = logic::activate(c, id));
+    super::app::update_store(|c| res = logic::activate(c, id).map(|changed| changed || !is_running(c, id)));
     match res {
         Ok(true) => restart(hwnd),
         Ok(false) => {}
         Err(e) => error_box(Some(hwnd), &e),
     }
+}
+
+/// Whether this viewer is running with connection `id`'s target. It may not be even when `id` is
+/// the active connection: a host or `--listen` on the command line overrides it for this run.
+fn is_running(c: &crate::config::Config, id: &str) -> bool {
+    logic::get(c, id).is_some_and(|s| s.pin_key(c.listen_port) == super::app::running_pin_target())
+}
+
+/// Connect makes sense for this row: a supported connection this viewer isn't already using.
+fn can_connect(r: &Row) -> bool {
+    r.supported && !(r.active && is_running(&snapshot(), &r.id))
 }
 
 /// Start a fresh viewer (it reads the new active connection) and close this one.
@@ -371,7 +382,7 @@ unsafe fn refresh(h: HWND, ctx: &Ctx, prefer: Option<String>) {
 unsafe fn update_selection(h: HWND, ctx: &Ctx) {
     let sel = selected(h, ctx);
     let any = sel.is_some();
-    enable(h, IDOK.0, sel.as_ref().is_some_and(|r| r.supported && !r.active));
+    enable(h, IDOK.0, sel.as_ref().is_some_and(can_connect));
     enable(h, IDC_CN_EDIT, any);
     enable(h, IDC_CN_DUPLICATE, any);
     enable(h, IDC_CN_REMOVE, any);
@@ -406,7 +417,7 @@ unsafe fn update_selection(h: HWND, ctx: &Ctx) {
 
 unsafe fn do_connect(h: HWND, ctx: &Ctx) {
     let Some(r) = selected(h, ctx) else { return };
-    if !r.supported || r.active {
+    if !can_connect(&r) {
         return;
     }
     *ctx.connect.borrow_mut() = Some(r.id);

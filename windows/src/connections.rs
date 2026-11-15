@@ -253,6 +253,18 @@ pub fn remove(c: &mut Config, id: &str) -> Option<Removed> {
         out.unpaired = c.pinned_hosts.remove(&key).is_some();
         c.last_display.remove(&key);
     }
+    // A viewer paired while listening keeps that pin under "listen:PORT" and `pairing` falls
+    // back to it, so it must go too unless another connection still depends on it: a
+    // listen-only one (its own key), or one with an address that has no pin of its own yet.
+    if let Some(f) = pin_fallback(&s.target(c.listen_port)) {
+        let needed = c.connections.iter().any(|o| {
+            let t = o.target(c.listen_port);
+            pin_target(&t) == f || (pin_fallback(&t).as_deref() == Some(f.as_str()) && !c.pinned_hosts.contains_key(&pin_target(&t)))
+        });
+        if !needed && c.pinned_hosts.remove(&f).is_some() {
+            out.unpaired = true;
+        }
+    }
     if c.active_connection.as_deref() == Some(id) {
         out.was_active = true;
         c.active_connection = None;
@@ -287,6 +299,14 @@ pub fn activate(c: &mut Config, id: &str) -> Result<bool, String> {
     let before = (c.host.clone(), c.accept_incoming);
     let host = Some(s.address.trim().to_string()).filter(|a| !a.is_empty());
     let accept = s.accept_incoming;
+    // Inbound admission: trust on first use pins the first Mac that connects in
+    // (`allowed_peers` = that one address), and only a Mac whose key is pinned may roam past it.
+    // A Mac this viewer hasn't paired with yet could then never connect in to pair, so
+    // switching to one resets that automatic pin to "first use" again (as Forget host does in
+    // listen mode). Hand-written lists (CIDRs, several entries) are left alone.
+    if s.pairing(c).is_none() && crate::peers::is_roamable(&c.allowed_peers) && s.target(c.listen_port) != current_target(c) {
+        c.allowed_peers.clear();
+    }
     c.host = host;
     // Listen-only keeps the user's accept setting; it means nothing without an address.
     if c.host.is_some() {
@@ -294,6 +314,11 @@ pub fn activate(c: &mut Config, id: &str) -> Result<bool, String> {
     }
     c.active_connection = Some(id.to_string());
     Ok(before != (c.host.clone(), c.accept_incoming))
+}
+
+/// The target `host` / `accept_incoming` / `listen_port` describe (what a plain launch uses).
+fn current_target(c: &Config) -> TargetSpec {
+    crate::config::resolve_target(None, None, false, c)
 }
 
 /// Reconcile the list with `host` / `accept_incoming` (written by the Set up dialog, by hand, or
@@ -597,6 +622,62 @@ mod tests {
         let r = remove(&mut c, "c2").unwrap();
         assert!(!r.unpaired && !r.was_active);
         assert_eq!(c.pinned_hosts.len(), 1);
+    }
+
+    #[test]
+    fn remove_forgets_listen_fallback_pin_unless_still_needed() {
+        let mut c = Config::default();
+        add(&mut c, &draft("Studio", "192.168.1.20")).unwrap();
+        add(&mut c, &draft("Laptop", "10.0.0.5")).unwrap();
+        // Paired while listening, then the address was entered (app copies the pin across).
+        pin(&mut c, "listen:7420", "Studio");
+        pin(&mut c, "192.168.1.20:7420", "Studio");
+        pin(&mut c, "10.0.0.5:7420", "Laptop");
+        // The laptop has its own pin, so nothing else needs the fallback.
+        assert!(remove(&mut c, "c1").unwrap().unpaired);
+        assert!(!c.pinned_hosts.contains_key("listen:7420"));
+        assert!(get(&c, "c2").unwrap().pairing(&c).is_some());
+
+        // An address-bearing connection without its own pin still relies on the fallback.
+        let mut c = Config::default();
+        add(&mut c, &draft("Studio", "192.168.1.20")).unwrap();
+        add(&mut c, &draft("Other", "10.0.0.5")).unwrap();
+        pin(&mut c, "listen:7420", "Studio");
+        remove(&mut c, "c1").unwrap();
+        assert!(c.pinned_hosts.contains_key("listen:7420"));
+
+        // So does a listen-only connection.
+        let mut c = Config::default();
+        add(&mut c, &draft("Studio", "192.168.1.20")).unwrap();
+        add(&mut c, &draft("Wait", "")).unwrap();
+        pin(&mut c, "listen:7420", "Studio");
+        remove(&mut c, "c1").unwrap();
+        assert!(c.pinned_hosts.contains_key("listen:7420"));
+    }
+
+    #[test]
+    fn switching_to_unpaired_mac_resets_tofu_admission_only() {
+        let mut c = Config::default();
+        add(&mut c, &draft("Studio", "192.168.1.20")).unwrap();
+        add(&mut c, &draft("Laptop", "10.0.0.5")).unwrap();
+        add(&mut c, &draft("Paired", "10.0.0.6")).unwrap();
+        pin(&mut c, "10.0.0.6:7420", "Paired");
+        // TOFU pinned Studio's address after an inbound session.
+        c.allowed_peers = vec!["192.168.1.20".into()];
+        // To a paired Mac: it may roam past the pin, nothing to reset.
+        activate(&mut c, "c3").unwrap();
+        assert_eq!(c.allowed_peers, ["192.168.1.20"]);
+        // To an unpaired one: back to first use, so it can connect in and pair.
+        activate(&mut c, "c2").unwrap();
+        assert!(c.allowed_peers.is_empty());
+        // A hand-written allowlist stays.
+        c.allowed_peers = vec!["192.168.1.0/24".into()];
+        activate(&mut c, "c1").unwrap();
+        assert_eq!(c.allowed_peers, ["192.168.1.0/24"]);
+        // Re-activating the current target changes nothing.
+        c.allowed_peers = vec!["192.168.1.20".into()];
+        activate(&mut c, "c1").unwrap();
+        assert_eq!(c.allowed_peers, ["192.168.1.20"]);
     }
 
     #[test]
