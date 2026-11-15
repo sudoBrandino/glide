@@ -37,6 +37,8 @@ final class SetupModel: ObservableObject {
     @Published var paired: [PairedViewer] = TrustStore.shared.list
     @Published var busy: String?
     @Published var error: String?
+    /// host.json exists but can't be read: nothing is saved until it's fixed (HostConfig.update).
+    @Published var configProblem: String? = HostConfig.problem
 
     private var timer: Timer?
     private var checking = false
@@ -67,6 +69,8 @@ final class SetupModel: ObservableObject {
         accessibility = AXIsProcessTrusted() ? .ok : .missing
         status = HostStatus.shared.snapshot
         paired = TrustStore.shared.list
+        let problem = HostConfig.problem
+        if problem != configProblem { configProblem = problem }
         let a = Instance.localAddresses()
         if a.map(\.address) != addresses.map(\.address) { addresses = a }
         guard !checking else { return }
@@ -89,10 +93,10 @@ final class SetupModel: ObservableObject {
 
     func install() {
         let dest = Instance.installDestination(existing: installer?.path)
-        busy = "Installing…"
-        let stop = installer != nil
+        let stop = installer != nil, running = installer?.path
+        busy = stop && Instance.installsInPlace(existing: running) ? "Restarting Glide Host…" : "Installing…"
         DispatchQueue.global().async {
-            let err = Instance.installAndRelaunch(to: dest, stopRunning: stop)  // returns only on failure
+            let err = Instance.installAndRelaunch(to: dest, stopRunning: stop, runningPath: running)  // returns only on failure
             DispatchQueue.main.async { self.busy = nil; self.error = err }
         }
     }
@@ -129,21 +133,30 @@ final class SetupModel: ObservableObject {
 
     func savePC() {
         let t = pcAddress.trimmingCharacters(in: .whitespaces)
-        var c = HostConfig.load()
-        c.connect = t.isEmpty ? nil : t
-        c.save()
-        savedPC = c.connect
-        actions.setDialTarget(c.connect)
+        do {
+            let c = try HostConfig.update { $0.connect = t.isEmpty ? nil : t }
+            savedPC = c.connect
+            actions.setDialTarget(c.connect)
+        } catch {
+            self.error = HostConfig.notSavedText(error, what: "the PC's address")
+        }
         refresh()
     }
 
     func pair() { actions.openPairing() }
     func cancelPairing() { actions.cancelPairing() }
 
-    func finish() {
-        var c = HostConfig.load()
-        c.setupVersion = GlideVersion.display
-        c.save()
+    /// Remembers that setup was finished for this version. False (and `error` says why) when
+    /// host.json couldn't be updated: the window then stays open.
+    @discardableResult
+    func finish() -> Bool {
+        do {
+            try HostConfig.update { $0.setupVersion = GlideVersion.display }
+            return true
+        } catch {
+            self.error = HostConfig.notSavedText(error, what: "that setup is finished")
+            return false
+        }
     }
 
     static func openPrivacy(_ pane: String) {
@@ -175,6 +188,11 @@ struct SetupView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    if let p = m.configProblem {
+                        Text("Settings can't be saved: \(p). Glide Host won't overwrite it, so your paired viewers are kept. Fix the file, or move it away to start over.")
+                            .foregroundStyle(.red).font(.callout).textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     if let i = m.installer { installerRow(i) } else {
                         installRow
                         loginRow
@@ -213,7 +231,7 @@ struct SetupView: View {
             if let b = m.busy { ProgressView().controlSize(.small); Text(b).foregroundStyle(.secondary) }
             Spacer()
             if m.installer == nil {
-                Button(m.allDone ? "Done" : "Finish Later") { m.finish(); close() }
+                Button(m.allDone ? "Done" : "Finish Later") { if m.finish() { close() } }
                     .keyboardShortcut(m.allDone ? .defaultAction : .cancelAction)
             } else {
                 Button("Cancel") { NSApp.terminate(nil) }.keyboardShortcut(.cancelAction)
@@ -225,10 +243,15 @@ struct SetupView: View {
     // MARK: Rows
 
     private func installerRow(_ i: (version: String?, path: String?)) -> some View {
-        Row(state: .todo, title: "Replace the running Glide Host",
-            detail: "Glide Host \(i.version ?? "(an older version)") is running\(i.path.map { " from \($0)" } ?? ""). "
-                + "Install this version (\(GlideVersion.display)) in its place? Your settings and paired viewers stay.") {
-            Button("Install \(GlideVersion.display)") { m.install() }.keyboardShortcut(.defaultAction).disabled(m.busy != nil)
+        let running = "Glide Host \(i.version ?? "(an older version)") is running\(i.path.map { " from \($0)" } ?? ""). "
+        // This copy already replaced the running host's app on disk: restart into it, no copy.
+        let inPlace = Instance.installsInPlace(existing: i.path)
+        return Row(state: .todo, title: inPlace ? "Restart with this version" : "Replace the running Glide Host",
+            detail: running + (inPlace
+                ? "This copy (\(GlideVersion.display)) is already in its place. Restart Glide Host to use it? Your settings and paired viewers stay."
+                : "Install this version (\(GlideVersion.display)) in its place? Your settings and paired viewers stay.")) {
+            Button(inPlace ? "Restart Glide Host" : "Install \(GlideVersion.display)") { m.install() }
+                .keyboardShortcut(.defaultAction).disabled(m.busy != nil)
         }
     }
 

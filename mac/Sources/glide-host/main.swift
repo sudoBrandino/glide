@@ -61,27 +61,43 @@ struct HostConfig: Codable {
 
     static var url: URL { dir.appendingPathComponent("host.json") }
 
-    /// Never overwrites an existing file it can't decode (that would drop the paired viewers);
-    /// uses defaults in memory instead.
+    /// For reading only. Never overwrites an existing file it can't decode (that would drop the
+    /// paired viewers); uses defaults in memory instead. To change the file, use `update`.
     static func load() -> HostConfig {
-        guard let d = try? Data(contentsOf: url) else {
+        do {
+            if let c = try ConfigFile.read(HostConfig.self, from: url) { return c }
             let c = HostConfig()
             c.save()
             return c
-        }
-        do { return try JSONDecoder().decode(HostConfig.self, from: d) } catch {
-            log("config: \(url.path) is not valid (\(error)); using defaults without saving — fix the file")
+        } catch {
+            log("config: \(error); using defaults without saving — fix the file")
             return HostConfig()
         }
     }
 
+    /// Read-modify-write of host.json for callers that show the error (setup window, CLI). A
+    /// missing file starts from defaults; an existing file that can't be read or decoded is never
+    /// overwritten: this throws `ConfigFile.Failure` and writes nothing. (`modify`, in
+    /// DisplayModeController.swift, refuses the same way and only logs.)
+    @discardableResult
+    static func update(_ change: (inout HostConfig) -> Void) throws -> HostConfig {
+        try ConfigFile.update(url, defaults: { HostConfig() }, change)
+    }
+
+    /// Why host.json can't be used, or nil when it's fine (or doesn't exist yet).
+    static var problem: String? {
+        do { _ = try ConfigFile.read(HostConfig.self, from: url); return nil } catch { return "\(error)" }
+    }
+
+    /// The message for a refused change (setup window, CLI).
+    static func notSavedText(_ error: Error, what: String) -> String {
+        "Couldn't save \(what): \(error). Nothing was changed, so your paired viewers are kept. Fix the file or move it away, then try again."
+    }
+
+    /// Writes this config as host.json. Never call it on a config from `load()` (that may be
+    /// defaults standing in for a file it couldn't decode): change the file with `update`.
     func save() {
-        let enc = JSONEncoder()
-        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let d = try! enc.encode(self)
-        let tmp = HostConfig.url.appendingPathExtension("tmp")
-        FileManager.default.createFile(atPath: tmp.path, contents: d, attributes: [.posixPermissions: 0o600])
-        rename(tmp.path, HostConfig.url.path)
+        do { try ConfigFile.write(self, to: HostConfig.url) } catch { log("config: \(error)") }
     }
 }
 
@@ -206,8 +222,18 @@ if let out = takeValue("--setup-preview") {  // offscreen render; never listens 
     exit(0)
 }
 
+if let v = takeValue("--set-connect") {
+    let target = v.trimmingCharacters(in: .whitespaces)
+    do {
+        try HostConfig.update { $0.connect = target.isEmpty ? nil : target }
+        print(target.isEmpty ? "cleared the connect target" : "saved connect target \(target)")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("error: \(HostConfig.notSavedText(error, what: "the connect target"))\n".utf8))
+        exit(1)
+    }
+}
 var config = HostConfig.load()
-if let v = takeValue("--set-connect") { config.connect = v; config.save(); print("saved connect target \(v)"); exit(0) }
 Instance.redirectLogIfNeeded()
 log("starting \(GlideVersion.banner("glide-host")) (pid \(getpid()))")
 if config.password != nil || config.salt != nil || ProcessInfo.processInfo.environment["GLIDE_PASSWORD"] != nil {
