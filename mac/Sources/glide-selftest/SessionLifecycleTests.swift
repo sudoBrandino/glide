@@ -52,6 +52,12 @@ private func logCoalescerTests() {
     check(late.log && late.summary?.hasPrefix("2 more log lines") == true, "coalescer: summary rides on the next line: \(late.summary ?? "nil")")
 
     // Many addresses: memory stays bounded and the summary stays one line.
+    // Security events: per-key budget only, so another peer's flood can't silence them.
+    let ev = LogCoalescer(window: 60, perKey: 2, total: .max, subject: "pairing/authentication events")
+    for i in 0..<500 { _ = ev.admit("10.0.0.\(i % 250)", now: 1) }  // 250 noisy keys, 2 each
+    check(ev.admit("192.168.50.20", now: 2).log, "coalescer: a security event from a new address is logged despite other peers' events")
+    check(ev.admit("192.168.50.20", now: 2).log && !ev.admit("192.168.50.20", now: 2).log, "coalescer: per-key event budget still applies")
+    check(ev.flush(now: 70)?.contains("pairing/authentication events suppressed") == true, "coalescer: event summary names its subject")
     let m = LogCoalescer(window: 60, perKey: 0, total: 0, maxTracked: 2, maxListed: 1)
     for i in 0..<100 { _ = m.admit("10.1.0.\(i % 50)", now: 0) }
     let ms = m.flush(now: 60) ?? ""

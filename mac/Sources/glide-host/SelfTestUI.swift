@@ -98,8 +98,14 @@ func runSelfTestUI(outDir: String?) -> Never {
     }
     // The pairing alert (built, not shown).
     let alert = PairingController.makeAlert(name: "DESKTOP-NEW", fingerprint: "aaa8 fff7 03b5 0b22", address: "192.168.10.20", code: 973_429)
-    check(alert.messageText == "Pair “DESKTOP-NEW” with this Mac?" && alert.buttons.map(\.title) == ["Codes Match — Pair", "Cancel"], "pairing alert: title + buttons")
+    check(alert.messageText == "Pair “DESKTOP-NEW” with this Mac?" && alert.buttons.map(\.title) == ["Cancel", "Codes Match — Pair"], "pairing alert: title + buttons")
     check((alert.accessoryView as? NSTextField)?.stringValue == "973 429", "pairing alert: code shown as 973 429")
+    alert.layout()
+    let cancelButton = alert.buttons[PairingController.cancelIndex], confirmButton = alert.buttons[PairingController.confirmIndex]
+    check(cancelButton.title == "Cancel" && cancelButton.keyEquivalent == "\r", "pairing alert: Return = Cancel (the default button)")
+    check(confirmButton.keyEquivalent.isEmpty, "pairing alert: no key equivalent on confirm")
+    check(!confirmButton.isEnabled, "pairing alert: confirm disabled until armed (\(PairingController.confirmDelay) s after showing)")
+    check(alert.window.initialFirstResponder === cancelButton, "pairing alert: focus starts on Cancel")
     print("log file: \(StatusMenu.logURL().path)")
     print(failures == 0 ? "UI SELFTEST PASSED" : "\(failures) UI FAILURE(S)")
     exit(failures == 0 ? 0 : 1)

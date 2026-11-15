@@ -313,7 +313,12 @@ final class Server: @unchecked Sendable {
     private var dialLoopActive = false
     /// Dial mode: consecutive sessions that ended without authenticating (backoff 2 s → 60 s).
     private var dialFailures = 0
-    private var pendingRedial: DispatchWorkItem?
+    /// The scheduled redial / idle check. `token` lets the work item tell whether it is still the
+    /// scheduled one (kickDialer may have taken it over and dialed already).
+    private var pendingRedial: (token: Int, work: DispatchWorkItem)?
+    private var redialSeq = 0
+    /// Dialing is held back until pairing opens (DialPolicy.waitForPairing); logged once per stretch.
+    private var waitingForPairing = false
 
     init(settings: HostSettings) throws {
         self.settings = settings
@@ -330,10 +335,11 @@ final class Server: @unchecked Sendable {
     func setDialTarget(_ target: String?) {
         lock.lock()
         dialGeneration += 1
-        pendingRedial?.cancel(); pendingRedial = nil
+        pendingRedial?.work.cancel(); pendingRedial = nil
         dialFailures = 0
         lastDialError = nil
         dialLoopActive = false
+        waitingForPairing = false
         dialTarget = target.flatMap(Self.parseTarget)
         let t = dialTarget
         lock.unlock()
@@ -355,21 +361,50 @@ final class Server: @unchecked Sendable {
         return (s, 7420)  // a bare name, or an IPv6 address without brackets
     }
 
+    /// Shown (menu, setup window) while dialing waits for the pairing window.
+    static let waitingForPairingText = "waiting until pairing is opened on this Mac"
+
     /// Keep a connection to `host:port` alive, redialing after it drops. Idle while another
-    /// session (a viewer that dialed in) is active, so there is only ever one.
+    /// session (a viewer that dialed in) is active, so there is only ever one, and while no viewer
+    /// is paired and the pairing window is closed (DialPolicy): the PC could only be refused then,
+    /// which would also grow its per-address backoff for this Mac.
     func dial(host: String, port: UInt16) {
         lock.lock()
         guard let t = dialTarget, t.host == host, t.port == port else { lock.unlock(); return }
-        if paused { dialLoopActive = false; lock.unlock(); return }
-        dialLoopActive = true
+        let isPaused = paused
         let generation = dialGeneration
-        let queue = DispatchQueue(label: "glide.session.\(nextId)", qos: .userInteractive)
         lock.unlock()
-        if sessions.current != nil {
+        let action = DialPolicy.next(paused: isPaused, sessionActive: sessions.current != nil,
+                                     pairedViewers: TrustStore.shared.list.count,
+                                     pairingOpen: PairingController.shared.window.isOpen())
+        switch action {
+        case .stop:
+            lock.lock(); dialLoopActive = false; lock.unlock()
+            return
+        case .waitForSession:
+            lock.lock(); waitingForPairing = false; lock.unlock()  // the viewer row replaces dialDetail
             scheduleRedial(host: host, port: port, generation: generation, idle: true)
             return
+        case .waitForPairing:
+            lock.lock(); let already = waitingForPairing; waitingForPairing = true; dialLoopActive = true; lock.unlock()
+            if !already {
+                log("dialer: no paired viewer and pairing is closed; not dialing \(host):\(port) until pairing opens (Pair New Viewer…)")
+                HostStatus.shared.update { $0.dialTarget = "\(host):\(port)"; $0.dialDetail = Self.waitingForPairingText }
+            }
+            scheduleRedial(host: host, port: port, generation: generation, idle: true)
+            return
+        case .dial:
+            break
         }
-        HostStatus.shared.update { $0.dialTarget = "\(host):\(port)"; if $0.dialDetail == nil { $0.dialDetail = "connecting" } }
+        lock.lock()
+        dialLoopActive = true
+        waitingForPairing = false
+        let queue = DispatchQueue(label: "glide.session.\(nextId)", qos: .userInteractive)
+        lock.unlock()
+        HostStatus.shared.update {
+            $0.dialTarget = "\(host):\(port)"
+            if $0.dialDetail == nil || $0.dialDetail == Self.waitingForPairingText { $0.dialDetail = "connecting" }
+        }
         let conn = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: SecureChannel.tcpParameters())
         lock.lock(); let quiet = dialFailures > 2 || lastDialError != nil; lock.unlock()
         if !quiet { log("dialer: connecting to \(host):\(port)") }
@@ -390,7 +425,7 @@ final class Server: @unchecked Sendable {
                 sessionStarted = true
                 self.lock.lock(); self.lastDialError = nil; self.lock.unlock()
                 // Hand the live connection to a Session (it re-installs its own state handler).
-                self.adopt(conn, queue: queue) { [weak self] s in
+                self.adopt(conn, queue: queue, outbound: true) { [weak self] s in
                     guard let self else { return }
                     self.lock.lock()
                     self.dialFailures = s.failedAuth ? self.dialFailures + 1 : 0
@@ -423,38 +458,45 @@ final class Server: @unchecked Sendable {
 
     /// Redial after 2 s, or longer after repeated failed handshakes (2 s doubling to 60 s), so an
     /// unpaired/impostor viewer isn't hammered. `kickDialer()` (pairing window opened) cuts it short.
-    /// `idle`: another session is active; just check again in 2 s.
+    /// `idle`: nothing was attempted (another session is active, or dialing waits for pairing);
+    /// just check again in 2 s.
     private func scheduleRedial(host: String, port: UInt16, generation: Int, idle: Bool = false) {
         lock.lock()
         guard generation == dialGeneration else { lock.unlock(); return }
         let n = idle ? 0 : dialFailures
-        let delay = n <= 1 ? 2.0 : min(2.0 * pow(2, Double(min(n - 1, 5))), 60)
-        var work: DispatchWorkItem!
-        work = DispatchWorkItem { [weak self] in
+        let delay = DialPolicy.redialDelay(failures: n)
+        redialSeq += 1
+        let token = redialSeq
+        let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.lock.lock()
-            if self.pendingRedial === work { self.pendingRedial = nil }
-            let current = generation == self.dialGeneration
+            // Not ours any more: replaced, cancelled with a target change, or taken by kickDialer.
+            let mine = self.pendingRedial?.token == token && generation == self.dialGeneration
+            if mine { self.pendingRedial = nil }
             self.lock.unlock()
-            if current { self.dial(host: host, port: port) }
+            if mine { self.dial(host: host, port: port) }
         }
-        pendingRedial = work
+        pendingRedial?.work.cancel()
+        pendingRedial = (token, work)
         lock.unlock()
         if n > 1 { HostStatus.shared.update { $0.dialDetail = "viewer not accepted — retrying in \(Int(delay)) s" } }
         DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    /// The pairing window opened: forget the dial backoff and redial now if we're waiting.
+    /// The pairing window opened: forget the dial backoff and dial now if we're waiting (backing
+    /// off, or holding back until pairing opens). A dial already in flight is left alone; if it
+    /// fails, the reset backoff redials it after 2 s.
     func kickDialer() {
         lock.lock()
         dialFailures = 0
-        let w = pendingRedial
-        pendingRedial = nil
+        let w = pendingRedial?.work
+        pendingRedial = nil  // the scheduled work item sees it is no longer the pending one
         let target = dialTarget
+        let wasWaiting = waitingForPairing
         lock.unlock()
         guard let w, !w.isCancelled, let target else { return }
-        w.cancel()  // a cancelled work item never runs: dial directly instead
-        log("dialer: pairing window opened; redialing now")
+        w.cancel()
+        log("dialer: pairing window opened; \(wasWaiting ? "dialing" : "redialing") \(target.host):\(target.port) now")
         DispatchQueue.global().async { self.dial(host: target.host, port: target.port) }
     }
 
@@ -466,11 +508,14 @@ final class Server: @unchecked Sendable {
         }
     }
 
-    private func adopt(_ conn: NWConnection, queue: DispatchQueue? = nil, onEnd extra: ((Session) -> Void)? = nil) {
+    /// `outbound`: the dialer opened `conn`; the session then stays out of the inbound rate limiter
+    /// (the dialer has its own backoff, see `scheduleRedial`).
+    private func adopt(_ conn: NWConnection, queue: DispatchQueue? = nil, outbound: Bool = false, onEnd extra: ((Session) -> Void)? = nil) {
         lock.lock()
         let id = nextId; nextId += 1
         lock.unlock()
         let s = Session(id: id, connection: conn, settings: settings, queue: queue)
+        s.outbound = outbound
         // A paused host still answers the handshake preamble (status 2) so the viewer can say why.
         s.isPaused = { [weak self] in
             guard let self else { return true }
@@ -510,7 +555,7 @@ final class Server: @unchecked Sendable {
         let target = dialTarget
         // Resuming cancels any redial scheduled before the pause and dials afresh.
         let needDial = !p && target != nil
-        if !p { dialGeneration += 1; pendingRedial?.cancel(); pendingRedial = nil; dialLoopActive = false }
+        if !p { dialGeneration += 1; pendingRedial?.work.cancel(); pendingRedial = nil; dialLoopActive = false; waitingForPairing = false }
         lock.unlock()
         HostStatus.shared.update { $0.paused = p; if p { $0.dialDetail = nil } }
         log("server: \(p ? "paused" : "resumed")")

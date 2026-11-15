@@ -15,6 +15,8 @@ public final class LogCoalescer: @unchecked Sendable {
     public let maxTracked: Int
     /// Keys named in a summary line (the most frequent first); the rest are counted as "other".
     public let maxListed: Int
+    /// What the lines are about, for the summary ("log lines about unauthenticated connections").
+    public let subject: String
 
     private let lock = NSLock()
     private var windowStart: TimeInterval?
@@ -23,12 +25,16 @@ public final class LogCoalescer: @unchecked Sendable {
     private var suppressed: [String: Int] = [:]
     private var suppressedOther = 0
 
-    public init(window: TimeInterval = 60, perKey: Int = 6, total: Int = 30, maxTracked: Int = 64, maxListed: Int = 4) {
+    /// `total: .max` gives a per-key budget only (security events: one noisy peer must not use up
+    /// the budget of another).
+    public init(window: TimeInterval = 60, perKey: Int = 6, total: Int = 30, maxTracked: Int = 64, maxListed: Int = 4,
+                subject: String = "log lines about unauthenticated connections") {
         self.window = window
         self.perKey = perKey
         self.total = total
         self.maxTracked = maxTracked
         self.maxListed = maxListed
+        self.subject = subject
     }
 
     public struct Decision: Equatable {
@@ -86,7 +92,7 @@ public final class LogCoalescer: @unchecked Sendable {
         var parts = ranked.prefix(maxListed).map { "\($0.value) from \($0.key)" }
         let other = ranked.dropFirst(maxListed).reduce(suppressedOther) { $0 + $1.value }
         if other > 0 { parts.append("\(other) from other addresses") }
-        return "\(count) more log line\(count == 1 ? "" : "s") about unauthenticated connections suppressed (\(Int(window)) s window): "
+        return "\(count) more \(subject) suppressed (\(Int(window)) s window): "
             + parts.joined(separator: ", ")
     }
 }

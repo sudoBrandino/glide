@@ -23,6 +23,7 @@ func run() throws {
     try transcriptTests(docs.appendingPathComponent("test-vectors-rust.json").path)
     try wireUnitTests()
     pairingLogicTests()
+    dialPolicyTests()
     try channelTests()
     try controlSocketTests()
 
