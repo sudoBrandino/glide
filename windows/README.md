@@ -68,8 +68,8 @@ tray icon (*Set up…*), and `--setup` opens it.
 - **Connect** saves the settings. From the menu it restarts the viewer with them.
 - A Start Menu shortcut that carries arguments (older install.ps1) is rewritten without them, so the
   config decides.
-- Test hooks: `GLIDE_SETUP_DUMP=x.bmp` saves a capture of the dialog; `GLIDE_SETUP_ANSWER=connect|cancel`
-  presses a button after about 0.5 s.
+- Test hooks (builds with `--features test-hooks` only, see below): `GLIDE_SETUP_DUMP=x.bmp` saves a
+  capture of the dialog; `GLIDE_SETUP_ANSWER=connect|cancel` presses a button after about 0.5 s.
 
 ### Config file, identity and pairing
 
@@ -122,7 +122,9 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
 - **Identity and pairing (security v2, `docs/PROTOCOL.md` §1–2):** no password.
   - The viewer's key is `identity.dpapi` next to `config.json` (DPAPI, current user: only this Windows account on this PC can use it). It is created on first run; `--identity` prints its fingerprint.
   - First connection to a host: the Mac must be in pairing mode (Glide menu → *Pair New Viewer…*, or `glide-host --pair`). A dialog shows a 6-digit code and both key fingerprints; click *Codes Match — Pair* only if the Mac shows the same code, and confirm there too. The host key is then pinned in `pinned_hosts`.
-  - Not paired yet / Mac not in pairing mode: the window says so and keeps retrying, so opening the pairing window on the Mac is enough.
+  - The dialog names the address it is pairing with: the address dialed, or, when the Mac connected to this PC, the IP that connection came from. *Cancel* is the default button, *Codes Match — Pair* stays disabled for a second after the dialog appears (and again when it is activated from the keyboard), so a Return or Space typed just then can't confirm it. It doesn't take the keyboard from another app: its taskbar button flashes instead.
+  - Not paired yet / Mac not in pairing mode: the window says so ("the Mac isn't accepting pairing — … Pair New Viewer…") and keeps retrying, so opening the pairing window on the Mac is enough. The Mac's handshake says whether its pairing window is open; while it is closed the viewer doesn't send a pair request at all.
+  - **Inbound pairing window:** an unpaired viewer accepts a pairing started by a Mac that *connects to this PC* only for 15 minutes after Glide starts (which includes the setup dialog's *Connect*), after *Set up…* is opened, after *Forget host*, or after tray → *Allow the Mac to pair*. Outside it, such a connection is closed before the pairing prompt and the status line says how to allow it. This keeps first setup working on a network where only the Mac can connect (start the viewer, then open *Pair New Viewer…* on the Mac), without letting any host on the LAN raise the prompt at any time. One successful pairing closes the window. Pairing when this PC dials the Mac, and re-pairing a host whose key is already pinned, don't need it.
   - A different host key than the pinned one: "HOST KEY CHANGED …", and the viewer never reveals its own key to it. If the Mac was really reset: tray → *Forget host (unpair)…*, then pair again.
   - If the Mac removed this viewer, the next attempt asks to pair again (still requiring the pinned Mac key).
   - Pre-auth limits: until the host has proven its pairing commitment the 5 s pre-auth deadline applies (wall clock); the pairing dialog then has 120 s in total.
@@ -132,14 +134,15 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   - If that monitor is gone, it uses the saved state of the monitor under the cursor, or opens centered.
   - A saved rect that no longer fits (for example after a resolution change) is clamped into the monitor's work area.
 - **Listen-mode admission control** (defense in depth; see `src/peers.rs`):
-  - **Allowlist:** if `allowed_peers` is non-empty, connections from any other IP are closed right after `accept()`, before a single handshake byte is sent or read. Entries are IPs or CIDRs, for example `"192.168.1.50"` or `"192.168.1.0/24"`.
+  - **Allowlist:** if `allowed_peers` is non-empty, connections from any other IP are closed right after `accept()`, before a single handshake byte is sent or read. Entries are IPs or CIDRs, for example `"192.168.1.50"` or `"192.168.1.0/24"`. Refused connections are shown in the status line, not only in the log.
   - **Trust on first use:** if `allowed_peers` is empty, the IP of the first peer that completes an authenticated session is pinned there (logged, and shown in the "Connected" toast). Tray → *Forget host (unpair)…* clears it together with the pinned key.
-  - **Backoff:** a failed handshake blocks the peer for 1 s, doubling on each further failure up to 60 s. Connections from a blocked peer are dropped without a handshake, and a successful session resets it. Peers are tracked per IPv4 address and per IPv6 /64, so a peer can't escape by rotating addresses within its /64.
+  - **The Mac's address changes (DHCP):** while `allowed_peers` holds the single plain address that trust on first use wrote and a host key is pinned, a connection from another address still gets a handshake, but it must present the pinned host key before the viewer sends anything about itself (a different key is refused before msg3, and a new key can't pair this way). It is treated like an unpinned peer (global budget) and backs off harder (4 s, 32 s, then 60 s). When it authenticates, the pin moves to the new address ("the Mac's address changed to …" in the toast). To refuse every other address before the handshake regardless, write the entry as a CIDR (`"192.168.1.50/32"`) or list several entries.
+  - **Backoff:** a failed handshake blocks the peer for 1 s, doubling on each further failure up to 60 s. Connections from a blocked peer are dropped without a handshake, and a successful session resets it. Peers are tracked per IPv4 address and per IPv6 /64, so a peer can't escape by rotating addresses within its /64. Not counted as failures: the host's "unknown viewer", "pairing window closed" and "busy" answers, the viewer not asking to pair because a pairing window is closed, and a connection closed before the host sent anything (one the Mac gave up on while it waited in the listen backlog). So opening *Pair New Viewer…* on the Mac is never answered by a blocked redial.
   - **Global budget (unpinned only):** while nothing is pinned, more than 10 failed handshakes from all peers within 60 s refuse every unpinned peer for 60 s. Pinned or allowlisted hosts are never affected.
   - **Pre-auth timeout:** a peer that hasn't completed the handshake after 5 s is disconnected.
 
   These limit who may start a handshake; the host's pinned key is what authenticates it.
-- **Tray icon:** Connect / Disconnect / Reconnect, Stats overlay, Mute, Set up…, Open config file, Forget host (unpair)…, Quit.
+- **Tray icon:** Connect / Disconnect / Reconnect, Stats overlay, Mute, Allow the Mac to pair (listening and not paired), Set up…, Open config file, Forget host (unpair)…, Quit.
   - *Disconnect* also stops listening, so the host can't reconnect until you choose *Connect*.
   - Left-click brings the window to the front.
 
@@ -166,7 +169,8 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   - The title bar shows `view WxH`.
   - Video that matches the window, or fits within about 6% of it, is drawn 1:1 and centered, never resampled.
   - `GLIDE_VIEW=WxH` pins the reported size.
-- `--bench` pairs on the console: it prints the code and asks `[y/N]` (or `GLIDE_PAIR_CONFIRM=yes|no`).
+- `--bench` pairs on the console: it prints the code and asks `[y/N]` (pipe `y` into it to script it;
+  `GLIDE_PAIR_CONFIRM=yes|no` works in `test-hooks` builds only).
 - `--listen [PORT]` is reverse connect. It binds `0.0.0.0:PORT` (default 7420) and accepts the host's
   connection (`glide-host --connect PC:PORT`). The GUI viewer accepts again after each disconnect; `--bench` accepts only once. The protocol is unchanged: the viewer still writes first (it is the Noise initiator).
   Use this mode when the firewall blocks PC → Mac. A Windows Firewall rule on the PC can then allow
@@ -327,7 +331,12 @@ With the default config and no address this listens on port 7420. Then pair: on 
 - `--clipboard-selftest` exercises the real Win32 clipboard path (apply, read back, CRLF, PNG/DIB,
   echo suppression, external changes) on hidden windows and prints one line per check. Session 0
   has its own clipboard, so running it over SSH doesn't touch the desktop user's clipboard.
-- Test hooks for the viewer:
+- Test hooks for the viewer. The ones that answer dialogs, dump captures or act for the user
+  (`GLIDE_PAIR_CONFIRM`, `GLIDE_PROMPT_DUMP`, `GLIDE_SETUP_ANSWER`, `GLIDE_SETUP_DUMP`, `GLIDE_DUMP_FRAME`,
+  `GLIDE_DUMP_MENU`, `GLIDE_TEST_ACTIONS`, `GLIDE_TEST_SEND_FILES`) only work in a build with the
+  `test-hooks` cargo feature (`cargo build --release --features test-hooks`); a normal build ignores them
+  and says so once at startup, so a variable left set (for example with `setx`) can never confirm a
+  pairing by itself.
   - `GLIDE_EXIT_AFTER=SECONDS` closes the window automatically and prints stats.
   - `GLIDE_DUMP_FRAME=path.bmp` writes the last rendered frame.
   - `GLIDE_OFFSCREEN=1` forces offscreen rendering. This is automatic in session 0, where no swap chain can be created.
@@ -338,7 +347,7 @@ With the default config and no address this listens on port 7420. Then pair: on 
   - `GLIDE_CONFIG_DIR=dir` uses another config folder. Use it for tests, so the real `%APPDATA%\Glide` is never touched.
   - `GLIDE_TEST_ACTIONS=mode,keyframe,hud,fullscreen,keyboard,reconnect,pullfiles,cancelfiles` fires those hotkey actions one at a time, every `GLIDE_TEST_ACTIONS_MS` (default 1500 ms).
   - `GLIDE_TEST_SEND_FILES=C:\a.bin;C:\folder` sends these to the host once it sent `FileCaps` (drag & drop can't be scripted over SSH). Point `download_dir` into a test folder (config in `GLIDE_CONFIG_DIR`).
-  - `GLIDE_PAIR_CONFIRM=yes|no` answers the pairing dialog after ~0.5 s (and the `--bench` console prompt); `GLIDE_PROMPT_DUMP=x.bmp` captures the dialog first.
+  - `GLIDE_PAIR_CONFIRM=yes|no` answers the pairing dialog once its confirm button is enabled (about 1.3 s; and the `--bench` console prompt); `GLIDE_PROMPT_DUMP=x.bmp` captures the dialog first.
   - `GLIDE_NO_TRAY=1` skips the tray icon.
 
 ## Testing without the Mac host

@@ -183,7 +183,7 @@ pub fn incoming(m: FileMsg) {
         eprintln!("files: host caps flags {flags:#x}, accepts up to {} / {max_files} files", human_bytes(*max_total_bytes));
         // Test hook: GLIDE_TEST_SEND_FILES="C:\a;C:\b" sends these once the host is ready
         // (drag & drop can't be scripted over SSH).
-        if let Ok(v) = std::env::var("GLIDE_TEST_SEND_FILES") {
+        if let Some(v) = crate::util::test_hook("GLIDE_TEST_SEND_FILES") {
             if !c.test_sent.swap(true, Ordering::Relaxed) {
                 let paths: Vec<PathBuf> = v.split(';').filter(|s| !s.is_empty()).map(PathBuf::from).collect();
                 let svc = c.service.clone();

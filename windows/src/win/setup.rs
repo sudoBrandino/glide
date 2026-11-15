@@ -15,8 +15,9 @@
 //! It opens by itself at startup when nothing is set up or the exe isn't installed (`at_startup`),
 //! and from the Glide menu / tray ("Set up…", `from_menu`; Connect there restarts the viewer).
 //!
-//! Test hooks (nobody to click): `GLIDE_SETUP_DUMP=x.bmp` saves a capture of the dialog,
-//! `GLIDE_SETUP_ANSWER=connect|cancel` presses the button after ~0.5 s.
+//! Test hooks (nobody to click; `test-hooks` builds only, see `util::test_hook`):
+//! `GLIDE_SETUP_DUMP=x.bmp` saves a capture of the dialog, `GLIDE_SETUP_ANSWER=connect|cancel`
+//! presses the button after ~0.5 s.
 
 use crate::config::{Config, Store};
 use crate::setup::{self as logic, FirewallStatus};
@@ -635,7 +636,7 @@ unsafe extern "system" fn dlg_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 start_test(h, ctx);
             }
             let _ = SetForegroundWindow(h);
-            if std::env::var("GLIDE_SETUP_ANSWER").is_ok() || std::env::var("GLIDE_SETUP_DUMP").is_ok() {
+            if crate::util::test_hook("GLIDE_SETUP_ANSWER").is_some() || crate::util::test_hook("GLIDE_SETUP_DUMP").is_some() {
                 SetTimer(Some(h), HOOK_TIMER, 500, None);
             }
             // Focus the address box (return 0: we set the focus ourselves).
@@ -646,13 +647,13 @@ unsafe extern "system" fn dlg_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         }
         WM_TIMER if wp.0 == HOOK_TIMER => {
             let _ = KillTimer(Some(h), HOOK_TIMER);
-            if let Ok(p) = std::env::var("GLIDE_SETUP_DUMP") {
+            if let Some(p) = crate::util::test_hook("GLIDE_SETUP_DUMP") {
                 match super::prompt::dump_window(h, &p) {
                     Ok((w, hh)) => eprintln!("setup: dumped {w}x{hh} dialog to {p}"),
                     Err(e) => eprintln!("setup: dump failed: {e}"),
                 }
             }
-            if let Ok(a) = std::env::var("GLIDE_SETUP_ANSWER") {
+            if let Some(a) = crate::util::test_hook("GLIDE_SETUP_ANSWER") {
                 let id = if a.trim().eq_ignore_ascii_case("connect") { IDOK.0 } else { IDCANCEL.0 };
                 let _ = PostMessageW(Some(h), WM_COMMAND, WPARAM(id as usize), LPARAM(0));
             }
