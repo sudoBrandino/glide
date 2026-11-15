@@ -652,6 +652,8 @@ if showSetupAtLaunch { DispatchQueue.main.async { showSetup() } }
 // Always listen; also dial the PC when its address is known. Whichever direction the network
 // allows connects (the dialer stays idle while a viewer that dialed in is connected).
 if connectTarget == nil || !noListen { server.start() } else { log("server: not listening (listen: false); dialing only") }
+// After an update the login item may be registered but refused by launchd (Instance.swift).
+if !hostTestMode { DispatchQueue.main.async { Instance.reviveLoginItemIfNeeded() } }
 if let target = connectTarget { server.setDialTarget(target) }
 // SIGTERM (launchctl, install scripts) and SIGINT: give the Mac its display arrangement back,
 // remove the virtual display and restore the monitor's own mode before exiting (a mirror set whose

@@ -89,6 +89,17 @@ PLIST
 plutil -lint "$OUT/Contents/Library/LaunchAgents/$GLIDE_BUNDLE_ID.plist" >/dev/null
 SIGN_FLAGS=(--timestamp=none)
 [[ "${GLIDE_HARDENED_RUNTIME:-0}" == 1 ]] && SIGN_FLAGS=(--options runtime --timestamp)
+# A signing identity kept in its own keychain (GLIDE_SIGN_KEYCHAIN, unlocked with the password in
+# GLIDE_SIGN_KEYCHAIN_PASSWORD_FILE): e.g. the self-signed "Glide Release Signing" certificate,
+# which gives every build the same designated requirement, so macOS keeps the Screen Recording and
+# Accessibility grants across updates (an ad hoc signature changes with every build).
+if [[ -n "${GLIDE_SIGN_KEYCHAIN:-}" ]]; then
+  [[ -f "$GLIDE_SIGN_KEYCHAIN" ]] || { echo "GLIDE_SIGN_KEYCHAIN: no such keychain: $GLIDE_SIGN_KEYCHAIN" >&2; exit 1; }
+  if [[ -n "${GLIDE_SIGN_KEYCHAIN_PASSWORD_FILE:-}" ]]; then
+    security unlock-keychain -p "$(cat "$GLIDE_SIGN_KEYCHAIN_PASSWORD_FILE")" "$GLIDE_SIGN_KEYCHAIN"
+  fi
+  SIGN_FLAGS+=(--keychain "$GLIDE_SIGN_KEYCHAIN")
+fi
 codesign --force "${SIGN_FLAGS[@]}" --sign "$SIGN_ID" --identifier "$GLIDE_BUNDLE_ID" "$OUT"
 codesign --verify --strict --verbose=1 "$OUT" 2>&1 | tail -1
 codesign -dr - "$OUT" 2>&1 | grep designated

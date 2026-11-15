@@ -192,6 +192,22 @@ enum Instance {
         log("login item: unregistered")
     }
 
+    /// The login item is on, yet this copy was opened by hand and no other host runs: launchd
+    /// didn't start it. Usually that's after an update: when it registers, macOS records a launch
+    /// requirement tied to that exact build (for apps not signed by an Apple developer team), and
+    /// refuses a newer build with EX_CONFIG until it registers again. Registering again starts it,
+    /// and it takes over from this copy (handoff). Call once this host's control socket is up.
+    static func reviveLoginItemIfNeeded() {
+        guard launchdLabel == nil, isAppBundle, loginService.status == .enabled else { return }
+        log("login item: on, but not running; registering it again (it starts and takes over from this copy)")
+        do {
+            try loginService.unregister()
+            try loginService.register()
+        } catch {
+            log("login item: re-registering failed: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: Install / replace
 
     static var isInApplications: Bool {
