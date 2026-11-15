@@ -4,8 +4,17 @@
 //! "Codes Match — Pair" (or Cancel). The dialog closes by itself when the host ends the pairing
 //! (`cancel` flag, polled).
 //!
-//! Test hooks (session 0 / SSH, nobody to click): `GLIDE_PAIR_CONFIRM=yes|no` presses the
-//! button after ~0.5 s; `GLIDE_PROMPT_DUMP=x.bmp` saves a PrintWindow capture of the dialog first.
+//! A pairing request can arrive while the user is typing (into the Mac through this viewer, or in
+//! another app), so a stray Return or Space must never confirm it:
+//! - Cancel is the default button and has the focus;
+//! - "Codes Match — Pair" stays disabled for `CONFIRM_DELAY_MS` after the dialog appears, and
+//!   again each time it is activated from the keyboard;
+//! - the dialog doesn't force itself to the foreground over another app: if it isn't the
+//!   foreground window, its taskbar button flashes until the user switches to it.
+//!
+//! Test hooks (session 0 / SSH, nobody to click; `test-hooks` builds only, see
+//! `util::test_hook`): `GLIDE_PAIR_CONFIRM=yes|no` presses the button once it is enabled;
+//! `GLIDE_PROMPT_DUMP=x.bmp` saves a PrintWindow capture of the dialog first.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,6 +24,7 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, IsWindowEnabled, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const IDD_PAIR: u16 = 102;
@@ -24,6 +34,11 @@ const IDC_PAIR_CODE: i32 = 1102;
 const IDC_PAIR_DETAIL: i32 = 1103;
 const AUTOFILL_TIMER: usize = 1;
 const POLL_TIMER: usize = 2;
+/// Enables "Codes Match — Pair" `CONFIRM_DELAY_MS` after the dialog appears (or is activated).
+const ARM_TIMER: usize = 3;
+/// Shortly after the dialog is shown: flash the taskbar button if it isn't in the foreground.
+const FLASH_TIMER: usize = 4;
+const CONFIRM_DELAY_MS: u32 = 1000;
 
 /// What the pairing dialog shows.
 pub struct PairText {
@@ -89,6 +104,25 @@ unsafe fn ctx_of(h: HWND) -> Option<&'static mut Ctx> {
     p.as_mut()
 }
 
+/// Disable "Codes Match — Pair" for `CONFIRM_DELAY_MS` (ARM_TIMER enables it again), keeping
+/// the focus on Cancel.
+unsafe fn guard_confirm(h: HWND) {
+    if let Ok(ok) = GetDlgItem(Some(h), IDOK.0) {
+        if GetFocus() == ok {
+            if let Ok(c) = GetDlgItem(Some(h), IDCANCEL.0) {
+                let _ = SetFocus(Some(c));
+            }
+        }
+        let _ = EnableWindow(ok, false);
+    }
+    SetTimer(Some(h), ARM_TIMER, CONFIRM_DELAY_MS, None);
+}
+
+/// "Codes Match — Pair" is enabled (only then does IDOK count, whatever sent it).
+unsafe fn confirm_enabled(h: HWND) -> bool {
+    GetDlgItem(Some(h), IDOK.0).is_ok_and(|ok| IsWindowEnabled(ok).as_bool())
+}
+
 unsafe extern "system" fn dlg_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
     match msg {
         WM_INITDIALOG => {
@@ -133,12 +167,52 @@ unsafe extern "system" fn dlg_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 }
                 ctx.icons.extend([ib, is]);
             }
-            let _ = SetForegroundWindow(h);
+            // Cancel is the default button (also in res/glide.rc) and gets the focus; the confirm
+            // button starts disabled. No SetForegroundWindow (nor DS_SETFOREGROUND): FLASH_TIMER
+            // flashes the taskbar button instead when another app has the foreground.
+            SendMessageW(h, DM_SETDEFID, Some(WPARAM(IDCANCEL.0 as usize)), None);
+            guard_confirm(h);
+            SetTimer(Some(h), FLASH_TIMER, 150, None);
             SetTimer(Some(h), POLL_TIMER, 200, None);
-            if std::env::var("GLIDE_PAIR_CONFIRM").is_ok() {
-                SetTimer(Some(h), AUTOFILL_TIMER, 500, None);
+            if crate::util::test_hook("GLIDE_PAIR_CONFIRM").is_some() {
+                SetTimer(Some(h), AUTOFILL_TIMER, CONFIRM_DELAY_MS + 300, None);
             }
-            1 // default focus (the "Codes Match" button)
+            if let Ok(c) = GetDlgItem(Some(h), IDCANCEL.0) {
+                let _ = SetFocus(Some(c));
+            }
+            0 // we set the focus ourselves (Cancel)
+        }
+        WM_ACTIVATE if (wp.0 & 0xFFFF) as u32 == WA_ACTIVE => {
+            // Activated from the keyboard (Alt+Tab, or the system handing it the focus): the user
+            // may be mid-keystroke, so hold the confirm button off again. A mouse click
+            // (WA_CLICKACTIVE) is deliberate and isn't delayed.
+            guard_confirm(h);
+            // Default processing restores the saved focus; then put it on Cancel.
+            if let Ok(c) = GetDlgItem(Some(h), IDCANCEL.0) {
+                let _ = PostMessageW(Some(h), WM_NEXTDLGCTL, WPARAM(c.0 as usize), LPARAM(1));
+            }
+            0
+        }
+        WM_TIMER if wp.0 == ARM_TIMER => {
+            let _ = KillTimer(Some(h), ARM_TIMER);
+            if let Ok(ok) = GetDlgItem(Some(h), IDOK.0) {
+                let _ = EnableWindow(ok, true);
+            }
+            1
+        }
+        WM_TIMER if wp.0 == FLASH_TIMER => {
+            let _ = KillTimer(Some(h), FLASH_TIMER);
+            if GetForegroundWindow() != h {
+                let fi = FLASHWINFO {
+                    cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                    hwnd: h,
+                    dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+                    uCount: 0,
+                    dwTimeout: 0,
+                };
+                let _ = FlashWindowEx(&fi);
+            }
+            1
         }
         WM_TIMER if wp.0 == POLL_TIMER => {
             if ctx_of(h).is_some_and(|c| c.cancel.load(Ordering::SeqCst)) {
@@ -148,14 +222,19 @@ unsafe extern "system" fn dlg_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         }
         WM_TIMER if wp.0 == AUTOFILL_TIMER => {
             let _ = KillTimer(Some(h), AUTOFILL_TIMER);
-            if let Ok(p) = std::env::var("GLIDE_PROMPT_DUMP") {
+            if let Some(p) = crate::util::test_hook("GLIDE_PROMPT_DUMP") {
                 match dump_window(h, &p) {
                     Ok((w, hh)) => eprintln!("prompt: dumped {w}x{hh} dialog to {p}"),
                     Err(e) => eprintln!("prompt: dump failed: {e}"),
                 }
             }
-            let yes = std::env::var("GLIDE_PAIR_CONFIRM").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "y" | "yes"));
+            let yes = crate::util::test_hook("GLIDE_PAIR_CONFIRM").is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "y" | "yes"));
             eprintln!("prompt: GLIDE_PAIR_CONFIRM -> {}", if yes { "Codes Match" } else { "Cancel" });
+            if yes && !confirm_enabled(h) {
+                // Activated again meanwhile: try once the button is enabled.
+                SetTimer(Some(h), AUTOFILL_TIMER, CONFIRM_DELAY_MS + 300, None);
+                return 1;
+            }
             let id = if yes { IDOK.0 } else { IDCANCEL.0 };
             let _ = PostMessageW(Some(h), WM_COMMAND, WPARAM(id as usize), LPARAM(0));
             1
@@ -163,6 +242,9 @@ unsafe extern "system" fn dlg_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         WM_COMMAND => {
             let id = (wp.0 & 0xFFFF) as i32;
             if id == IDOK.0 {
+                if !confirm_enabled(h) {
+                    return 1; // still held off: ignore, whatever sent it
+                }
                 if let Some(ctx) = ctx_of(h) {
                     ctx.answer = true;
                 }

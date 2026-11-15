@@ -1,4 +1,4 @@
-//! Small helpers: hex, monotonic clock, percentiles, JSON string escaping.
+//! Small helpers: hex, monotonic clock, percentiles, JSON string escaping, test hooks.
 
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -9,6 +9,49 @@ pub fn hex(b: &[u8]) -> String {
 
 pub fn unhex(s: &str) -> Vec<u8> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex")).collect()
+}
+
+/// Built with the `test-hooks` cargo feature (off by default, never in a release build).
+pub const TEST_HOOKS: bool = cfg!(feature = "test-hooks");
+
+/// Environment variables that answer dialogs, dump captures or act for the user (for SSH /
+/// session 0 smoke tests where nobody can click). They work only in a `test-hooks` build: in a
+/// release viewer a variable left set (e.g. with `setx`) must never confirm a pairing by itself.
+pub const TEST_HOOK_VARS: &[&str] = &[
+    "GLIDE_PAIR_CONFIRM",
+    "GLIDE_PROMPT_DUMP",
+    "GLIDE_SETUP_ANSWER",
+    "GLIDE_SETUP_DUMP",
+    "GLIDE_DUMP_FRAME",
+    "GLIDE_DUMP_MENU",
+    "GLIDE_TEST_ACTIONS",
+    "GLIDE_TEST_SEND_FILES",
+];
+
+/// The value of test hook `name` (one of `TEST_HOOK_VARS`); always None without `test-hooks`.
+pub fn test_hook(name: &str) -> Option<String> {
+    test_hook_in(TEST_HOOKS, name, |n| std::env::var(n).ok())
+}
+
+fn test_hook_in(enabled: bool, name: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    debug_assert!(TEST_HOOK_VARS.contains(&name), "{name} is not a listed test hook");
+    if enabled {
+        env(name)
+    } else {
+        None
+    }
+}
+
+/// Test hook variables that are set but ignored because this build has no `test-hooks`.
+pub fn ignored_test_hooks() -> Vec<&'static str> {
+    ignored_in(TEST_HOOKS, |n| std::env::var_os(n).is_some())
+}
+
+fn ignored_in(enabled: bool, is_set: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    if enabled {
+        return Vec::new();
+    }
+    TEST_HOOK_VARS.iter().copied().filter(|v| is_set(v)).collect()
 }
 
 static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -111,5 +154,18 @@ mod tests {
         assert_eq!(percentile(&[], 50.0), None);
         assert_eq!(json_str("a\"b\n"), "\"a\\\"b\\n\"");
         assert_eq!(unhex(&hex(&[0, 255, 16])), vec![0, 255, 16]);
+    }
+
+    #[test]
+    fn test_hooks_need_the_feature() {
+        // A release build (no `test-hooks`) never sees GLIDE_PAIR_CONFIRM, even when it is set.
+        let env = |n: &str| (n == "GLIDE_PAIR_CONFIRM").then(|| "yes".to_string());
+        assert_eq!(test_hook_in(false, "GLIDE_PAIR_CONFIRM", env), None);
+        assert_eq!(test_hook_in(true, "GLIDE_PAIR_CONFIRM", env).as_deref(), Some("yes"));
+        assert_eq!(test_hook_in(true, "GLIDE_SETUP_ANSWER", env), None);
+        let set = |n: &str| n == "GLIDE_PAIR_CONFIRM" || n == "GLIDE_SETUP_DUMP";
+        assert_eq!(ignored_in(false, set), vec!["GLIDE_PAIR_CONFIRM", "GLIDE_SETUP_DUMP"]);
+        assert!(ignored_in(true, set).is_empty());
+        assert_eq!(TEST_HOOKS, cfg!(feature = "test-hooks"));
     }
 }

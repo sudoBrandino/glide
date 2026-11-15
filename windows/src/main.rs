@@ -87,7 +87,8 @@ const USAGE: &str = "usage: glide-client [host[:port] [--no-listen] | --listen [
 Config: %APPDATA%\\Glide\\config.json (GLIDE_CONFIG_DIR overrides the folder). Pairing: the
 first connection to a host shows a 6-digit code on both screens; confirm on both if they match.
 The viewer's key is identity.dpapi next to the config (only this Windows account can use it).
-GLIDE_PAIR_CONFIRM=yes|no answers the pairing prompt non-interactively (tests, --bench).
+Builds with the `test-hooks` feature only: GLIDE_PAIR_CONFIRM=yes|no answers the pairing prompt
+non-interactively (tests, --bench); release builds ignore it (pipe `y` into --bench instead).
 
 Viewer hotkeys (handled locally, never sent to the Mac; F11 / Alt+Enter also toggle fullscreen):";
 
@@ -154,13 +155,14 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Strin
     Ok(a)
 }
 
-/// Console pairing prompt (headless --bench, non-Windows). GLIDE_PAIR_CONFIRM=yes|no answers it.
+/// Console pairing prompt (headless --bench, non-Windows). GLIDE_PAIR_CONFIRM=yes|no answers it
+/// in `test-hooks` builds.
 struct ConsolePairing;
 
 impl PairingUi for ConsolePairing {
     fn confirm(&self, p: &PairPrompt) -> bool {
-        eprintln!("PAIRING with {} — code {}  (host key {}, this viewer {})", p.target, p.code, p.host_fingerprint, p.viewer_fingerprint);
-        if let Ok(v) = std::env::var("GLIDE_PAIR_CONFIRM") {
+        eprintln!("PAIRING with {} — code {}  (host key {}, this viewer {})", p.peer, p.code, p.host_fingerprint, p.viewer_fingerprint);
+        if let Some(v) = glide::util::test_hook("GLIDE_PAIR_CONFIRM") {
             let yes = matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "y" | "yes");
             eprintln!("GLIDE_PAIR_CONFIRM={v}: {}", if yes { "codes match" } else { "declined" });
             return yes;
@@ -253,6 +255,9 @@ fn main() -> ExitCode {
         eprintln!("warning: {w}");
     }
     let cfg_dir = store.dir.clone();
+    for v in glide::util::ignored_test_hooks() {
+        eprintln!("note: {v} is ignored (test hooks are only in builds with the test-hooks feature)");
+    }
     #[cfg(windows)]
     if store.config.clipboard_sync_secrets {
         glide::win::clipboard::set_sync_secrets(true);
@@ -413,6 +418,8 @@ fn main() -> ExitCode {
         pinned: store.config.pinned_key_or(&pin_target, pin_fallback.as_deref()),
         request_pairing: false,
         pairing: Arc::new(ConsolePairing),
+        // One-shot --bench --listen: started by hand for this connection, and the console asks.
+        inbound_pairing: Arc::new(|| true),
     };
     // One-shot: dial (both mode doesn't wait for the host to dial in here).
     let res = match &target {

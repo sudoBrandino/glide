@@ -351,8 +351,60 @@ pub struct PairPrompt {
     pub code: String,
     pub host_fingerprint: String,
     pub viewer_fingerprint: String,
-    /// The target being paired ("192.168.50.4:7420", "listen:7420").
+    /// The pin-store target being paired ("192.168.50.4:7420", "listen:7420").
     pub target: String,
+    /// Who is on the other end (`peer_label`): the address dialed, or for a connection the Mac
+    /// made to this PC, the IP it came from. This is what the prompt names.
+    pub peer: String,
+    /// The Mac connected to this PC (rather than this PC dialing the Mac).
+    pub inbound: bool,
+}
+
+/// The address the pairing prompt names: for a connection the Mac made to this PC, the IP it
+/// actually came from (never the configured Mac address, which says nothing about who connected);
+/// for a connection this PC dialed, the target it dialed.
+pub fn peer_label(target: &str, inbound: Option<std::net::IpAddr>) -> String {
+    match inbound {
+        Some(ip) => crate::peers::canonical(ip).to_string(),
+        None => target.to_string(),
+    }
+}
+
+/// The pairing prompt's headline.
+pub fn pair_headline(p: &PairPrompt) -> String {
+    if p.inbound {
+        format!("A Mac at {} connected to this PC and asks to pair.\nContinue only if you started pairing on your Mac and the codes match.", p.peer)
+    } else {
+        format!("Pair this PC with the Mac at {}?\nContinue only if the Mac shows the same code.", p.peer)
+    }
+}
+
+/// What happens after msg2 when this viewer would ask to pair (docs/PROTOCOL.md §2.3–2.4).
+/// Ok(()) = no pairing needed, or go ahead and send the pair request.
+/// - A connection the Mac made to this PC may only start pairing a *new* host key (nothing
+///   pinned) while this PC's inbound pairing window is open (`Auth::inbound_pairing`), so a
+///   random LAN host can't raise the prompt whenever it likes.
+/// - msg2 says the Mac's pairing window is closed: the host would only answer AuthResult 2, so
+///   don't send the pair request at all.
+pub fn pairing_gate(
+    wants_pairing: bool,
+    pinned: bool,
+    host_window_open: bool,
+    inbound: Option<std::net::IpAddr>,
+    inbound_allowed: &dyn Fn() -> bool,
+) -> Result<(), ConnectError> {
+    if !wants_pairing {
+        return Ok(());
+    }
+    if let Some(ip) = inbound {
+        if !pinned && !inbound_allowed() {
+            return Err(ConnectError::InboundPairingClosed { peer: crate::peers::canonical(ip).to_string() });
+        }
+    }
+    if !host_window_open {
+        return Err(ConnectError::HostPairingClosed);
+    }
+    Ok(())
 }
 
 /// Asks the user to compare the pairing code. Implemented by the GUI (a dialog) and the console.
@@ -378,6 +430,9 @@ pub struct Auth {
     /// The host key must still equal the pin.
     pub request_pairing: bool,
     pub pairing: Arc<dyn PairingUi>,
+    /// Whether a connection the Mac made to this PC may pair a new host key right now (this PC's
+    /// inbound pairing window, see `pairing_gate`). Asked only when it matters.
+    pub inbound_pairing: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl Auth {
@@ -419,6 +474,12 @@ pub enum ConnectError {
     PairingCancelled,
     /// Pairing broke off (bad commitment, connection dropped, timeout).
     PairingFailed(String),
+    /// This viewer would ask to pair, but msg2 says the Mac's pairing window is closed: it closed
+    /// the connection instead of sending a pair request the host would refuse (AuthResult 2).
+    HostPairingClosed,
+    /// A Mac connected to this unpaired PC to pair while this PC's inbound pairing window was
+    /// closed (`pairing_gate`); `peer` is the IP it came from.
+    InboundPairingClosed { peer: String },
 }
 
 impl ConnectError {
@@ -448,9 +509,13 @@ impl ConnectError {
             ConnectError::Rejected(AUTH_UNKNOWN_VIEWER) => {
                 format!("{host} doesn't recognize this PC. On the Mac choose Glide → Pair New Viewer…; a code will appear here")
             }
-            ConnectError::Rejected(AUTH_PAIRING_CLOSED) => {
-                format!("Not paired with {host} yet. On the Mac choose Glide → Pair New Viewer…; a code will appear here")
+            ConnectError::Rejected(AUTH_PAIRING_CLOSED) | ConnectError::HostPairingClosed => {
+                format!("Not paired with {host} yet, and the Mac isn't accepting pairing. On the Mac choose Glide → Pair New Viewer…; a code will appear here")
             }
+            ConnectError::InboundPairingClosed { peer } => format!(
+                "A Mac at {peer} asked to pair, but this PC accepts pairing from the Mac only in the first {} minutes after Glide starts. To allow it, choose “Allow the Mac to pair” in the tray icon menu",
+                crate::peers::INBOUND_PAIRING_WINDOW.as_secs() / 60
+            ),
             ConnectError::Rejected(AUTH_DECLINED) => "Pairing was declined on the Mac".into(),
             ConnectError::Rejected(AUTH_TIMEOUT) => "Pairing timed out (nobody confirmed the code on the Mac)".into(),
             ConnectError::Rejected(AUTH_BUSY) => format!("{host} is busy pairing another viewer; try again"),
@@ -481,6 +546,8 @@ impl std::fmt::Display for ConnectError {
             ConnectError::Rejected(c) => write!(f, "host rejected the viewer (AuthResult {c})"),
             ConnectError::PairingCancelled => write!(f, "pairing cancelled by the user"),
             ConnectError::PairingFailed(s) => write!(f, "pairing failed: {s}"),
+            ConnectError::HostPairingClosed => write!(f, "the host's pairing window is closed (no pair request sent)"),
+            ConnectError::InboundPairingClosed { peer } => write!(f, "{peer} asked to pair while this PC's inbound pairing window is closed"),
         }
     }
 }
@@ -608,12 +675,12 @@ impl Connection {
         let (stream, peer) = l.accept().map_err(ConnectError::Io)?;
         drop(l);
         eprintln!("host connected from {peer}");
-        Self::from_stream(stream, auth, hello)
+        Self::from_stream_timeout(stream, auth, hello, HANDSHAKE_TIMEOUT, &|| {}, Some(peer.ip()))
     }
 
-    /// Run the client handshake on an already-connected stream.
+    /// Run the client handshake on a stream this viewer dialed.
     pub fn from_stream(stream: TcpStream, auth: &Auth, hello: &ClientMsg) -> Result<Connection, ConnectError> {
-        Self::from_stream_timeout(stream, auth, hello, HANDSHAKE_TIMEOUT, &|| {})
+        Self::from_stream_timeout(stream, auth, hello, HANDSHAKE_TIMEOUT, &|| {}, None)
     }
 
     /// Like `from_stream`, with an explicit pre-auth deadline. Everything up to the first
@@ -622,20 +689,26 @@ impl Connection {
     /// Windows, shutting a socket down from another thread does not interrupt a blocked recv()).
     /// Only once the host has proven its pairing commitment does the user prompt start; it has its
     /// own total deadline (`PAIRING_TIMEOUT`), and `on_pairing` runs then (listen mode lifts its
-    /// pre-auth timer there).
+    /// pre-auth timer there). `inbound` is the peer's IP when the Mac connected to this PC (None
+    /// when this viewer dialed): it decides what the prompt names and `pairing_gate`.
     pub fn from_stream_timeout(
         mut stream: TcpStream,
         auth: &Auth,
         hello: &ClientMsg,
         read_timeout: Duration,
         on_pairing: &dyn Fn(),
+        inbound: Option<std::net::IpAddr>,
     ) -> Result<Connection, ConnectError> {
         stream.set_nodelay(true).map_err(ConnectError::Io)?;
         let preauth = Instant::now() + read_timeout.min(HANDSHAKE_TIMEOUT).max(Duration::from_millis(50));
 
         // -> ClientPreamble, msg1
         let mut hs = ViewerHandshake::new(auth.identity.secret(), &auth.name, None, None);
-        stream.write_all(&hs.first_flight())?;
+        if let Err(e) = stream.write_all(&hs.first_flight()) {
+            // Already closed by the peer (e.g. a connection the Mac gave up on while it waited in
+            // the listen backlog): like closing before the preamble, nothing came from the host.
+            return Err(if is_eof(&e) || e.kind() == std::io::ErrorKind::BrokenPipe { ConnectError::HostIsV1 } else { ConnectError::Io(e) });
+        }
         // <- HostPreamble, msg2
         let mut pre = [0u8; HOST_PREAMBLE_LEN];
         if let Err(e) = timed(&mut stream, preauth).read_exact(&mut pre) {
@@ -657,6 +730,11 @@ impl Connection {
             }
         }
         let pairing = auth.wants_pairing();
+        if let Err(e) = pairing_gate(pairing, auth.pinned.is_some(), info.pairing_open(), inbound, &*auth.inbound_pairing) {
+            // Before msg3: no pair request, and this viewer's identity isn't revealed.
+            let _ = stream.shutdown(Shutdown::Both);
+            return Err(e);
+        }
         // -> msg3 (+ ClientHello right away when already paired)
         let mut out = hs.write_msg3(if pairing { VIEWER_FLAG_PAIR_REQUEST } else { 0 });
         let n_v = hs.nonce();
@@ -692,8 +770,10 @@ impl Connection {
                 host_fingerprint: fingerprint(&host_key),
                 viewer_fingerprint: auth.identity.fingerprint(),
                 target: auth.target.clone(),
+                peer: peer_label(&auth.target, inbound),
+                inbound: inbound.is_some(),
             };
-            eprintln!("pairing with {}: code {} (host key {})", prompt.target, prompt.code, prompt.host_fingerprint);
+            eprintln!("pairing with {} ({}): code {} (host key {})", prompt.peer, prompt.target, prompt.code, prompt.host_fingerprint);
             // The host's verdict may arrive while the prompt is open (declined/timeout on the Mac),
             // and the whole pairing has a total deadline: a helper thread reads the verdict until
             // then and closes the prompt as soon as it has one (or time is up).
@@ -743,7 +823,7 @@ impl Connection {
                 }
                 Err(e) => return Err(e),
             }
-            eprintln!("paired with {} (host key {})", prompt.target, prompt.host_fingerprint);
+            eprintln!("paired with {} ({}, host key {})", prompt.peer, prompt.target, prompt.host_fingerprint);
             hello_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
             stream.write_all(&sealer.seal(&hello.encode()))?;
         }
@@ -901,7 +981,15 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn auth(id: &Identity, pinned: Option<[u8; 32]>, ui: Arc<TestUi>) -> Auth {
-        Auth { identity: id.clone(), name: "test-pc".into(), target: "test:1".into(), pinned, request_pairing: false, pairing: ui }
+        Auth {
+            identity: id.clone(),
+            name: "test-pc".into(),
+            target: "test:1".into(),
+            pinned,
+            request_pairing: false,
+            pairing: ui,
+            inbound_pairing: Arc::new(|| true),
+        }
     }
 
     /// Run the fake host on a loopback listener and connect the viewer to it.
@@ -953,6 +1041,79 @@ pub(crate) mod tests {
         assert_eq!(shown[0].code.len(), 7);
         assert_eq!(shown[0].host_fingerprint, host.fingerprint());
         assert_eq!(shown[0].viewer_fingerprint, viewer.fingerprint());
+        // dialed: the prompt names the target that was dialed
+        assert_eq!((shown[0].peer.as_str(), shown[0].inbound), ("test:1", false));
+    }
+
+    #[test]
+    fn prompt_names_the_actual_peer() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        // Both mode stores the pin under the configured Mac address; a connection that came in
+        // from somewhere else must be shown with its own address, not that one.
+        assert_eq!(peer_label("192.168.50.4:7420", Some(ip("192.168.50.66"))), "192.168.50.66");
+        assert_eq!(peer_label("listen:7420", Some(ip("::ffff:192.168.50.66"))), "192.168.50.66");
+        assert_eq!(peer_label("listen:7420", Some(ip("fd00::66"))), "fd00::66");
+        assert_eq!(peer_label("mac.local:7420", None), "mac.local:7420");
+        let mut p = PairPrompt {
+            code: "123 456".into(),
+            host_fingerprint: "aaaa".into(),
+            viewer_fingerprint: "bbbb".into(),
+            target: "192.168.50.4:7420".into(),
+            peer: "192.168.50.66".into(),
+            inbound: true,
+        };
+        let h = pair_headline(&p);
+        assert!(h.contains("192.168.50.66") && !h.contains("192.168.50.4"), "{h}");
+        assert!(h.contains("connected to this PC"));
+        p.inbound = false;
+        p.peer = "192.168.50.4:7420".into();
+        assert!(pair_headline(&p).starts_with("Pair this PC with the Mac at 192.168.50.4:7420?"));
+    }
+
+    #[test]
+    fn pairing_gate_rules() {
+        let ip: std::net::IpAddr = "192.168.50.66".parse().unwrap();
+        let open = || true;
+        let closed = || false;
+        let gate = |want, pinned, host_open, inbound, allowed: &dyn Fn() -> bool| pairing_gate(want, pinned, host_open, inbound, allowed);
+        // no pairing wanted: nothing to check
+        assert!(gate(false, true, false, Some(ip), &closed).is_ok());
+        // dialed, Mac window open/closed
+        assert!(gate(true, false, true, None, &closed).is_ok(), "the PC's inbound window doesn't apply to dialing");
+        assert!(matches!(gate(true, false, false, None, &open), Err(ConnectError::HostPairingClosed)));
+        // inbound, nothing pinned: needs this PC's window
+        assert!(gate(true, false, true, Some(ip), &open).is_ok());
+        match gate(true, false, true, Some(ip), &closed) {
+            Err(e @ ConnectError::InboundPairingClosed { .. }) => {
+                assert!(e.user_message("x").contains("192.168.50.66") && e.user_message("x").contains("Allow the Mac to pair"), "{}", e.user_message("x"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // the PC's window is checked first (that's what the user can act on here)
+        assert!(matches!(gate(true, false, false, Some(ip), &closed), Err(ConnectError::InboundPairingClosed { .. })));
+        // re-pairing a pinned key (the Mac forgot us) doesn't need the PC's window
+        assert!(gate(true, true, true, Some(ip), &closed).is_ok());
+        assert!(matches!(gate(true, true, false, Some(ip), &closed), Err(ConnectError::HostPairingClosed)));
+    }
+
+    #[test]
+    fn inbound_pairing_needs_the_pcs_window() {
+        // An unpaired listening viewer: a Mac (or anyone) dials in to pair while this PC's inbound
+        // pairing window is closed. No prompt; the host never gets msg3.
+        let host = Identity::generate();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let mut cfg = HostCfg::new(host.clone());
+        cfg.pairing_open = true;
+        let h = thread::spawn(move || serve(TcpStream::connect(addr).unwrap(), &cfg));
+        let (s, peer) = l.accept().unwrap();
+        let ui = TestUi::new(true);
+        let mut a = auth(&Identity::generate(), None, ui.clone());
+        a.inbound_pairing = Arc::new(|| false);
+        let r = Connection::from_stream_timeout(s, &a, &hello(), HANDSHAKE_TIMEOUT, &|| {}, Some(peer.ip()));
+        assert!(matches!(r, Err(ConnectError::InboundPairingClosed { ref peer }) if peer == "127.0.0.1"), "{:?}", r.err());
+        assert!(matches!(h.join().unwrap(), Outcome::Closed(ref s) if s.contains("before msg3")));
+        assert!(ui.shown.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -975,10 +1136,19 @@ pub(crate) mod tests {
     #[test]
     fn pairing_rejections() {
         let (host, viewer) = (Identity::generate(), Identity::generate());
-        // window closed
-        let (r, out) = run(HostCfg::new(host.clone()), &auth(&viewer, None, TestUi::new(true)));
-        assert!(matches!(r, Err(ConnectError::Rejected(crate::protocol::AUTH_PAIRING_CLOSED))));
-        assert_eq!(out, Outcome::Rejected(crate::protocol::AUTH_PAIRING_CLOSED));
+        // window closed: msg2 says so, so the viewer doesn't send a pair request (nor msg3)
+        let ui = TestUi::new(true);
+        let (r, out) = run(HostCfg::new(host.clone()), &auth(&viewer, None, ui.clone()));
+        let e = r.err().unwrap();
+        assert!(matches!(e, ConnectError::HostPairingClosed), "{e:?}");
+        assert!(e.user_message("mac").contains("isn't accepting pairing") && e.user_message("mac").contains("Pair New Viewer"));
+        assert!(matches!(out, Outcome::Closed(ref s) if s.contains("before msg3")), "{out:?}");
+        assert!(ui.shown.lock().unwrap().is_empty());
+        // same when re-pairing with the pinned key (the Mac forgot this viewer)
+        let mut a = auth(&viewer, Some(host.public()), TestUi::new(true));
+        a.request_pairing = true;
+        let (r, _) = run(HostCfg::new(host.clone()), &a);
+        assert!(matches!(r, Err(ConnectError::HostPairingClosed)), "{:?}", r.err());
         // the Mac says no
         let mut cfg = HostCfg::new(host.clone());
         cfg.pairing_open = true;
@@ -1014,7 +1184,7 @@ pub(crate) mod tests {
             let pp = paired_phase.clone();
             let t0 = std::time::Instant::now();
             let s = TcpStream::connect(addr).unwrap();
-            let r = Connection::from_stream_timeout(s, &auth(&viewer, None, ui), &hello(), deadline, &move || pp.store(true, Ordering::SeqCst));
+            let r = Connection::from_stream_timeout(s, &auth(&viewer, None, ui), &hello(), deadline, &move || pp.store(true, Ordering::SeqCst), None);
             let took = t0.elapsed();
             let _ = h.join();
             (r, took, paired_phase.load(Ordering::SeqCst))
