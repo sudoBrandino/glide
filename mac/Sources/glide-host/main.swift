@@ -120,6 +120,8 @@ func usage() -> Never {
            glide-host --set-connect HOST[:PORT] (save the PC's address: the host dials it as well as listening)
            glide-host --login-item on|off|status (start this app at login, like the setup window's button)
            glide-host --setup-preview OUT.png [--installer] (render the setup window to a PNG; no server)
+           glide-host --drag-helper-preview     (open System Settings' Screen Recording list with the
+                                                drag-into-the-list panel for 90 s; no server)
            glide-host --selftest-ui [--out DIR] (print the status menu per state + display-mode picks; no capture)
            glide-host --encode-bench [SECONDS]  (offline VideoToolbox encode timing, normal vs low-latency RC,
                                                 synthetic 2560x1440 desktop content; no capture, no network)
@@ -220,6 +222,15 @@ if let out = takeValue("--setup-preview") {  // offscreen render; never listens 
     RunLoop.main.run(until: Date().addingTimeInterval(0.3))
     print(SetupWindowController.renderPreview(m, to: out, dark: args.contains("--dark")) ? "wrote \(out)" : "render failed")
     exit(0)
+}
+
+if args.contains("--drag-helper-preview") {  // opens System Settings' Screen Recording list; never listens or captures
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    SetupModel.openPrivacy("Privacy_ScreenCapture")
+    PermissionDragHelper.shared.show(permission: "Screen Recording") { false }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 90) { exit(0) }
+    app.run()
 }
 
 if let v = takeValue("--set-connect") {

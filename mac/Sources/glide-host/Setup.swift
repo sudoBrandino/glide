@@ -120,13 +120,17 @@ final class SetupModel: ObservableObject {
         // A grant made for an earlier build (signed ad hoc) can look switched on without applying;
         // clear it so macOS asks again. Nothing is lost: the permission is missing either way.
         Instance.run("/usr/bin/tccutil", ["reset", "ScreenCapture", Instance.bundleID])
-        if !CGRequestScreenCaptureAccess() { Self.openPrivacy("Privacy_ScreenCapture") }
+        if !CGRequestScreenCaptureAccess() {
+            Self.openPrivacy("Privacy_ScreenCapture")
+            PermissionDragHelper.shared.show(permission: "Screen Recording") { [weak self] in self?.screen == .ok }
+        }
     }
 
     func requestAccessibility() {
         Instance.run("/usr/bin/tccutil", ["reset", "Accessibility", Instance.bundleID])
         _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
         Self.openPrivacy("Privacy_Accessibility")
+        PermissionDragHelper.shared.show(permission: "Accessibility") { AXIsProcessTrusted() }
     }
 
     func restartForScreen() { Instance.relaunch(reason: "Screen Recording granted (setup window)") }
@@ -288,7 +292,7 @@ struct SetupView: View {
             title: "Screen Recording",
             detail: m.screenNeedsRestart ? "Allowed. Glide Host restarts to use it."
                 : m.screen == .ok ? "Allowed: the PC can see this Mac's screen."
-                : "Needed to show this Mac's screen on the PC. Switch on Glide Host in the list that opens.") {
+                : "Needed to show this Mac's screen on the PC. Switch on Glide Host in the list that opens, or drag it in if it isn't listed.") {
             if m.screenNeedsRestart { Button("Restart Glide Host") { m.restartForScreen() }.keyboardShortcut(.defaultAction) }
             else if m.screen == .missing { Button("Allow…") { m.requestScreen() } }
         }
@@ -297,7 +301,7 @@ struct SetupView: View {
     private var accessibilityRow: some View {
         Row(state: m.accessibility == .ok ? .done : .todo, title: "Accessibility",
             detail: m.accessibility == .ok ? "Allowed: the PC's mouse and keyboard control this Mac."
-                : "Needed for the PC's mouse and keyboard. Switch on Glide Host in the list that opens.") {
+                : "Needed for the PC's mouse and keyboard. Switch on Glide Host in the list that opens, or drag it in if it isn't listed.") {
             if m.accessibility != .ok { Button("Allow…") { m.requestAccessibility() } }
         }
     }

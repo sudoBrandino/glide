@@ -43,6 +43,8 @@ No Terminal needed. Both apps have a setup window that walks through everything 
    - **Screen Recording → Allow…**, switch on Glide Host, then **Restart Glide Host** when the
      window offers it.
    - **Accessibility → Allow…**, switch on Glide Host.
+   - If Glide Host isn't in the list that opens, a small panel next to System Settings shows its
+     icon: drag the icon into the list, then switch Glide Host on.
    - **Connect the PC:** the window shows this Mac's address for the viewer. If your network
      only lets the Mac reach the PC, also enter the PC's address.
    - **Pair a Viewer…**, then connect from the PC: both screens show the same code; confirm on
@@ -203,8 +205,9 @@ keyboard and mouse. Both must be granted to *Glide Host* itself, not to Terminal
 
 The host started by the LaunchAgent (section 2.2) asks for both the first time it runs: answer
 the system prompts, then turn **Glide Host** on in **System Settings → Privacy & Security →
-Screen Recording** and **→ Accessibility**. If it isn't listed, add it with the **+** button
-(choose `~/Applications/Glide Host.app`).
+Screen Recording** and **→ Accessibility**. If it isn't listed, drag Glide Host's icon from the
+panel the setup window shows next to System Settings into the list, or add it with the **+**
+button (choose `Glide Host.app` in Applications).
 
 To bring the prompts back later, launch the app through Launch Services so macOS attributes the
 request to Glide Host:

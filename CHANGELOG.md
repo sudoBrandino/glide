@@ -16,6 +16,13 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ## [Unreleased]
 
+### Added
+
+- **Mac setup:** when **Allow…** opens the Screen Recording or Accessibility list in System
+  Settings, a small panel beside it shows Glide Host's icon. If Glide Host isn't in the list, drag
+  the icon in instead of hunting for the app with the **+** button. The panel closes once the
+  permission is granted or System Settings closes.
+
 ### Changed
 
 - **Mac, laptop with the lid open and no external monitor:** Glide no longer changes the built-in
