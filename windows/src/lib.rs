@@ -11,6 +11,7 @@ pub mod blockcode;
 pub mod clipboard;
 pub mod config;
 pub mod connbar;
+pub mod connections;
 pub mod crypto;
 pub mod displays;
 pub mod files;

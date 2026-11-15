@@ -311,7 +311,7 @@ fn fix_shortcut_arguments(exe: &Path) {
     }
 }
 
-fn spawn(exe: &Path) -> Result<(), String> {
+pub(super) fn spawn(exe: &Path) -> Result<(), String> {
     let mut c = std::process::Command::new(exe);
     c.arg("--after-setup");
     if let Some(d) = exe.parent() {
@@ -320,7 +320,7 @@ fn spawn(exe: &Path) -> Result<(), String> {
     c.spawn().map(|_| ()).map_err(|e| format!("can't start {}: {e}", exe.display()))
 }
 
-fn current_exe() -> PathBuf {
+pub(super) fn current_exe() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from(EXE_NAME))
 }
 
