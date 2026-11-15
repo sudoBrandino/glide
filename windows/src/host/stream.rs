@@ -402,7 +402,7 @@ mod tests {
     /// Read timeouts in the middle of a length prefix or a body don't lose framing.
     #[test]
     fn record_reader_keeps_framing_across_timeouts() {
-        let key = [7u8; 32];
+        let key = crate::handshake::random32(); // any key: the test is about framing
         let mut sealer = Sealer::new(&key);
         let msgs: Vec<Vec<u8>> = vec![b"one".to_vec(), vec![0xAB; 3000], b"three".to_vec()];
         let wire: Vec<u8> = msgs.iter().flat_map(|m| sealer.seal(m)).collect();
