@@ -440,6 +440,16 @@ func virtualDisplayTests() throws {
     check(VirtualDisplayLayout.reconcile(.none, virtual: V, streaming: true, mode: d.monitorMode(physicalBuiltIn: [true]),
                                          displays: [D(id: BUILTIN, mirrorOf: V)]) == [.unmirror(BUILTIN)],
           "vd laptop: the lid opens mid-session still mirroring -> the panel is un-mirrored, not adopted")
+    var lidClose = VirtualDisplayLifecycle(enabled: true)
+    let lidCloseBegan = lidClose.sessionBegan(wanted: false)  // lid open: the panel is streamed
+    check(lidCloseBegan == .none && !lidClose.exists && lidClose.sessionActive
+          && lidClose.displaysChanged(onlyDisplay: true, wanted: true) == .create && lidClose.phase == .inUse && lidClose.creating
+          && lidClose.created() == .streaming,
+          "vd laptop: the lid closes mid-session -> a virtual display is created for the connected viewer")
+    var lidStays = VirtualDisplayLifecycle(enabled: true)
+    _ = lidStays.sessionBegan(wanted: false)
+    check(lidStays.displaysChanged(onlyDisplay: false, wanted: false) == .none && !lidStays.exists,
+          "vd laptop: other display changes with the panel still online -> keep streaming it")
 
     // Read-back of the virtual display's mode from a child process (--list-display-modes).
     let listing = "display 10: main no, builtin no, bounds -1280,0 1280x720 pt\ncurrent: 1280x720 px=2560x1440 hz=120\nusable modes: 14\n"

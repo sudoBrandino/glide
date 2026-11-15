@@ -47,7 +47,9 @@ Mirroring would give the panel the viewer's size and shape, which looks wrong on
 the default's laptop case; set `whenMonitorAttached` explicitly (for example to `"mirror"` in the
 menu or host.json) to use that mode with the lid open too. If the lid opens during a session that
 uses the virtual display, the panel comes back as its own screen and the session keeps the virtual
-display until the viewer leaves.
+display until the viewer leaves. If the lid closes during a session that streams the panel, Glide
+creates the virtual display for that session (the same happens with `"stream"` when the monitor is
+unplugged).
 
 **Without a monitor** (headless, or a laptop with the lid closed and no external display): the
 virtual display is the Mac's only screen, so it is the main display by itself. It is kept when the

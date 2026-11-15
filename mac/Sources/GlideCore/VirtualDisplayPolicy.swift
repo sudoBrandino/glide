@@ -328,7 +328,8 @@ public struct VirtualDisplayLifecycle: Equatable, Sendable {
     /// Displays were added, removed or rearranged (a monitor plugged in, the lid opened). An idle
     /// display that is no longer the only one and isn't always-on is removed; an always-on one
     /// re-hides behind the (new) main monitor; "stream" with a monitor removes an idle one. A
-    /// connected viewer keeps it.
+    /// connected viewer keeps it. A viewer streaming a monitor that went away (the lid closed)
+    /// gets one created.
     public mutating func displaysChanged(onlyDisplay: Bool, wanted: Bool = true) -> Action {
         guard enabled else { return .none }
         // Decided once the create finishes, with the displays online then (a monitor plugged in
@@ -341,7 +342,15 @@ public struct VirtualDisplayLifecycle: Equatable, Sendable {
         case .lingering:
             return wanted || onlyDisplay ? .none : off()
         case .off:
-            guard alwaysOn, wanted, !sessionActive else { return .none }
+            guard wanted else { return .none }
+            if sessionActive {
+                // The session streams a monitor that went away ("stream", or a laptop's panel
+                // when the lid closes): the virtual display takes over for it.
+                phase = .inUse
+                creating = true
+                return .create
+            }
+            guard alwaysOn else { return .none }
             phase = .standby
             creating = true
             return .create
