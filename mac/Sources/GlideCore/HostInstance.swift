@@ -3,6 +3,15 @@ import Foundation
 /// The decisions behind "one Glide Host per user" and installing over a running host
 /// (glide-host Instance.swift), without side effects so glide-selftest can check every case.
 public enum HostInstance {
+    /// The launchd job label from `XPC_SERVICE_NAME`, when a login item or LaunchAgent started this
+    /// process (launchd's KeepAlive then restarts it after it exits). An app opened from Finder,
+    /// the Dock or `open` also has the variable, but as "application.<bundle id>.<n>.<n>" (Launch
+    /// Services): that is not a job launchd restarts, so it doesn't count. "0" means none.
+    public static func launchdLabel(xpcServiceName: String?) -> String? {
+        guard let v = xpcServiceName, !v.isEmpty, v != "0", !v.hasPrefix("application.") else { return nil }
+        return v
+    }
+
     /// A running host's answer to `instance` on the control socket.
     public struct Info: Equatable {
         public var version: String

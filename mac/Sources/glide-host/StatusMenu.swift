@@ -78,8 +78,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     init(actions: Actions, showStatusItem: Bool = true) {
         self.actions = actions
-        let env = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"]
-        launchdLabel = (env?.isEmpty == false && env != "0") ? env : nil
+        launchdLabel = Instance.launchdLabel
         super.init()
         buildMenu()
         if showStatusItem {

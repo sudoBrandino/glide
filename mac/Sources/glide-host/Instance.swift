@@ -26,10 +26,7 @@ enum Instance {
     }
 
     /// The launchd label when started as a login item or LaunchAgent (KeepAlive relaunches us).
-    static let launchdLabel: String? = {
-        let env = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"]
-        return (env?.isEmpty == false && env != "0") ? env : nil
-    }()
+    static let launchdLabel: String? = HostInstance.launchdLabel(xpcServiceName: ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"])
 
     static var bundlePath: String { Bundle.main.bundlePath }
     static var bundleID: String { Bundle.main.bundleIdentifier ?? "io.github.sudobrandino.glide.host" }
