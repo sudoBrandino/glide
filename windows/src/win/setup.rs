@@ -372,6 +372,9 @@ fn apply(owner: Option<HWND>, init: &Init, ch: &Choice) -> (PathBuf, bool, Optio
 fn save_choice(c: &mut Config, ch: &Choice, portable: Option<String>) {
     c.host = ch.host.clone();
     c.accept_incoming = ch.accept;
+    // Right away, not on the next load: the Connections window and tray read the saved list
+    // from this same live config.
+    crate::connections::sync_from_host(c);
     if portable.is_some() {
         c.portable_exe = portable;
     }

@@ -1808,6 +1808,7 @@ fn run_menu_cmd(hwnd: HWND, c: Cmd) {
             toast(if pinned { "Connection bar pinned" } else { "Connection bar unpinned" });
         }
         Cmd::SetUp => set_up(hwnd),
+        Cmd::Connections => manage_connections(hwnd),
         Cmd::Settings => match ui().store.lock().unwrap().path() {
             Some(p) => tray::open_in_editor(&p),
             None => toast("No config file (APPDATA not set)"),
@@ -2048,6 +2049,25 @@ fn set_up(hwnd: HWND) {
     allow_inbound_pairing(false);
 }
 
+/// "Connections…" (Glide menu / tray). Like Set up…: adding a Mac there is usually followed by
+/// pairing from the Mac, so this PC accepts inbound pairing while it is open and for a while after.
+fn manage_connections(hwnd: HWND) {
+    allow_inbound_pairing(false);
+    super::connections::manage(hwnd);
+    allow_inbound_pairing(false);
+}
+
+/// A session started: stamp the active saved connection's "last used" (Connections window, tray
+/// order). Only when this viewer's target *is* that connection: a host given on the command line
+/// overrides it for this run, and must not make another entry look recently used.
+fn record_last_use(pin_target: &str) {
+    let mut store = ui().store.lock().unwrap();
+    let c = &store.config;
+    if crate::connections::active(c).map(|s| s.pin_key(c.listen_port)).as_deref() == Some(pin_target) {
+        store.update(|c| crate::connections::touch_active(c, std::time::SystemTime::now()));
+    }
+}
+
 /// Tray "Allow the Mac to pair" (and Set up…): (re)open this PC's inbound pairing window, so a
 /// Mac that connects to this PC may start pairing for the next `INBOUND_PAIRING_WINDOW`.
 fn allow_inbound_pairing(announce: bool) {
@@ -2201,9 +2221,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Separate statements: a store guard taken inside the struct literal would live until
             // the end of it, and inbound_pairing_minutes() locks the store too (std Mutex isn't
             // reentrant: the UI thread would deadlock).
-            let paired = {
+            let (paired, connections) = {
                 let store = ui().store.lock().unwrap();
-                store.config.pin_entry(&ui().shared.pin_target, ui().shared.pin_fallback.as_deref()).map(|(_, p)| p.name.clone())
+                let paired = store.config.pin_entry(&ui().shared.pin_target, ui().shared.pin_fallback.as_deref()).map(|(_, p)| p.name.clone());
+                (paired, crate::connections::quick_list(&store.config, 10))
             };
             let allow_pairing = inbound_pairing_minutes();
             let st = tray::MenuState {
@@ -2213,6 +2234,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 paired,
                 files: files::enabled().then(files::busy),
                 allow_pairing,
+                connections,
             };
             tray::on_notify(hwnd, lparam, &st);
             LRESULT(0)
@@ -2239,7 +2261,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 Some(tray::MenuCmd::SetUp) => set_up(hwnd),
                 Some(tray::MenuCmd::AllowPairing) => allow_inbound_pairing(true),
-                None => {}
+                Some(tray::MenuCmd::Connections) => manage_connections(hwnd),
+                None => {
+                    if let Some(id) = tray::connection_for_id((wparam.0 & 0xFFFF) as u16) {
+                        super::connections::switch_to(hwnd, &id);
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -2787,6 +2814,7 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
             shared.inbound_pairing.lock().unwrap().close(Instant::now());
             *shared.just_paired.lock().unwrap() = Some(crate::handshake::fingerprint(&conn.host_key));
         }
+        record_last_use(&shared.pin_target);
         ever_connected = true;
         *last_refused.borrow_mut() = None;
         let reason = run_connection(conn, &shared, &tx, hwnd_raw);

@@ -41,6 +41,8 @@ glide-client.exe                               (uses the config file; opens the 
 glide-client.exe <host[:port]> [--no-listen] [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--no-clipboard] [--clipboard-sync-secrets] [--no-audio] [--bench SECONDS] [--probe]
 glide-client.exe --listen [PORT] [same options]
 glide-client.exe --setup                       (open the setup dialog)
+glide-client.exe --connection NAME [same options]                   (use a saved connection; it becomes the default)
+glide-client.exe --list-connections                                 (print the saved connections)
 glide-client.exe --forget-host [host[:port] | --listen [PORT]]   (unpair, then exit)
 glide-client.exe --identity                                         (print this viewer's key fingerprint)
 ```
@@ -71,6 +73,27 @@ tray icon (*Set up…*), and `--setup` opens it.
 - Test hooks (builds with `--features test-hooks` only, see below): `GLIDE_SETUP_DUMP=x.bmp` saves a
   capture of the dialog; `GLIDE_SETUP_ANSWER=connect|cancel` presses a button after about 0.5 s.
 
+### Saved connections
+
+The viewer remembers the Macs it connects to. It still connects to one Mac at a time; switching
+saves the choice and restarts the viewer onto it (like **Connect** in the setup dialog).
+
+- **Connections window** (Glide menu or tray → *Connections…*): the saved Macs, grouped, with
+  their pairing state and when each was last used. Connect, add, edit, duplicate, remove and unpair
+  from there. Like *Set up…*, a Mac connecting to this PC may start pairing while it is open.
+- **Tray → Connect to**: up to 10 saved connections (favorites first, then the most recently
+  used); a check marks the active one. Pick another to switch.
+- `--connection NAME` picks one by name, id or address and makes it the active one, so plain
+  launches use it from then on. It can't be combined with a positional host or `--listen`. An
+  unknown name exits with code 2 and lists the saved names.
+- `--list-connections` prints them (`*` = active) with address, group and pairing state.
+- Config: `connections` (list of `{ "id", "name", "platform": "mac", "address", "accept_incoming",
+  "group", "favorite", "last_connected" }`) and `active_connection` (an id). The active connection
+  is mirrored into `host` / `accept_incoming`, which the connect path and pairing still use; a
+  `host` written by the setup dialog, by hand or by an older viewer is added to (or updates) the
+  list when the config loads. A session started with a host on the command line doesn't change
+  the list.
+
 ### Config file, identity and pairing
 
 Settings live in `%APPDATA%\Glide\config.json` (set `GLIDE_CONFIG_DIR` to use another folder). The file
@@ -82,6 +105,8 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   "listen_port": 7420,      // where the Mac can connect to this PC (glide-host --connect)
   "host": null,             // "mac.local:7420" = dial the Mac (and keep listening, see below)
   "accept_incoming": true,  // with "host": also listen on listen_port; false = dial only
+  "connections": [],        // saved connections (see Saved connections); the active one sets "host"
+  "active_connection": null, // id of the saved connection in use ("c1"), or null
   "portable_exe": null,     // an exe the user chose to run without installing (setup dialog)
   "mode": null,             // "fast" | "hybrid" | "sharp"; null = auto (hybrid if 4:4:4 decodes)
   "ctrl_as_cmd": true,       // Ctrl → Command, Win → Control (menu → Input)
@@ -114,7 +139,8 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
 - **Precedence:** command-line flags win over the config file.
   - A positional `host` (both mode; `--no-listen` = dial only; `--listen PORT` sets the port it
     listens on), then `--listen [PORT]` alone (listen only), then the config's `host` (both mode
-    unless `"accept_incoming": false`), then listening on `listen_port`.
+    unless `"accept_incoming": false`), then listening on `listen_port`. `--connection NAME`
+    first makes that saved connection the config's `host`.
   - `--mode` wins over `"mode"`, which wins over auto.
   - `--no-ctrl-as-cmd` / `--ctrl-as-cmd` win over `"ctrl_as_cmd"`.
   - `--no-audio` wins over `"audio"`.
