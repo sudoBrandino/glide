@@ -10,6 +10,7 @@
 #define WS_CAPTION        0x00C00000L
 #define WS_SYSMENU        0x00080000L
 #define WS_TABSTOP        0x00010000L
+#define WS_DISABLED       0x08000000L
 #define WS_EX_APPWINDOW   0x00040000L
 #define SS_ICON           0x3
 #define SS_CENTERIMAGE    0x200
@@ -52,18 +53,21 @@ IDI_GLIDE ICON "glide.ico"
 
 // Pairing (security v2): both screens show the same 6-digit code; the user confirms on both.
 // Texts are set at runtime (win/prompt.rs); keep this file ASCII for rc.exe.
+// Cancel is the default button and the confirm button starts disabled (prompt.rs enables it after
+// a second), and no DS_SETFOREGROUND: a request that arrives while the user is typing must not be
+// confirmed by a stray Return/Space, nor take the keyboard from another app.
 IDD_PAIR DIALOGEX 0, 0, 262, 150
-STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | DS_SETFOREGROUND | WS_POPUP | WS_CAPTION | WS_SYSMENU
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 EXSTYLE WS_EX_APPWINDOW
 CAPTION "Glide: Pair with Mac"
 FONT 9, "Segoe UI", 400, 0, 1
 BEGIN
     CONTROL         "", IDC_PAIR_ICON, "Static", SS_ICON | SS_CENTERIMAGE, 10, 10, 24, 24
-    LTEXT           "Pair this PC with the Mac?", IDC_PAIR_TEXT, 44, 10, 208, 26
+    LTEXT           "Pair this PC with the Mac?", IDC_PAIR_TEXT, 44, 8, 208, 30
     CTEXT           "000 000", IDC_PAIR_CODE, 10, 40, 242, 32
     LTEXT           "", IDC_PAIR_DETAIL, 10, 78, 242, 44
-    DEFPUSHBUTTON   "Codes Match, Pair", IDOK, 118, 128, 80, 14, WS_TABSTOP
-    PUSHBUTTON      "Cancel", IDCANCEL, 202, 128, 50, 14, WS_TABSTOP
+    PUSHBUTTON      "Codes Match, Pair", IDOK, 118, 128, 80, 14, WS_TABSTOP | WS_DISABLED
+    DEFPUSHBUTTON   "Cancel", IDCANCEL, 202, 128, 50, 14, WS_TABSTOP
 END
 
 // Setup (win/setup.rs): Mac address + test, firewall, start at sign-in, install. Tab order is

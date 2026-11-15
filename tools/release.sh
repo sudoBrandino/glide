@@ -174,10 +174,14 @@ cmd_viewer() {
   sed 's/$/\r/' > "$stage/README.txt" <<EOF
 Glide viewer $VERSION (Windows 10/11 x64), protocol v2, commit $GLIDE_BUILD_COMMIT
 
-Run glide-client.exe. With no arguments it waits for the Mac to connect on TCP port 7420
-(the host dials out with: glide-host --connect THIS-PC:7420). To connect to the Mac instead:
+Run glide-client.exe. The first time, its setup window offers to install it, asks for the
+Mac's address, and whether the Mac may connect to this PC as well (with a Windows Firewall
+rule). Either side can open the connection on TCP port 7420; one direction that your network
+allows is enough. From a command line instead:
 
-    glide-client.exe 192.168.1.50
+    glide-client.exe 192.168.1.50              dial the Mac; it may also connect to this PC
+    glide-client.exe 192.168.1.50 --no-listen  dial only
+    glide-client.exe --listen                  only wait for the Mac to connect
 
 The first connection pairs this PC with the Mac: both screens show the same 6-digit code;
 confirm on both only if they match. Settings: %APPDATA%\\Glide\\config.json.

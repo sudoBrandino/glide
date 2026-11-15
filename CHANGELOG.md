@@ -51,6 +51,47 @@ changed for them, not how. Delete empty subsections when the release is cut.
 - `glide-host --permission-status` reports whether Screen Recording and Accessibility are granted,
   without prompting. The installer uses it to notice the grants as soon as you make them.
 
+### Fixed
+
+- Updating by dragging a new Glide Host over the running one and opening it now restarts into
+  the new version. Before, the host stopped and nothing started again. The old LaunchAgents are
+  removed only once the new copy is in place, and a failed copy puts the old app back.
+- A `host.json` that can't be read is never overwritten any more (saving the PC's address,
+  finishing setup, `--set-connect`): it used to be replaced with defaults, which dropped the
+  paired viewers. The setup window shows what is wrong with the file instead.
+- The Mac no longer keeps capturing the screen when a viewer disconnects while capture is still
+  starting, and ending a session is now done on that session's own queue (a viewer replacing a
+  half-open session could crash the host or start a second dialer).
+- On networks where only the Mac can reach the PC, pairing no longer stalls for up to a minute:
+  the viewer doesn't count "pairing closed" answers or leftover connections against the Mac, the
+  host doesn't charge its own failed dials to the PC's address, and the host doesn't dial an
+  unpaired PC until its pairing window opens.
+- When the Mac's address changes (a new DHCP lease), a PC that only accepts the Mac's connections
+  lets it back in after it proves the paired key, instead of refusing it until it is re-paired.
+  Refused connections show in the viewer's status line.
+- A viewer reporting a tiny window size can't make the Mac capture 0×0 any more.
+- `install.sh` copies the new app next to the old one and swaps it in, so a failed copy leaves the
+  old host installed. It reuses a copy the setup window put in /Applications instead of adding a
+  second one.
+
+### Security
+
+- Pairing prompts on both sides: Cancel is now the default button (Return/Escape), confirming is
+  possible only after 1 s, and the prompt no longer takes keyboard focus from the app you are
+  typing in. The viewer shows the address the connection actually came from.
+- An unpaired viewer accepts a pairing started by a Mac that connects to it only for 15 minutes
+  after it starts or its setup dialog is used (or from the tray's *Allow the Mac to pair*), and
+  doesn't ask for pairing at all when the Mac's pairing window is closed.
+- Release builds of the viewer ignore the test variables (`GLIDE_PAIR_CONFIRM` and friends), so a
+  variable left set can't confirm a pairing; they need the `test-hooks` build feature.
+- `install.ps1` runs its elevated firewall step through PowerShell's full path with an encoded
+  command, and quotes paths with typographic apostrophes correctly. `install.sh` stops when a
+  GitHub build-provenance check fails (when the GitHub CLI can run it).
+- Unauthenticated connections can no longer grow the host's log without bound; security events
+  (unknown viewers, pair requests) have their own budget so connection noise can't hide them.
+  Glide v1 viewers now go through the same rate limit as everyone else.
+- The release workflow loads the signing identity only for tag pushes, not for pull requests.
+
 ### Changed
 
 - The LaunchAgent keeps the host running only while the app exists (`KeepAlive` `PathState`):

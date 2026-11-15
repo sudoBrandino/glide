@@ -90,13 +90,20 @@ What changes is the exposure of the viewer:
   admission control (`windows/src/peers.rs`): the `allowed_peers` IP/CIDR allowlist, or, if
   that's empty, the IP of the first host that completed an authenticated session (trust on first
   use); plus a per-address backoff.
-- An unpaired listening viewer will show a pairing prompt to any Glide host that connects. Pair
-  only while you are pairing your own Mac, and only if both screens show the same code.
+- An unpaired viewer shows a pairing prompt to a Glide host that connects to it only during its
+  15-minute inbound pairing window (from start, the setup dialog, *Forget host* or the tray's
+  *Allow the Mac to pair*), and only if that host's pairing window is open. Cancel is the default
+  button and confirming is possible only after 1 s, so a stray keystroke can't pair. Pair only
+  while you are pairing your own Mac, and only if both screens show the same code.
+- The trust-on-first-use IP may move: with a pinned host key, a connection from a new address must
+  present that key before the viewer reveals anything, and only then replaces the pinned IP. List
+  the Mac's address as a CIDR (or several entries) in `allowed_peers` to forbid that.
 - Recommended: set `allowed_peers` to the Mac's address and add a Windows Firewall rule that
   admits only the Mac to `glide-client.exe`.
 
-The host redials every 2 s (backing off to 60 s while it is refused), and doesn't dial while a
-viewer that dialed in is connected. It sends nothing about
+The host redials every 2 s (backing off to 60 s while it is refused), doesn't dial while a viewer
+that dialed in is connected, and doesn't dial at all while it has no paired viewer and its pairing
+window is closed. Its own dialed sessions never count against the inbound rate limiter. It sends nothing about
 itself beyond what any host sends to a connecting viewer.
 
 ## Untrusted input, by side

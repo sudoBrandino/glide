@@ -72,6 +72,12 @@ features = [
     "Win32_System_SystemInformation",
 ]
 
+[features]
+# Test hooks for SSH / session-0 smoke tests (GLIDE_PAIR_CONFIRM, GLIDE_SETUP_ANSWER, the dialog and
+# frame dumps, GLIDE_TEST_ACTIONS, GLIDE_TEST_SEND_FILES; see util::TEST_HOOK_VARS). Off by default,
+# so release builds ignore them: a variable left set must never answer a pairing prompt.
+test-hooks = []
+
 [dev-dependencies]
 
 # CI runs `cargo clippy --all-targets -- -D warnings` for the host and the Windows target.

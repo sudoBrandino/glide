@@ -12,7 +12,17 @@ final class Session: @unchecked Sendable {
     private let settings: HostSettings
     private let injector: InputInjector
     private var inputQueue: DispatchQueue { injector.queue }
-    private var pipeline: VideoPipeline?
+    /// Guards `ended` and the state end() tears down that other threads read (the main queue: menu
+    /// actions and display observers; the pipeline queue; capture tasks). end() itself always runs
+    /// on the session queue (`channel.queue`).
+    private let stateLock = NSLock()
+    private var endedValue = false
+    private var ended: Bool { stateLock.withLock { endedValue } }
+    private var pipelineValue: VideoPipeline?
+    private var pipeline: VideoPipeline? {
+        get { stateLock.withLock { pipelineValue } }
+        set { stateLock.withLock { pipelineValue = newValue } }
+    }
     private var audio: AudioPipeline?
     private var audioOff = false
     private let cursor = CursorMonitor()
@@ -36,9 +46,17 @@ final class Session: @unchecked Sendable {
         set { timingLock.lock(); viewerLatencyValue = newValue; timingLock.unlock() }
     }
     /// Created at auth if the viewer advertised clipboard support; started after ServerHello.
-    private var clipboard: ClipboardSync?
+    private var clipboardValue: ClipboardSync?
+    private var clipboard: ClipboardSync? {
+        get { stateLock.withLock { clipboardValue } }
+        set { stateLock.withLock { clipboardValue = newValue } }
+    }
     /// Created at auth if the viewer advertised file transfer (caps bit 11) and it's enabled.
-    private var files: SessionFiles?
+    private var filesValue: SessionFiles?
+    private var files: SessionFiles? {
+        get { stateLock.withLock { filesValue } }
+        set { stateLock.withLock { filesValue = newValue } }
+    }
     /// The viewer set caps bit 13: DisplayList / DisplayChanged / SelectDisplay (PROTOCOL.md §3.5).
     private var displaysEnabled = false
     private let displayLock = NSLock()
@@ -65,11 +83,16 @@ final class Session: @unchecked Sendable {
     /// Bumped whenever the pre-auth deadline is re-armed (stale timers ignore themselves).
     private var deadlineGen = 0
 
+    /// Marks each session's queue with its id, so end() knows whether it already runs there.
+    private static let queueKey = DispatchSpecificKey<Int>()
+
     /// `queue`: the queue `connection` was already started on (dialer), else a new one.
     init(id: Int, connection: NWConnection, settings: HostSettings, queue: DispatchQueue? = nil) {
         self.id = id
         self.settings = settings
-        self.channel = SecureChannel(connection: connection, queue: queue ?? DispatchQueue(label: "glide.session.\(id)", qos: .userInteractive))
+        let q = queue ?? DispatchQueue(label: "glide.session.\(id)", qos: .userInteractive)
+        q.setSpecific(key: Session.queueKey, value: id)
+        self.channel = SecureChannel(connection: connection, queue: q)
         self.injector = InputInjector()
     }
 
@@ -85,6 +108,23 @@ final class Session: @unchecked Sendable {
     }
     /// Ended without ever streaming (handshake/auth failed): the dialer backs off.
     var failedAuth: Bool { !authed }
+    /// The host dialed this connection (Server.dial). Set before `start()`. Outbound sessions stay
+    /// out of the inbound rate limiter: the dialer has its own backoff, and charging the PC's
+    /// address for our own failed dials would refuse the PC when it dials in (PROTOCOL.md §2.5).
+    var outbound = false
+    /// Counts a failed attempt against the peer's address (inbound connections only).
+    private func chargeFailure() { if !outbound { PairingController.shared.backoff.failed(address) } }
+
+    /// Logs `line`; before authentication through `PeerLog`, so a peer that keeps connecting can't
+    /// grow the log without bound.
+    private func peerLog(_ line: String) {
+        if authed { log(line) } else { PeerLog.line(address, line) }
+    }
+
+    /// Security-relevant lines before authentication: never crowded out by connection noise.
+    private func securityLog(_ line: String) {
+        if authed { log(line) } else { PeerLog.event(address, line) }
+    }
 
     func start() {
         channel.connection.stateUpdateHandler = { [weak self] st in
@@ -92,7 +132,7 @@ final class Session: @unchecked Sendable {
             switch st {
             case .ready:
                 self.runHandshake()
-            case .failed(let e): log("session \(self.id): connection failed: \(e)"); self.end()
+            case .failed(let e): self.peerLog("session \(self.id): connection failed: \(e)"); self.end()
             case .cancelled: self.end()
             default: break
             }
@@ -103,8 +143,8 @@ final class Session: @unchecked Sendable {
         channel.onClose = { [weak self] err in
             guard let self else { return }
             if let err, !self.authed {
-                log("session \(self.id): closed during \(self.phase) from \(self.peer): \(err)")
-                if self.phase == .handshake || self.phase == .awaitHello { PairingController.shared.backoff.failed(self.address) }
+                self.peerLog("session \(self.id): closed during \(self.phase) from \(self.peer): \(err)")
+                if self.phase == .handshake || self.phase == .awaitHello { self.chargeFailure() }
             } else if let err {
                 log("session \(self.id): closed: \(err)")
             }
@@ -129,8 +169,8 @@ final class Session: @unchecked Sendable {
                 self.reject(.timeout)
                 return
             }
-            log("session \(self.id): no \(what) within \(Int(seconds))s from \(self.peer); closing")
-            PairingController.shared.backoff.failed(self.address)
+            self.peerLog("session \(self.id): no \(what) within \(Int(seconds))s from \(self.peer); closing")
+            self.chargeFailure()
             self.end()
         }
     }
@@ -140,10 +180,11 @@ final class Session: @unchecked Sendable {
     private func runHandshake() {
         let pc = PairingController.shared
         let addr = address
+        let outbound = outbound
         channel.acceptHandshake(identity: settings.identity, admission: { [weak self] in
             if self?.isPaused() == true { return (GlideHandshake.statusPaused, 0) }
-            if let left = pc.backoff.blocked(addr) {
-                log("session \(self?.id ?? 0): \(addr) is rate-limited (\(Int(left.rounded(.up))) s left); refusing")
+            if !outbound, let left = pc.backoff.blocked(addr) {
+                PeerLog.line(addr, "session \(self?.id ?? 0): \(addr) is rate-limited (\(Int(left.rounded(.up))) s left); refusing")
                 return (GlideHandshake.statusRateLimited, 0)
             }
             return (GlideHandshake.statusOK, pc.window.isOpen() ? GlideHandshake.hostFlagPairingOpen : 0)
@@ -151,16 +192,18 @@ final class Session: @unchecked Sendable {
             guard let self, !self.ended else { return }
             switch result {
             case .failure(SecureChannel.HandshakeFailure.v1Viewer):
-                log("session \(self.id): rejected a Glide v1 viewer from \(self.peer) (it shows “unsupported protocol version 2”; update the viewer)")
+                // It passed admission (not rate-limited); it counts as a failure like any refusal.
+                self.securityLog("session \(self.id): rejected a Glide v1 viewer from \(self.peer) (it shows “unsupported protocol version 2”; update the viewer)")
                 HostStatus.shared.note("Rejected a Glide v1 viewer (\(addr)) — update it", warning: true)
+                self.chargeFailure()
                 self.end()
             case .failure(SecureChannel.HandshakeFailure.refused(let st)):
-                if st != GlideHandshake.statusRateLimited { log("session \(self.id): refused \(self.peer) (status \(st))") }
+                if st != GlideHandshake.statusRateLimited { self.peerLog("session \(self.id): refused \(self.peer) (status \(st))") }
                 self.end()
             case .failure(let e):
                 // EOF right after msg2 = the viewer didn't like our key (pinned to another host key).
-                log("session \(self.id): handshake with \(self.peer) failed: \(e)")
-                pc.backoff.failed(addr)
+                self.peerLog("session \(self.id): handshake with \(self.peer) failed: \(e)")
+                self.chargeFailure()
                 self.end()
             case .success(let acc):
                 self.accepted(acc)
@@ -180,11 +223,11 @@ final class Session: @unchecked Sendable {
         if acc.info.pairRequest {
             switch pc.window.claim(id) {
             case .closed:
-                log("session \(id): viewer “\(name)” (\(fp)) at \(address) asked to pair, but pairing isn't open")
+                securityLog("session \(id): viewer “\(name)” (\(fp)) at \(address) asked to pair, but pairing isn't open")
                 HostStatus.shared.note("“\(name)” (\(address)) asked to pair — use Pair New Viewer…", warning: true)
                 reject(.pairingClosed)
             case .busy:
-                log("session \(id): viewer “\(name)” asked to pair while another pairing is in progress")
+                securityLog("session \(id): viewer “\(name)” asked to pair while another pairing is in progress")
                 reject(.busy)
             case .granted:
                 phase = .pairing
@@ -199,7 +242,7 @@ final class Session: @unchecked Sendable {
         } else if TrustStore.shared.isPaired(acc.viewerKey) {
             phase = .awaitHello
         } else {
-            log("session \(id): rejected unknown viewer “\(name)” (\(fp)) from \(address)")
+            securityLog("session \(id): rejected unknown viewer “\(name)” (\(fp)) from \(address)")
             HostStatus.shared.note("Rejected unknown viewer “\(name)” (\(address))", warning: true)
             reject(.unknownViewer)
         }
@@ -238,17 +281,31 @@ final class Session: @unchecked Sendable {
             pc.window.release(id, paired: false)
             pc.finished(sessionId: id, result: "failed \(code)")
         }
-        pc.backoff.failed(address)
+        chargeFailure()
         phase = .rejected  // ignore whatever else arrives (e.g. a pipelined ClientHello) until flushed
         channel.send(HostMessage.authResult(code).encoded) { [weak self] _ in
             self?.channel.queue.async { self?.end() }
         }
     }
 
-    private var ended = false
+    /// Ends the session; idempotent and callable from any thread. The teardown always runs on the
+    /// session queue: right away when called there (callers on it may rely on `ended` afterwards),
+    /// else asynchronously. So it never races the queue's own handlers or the stats timer, and
+    /// `onEnd` fires exactly once, on that queue.
     func end() {
-        guard !ended else { return }
-        ended = true
+        if DispatchQueue.getSpecific(key: Session.queueKey) == id {
+            endOnQueue()
+        } else {
+            channel.queue.async { self.endOnQueue() }
+        }
+    }
+
+    private func endOnQueue() {
+        let first = stateLock.withLock { () -> Bool in
+            defer { endedValue = true }
+            return !endedValue
+        }
+        guard first else { return }
         if phase == .pairing {
             PairingController.shared.window.release(id, paired: false)
             PairingController.shared.finished(sessionId: id, result: "failed the viewer disconnected")
@@ -258,17 +315,22 @@ final class Session: @unchecked Sendable {
         Power.release(displayAssertion); displayAssertion = nil
         if let o = displayObserver { NotificationCenter.default.removeObserver(o) }
         if let o = preferenceObserver { NotificationCenter.default.removeObserver(o) }
-        displayRestart?.cancel()
+        displayObserver = nil; preferenceObserver = nil
+        DispatchQueue.main.async { [self] in displayRestart?.cancel(); displayRestart = nil }  // set on main
         ActiveDisplay.clearSelection(owner: id)
         cursor.stop()
-        clipboard?.stop(); clipboard = nil
-        files?.stop(); files = nil
+        let (p, clip, f) = stateLock.withLock { () -> (VideoPipeline?, ClipboardSync?, SessionFiles?) in
+            defer { pipelineValue = nil; clipboardValue = nil; filesValue = nil }
+            return (pipelineValue, clipboardValue, filesValue)
+        }
+        clip?.stop()
+        f?.stop()
         HostStatus.shared.fileProgress = nil
         inputQueue.async { self.injector.releaseAll() }
-        if let p = pipeline { Task { await p.stop() } }
-        pipeline = nil
+        // Final: also cancels a capture start still in progress, and any later one (captureLoop).
+        if let p { Task { await p.shutdown() } }
         if authed && !hostTestMode { DisplayModeController.shared.sessionEnded(id: id); HostStatus.shared.sessionEnded(id: id) }
-        log("session \(id): ended")
+        peerLog("session \(id): ended")
         onEnd?(self)
     }
 
@@ -287,7 +349,7 @@ final class Session: @unchecked Sendable {
 
     private func handle(_ d: Data) {
         let msg: ClientMessage
-        do { msg = try ClientMessage.decode(d) } catch { log("session \(id): bad message: \(error)"); if !authed { end() }; return }
+        do { msg = try ClientMessage.decode(d) } catch { peerLog("session \(id): bad message: \(error)"); if !authed { end() }; return }
         if !authed {
             switch (phase, msg) {
             case (.rejected, _):
@@ -299,11 +361,15 @@ final class Session: @unchecked Sendable {
             case (.awaitHello, .hello):
                 break
             default:
-                log("session \(id): unexpected \(msg) during \(phase); closing")
+                peerLog("session \(id): unexpected \(msg) during \(phase); closing")
                 end()
                 return
             }
             guard case let .hello(version, caps, vw, vh, mode, maxFps, _) = msg else { return }
+            // 0 = not reported (stays "unknown"); anything else within sane limits (a 1x1 view used
+            // to end in a 0x0 capture).
+            let view = ViewSizeLimits.clamp(Int(vw), Int(vh))
+            let viewW = view?.w ?? 0, viewH = view?.h ?? 0
             authed = true
             phase = .streaming
             channel.maxRecordBytes = RecordCipher.maxRecord
@@ -317,10 +383,10 @@ final class Session: @unchecked Sendable {
             }
             onAuthenticated?(self)
             if ended { return }  // rejected by the server (e.g. paused)
-            HostStatus.shared.sessionAuthed(id: id, name: name, endpoint: channel.connection.endpoint, viewW: Int(vw), viewH: Int(vh))
+            HostStatus.shared.sessionAuthed(id: id, name: name, endpoint: channel.connection.endpoint, viewW: viewW, viewH: viewH)
             Power.wakeDisplay()
             displayAssertion = Power.preventDisplaySleep()
-            log("session \(id): '\(name)' (\(GlideHandshake.fingerprint(viewerKey ?? Data()))) authenticated from \(peer) (proto v\(version), view \(vw)x\(vh), caps \(caps.rawValue), mode \(mode), fps \(maxFps))")
+            log("session \(id): '\(name)' (\(GlideHandshake.fingerprint(viewerKey ?? Data()))) authenticated from \(peer) (proto v\(version), view \(vw)x\(vh)\(viewW != Int(vw) || viewH != Int(vh) ? " -> \(viewW)x\(viewH)" : ""), caps \(caps.rawValue), mode \(mode), fps \(maxFps))")
             displaysEnabled = caps.contains(.displays)
             if caps.contains(.clipboard) {
                 clipboard = ClipboardSync(sessionId: id, syncConcealed: settings.clipboardSyncConcealed) { [weak self] c in self?.send(.clipboard(c)) }
@@ -336,10 +402,10 @@ final class Session: @unchecked Sendable {
             }
             // Size the virtual display for this viewer (pixels and refresh rate; max_fps is the viewer
             // monitor's refresh), or switch the Mac's display mode if the policy says so, then capture once.
-            DisplayModeController.shared.sessionBegan(id: id, viewW: Int(vw), viewH: Int(vh), viewerHz: Int(maxFps)) { [weak self] in
+            DisplayModeController.shared.sessionBegan(id: id, viewW: viewW, viewH: viewH, viewerHz: Int(maxFps)) { [weak self] in
                 self?.channel.queue.async {
                     guard let self, !self.ended else { return }
-                    self.startStreaming(caps: caps, mode: mode, maxFps: maxFps, viewW: vw)
+                    self.startStreaming(caps: caps, mode: mode, maxFps: maxFps, viewW: viewW)
                 }
             }
             return
@@ -358,12 +424,17 @@ final class Session: @unchecked Sendable {
         case let .mouseDelta(dx, dy): Power.wakeDisplay(); inputQueue.async { self.injector.mouseDelta(dx: dx, dy: dy) }
         case let .keyExtra(k): Power.wakeDisplay(); inputQueue.async { self.injector.keyExtra(k) }
         case .requestKeyframe: pipeline?.requestKeyframe()
-        case let .viewSize(vw, vh):
-            HostStatus.shared.viewSize(id: id, w: Int(vw), h: Int(vh))
+        case let .viewSize(rawW, rawH):
+            guard let view = ViewSizeLimits.clamp(Int(rawW), Int(rawH)) else {
+                log("session \(id): ignoring ViewSize \(rawW)x\(rawH)")
+                return
+            }
+            let vw = view.w, vh = view.h
+            HostStatus.shared.viewSize(id: id, w: vw, h: vh)
             // Debounced; may switch the display mode, in which case the display-change observer re-captures.
-            DisplayModeController.shared.viewSizeChanged(id: id, viewW: Int(vw), viewH: Int(vh)) { [weak self] switched in
+            DisplayModeController.shared.viewSizeChanged(id: id, viewW: vw, viewH: vh) { [weak self] switched in
                 guard let self, !self.ended, let p = self.pipeline else { return }
-                let target = min(self.settings.maxWidth, Int(vw))
+                let target = min(self.settings.maxWidth, vw)
                 if switched { p.setMaxWidth(target); return }
                 guard target != p.options.maxWidth else { return }
                 log("session \(self.id): viewer now \(vw)px wide -> re-capturing at max width \(target)")
@@ -400,13 +471,14 @@ final class Session: @unchecked Sendable {
         }
     }
 
-    private func startStreaming(caps: CodecCaps, mode: StreamMode, maxFps: UInt8, viewW: UInt16) {
+    /// `viewW`: clamped to `ViewSizeLimits`, 0 = unknown.
+    private func startStreaming(caps: CodecCaps, mode: StreamMode, maxFps: UInt8, viewW: Int) {
         let codec: Codec = caps.contains(.hevc420) || caps.intersection(.codecMask).isEmpty ? .hevc : .h264
         var m = mode
         if (m == .sharp || m == .hybrid) && !caps.contains(.hevc444) { m = .fast }
         let fps = maxFps > 0 ? min(Int(maxFps), settings.fps) : settings.fps
         // Never send more pixels than the viewer can show 1:1 (e.g. a 5K HiDPI desktop to a 4K monitor).
-        let viewerW = Int(viewW) > 0 ? Int(viewW) : settings.maxWidth
+        let viewerW = viewW > 0 ? viewW : settings.maxWidth
         let p = VideoPipeline(options: .init(displayID: ActiveDisplay.current(), mode: m, codec: codec, fps: fps, bitrateKbps: settings.bitrateKbps, maxWidth: min(settings.maxWidth, viewerW)))
         pipeline = p
         let maxInFlight = settings.maxInFlightBytes
@@ -500,22 +572,36 @@ final class Session: @unchecked Sendable {
     /// Starts capture, retrying until it works or the session ends. The display can be unavailable
     /// (asleep, locked, reconfiguring); the session stays alive meanwhile so input still reaches the
     /// Mac (which wakes the display).
-    private var capturing = false
+    private var capturing = false  // stateLock
     private func captureLoop(_ p: VideoPipeline) async {
-        if capturing { return }
-        capturing = true
-        defer { capturing = false }
+        let mine = stateLock.withLock { () -> Bool in
+            defer { capturing = true }
+            return !capturing
+        }
+        guard mine else { return }
+        defer { stateLock.withLock { capturing = false } }
         var attempt = 0
         while !ended {
             attempt += 1
             do {
                 try await p.start()
-                cursor.start()
-                if statsTimer == nil { startStats() }
-                if displayObserver == nil { watchDisplayChanges() }
-                if attempt > 1 { log("session \(id): capture started after \(attempt) attempts") }
+                // end() may have run while capture was starting (a viewer that dropped right away, or
+                // a new session replacing this one): never leave that capture running.
+                if ended { await p.shutdown(); return }
+                let attempts = attempt
+                channel.queue.async { [self] in  // like end(), so end's teardown can't be undone here
+                    guard !ended else { return }
+                    cursor.start()
+                    if statsTimer == nil { startStats() }
+                    if displayObserver == nil { watchDisplayChanges() }
+                    if attempts > 1 { log("session \(id): capture started after \(attempts) attempts") }
+                }
                 HostStatus.shared.captureError(id: id, nil)
                 return
+            } catch let stopped as VideoPipeline.Stopped {
+                // Shut down (the session ended), or a re-capture stopped this start: start over now.
+                if stopped.final || ended { return }
+                attempt -= 1
             } catch {
                 if attempt <= 3 || attempt % 15 == 0 {
                     log("session \(id): capture unavailable (attempt \(attempt), screen recording \(CGPreflightScreenCaptureAccess() ? "granted" : "NOT granted")): \(error.localizedDescription) — waking display and retrying")
@@ -688,5 +774,49 @@ final class Session: @unchecked Sendable {
         }
         t.resume()
         statsTimer = t
+    }
+}
+
+/// Log lines about connections that haven't authenticated. Anyone who can reach the port can
+/// open connections (rate-limited ones too), so these lines go through a `LogCoalescer`: a few per
+/// address bucket per minute, then one "N more ... suppressed" summary once the minute is over.
+enum PeerLog {
+    static let coalescer = LogCoalescer(window: 60, perKey: 6, total: 30)
+    /// Security events (unknown viewer rejected, pairing requested, v1 viewer rejected) have their
+    /// own budget, per address only: connection noise from any peer can't push them out of the log,
+    /// and one peer flooding events only silences itself (its count still appears in the summary).
+    static let events = LogCoalescer(window: 60, perKey: 6, total: .max, subject: "pairing/authentication events")
+    private static let flushLock = NSLock()
+    private static var flushScheduled = false
+
+    /// `address`: the peer's IP (bucketed like the rate limiter: IPv4 address, IPv6 /64).
+    static func line(_ address: String, _ text: String) {
+        let d = coalescer.admit(HandshakeBackoff.key(address), now: ProcessInfo.processInfo.systemUptime)
+        if let s = d.summary { log("server: " + s) }
+        if d.log { log(text) } else { scheduleFlush() }
+    }
+
+    static func event(_ address: String, _ text: String) {
+        let d = events.admit(HandshakeBackoff.key(address), now: ProcessInfo.processInfo.systemUptime)
+        if let s = d.summary { log("server: " + s) }
+        if d.log { log(text) } else { scheduleFlush() }
+    }
+
+    /// Reports the suppressed count when the window ends, not only at the next connection.
+    private static func scheduleFlush() {
+        guard let at = [coalescer.pendingSummaryAt, events.pendingSummaryAt].compactMap({ $0 }).min() else { return }
+        let first = flushLock.withLock { () -> Bool in
+            defer { flushScheduled = true }
+            return !flushScheduled
+        }
+        guard first else { return }
+        let delay = max(1, at - ProcessInfo.processInfo.systemUptime + 0.1)
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) {
+            flushLock.withLock { flushScheduled = false }
+            let now = ProcessInfo.processInfo.systemUptime
+            if let s = coalescer.flush(now: now) { log("server: " + s) }
+            if let s = events.flush(now: now) { log("server: " + s) }
+            scheduleFlush()  // a newer window may have suppressed lines meanwhile
+        }
     }
 }

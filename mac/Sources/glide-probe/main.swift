@@ -293,15 +293,25 @@ struct ProbeConfig: Codable {
         if let p = ProcessInfo.processInfo.environment["GLIDE_PROBE_CONFIG"], !p.isEmpty { return URL(fileURLWithPath: p) }
         return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Glide/probe.json")
     }
+    /// A new key only when there is no file. A file that can't be read is never replaced (that
+    /// would drop the probe's paired identity and the pinned host keys): exit with the reason.
     static func load() -> ProbeConfig {
-        if let d = try? Data(contentsOf: url), let c = try? JSONDecoder().decode(ProbeConfig.self, from: d), Data(hex: c.key)?.count == 32 { return c }
+        do {
+            if let c = try ConfigFile.read(ProbeConfig.self, from: url) {
+                guard Data(hex: c.key)?.count == 32 else { throw ConfigFile.Failure.undecodable(path: url.path, reason: "key: not 32 bytes of hex") }
+                return c
+            }
+        } catch {
+            print("error: \(error); fix or move the file (a new one gets a new key and no pins)")
+            exit(1)
+        }
         let c = ProbeConfig(key: Curve25519.KeyAgreement.PrivateKey().rawRepresentation.hex)
         c.save()
         return c
     }
     func save() {
         try? FileManager.default.createDirectory(at: ProbeConfig.url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        FileManager.default.createFile(atPath: ProbeConfig.url.path, contents: try! JSONEncoder().encode(self), attributes: [.posixPermissions: 0o600])
+        do { try ConfigFile.write(self, to: ProbeConfig.url) } catch { print("error: \(error)") }
     }
 }
 var probeConfig = ProbeConfig.load()

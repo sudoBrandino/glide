@@ -193,9 +193,10 @@ The viewer (`windows/src/win/app.rs`) runs these threads:
 - **Render thread:** owns the D3D11 device, both Media Foundation decoders, the canvas and the
   swap chain. Frames arrive from the network over a channel and are presented as soon as they
   decode.
-- **Session thread:** connects, or listens in `--listen` mode, runs one connection at a time and
-  survives disconnects. While disconnected it shows a status line over the dimmed last frame,
-  releases held keys, and retries every 2 s or re-listens. Each connection has its own receive
+- **Session thread:** dials the Mac and listens (both mode, `both_round`), only dials
+  (`--no-listen`) or only listens (no Mac address), runs one connection at a time and survives
+  disconnects. While disconnected it shows a status line over the dimmed last frame, releases held
+  keys, and retries every 2 s or re-listens. Each connection has its own receive
   thread and a 2 Hz ping thread from `net.rs`. The ping thread tracks RTT and the host clock
   offset: the lowest-RTT samples of a sliding 30 s window, with drift tracking (LATENCY.md).
 

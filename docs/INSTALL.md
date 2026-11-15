@@ -74,12 +74,17 @@ brew install --cask sudobrandino/glide/glide-host && glide-setup                
 irm https://raw.githubusercontent.com/sudoBrandino/glide/main/install.ps1 | iex           # Windows
 ```
 
-`install.sh` downloads the latest release, checks it against `SHA256SUMS`, installs the app to
-`~/Applications` with a LaunchAgent, removes an older Glide Host that would compete for the
-screen, walks through the permissions, the connection and pairing; `--help` lists its options.
-With Homebrew, run `glide-setup` again after each `brew upgrade` (each build needs the permissions
-again). `install.ps1` installs the viewer where an existing one lives, offers the firewall rule and
-shortcuts. Read a script before you pipe it into a shell: both are short and in this repository
+`install.sh` downloads the latest release, checks it against `SHA256SUMS` (and its build
+provenance, when the GitHub CLI is installed and signed in), installs the app with a LaunchAgent,
+removes an older Glide Host that would compete for the screen, walks through the permissions, the
+connection (the PC's address is optional: the Mac listens either way) and pairing; `--help` lists
+its options. It updates the copy that is already installed, in `/Applications` or
+`~/Applications`, else installs to `~/Applications`; if that copy was set to Start at Login in its
+setup window, the LaunchAgent takes over from the login item. With Homebrew, run `glide-setup`
+again after each `brew upgrade` (each build needs the permissions again). `install.ps1` installs
+the viewer where an existing one lives, saves the Mac's address (optional) and whether the Mac may
+connect to the PC in the viewer's settings, offers the firewall rule when it may, and adds a Start
+menu shortcut. Read a script before you pipe it into a shell: both are short and in this repository
 ([`install.sh`](../install.sh), [`install.ps1`](../install.ps1)). The sections below are the same
 steps by hand.
 
@@ -109,7 +114,8 @@ Get-FileHash .\Glide-Viewer-0.2.0-windows-x64.zip -Algorithm SHA256
 
 Releases built by GitHub Actions also carry a build provenance attestation. If you have the
 GitHub CLI, `gh attestation verify <zip> --repo sudoBrandino/glide` checks that the file was
-built from this repository by the release workflow.
+built from this repository by the release workflow. `install.sh` runs this check when `gh` is
+installed and signed in, and doesn't install a download that fails it.
 
 ## 2. Install the host on the Mac
 
@@ -208,9 +214,10 @@ Glide Host** (the LaunchAgent starts it again).
 
 ### 2.4 Mac firewall
 
-If the macOS firewall is on (System Settings → Network → Firewall) and the viewer connects to the
-Mac, macOS asks whether *Glide Host* may accept incoming connections. Allow it. If the Mac dials
-out instead (see [4.2](#42-choose-who-connects)), nothing listens on the Mac and no rule is needed.
+If the macOS firewall is on (System Settings → Network → Firewall), macOS asks whether *Glide
+Host* may accept incoming connections: the host listens on port 7420 even when it also dials the
+PC. Allow it if the PC should be able to connect to the Mac. Only with `"listen": false` (see
+[4.2](#42-choose-who-connects)) does nothing listen on the Mac, and then no rule is needed.
 
 ## 3. Install the viewer on the PC
 
@@ -227,10 +234,13 @@ right-click the exe → **Properties** → tick **Unblock** → OK, or in PowerS
 Unblock-File "$env:LOCALAPPDATA\Glide\glide-client.exe"
 ```
 
-**Firewall.** With no arguments the viewer *listens* on TCP port 7420 and waits for the Mac to
-connect. The first time, Windows Defender Firewall asks whether to allow it. Allow it on
-**Private** networks only. For a tighter rule that admits only your Mac (run in an elevated
-PowerShell, with your path and the Mac's address):
+**Firewall.** Besides dialing the Mac, the viewer *listens* on TCP port 7420 so the Mac can
+connect to it, unless **Let the Mac connect to this PC** is off in its setup window
+(`"accept_incoming": false`, or `--no-listen`). Without the Mac's address it only listens. The
+setup window's **Allow in Windows Firewall** (and `install.ps1`) adds a rule for Private networks;
+otherwise Windows Defender Firewall asks the first time. Allow it on **Private** networks only.
+For a tighter rule that admits only your Mac (run in an elevated PowerShell, with your path and
+the Mac's address):
 
 ```powershell
 New-NetFirewallRule -DisplayName "Glide viewer (from the Mac only)" -Direction Inbound `
@@ -238,7 +248,7 @@ New-NetFirewallRule -DisplayName "Glide viewer (from the Mac only)" -Direction I
   -RemoteAddress 192.168.1.50 -Action Allow -Profile Private
 ```
 
-If the viewer connects to the Mac instead, it needs no inbound rule.
+A viewer that only dials the Mac needs no inbound rule.
 
 When you double-click the exe, its console window closes and messages are not shown. To see them,
 run it from a Command Prompt or PowerShell window. `glide-client.exe --help` lists every option,
@@ -266,19 +276,25 @@ screen on the Mac, run `glide-host --pair` and then, once the PC shows the code,
 
 ### 4.2 Choose who connects
 
-Either side can open the connection. The protocol is the same in both directions. Below,
-`glide-host` stands for `~/Applications/Glide\ Host.app/Contents/MacOS/glide-host`.
+Either side can open the connection, and the protocol is the same in both directions. Both sides
+listen and dial at the same time, so one direction that your network allows is enough. Below,
+`glide-host` stands for `~/Applications/Glide\ Host.app/Contents/MacOS/glide-host` (or the copy in
+`/Applications`).
 
-| Mode | Mac (host) | PC (viewer) | Use when |
-|---|---|---|---|
-| **Mac dials the PC** | `glide-host --set-connect PC-ADDRESS:7420`, then menu bar → Restart Glide Host | Run `glide-client.exe` with no arguments: it listens on 7420 | The PC must not be reachable from other machines, or only Mac → PC connections are allowed |
-| **PC dials the Mac** | Nothing to do: by default the host listens on 7420 | `glide-client.exe MAC-ADDRESS` (or set `"host": "MAC-ADDRESS:7420"` in `config.json`) | The PC can reach the Mac |
+| | Mac (host) | PC (viewer) |
+|---|---|---|
+| **Listens** | Always, on port 7420 | On port 7420, unless **Let the Mac connect to this PC** is off (`"accept_incoming": false`, `--no-listen`) |
+| **Dials the other** | Once it has the PC's address: setup window, or `glide-host --set-connect PC-ADDRESS:7420` then menu bar → Restart Glide Host | Once it has the Mac's address: setup window, `"host": "MAC-ADDRESS:7420"` in `config.json`, or `glide-client.exe MAC-ADDRESS` |
 
-- `--set-connect` saves the target in `~/Library/Application Support/Glide/host.json`
-  (`"connect"`). The host redials every 2 seconds while disconnected. To go back to listening,
-  remove `"connect"` from `host.json` and restart the host.
-- In listen mode the viewer accepts only the first Mac that pairs with it (it pins that address),
-  or the addresses in `"allowed_peers"` in `config.json`.
+- Usually it is enough to give the viewer the Mac's address. If only the Mac can reach the PC (for
+  example a Mac on a restricted network segment), also give the Mac the PC's address, and allow
+  the viewer through Windows Firewall.
+- `--set-connect` saves the PC's address in `~/Library/Application Support/Glide/host.json`
+  (`"connect"`). The host redials every 2 seconds while disconnected. To stop dialing, clear it in
+  the setup window, or remove `"connect"` from `host.json` and restart the host. With
+  `"listen": false` as well, nothing listens on the Mac: only the Mac connects.
+- A viewer that listens accepts only the first Mac that pairs with it (it pins that address), or
+  the addresses in `"allowed_peers"` in `config.json`.
 - The viewer keeps its window open across disconnects and reconnects on its own.
 
 ### 4.3 Using it
@@ -366,9 +382,9 @@ tccutil reset Accessibility io.github.sudobrandino.glide.host
 
 **PC.** Run the installer with `-Uninstall` (add `-Purge` for the settings):
 `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sudoBrandino/glide/main/install.ps1))) -Uninstall`.
-By hand: quit the viewer (tray → **Quit Glide**), delete its folder and its Start menu shortcut,
-and optionally delete `%APPDATA%\Glide` (settings, this PC's key, the pinned Mac key) and any
-firewall rule you added.
+By hand: quit the viewer (tray → **Quit Glide**), turn off **Start Glide when I sign in** in its
+setup window, delete its folder and its Start menu shortcut, and optionally delete
+`%APPDATA%\Glide` (settings, this PC's key, the pinned Mac key) and any firewall rule you added.
 
 ## 7. Troubleshooting
 
@@ -385,7 +401,7 @@ the PC, run `glide-client.exe` from a terminal to see its messages.
 | Viewer: "Not paired" or "doesn't recognize this PC" | Open the pairing window on the Mac (**Pair New Viewer…**). The viewer keeps retrying |
 | Viewer: "HOST KEY CHANGED" | The Mac presented a different key from the one you paired. If you reset or reinstalled the Mac's Glide settings, use tray → **Forget host (unpair)…** and pair again. Otherwise, treat it as an impersonation attempt |
 | A message about protocol v1, or "unsupported protocol version" | The other side runs an older build. Install the same release on both |
-| The viewer waits forever ("Waiting for host on port 7420…") | It is in listen mode. Either set the Mac to dial it (`--set-connect`), or start the viewer with the Mac's address. Check the Windows firewall rule |
+| The viewer waits forever ("Waiting for host on port 7420…") | It has no Mac address, so it only listens. Enter the Mac's address (Glide menu or tray → **Set up…**), or give the Mac the PC's address (its setup window, or `--set-connect`). Check the Windows firewall rule |
 | Can't connect to the Mac | Check the address and that port 7420 is reachable (`Test-NetConnection MAC-ADDRESS -Port 7420` in PowerShell), and the macOS firewall ([2.4](#24-mac-firewall)) |
 | No hybrid or sharp mode, or no picture at all | Install the HEVC Video Extensions. `glide-client.exe --probe` prints what the GPU can decode |
 | Blurry picture | See *Blurry picture* in the README's [Troubleshooting](../README.md#troubleshooting) section |

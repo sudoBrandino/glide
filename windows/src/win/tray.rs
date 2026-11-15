@@ -1,7 +1,8 @@
 //! Notification-area (tray) icon: tooltip = window title; left click brings the viewer to
 //! the front; right click opens Connect / Disconnect / Reconnect / Stats / Mute / received files /
-//! cancel file transfer / Set up / Open config / Forget host (unpair) / Quit. `notify` shows a notification
-//! balloon (file transfer results). Commands arrive at the viewer window as WM_COMMAND.
+//! cancel file transfer / Allow the Mac to pair / Set up / Open config / Forget host (unpair) /
+//! Quit. `notify` shows a notification balloon (file transfer results). Commands arrive at the
+//! viewer window as WM_COMMAND.
 
 use std::sync::OnceLock;
 use windows::core::{w, PCWSTR};
@@ -22,6 +23,7 @@ pub enum MenuCmd {
     OpenDownloads,
     Quit,
     SetUp,
+    AllowPairing,
 }
 
 /// What the menu shows (enabled/checked state).
@@ -34,10 +36,13 @@ pub struct MenuState {
     pub paired: Option<String>,
     /// None = file transfer off; Some(a transfer is running).
     pub files: Option<bool>,
+    /// Listening and not paired: minutes left in the inbound pairing window (0 = closed), which
+    /// "Allow the Mac to pair" (re)opens. None = hide the item.
+    pub allow_pairing: Option<u64>,
 }
 
 const BASE: u16 = 0x4100;
-const CMDS: [MenuCmd; 11] = [
+const CMDS: [MenuCmd; 12] = [
     MenuCmd::Connect,
     MenuCmd::Disconnect,
     MenuCmd::Reconnect,
@@ -49,6 +54,7 @@ const CMDS: [MenuCmd; 11] = [
     MenuCmd::OpenDownloads,
     MenuCmd::Quit,
     MenuCmd::SetUp,
+    MenuCmd::AllowPairing,
 ];
 
 impl MenuCmd {
@@ -193,6 +199,13 @@ fn show_menu(hwnd: HWND, st: &MenuState) {
             item(MenuCmd::OpenDownloads, "Open &received files folder", MF_ENABLED);
             item(MenuCmd::CancelFiles, "Cancel file &transfer\tCtrl+Alt+Shift+X", gray(!busy));
             let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+        }
+        if let Some(left) = st.allow_pairing {
+            let text = match left {
+                0 => format!("Allow the Mac to &pair ({} min)", crate::peers::INBOUND_PAIRING_WINDOW.as_secs() / 60),
+                n => format!("Allow the Mac to &pair (allowed, {n} min left)"),
+            };
+            item(MenuCmd::AllowPairing, &text, MF_ENABLED);
         }
         item(MenuCmd::SetUp, "Set &up…", MF_ENABLED);
         item(MenuCmd::OpenConfig, "Open &config file", MF_ENABLED);

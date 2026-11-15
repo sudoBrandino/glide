@@ -23,6 +23,7 @@ func run() throws {
     try transcriptTests(docs.appendingPathComponent("test-vectors-rust.json").path)
     try wireUnitTests()
     pairingLogicTests()
+    dialPolicyTests()
     try channelTests()
     try controlSocketTests()
 
@@ -494,6 +495,10 @@ do {
 } catch { failures += 1; print("  FAIL input threw \(error)") }
 inputValidationTests()
 fileHardeningTests()
+instanceRoleTests()
+installPlanTests()
+do { try configFileTests() } catch { failures += 1; print("  FAIL config file threw \(error)") }
+do { try sessionLifecycleTests() } catch { failures += 1; print("  FAIL session lifecycle threw \(error)") }
 fuzzTests(vectorsDir: URL(fileURLWithPath: CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "../docs/test-vectors.json").deletingLastPathComponent())
 print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)
