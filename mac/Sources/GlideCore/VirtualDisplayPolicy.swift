@@ -28,7 +28,8 @@ public struct VirtualDisplayConfig: Codable, Equatable, Sendable {
     /// Seconds after a disconnect before Glide restores the arrangement and removes the display, so
     /// a reconnect does not reshuffle anything (default 10, 0 = at once, capped at 24 h).
     public var keepAliveSeconds: Double?
-    /// "mirror" (default) | "extend" | "stream"; see `VirtualDisplayMonitorMode`.
+    /// "mirror" (default) | "extend" | "stream"; see `VirtualDisplayMonitorMode`. Unset, a laptop
+    /// with only its built-in panel online streams the panel as it is (`monitorMode(physicalBuiltIn:)`).
     public var whenMonitorAttached: String?
     /// "extend" only: make the virtual display the main display (menu bar, Dock, new windows) while
     /// it is streamed (default true).
@@ -58,8 +59,27 @@ public struct VirtualDisplayConfig: Codable, Equatable, Sendable {
     public var explicitlyEnabled: Bool { enabled == true }
     public var alwaysOn: Bool { lifetime?.lowercased() == "always" }
     public var keepAlive: Double { min(max(keepAliveSeconds ?? Self.defaultKeepAlive, 0), 86_400) }
-    public var monitorMode: VirtualDisplayMonitorMode {
-        whenMonitorAttached.flatMap { VirtualDisplayMonitorMode(rawValue: $0.lowercased()) } ?? .mirror
+    public var monitorMode: VirtualDisplayMonitorMode { explicitMonitorMode ?? .mirror }
+    /// The mode host.json (or the menu) chose; nil when unset or unknown (the default applies).
+    public var explicitMonitorMode: VirtualDisplayMonitorMode? {
+        whenMonitorAttached.flatMap { VirtualDisplayMonitorMode(rawValue: $0.lowercased()) }
+    }
+    /// The mode in effect with these physical displays online (`true` = built-in panel). Left at
+    /// the default, a laptop whose only screen is its built-in panel (lid open, no external
+    /// monitor) streams the panel as it is: mirroring would give the panel the viewer's resolution
+    /// and shape (a 16:9 desktop on a 16:10 panel). An explicit choice is always kept.
+    public func monitorMode(physicalBuiltIn: [Bool]) -> VirtualDisplayMonitorMode {
+        if let m = explicitMonitorMode { return m }
+        return Self.leavesBuiltInAlone(physicalBuiltIn: physicalBuiltIn) ? .stream : .mirror
+    }
+    /// The default's laptop case: every physical display online is a built-in panel.
+    public static func leavesBuiltInAlone(physicalBuiltIn: [Bool]) -> Bool {
+        !physicalBuiltIn.isEmpty && physicalBuiltIn.allSatisfy { $0 }
+    }
+    /// Whether `monitorMode(physicalBuiltIn:)` streams the built-in panel because of the laptop
+    /// default (not because host.json says "stream").
+    public func streamsBuiltInAsIs(physicalBuiltIn: [Bool]) -> Bool {
+        explicitMonitorMode == nil && Self.leavesBuiltInAlone(physicalBuiltIn: physicalBuiltIn)
     }
     public var wantsMain: Bool { makeMain ?? true }
     /// The panel refresh rate: host.json if set, else the viewer's monitor (ClientHello `max_fps`,

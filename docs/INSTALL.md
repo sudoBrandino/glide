@@ -321,7 +321,9 @@ When a viewer connects, the host creates a **virtual display** with exactly the 
 size and refresh rate and streams it 1:1, which gives the sharpest picture and the lowest latency.
 What you see on the Mac itself:
 
-- **With a monitor attached** (or the lid open), the monitor **mirrors** the virtual display for
+- **A laptop with the lid open and no external monitor:** nothing changes on the Mac. Glide
+  streams the built-in display as it is, scaled to fit the PC's window.
+- **With an external monitor attached**, the monitor **mirrors** the virtual display for
   the length of the session, so it briefly changes resolution when you connect. Your windows,
   menu bar and Dock stay where they are. About 10 seconds after the viewer disconnects, the
   mirror ends and the monitor goes back to its own mode. If the monitor's current mode already

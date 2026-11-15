@@ -16,6 +16,14 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ## [Unreleased]
 
+### Changed
+
+- **Mac, laptop with the lid open and no external monitor:** Glide no longer changes the built-in
+  display's resolution while the PC is connected. It streams the built-in display as it is, scaled
+  to fit the PC's window, instead of mirroring a PC-sized virtual display onto it. With an external
+  monitor, or with the lid closed, nothing changes. Set `whenMonitorAttached` to `"mirror"` to keep
+  the old behavior.
+
 ## [0.3.0] - 2026-11-14
 
 Setup without Terminal, connections in either direction, and the fixes from a full-codebase

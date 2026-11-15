@@ -265,6 +265,10 @@ final class DisplayModeController: @unchecked Sendable {
             return switched
         }
         if userOverride { log("display: not switching (\(reason)) — mode was changed manually this session"); return false }
+        // A laptop with the lid open and no monitor: its panel is streamed as it is (VirtualDisplay).
+        if CGDisplayIsBuiltin(displayID) != 0 && VirtualDisplayManager.shared.streamsBuiltInAsIs {
+            log("display: not switching the built-in display (\(reason)) — it is streamed as it is"); return false
+        }
         let all = modes()
         let cur = currentMode()
         guard let target = DisplayModePolicy.choose(preference: effectivePreference, viewerW: v.w, viewerH: v.h,

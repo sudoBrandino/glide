@@ -422,6 +422,25 @@ func virtualDisplayTests() throws {
     check(!fx.alwaysOn && fx.fixedSize.map { $0 == (2560, 1440) } == true && fx.refreshRate(viewerHz: 60) == 120 && fx.monitorMode == .mirror,
           "vd config: fixed size; unknown lifetime/monitor mode -> defaults")
 
+    // A laptop with the lid open and no monitor: the default streams the built-in panel as it is.
+    check(d.monitorMode(physicalBuiltIn: [true]) == .stream && d.streamsBuiltInAsIs(physicalBuiltIn: [true])
+          && !VirtualDisplayTopology.wantsVirtual(mode: d.monitorMode(physicalBuiltIn: [true]), physicalDisplays: 1),
+          "vd laptop: lid open, no monitor -> stream the built-in display, no virtual display")
+    check(d.monitorMode(physicalBuiltIn: [false]) == .mirror && d.monitorMode(physicalBuiltIn: [true, false]) == .mirror
+          && !d.streamsBuiltInAsIs(physicalBuiltIn: [true, false]), "vd laptop: an external monitor attached -> it mirrors the virtual display as before")
+    check(d.monitorMode(physicalBuiltIn: []) == .mirror && !d.streamsBuiltInAsIs(physicalBuiltIn: [])
+          && VirtualDisplayTopology.wantsVirtual(mode: d.monitorMode(physicalBuiltIn: []), physicalDisplays: 0),
+          "vd laptop: lid closed, no monitor -> the virtual display alone")
+    let explicitMirror = VirtualDisplayConfig(whenMonitorAttached: "mirror")
+    check(explicitMirror.monitorMode(physicalBuiltIn: [true]) == .mirror && !explicitMirror.streamsBuiltInAsIs(physicalBuiltIn: [true])
+          && VirtualDisplayConfig(whenMonitorAttached: "extend").monitorMode(physicalBuiltIn: [true]) == .extend
+          && !VirtualDisplayConfig(whenMonitorAttached: "stream").streamsBuiltInAsIs(physicalBuiltIn: [true])
+          && fx.monitorMode(physicalBuiltIn: [true]) == .stream,
+          "vd laptop: an explicit whenMonitorAttached wins; an unknown one is the default")
+    check(VirtualDisplayLayout.reconcile(.none, virtual: V, streaming: true, mode: d.monitorMode(physicalBuiltIn: [true]),
+                                         displays: [D(id: BUILTIN, mirrorOf: V)]) == [.unmirror(BUILTIN)],
+          "vd laptop: the lid opens mid-session still mirroring -> the panel is un-mirrored, not adopted")
+
     // Read-back of the virtual display's mode from a child process (--list-display-modes).
     let listing = "display 10: main no, builtin no, bounds -1280,0 1280x720 pt\ncurrent: 1280x720 px=2560x1440 hz=120\nusable modes: 14\n"
     let parsed = DisplayModeInfo.parseListing(listing)
