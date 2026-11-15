@@ -454,10 +454,11 @@ final class Server: @unchecked Sendable {
         var source = "\(conn.endpoint)"
         if case let .hostPort(host, _) = conn.endpoint { source = "\(host)" }
         if let evicted = sessions.admit(s, source: source) {
-            log("server: too many unauthenticated connections; dropping pending session \(evicted.id)")
+            PeerLog.line(source, "server: too many unauthenticated connections; dropping pending session \(evicted.id)")
             evicted.end()
         }
-        log("server: connection \(id) with \(conn.endpoint) (authenticating)")
+        // Coalesced per address: an unauthenticated peer can open any number of connections.
+        PeerLog.line(source, "server: connection \(id) with \(conn.endpoint) (authenticating)")
         s.onAuthenticated = { [weak self] s in
             guard let self else { return }
             self.lock.lock(); let isPaused = self.paused; self.lock.unlock()

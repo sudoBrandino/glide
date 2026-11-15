@@ -494,6 +494,7 @@ do {
 } catch { failures += 1; print("  FAIL input threw \(error)") }
 inputValidationTests()
 fileHardeningTests()
+do { try sessionLifecycleTests() } catch { failures += 1; print("  FAIL session lifecycle threw \(error)") }
 fuzzTests(vectorsDir: URL(fileURLWithPath: CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "../docs/test-vectors.json").deletingLastPathComponent())
 print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)

@@ -109,7 +109,11 @@ public final class SecureChannel: @unchecked Sendable {
             if magic == GlideHandshake.magicV1 {
                 // v1 viewer: let it finish its 54-byte ClientHandshake, answer with the v1 layout
                 // carrying version 2 (it reports "unsupported protocol version 2"), then give up.
-                readExactly(GlideHandshake.v1ClientSize - 4) { [self] _ in
+                // Admission applies here too, so a rate-limited (or paused-host) peer gets no reply.
+                readExactly(GlideHandshake.v1ClientSize - 4) { [self] res in
+                    if case .failure(let e) = res { completion(.failure(e)); return }
+                    let (status, _) = admission()
+                    guard status == GlideHandshake.statusOK else { completion(.failure(HandshakeFailure.refused(status))); return }
                     writeRaw(GlideHandshake.v1Rejection()) { _ in completion(.failure(HandshakeFailure.v1Viewer)) }
                 }
                 return

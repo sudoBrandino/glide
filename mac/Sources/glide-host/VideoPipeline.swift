@@ -47,8 +47,20 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
 
     let queue = DispatchQueue(label: "glide.video", qos: .userInteractive)
     private(set) var options: Options
+    /// The streams of the current (or in-progress) start. Set and cleared on `queue` (the capture
+    /// callback compares against `sharpStream` there), only by operations inside `lifecycle`.
     private var baseStream: SCStream?
     private var sharpStream: SCStream?
+    /// start / stop / restart / shutdown run one at a time (they await ScreenCaptureKit).
+    private let lifecycle = SerialGate()
+    /// A stop requested while a start is still awaiting cancels that start (see `StopEpoch`).
+    private let epoch = StopEpoch()
+
+    /// A start that gave up because the pipeline was stopped (or shut down) meanwhile.
+    struct Stopped: LocalizedError {
+        let final: Bool
+        var errorDescription: String? { final ? "capture was shut down" : "capture was stopped while starting" }
+    }
     private var encoder: VideoEncoder?
     private var sharpEncoder: VideoEncoder?
     private(set) var config: VideoConfig?
@@ -122,8 +134,46 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
 
     // MARK: Lifecycle
 
+    /// Starts capturing, unless it already is. Throws `Stopped` if `stop()`/`shutdown()` was called
+    /// before the start completed; whatever it had set up is torn down again.
     func start() async throws {
+        try await lifecycle.run { try await self.startLocked() }
+    }
+
+    /// Stops capturing; cancels a start that is still in progress. A later `start()` captures again.
+    func stop() async {
+        epoch.requestStop()
+        await lifecycle.run { await self.stopLocked() }
+    }
+
+    /// Stops capturing for good (the session ended): a start in progress or still to come does
+    /// nothing. Idempotent.
+    func shutdown() async {
+        epoch.close()
+        await lifecycle.run { await self.stopLocked() }
+    }
+
+    func restart(mode: StreamMode? = nil, bitrateKbps: Int? = nil, fps: Int? = nil, maxWidth: Int? = nil) async throws {
+        epoch.requestStop()
+        try await lifecycle.run {
+            await self.stopLocked()
+            if let maxWidth, maxWidth > 0 { self.options.maxWidth = maxWidth }
+            if let mode { self.options.mode = mode }
+            if let bitrateKbps { self.options.bitrateKbps = bitrateKbps }
+            if let fps, fps > 0 { self.options.fps = fps }
+            try await self.startLocked()
+        }
+    }
+
+    /// Inside `lifecycle`.
+    private func startLocked() async throws {
+        guard let token = epoch.begin() else { throw Stopped(final: true) }
+        if queue.sync(execute: { baseStream != nil }) { return }  // already capturing (a retry that lost to a restart)
+        func stillWanted() throws {
+            if !epoch.isCurrent(token) { throw Stopped(final: epoch.isClosed) }
+        }
         var content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        try stillWanted()
         // Re-resolve on every (re)start: the display from the last start may be gone (lid closed).
         let want = ActiveDisplay.current()
         // A just-created virtual display can take a moment to show up in ScreenCaptureKit; don't
@@ -132,7 +182,9 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         while ActiveDisplay.isVirtual(want), !content.displays.contains(where: { $0.displayID == want }), tries < 10 {
             tries += 1
             try await Task.sleep(nanoseconds: 300_000_000)
+            try stillWanted()
             content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            try stillWanted()
         }
         // ScreenCaptureKit may not list a display CoreGraphics already reports (just plugged in, or a
         // virtual display being set up): fall back to the default display, then to any.
@@ -146,13 +198,10 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         // ActiveDisplay.mode: CoreGraphics reports no mode for our own virtual display.
         let mode = ActiveDisplay.mode(of: display.displayID)
         let nativeW = mode?.pixelWidth ?? display.width
-        var pw = nativeW, ph = mode?.pixelHeight ?? display.height
-        let scale = Float(pw) / Float(max(display.width, 1))
-        if pw > options.maxWidth {  // downscale very large displays, keep aspect
-            ph = ph * options.maxWidth / pw
-            pw = options.maxWidth
-        }
-        pw &= ~1; ph &= ~1
+        let scale = Float(nativeW) / Float(max(display.width, 1))
+        // Downscale very large displays (keep aspect), round to even; never below 2x2 (a tiny
+        // ViewSize used to make this 0x0, ViewSizeLimits).
+        let (pw, ph) = ViewSizeLimits.captureSize(pixelW: nativeW, pixelH: mode?.pixelHeight ?? display.height, maxWidth: options.maxWidth)
 
         if options.mode == .hybrid && options.codec != .hevc { options.mode = .fast }
         let baseChroma: Chroma = (options.mode == .sharp && options.codec == .hevc) ? .yuv444 : .yuv420
@@ -205,7 +254,10 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             sharp = s
         }
 
+        try stillWanted()
         queue.sync {
+            self.baseStream = base
+            self.sharpStream = sharp  // before it starts: its first frames must not pass for base frames
             self.encoder = enc
             self.sharpEncoder = sharpEnc
             self.config = vc
@@ -217,35 +269,47 @@ final class VideoPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             self.frameSize = CGSize(width: pw, height: ph)
             self.running = true
         }
-        queue.async { self.onConfig?(vc, sharpVC) }
-        try await base.startCapture()
-        baseStream = base
-        if let sharp { try await sharp.startCapture(); sharpStream = sharp }
-        startIdleTimer()
+        nonisolated(unsafe) let configs = (vc, sharpVC)  // plain values, handed to the queue once
+        queue.async { self.onConfig?(configs.0, configs.1) }
+        var started: [SCStream] = []
+        do {
+            try await base.startCapture()
+            started.append(base)
+            try stillWanted()
+            if let sharp { try await sharp.startCapture(); started.append(sharp) }
+            try stillWanted()
+        } catch {
+            // Stopped meanwhile, or a stream failed to start: leave nothing running.
+            for s in started.reversed() { try? await s.stopCapture() }
+            queue.sync { teardownQueueState() }
+            throw error
+        }
+        // A stop() from here on waits for this start to return, then stops what it started.
+        queue.sync { startIdleTimer() }
         if wallclockPts { log("capture: encoder PTS = wall clock (GLIDE_PTS=wallclock)") }
         if queueDepth != 5 || nativeInterval { log("capture: SCK queueDepth \(queueDepth), minimumFrameInterval \(nativeInterval ? "native (none)" : "1/\(fps)")") }
         log("capture: display \(display.displayID) \(display.width)x\(display.height)pt (\(nativeW)px wide) -> \(pw)x\(ph)px, mode \(options.mode), \(options.codec) base \(baseChroma == .yuv444 ? "4:4:4" : "4:2:0")\(hybrid ? " + 4:4:4 sharp layer" : ""), \(fps)fps, \(bps / 1_000_000) Mbps")
     }
 
-    func stop() async {
-        queue.sync { running = false; idleTimer?.cancel(); idleTimer = nil }
-        if let s = baseStream { try? await s.stopCapture() }
-        if let s = sharpStream { try? await s.stopCapture() }
-        baseStream = nil; sharpStream = nil
-        queue.sync {
-            encoder?.invalidate(); encoder = nil
-            sharpEncoder?.invalidate(); sharpEncoder = nil
-            latest = nil; latestSharp = nil; prevBase = nil
+    /// Inside `lifecycle`.
+    private func stopLocked() async {
+        let (base, sharp) = queue.sync { () -> (SCStream?, SCStream?) in
+            running = false; idleTimer?.cancel(); idleTimer = nil
+            return (baseStream, sharpStream)
         }
+        if let base { try? await base.stopCapture() }
+        if let sharp { try? await sharp.stopCapture() }
+        queue.sync { teardownQueueState() }
     }
 
-    func restart(mode: StreamMode? = nil, bitrateKbps: Int? = nil, fps: Int? = nil, maxWidth: Int? = nil) async throws {
-        await stop()
-        if let maxWidth, maxWidth > 0 { options.maxWidth = maxWidth }
-        if let mode { options.mode = mode }
-        if let bitrateKbps { options.bitrateKbps = bitrateKbps }
-        if let fps, fps > 0 { options.fps = fps }
-        try await start()
+    /// On `queue`: forget the streams, encoders and buffers of the last start.
+    private func teardownQueueState() {
+        running = false
+        idleTimer?.cancel(); idleTimer = nil
+        baseStream = nil; sharpStream = nil
+        encoder?.invalidate(); encoder = nil
+        sharpEncoder?.invalidate(); sharpEncoder = nil
+        latest = nil; latestSharp = nil; prevBase = nil
     }
 
     /// Sets the max encoded width for the next (re)start without restarting now (used when a display
