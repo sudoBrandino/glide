@@ -4,8 +4,8 @@ import Foundation
 import GlideCore
 import Network
 
-/// The viewer's persistent files (viewer.json writes go through read-modify-write, so a
-/// connection manager editing the same file at the same time loses nothing).
+/// The viewer's persistent files. viewer.json writes are a locked read-modify-write, so another
+/// viewer process editing the same file at the same time loses nothing.
 enum ViewerStore {
     static func load() throws -> ViewerConfig {
         try ConfigFile.read(ViewerConfig.self, from: ViewerPaths.config) ?? ViewerConfig()
@@ -16,13 +16,40 @@ enum ViewerStore {
     static func update(_ change: (inout ViewerConfig) -> Void) -> Error? {
         do {
             try ViewerPaths.ensureDirectory()
-            try ConfigFile.update(ViewerPaths.config, defaults: { ViewerConfig() }) { c in change(&c) }
+            // Several glide-viewer processes share viewer.json: hold an exclusive lock on a
+            // sidecar file across the whole read-modify-write so no update (a new pin) is lost.
+            let lockPath = ViewerPaths.config.path + ".lock"
+            let fd = open(lockPath, O_RDWR | O_CREAT, 0o600)
+            if fd >= 0 { _ = flock(fd, LOCK_EX) }
+            defer { if fd >= 0 { _ = flock(fd, LOCK_UN); _ = Darwin.close(fd) } }
+            _ = try ConfigFile.update(ViewerPaths.config, defaults: { ViewerConfig() }) { c in change(&c) }
             return nil
         } catch {
             print("error: \(error)")
             return error
         }
     }
+}
+
+/// Which stream messages one connection may deliver, read and written on the network queue and
+/// the main thread. Nothing reaches the decoder until this viewer has sent ClientHello (so it has
+/// authenticated the host, or finished pairing), and no frame until a ServerHello followed it: an
+/// unpaired peer can't stream during the pairing prompt or lift the pre-auth record cap.
+final class StreamGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var helloSent = false
+    private var streaming = false
+
+    func openHello() { lock.lock(); helloSent = true; lock.unlock() }
+
+    /// A ServerHello arrived: true if it is allowed (ClientHello was sent), and streaming starts.
+    func acceptServerHello() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if helloSent { streaming = true }
+        return helloSent
+    }
+
+    var isStreaming: Bool { lock.lock(); defer { lock.unlock() }; return streaming }
 }
 
 /// One viewer window connected to one host: connection, handshake and pairing (PROTOCOL.md
@@ -50,6 +77,7 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
 
     private let net = DispatchQueue(label: "glide.viewer.net", qos: .userInteractive)
     private var channel: SecureChannel?
+    private var gate = StreamGate()
     private var generation = 0
     private(set) var phase: Phase = .idle
     private var backoff = ReconnectBackoff()
@@ -153,6 +181,8 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         let ch = SecureChannel(connection: conn, queue: net)
         ch.maxRecordBytes = SecureChannel.preAuthMaxRecord
         channel = ch
+        let gate = StreamGate()
+        self.gate = gate
         let decoder = VideoDecoder()
         decoder.onFrame = { [weak self] pb in
             DispatchQueue.main.async { if let self, self.generation == gen { self.video.show(pb) } }
@@ -162,7 +192,7 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         }
         ch.onMessage = { [weak self, weak ch] d in
             guard let ch else { return }
-            self?.received(d, gen: gen, channel: ch, decoder: decoder)
+            self?.received(d, gen: gen, channel: ch, decoder: decoder, gate: gate)
         }
         ch.onClose = { [weak self] err in DispatchQueue.main.async { self?.closed(gen, err) } }
         let label = self.label
@@ -248,6 +278,7 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         let s = window.screen ?? NSScreen.main
         let px = screenPixels(s)
         sentViewSize = px
+        gate.openHello()
         let fps = s?.maximumFramesPerSecond ?? 60
         ch.send(ViewerHello.message(viewW: px.w, viewH: px.h, maxFps: fps, name: Host.current().localizedName ?? "Mac").encoded)
     }
@@ -259,18 +290,25 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
 
     /// Channel callback, on `net`. Video stays on this queue (decoder order = stream order);
     /// everything else goes to the main thread.
-    private func received(_ d: Data, gen: Int, channel ch: SecureChannel, decoder: VideoDecoder) {
+    private func received(_ d: Data, gen: Int, channel ch: SecureChannel, decoder: VideoDecoder, gate: StreamGate) {
         guard let m = try? HostMessage.decode(d) else { return }  // unknown message types are ignored
         switch m {
         case let .videoFrame(_, _, _, _, sharp, _, data):
             // Fast mode only: no sharp layer, and every base frame is decoded and shown whole.
-            if sharp { return }
+            guard gate.isStreaming, !sharp else { return }
             decoder.decode(data)
             return
         case let .serverHello(_, _, cfg):
+            // Before ClientHello (during pairing) a ServerHello is a protocol violation: drop the
+            // connection rather than configure the stream.
+            guard gate.acceptServerHello() else {
+                ch.close()
+                return
+            }
             decoder.reset(codec: cfg.codec)
             ch.maxRecordBytes = RecordCipher.maxRecord
         case let .videoConfig(cfg):
+            guard gate.isStreaming else { return }
             decoder.reset(codec: cfg.codec)
         default:
             break

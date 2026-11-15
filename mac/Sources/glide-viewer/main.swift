@@ -132,8 +132,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let s = ViewerSession(target: target, connectionID: connectionID, label: label, identity: identity, remap: remap,
                               forcePair: options.pair, fullscreen: options.fullscreen)
         s.onEnd = { [weak self, weak s] in
-            guard let self else { return }
-            if self.session === s { self.session = nil }
+            // A session replaced from the connection list ends after its successor started:
+            // only the current session may clear it, show the list or quit.
+            guard let self, let s, self.session === s else { return }
+            self.session = nil
             if self.options.target != nil { NSApp.terminate(nil) } else { self.showList() }
         }
         session = s
