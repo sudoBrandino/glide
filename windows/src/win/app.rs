@@ -2198,13 +2198,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_APP_TRAY => {
+            // Separate statements: a store guard taken inside the struct literal would live until
+            // the end of it, and inbound_pairing_minutes() locks the store too (std Mutex isn't
+            // reentrant: the UI thread would deadlock).
+            let paired = {
+                let store = ui().store.lock().unwrap();
+                store.config.pin_entry(&ui().shared.pin_target, ui().shared.pin_fallback.as_deref()).map(|(_, p)| p.name.clone())
+            };
+            let allow_pairing = inbound_pairing_minutes();
             let st = tray::MenuState {
                 audio: ui().shared.audio.as_ref().map(|a| a.muted()),
                 paused: ui().shared.paused.load(Ordering::Relaxed),
                 hud_on: STATE.with(|s| s.borrow().hud_on),
-                paired: ui().store.lock().unwrap().config.pin_entry(&ui().shared.pin_target, ui().shared.pin_fallback.as_deref()).map(|(_, p)| p.name.clone()),
+                paired,
                 files: files::enabled().then(files::busy),
-                allow_pairing: inbound_pairing_minutes(),
+                allow_pairing,
             };
             tray::on_notify(hwnd, lparam, &st);
             LRESULT(0)
