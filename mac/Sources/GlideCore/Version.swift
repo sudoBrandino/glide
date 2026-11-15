@@ -5,7 +5,7 @@ import Foundation
 /// fails if it drifts.
 public enum GlideVersion {
     /// Marketing version (semver), e.g. "0.2.0". Keep in sync with `VERSION` via tools/version.sh.
-    public static let version = "0.3.0"
+    public static let version = "0.3.1"
 
     /// Wire protocol version spoken by this build (PROTOCOL.md).
     public static var protocolVersion: UInt16 { GlideHandshake.version }

@@ -16,6 +16,11 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-15
+
+Fixes from a fresh-install test on a MacBook. Protocol version 2 (unchanged). Screen Recording and
+Accessibility grants from 0.3.0 carry over.
+
 ### Added
 
 - **Mac setup:** when **Allow…** opens the Screen Recording or Accessibility list in System
@@ -305,6 +310,7 @@ These matter only if you ran a development build from before this release (proto
 - A paired Mac that floods the viewer with video-configuration messages can make the viewer
   unresponsive until it disconnects (see [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)).
 
-[Unreleased]: https://github.com/sudoBrandino/glide/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/sudoBrandino/glide/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/sudoBrandino/glide/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/sudoBrandino/glide/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sudoBrandino/glide/releases/tag/v0.2.0
