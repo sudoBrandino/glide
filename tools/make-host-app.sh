@@ -99,6 +99,16 @@ if [[ -n "${GLIDE_SIGN_KEYCHAIN:-}" ]]; then
     security unlock-keychain -p "$(cat "$GLIDE_SIGN_KEYCHAIN_PASSWORD_FILE")" "$GLIDE_SIGN_KEYCHAIN"
   fi
   SIGN_FLAGS+=(--keychain "$GLIDE_SIGN_KEYCHAIN")
+  # Sign by the certificate's SHA-1 rather than its name: a self-signed certificate isn't trusted,
+  # and codesign's lookup by name doesn't find untrusted identities on every macOS version.
+  _id_hash="$(security find-identity -p codesigning "$GLIDE_SIGN_KEYCHAIN" \
+    | awk -v name="\"$SIGN_ID\"" 'index($0, name) { print $2; exit }')"
+  if [[ -z "$_id_hash" ]]; then
+    echo "no signing identity \"$SIGN_ID\" in $GLIDE_SIGN_KEYCHAIN; it holds:" >&2
+    security find-identity -p codesigning "$GLIDE_SIGN_KEYCHAIN" >&2
+    exit 1
+  fi
+  SIGN_ID="$_id_hash"
 fi
 codesign --force "${SIGN_FLAGS[@]}" --sign "$SIGN_ID" --identifier "$GLIDE_BUNDLE_ID" "$OUT"
 codesign --verify --strict --verbose=1 "$OUT" 2>&1 | tail -1
