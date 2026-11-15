@@ -129,7 +129,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the details.
 | Keyboard (USB HID usages, Ctrl→Cmd remap, Win/Alt-Tab capture), mouse, wheel, cursor shapes | done |
 | Viewer: borderless fullscreen, auto-reconnect, status overlay, dims last frame on disconnect | done |
 | `ViewSize`: host re-captures to match the viewer's monitor (no resampling at 1:1) | done |
-| Dial-out (host → viewer `--listen`) for one-way firewalls, auto-redial | done |
+| Either side connects: both listen and dial once they know the other's address (one-way firewalls), auto-redial | done |
 | Signed `Glide Host.app` + LaunchAgent (stable TCC grants), `host.json` config | done |
 | Power management: no idle sleep while hosting, display kept awake during a session | done |
 | CI: Swift build + selftest, Rust tests, Windows cross-build artifact, vector check | done |
@@ -252,12 +252,13 @@ only takes effect after the host restarts. The LaunchAgent restarts it on its ow
 |---|---|
 | `pairedViewers` | Viewers allowed to connect: `name`, public `key`, `paired` date (see Pairing below) |
 | `salt`, `password` | v1 leftovers: no longer used (kept so a rollback to v1 still works) |
-| `connect` | Default dial-out target (`HOST[:PORT]`). If it is set, the host dials the viewer instead of listening |
+| `connect` | The PC's address (`HOST[:PORT]`). If it is set, the host dials the viewer as well as listening |
+| `listen` | `false`: don't listen while `connect` is set, so nothing on the Mac accepts connections (default `true`) |
 | `clipboard` | `{"syncConcealed": false}`. `true` also syncs password-manager (concealed) pasteboard items to the viewer |
 
 ```sh
 H=~/Applications/Glide\ Host.app/Contents/MacOS/glide-host
-"$H" --set-connect 192.168.1.60:7420         # make the host dial this viewer by default
+"$H" --set-connect 192.168.1.60:7420         # also dial this viewer (the host keeps listening)
 "$H" --pair                                  # open the 2-minute pairing window (see Pairing)
 "$H" --paired                                # list paired viewers;  --unpair NAME|KEY removes one
 "$H" --identity                              # this Mac's key fingerprint
@@ -281,7 +282,7 @@ The host's key is `host-key` in the same folder (0600; created on first start). 
 cd mac && swift build -c release --build-system native   # native backend: needed with CLT-only setups
 .build/release/glide-selftest ../docs/test-vectors.json  # protocol self-test
 .build/release/glide-host                              # listen
-.build/release/glide-host --connect 192.168.1.60       # dial out
+.build/release/glide-host --connect 192.168.1.60       # listen, and also dial the PC
 # Local end-to-end check on the same Mac (exact latency); opens a small test window.
 # The probe pairs on first use (glide-host --pair, then confirm the printed code).
 .build/release/glide-probe 127.0.0.1 --seconds 8 --animate --png /tmp/frame.png
@@ -309,8 +310,10 @@ The exe is self-contained: it uses static CRT and needs only system DLLs. Run it
 interactive desktop session:
 
 ```bat
-glide-client.exe --listen 7420        :: host dials in (glide-host --connect PC:7420)
-glide-client.exe 192.168.1.50         :: or: viewer dials the host
+glide-client.exe 192.168.1.50         :: dial the host, and listen on 7420 so it can dial in too
+glide-client.exe 192.168.1.50 --no-listen   :: dial only
+glide-client.exe --listen 7420        :: only wait for the host (glide-host --connect PC:7420)
+glide-client.exe                      :: use the config file (the setup window opens the first time)
 ```
 
 - **F11** or **Alt+Enter** toggles borderless fullscreen.
@@ -397,21 +400,25 @@ one evicts the oldest instead of being refused.
 ## Network model
 
 Either side can open the TCP connection. Once it is open, the protocol is the same in both
-directions, and the viewer always sends the first handshake message.
+directions, and the viewer always sends the first handshake message. Both sides listen and dial
+at the same time, so one direction that the network allows is enough:
 
-| Mode | Host | Viewer | Use when |
+| Side | Listens | Dials | Turn listening off |
 |---|---|---|---|
-| **Viewer dials** (default) | `glide-host` listens on :7420 | `glide-client.exe MAC[:PORT]` | The PC can reach the Mac |
-| **Host dials** | `glide-host --connect PC[:PORT]`, or `connect` set in `host.json` | `glide-client.exe --listen [PORT]` | Only Mac → PC connections are allowed |
+| **Host** | On :7420 | The PC, once it knows its address: `glide-host --connect PC[:PORT]`, `connect` in `host.json`, or the setup window | `"listen": false` in `host.json` (only with a PC address) |
+| **Viewer** | On :7420 (`listen_port`), unless turned off | The Mac, once it knows its address: `glide-client.exe MAC[:PORT]`, `host` in `config.json`, or the setup window | `--no-listen`, or `"accept_incoming": false` |
 
-When the host dials, it redials every 2 s while it is disconnected. In listen mode the viewer
-accepts again after every disconnect.
+The viewer with no Mac address (`glide-client.exe --listen [PORT]`, or no `host` in its config)
+only listens. Dialers retry every 2 s while disconnected, a listening viewer accepts again after
+every disconnect, and there is one session at a time.
 
 **Example: a one-way firewall.** Say the Mac (192.168.1.50) is on a restricted network segment.
 The firewall lets the Mac reach the PC (192.168.1.60) but blocks the other direction. The setup is:
 
-- The host has `connect` set to `192.168.1.60:7420`.
-- The viewer runs `--listen 7420`.
+- The host has `connect` set to `192.168.1.60:7420` (the setup window's PC address), and
+  `"listen": false` so nothing listens on the Mac.
+- The viewer listens on 7420: `--listen 7420`, or the Mac's address with "Let the Mac connect to
+  this PC" on (its dialing just fails).
 - A Windows Firewall rule on the PC admits only 192.168.1.50 to `glide-client.exe` at a fixed path.
 
 Nothing listens on the Mac, and the PC accepts the connection only from the Mac.
