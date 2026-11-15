@@ -231,7 +231,8 @@ fn post_box<T>(h: isize, msg: u32, v: T) {
 fn last_used_phrase(r: &Row) -> String {
     match r.last_used.as_str() {
         "Never" => "Never used".into(),
-        s if s.starts_with(|c: char| c.is_ascii_digit()) && s.len() == 10 => format!("Last used on {s}"),
+        // A date ("2026-11-02"; `relative_time` for older uses), not "5 days ago" (also 10 chars).
+        s if s.len() == 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' => format!("Last used on {s}"),
         s => {
             let mut c = s.chars();
             let lower = c.next().map(|f| f.to_lowercase().chain(c).collect::<String>()).unwrap_or_default();

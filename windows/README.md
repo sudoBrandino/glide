@@ -93,6 +93,8 @@ saves the choice and restarts the viewer onto it (like **Connect** in the setup 
   `host` written by the setup dialog, by hand or by an older viewer is added to (or updates) the
   list when the config loads. A session started with a host on the command line doesn't change
   the list.
+- Test hook (`--features test-hooks` builds only): `GLIDE_CONNS_DUMP=x.bmp` saves a capture of the
+  Connections window after about 0.5 s and closes it.
 
 ### Config file, identity and pairing
 
@@ -358,7 +360,7 @@ With the default config and no address this listens on port 7420. Then pair: on 
   echo suppression, external changes) on hidden windows and prints one line per check. Session 0
   has its own clipboard, so running it over SSH doesn't touch the desktop user's clipboard.
 - Test hooks for the viewer. The ones that answer dialogs, dump captures or act for the user
-  (`GLIDE_PAIR_CONFIRM`, `GLIDE_PROMPT_DUMP`, `GLIDE_SETUP_ANSWER`, `GLIDE_SETUP_DUMP`, `GLIDE_DUMP_FRAME`,
+  (`GLIDE_PAIR_CONFIRM`, `GLIDE_PROMPT_DUMP`, `GLIDE_SETUP_ANSWER`, `GLIDE_SETUP_DUMP`, `GLIDE_CONNS_DUMP`, `GLIDE_DUMP_FRAME`,
   `GLIDE_DUMP_MENU`, `GLIDE_TEST_ACTIONS`, `GLIDE_TEST_SEND_FILES`) only work in a build with the
   `test-hooks` cargo feature (`cargo build --release --features test-hooks`); a normal build ignores them
   and says so once at startup, so a variable left set (for example with `setx`) can never confirm a
