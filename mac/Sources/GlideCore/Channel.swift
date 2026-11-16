@@ -171,16 +171,23 @@ public final class SecureChannel: @unchecked Sendable {
         case hostKeyChanged(pinned: Data, presented: Data)
         /// The host closed without answering (a v1 host does that).
         case hostIsV1
+        /// The viewer would have asked to pair, but msg2 says the host's pairing window is closed:
+        /// closed before msg3 (only with `requireOpenPairingWindow`, PROTOCOL.md §2.3 rule 1).
+        case hostPairingClosed(hostKey: Data)
         public var description: String {
             switch self {
             case let .hostKeyChanged(p, n): return "host key changed: pinned \(GlideHandshake.fingerprint(p)), presented \(GlideHandshake.fingerprint(n))"
             case .hostIsV1: return "host closed the connection without answering (still Glide v1?)"
+            case .hostPairingClosed: return "not paired, and the host's pairing window is closed"
             }
         }
     }
 
-    /// Viewer (initiator) side, for glide-probe. Aborts before msg3 if `pinned` doesn't match.
+    /// Viewer (initiator) side, for glide-probe and glide-viewer. Aborts before msg3 if `pinned`
+    /// doesn't match, and (with `requireOpenPairingWindow`) when it would ask to pair while msg2
+    /// says the host's pairing window is closed.
     public func performHandshake(identity: Curve25519.KeyAgreement.PrivateKey, name: String, pinned: Data?, requestPairing: Bool = false,
+                                 requireOpenPairingWindow: Bool = false,
                                  completion: @escaping (Result<ViewerConnected, Error>) -> Void) {
         let v = GlideHandshake.Viewer(identity: identity, name: name)
         writeRaw(v.firstFlight())
@@ -196,6 +203,9 @@ public final class SecureChannel: @unchecked Sendable {
                         let (key, info) = try v.readMsg2(msg2, preambleVersion: ver)
                         if let pinned, pinned != key { completion(.failure(ViewerFailure.hostKeyChanged(pinned: pinned, presented: key))); return }
                         let pairing = pinned == nil || requestPairing
+                        if pairing && requireOpenPairingWindow && !info.pairingOpen {
+                            completion(.failure(ViewerFailure.hostPairingClosed(hostKey: key))); return
+                        }
                         writeRaw(v.writeMsg3(flags: pairing ? GlideHandshake.viewerFlagPairRequest : 0))
                         let est = v.finish()
                         sendCipher = RecordCipher(key: est.sendKey)

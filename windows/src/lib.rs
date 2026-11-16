@@ -17,6 +17,7 @@ pub mod displays;
 pub mod files;
 pub mod handshake;
 pub mod hid;
+pub mod host;
 pub mod hotkeys;
 pub mod hud;
 pub mod identity;

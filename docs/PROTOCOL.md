@@ -9,7 +9,10 @@ of §2 as "legacy, removed".
 
 - All integers are **little-endian**. `f32` is IEEE-754 little-endian.
 - `str` = `u16 byte_length` + UTF-8 bytes.
-- "Host" = the Mac being controlled. "Client" / "viewer" = the viewer (Windows).
+- "Host" = the machine being controlled. "Client" / "viewer" = the machine in front of the user.
+  Glide's original pairing is a Mac host and a Windows viewer; a Windows host and a Mac viewer speak
+  the same protocol ([WINDOWS_HOST.md](WINDOWS_HOST.md)). Where this document says "Mac" or "PC" it
+  describes the original pairing; the rules apply to the role.
 - Default TCP port: **7420**. Both sides set `TCP_NODELAY`.
 - `‖` = concatenation. `SHA-256` as in FIPS 180-4.
 

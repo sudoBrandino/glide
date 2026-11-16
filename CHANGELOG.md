@@ -18,6 +18,12 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ### Added
 
+- **Control a Windows PC from a Mac (preview).** Glide now works in the other direction too: run
+  `glide-host.exe` on the PC and `glide-viewer` on the Mac. It pairs the same way (a 6-digit code
+  confirmed on both screens) and streams hardware H.264/HEVC with keyboard, mouse and the PC's
+  cursor. Command, Control and Option on the Mac map to Control, Windows and Alt on the PC. The PC
+  listens on port 7421, so it can run next to the existing viewer. Audio, clipboard, file transfer
+  and the sharp 4:4:4 layer are not in this direction yet. See `docs/WINDOWS_HOST.md`.
 - **Windows viewer, saved connections:** the viewer remembers the Macs you connect to. *Connections…*
   in the Glide menu and the tray lists them (grouped, with pairing state and last use) and switches
   between them; the tray's **Connect to** submenu switches in one click. `--connection NAME` starts
