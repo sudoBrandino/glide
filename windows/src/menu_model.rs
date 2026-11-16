@@ -55,10 +55,12 @@ pub enum Cmd {
     ToggleRelativeMouse,
     /// The setup dialog (Mac address, firewall, start at sign-in, install).
     SetUp,
+    /// The Connections window (saved Macs: switch, add, edit, remove).
+    Connections,
 }
 
 // New commands go at the end: ids are positions in this list.
-const ALL: [Cmd; 37] = [
+const ALL: [Cmd; 38] = [
     Cmd::ModeFast,
     Cmd::ModeHybrid,
     Cmd::ModeSharp,
@@ -96,6 +98,7 @@ const ALL: [Cmd; 37] = [
     Cmd::ToggleNaturalScroll,
     Cmd::ToggleRelativeMouse,
     Cmd::SetUp,
+    Cmd::Connections,
 ];
 
 /// Menu ids: 0x2000 + 16·index. Low nibble zero and below 0xF000, so the same ids work as
@@ -357,6 +360,7 @@ pub fn build(s: &MenuState) -> Vec<Item> {
             Item::Separator,
         ]);
     }
+    v.push(cmd(Cmd::Connections, "Co&nnections…", false, true));
     v.push(cmd(Cmd::SetUp, "Set &up…", false, true));
     v.push(cmd(Cmd::Settings, "S&ettings…", false, true));
     v
@@ -373,6 +377,7 @@ pub fn system_items(s: &MenuState) -> Vec<Item> {
         cmd(Cmd::ToggleFullscreen, "F&ullscreen\tCtrl+Alt+Shift+F", s.fullscreen, true),
         cmd(Cmd::RefreshPicture, "Re&fresh picture\tCtrl+Alt+Shift+R", false, s.connected),
         cmd(Cmd::Reconnect, "&Reconnect\tCtrl+Alt+Shift+D", false, !s.paused),
+        cmd(Cmd::Connections, "Co&nnections…", false, true),
         cmd(Cmd::SetUp, "Set &up…", false, true),
         cmd(Cmd::Settings, "S&ettings…", false, true),
     ]
@@ -578,6 +583,22 @@ mod tests {
         let sys = system_items(&s);
         assert!(matches!(sys[0], Item::Separator));
         assert!(find(&sys, Cmd::OpenMenu).is_some() && find(&sys, Cmd::ModeFast).is_some());
+    }
+
+    #[test]
+    fn connections_item_next_to_set_up() {
+        // Always available (it's how you switch Macs), connected or not, in both menus.
+        for s in [MenuState::default(), MenuState { connected: true, ..Default::default() }, MenuState { paused: true, ..Default::default() }] {
+            for m in [build(&s), system_items(&s)] {
+                assert_eq!(state(&m, Cmd::Connections), (false, true));
+                let text = to_text(&m);
+                assert!(text.contains("Connections…\nSet up…\nSettings…"), "{text}");
+            }
+        }
+        // Appended, so older ids keep their values.
+        assert_eq!(Cmd::SetUp.id(), ID_BASE + 16 * 36);
+        assert_eq!(Cmd::Connections.id(), ID_BASE + 16 * 37);
+        assert_eq!(Cmd::from_name("connections"), Some(Cmd::Connections));
     }
 
     #[test]

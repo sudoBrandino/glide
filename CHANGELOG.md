@@ -16,6 +16,14 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ## [Unreleased]
 
+### Added
+
+- **Windows viewer, saved connections:** the viewer remembers the Macs you connect to. *Connections…*
+  in the Glide menu and the tray lists them (grouped, with pairing state and last use) and switches
+  between them; the tray's **Connect to** submenu switches in one click. `--connection NAME` starts
+  with a saved connection (and makes it the default), `--list-connections` prints them. The Mac
+  address you already set up becomes the first saved connection.
+
 ## [0.3.1] - 2026-11-15
 
 Fixes from a fresh-install test on a MacBook. Protocol version 2 (unchanged). Screen Recording and

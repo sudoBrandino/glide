@@ -4,6 +4,7 @@ pub mod app;
 pub mod audio;
 pub mod bench_decoder;
 pub mod clipboard;
+pub mod connections;
 pub mod connbar;
 pub mod console;
 pub mod cursor;

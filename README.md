@@ -314,12 +314,16 @@ glide-client.exe 192.168.1.50         :: dial the host, and listen on 7420 so it
 glide-client.exe 192.168.1.50 --no-listen   :: dial only
 glide-client.exe --listen 7420        :: only wait for the host (glide-host --connect PC:7420)
 glide-client.exe                      :: use the config file (the setup window opens the first time)
+glide-client.exe --connection "Studio Mac"  :: use a saved connection (and make it the default)
 ```
 
 - **F11** or **Alt+Enter** toggles borderless fullscreen.
 - `--mode fast|sharp|hybrid` picks the mode. The default is `hybrid` when the GPU decodes HEVC
   4:4:4.
 - `--no-ctrl-as-cmd` turns off the Ctrl→Cmd remap.
+- **Saved connections:** Glide menu or tray → *Connections…* manages the Macs this viewer knows
+  (config `connections` / `active_connection`); tray → *Connect to* switches between them, and
+  `--list-connections` prints them.
 - The viewer keeps its window open across disconnects and reconnects on its own.
 
 See [`windows/README.md`](windows/README.md) for every flag, `--probe`, `--bench` and the test
