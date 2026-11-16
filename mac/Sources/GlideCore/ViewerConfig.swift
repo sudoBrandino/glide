@@ -81,7 +81,7 @@ public struct SavedConnection: Codable, Equatable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        let decodedID = try c.decodeIfPresent(String.self, forKey: .id)
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
         platform = try c.decodeIfPresent(String.self, forKey: .platform) ?? "windows"
         var addr = try c.decodeIfPresent(String.self, forKey: .address) ?? ""
@@ -91,9 +91,21 @@ public struct SavedConnection: Codable, Equatable, Sendable {
             addr = ViewerTarget(host: t.host, port: port).display
         }
         address = addr
+        // An entry written without an id gets one derived from its contents, so every read of the
+        // file gives it the same id (a random one would change between loading the list and the
+        // read-modify-write that removes or updates the entry).
+        id = decodedID ?? SavedConnection.derivedID(name: name, platform: platform, address: addr)
         group = try c.decodeIfPresent(String.self, forKey: .group)
         favorite = try c.decodeIfPresent(Bool.self, forKey: .favorite) ?? false
         lastConnected = try c.decodeIfPresent(String.self, forKey: .lastConnected)
+    }
+
+    /// A stable UUID-shaped id from an entry's contents (for entries saved without one).
+    public static func derivedID(name: String, platform: String, address: String) -> String {
+        let d = Array(SHA256.hash(data: Data("glide-viewer connection\u{0}\(name)\u{0}\(platform)\u{0}\(address)".utf8)))
+        let hex = d.prefix(16).map { String(format: "%02X", $0) }.joined()
+        let parts = [hex.prefix(8), hex.dropFirst(8).prefix(4), hex.dropFirst(12).prefix(4), hex.dropFirst(16).prefix(4), hex.dropFirst(20).prefix(12)]
+        return parts.map { String($0) }.joined(separator: "-")
     }
 
     public func encode(to encoder: Encoder) throws {

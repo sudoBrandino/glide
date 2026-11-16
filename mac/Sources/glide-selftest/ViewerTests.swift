@@ -79,6 +79,12 @@ private func viewerConfigTests() throws {
     check(d.remapModifiers && d.connections.count == 3, "viewer.json: missing keys get defaults")
     check(!d.connections[0].id.isEmpty && d.connections[0].platform == "windows" && !d.connections[0].favorite && d.connections[0].group == nil,
           "viewer.json: connection defaults (id, platform, favorite)")
+    let again = try JSONDecoder().decode(ViewerConfig.self, from: Data(doc.utf8))
+    check(again.connections.map(\.id) == d.connections.map(\.id), "viewer.json: an entry without an id gets the same id on every read")
+    check(d.connections[0].id.count == 36 && d.connections[0].id != d.connections[1].id, "viewer.json: derived ids are UUID-shaped and differ per entry")
+    var removed = again
+    removed.remove(id: d.connections[0].id)
+    check(removed.connections.count == 2, "viewer.json: remove by an id from an earlier read")
     check(d.connections[1].address == "10.0.0.6:9000" && d.connections[2].address == "10.0.0.7:7000", "viewer.json: legacy port folded only when the address has none")
     check(d.pinnedKey(for: ViewerTarget.parse("10.0.0.5")!) == key && d.pinnedHosts["10.0.0.5:7421"]?.name == "", "viewer.json: pin with only a key")
     check((try? JSONDecoder().decode(ViewerConfig.self, from: Data("{}".utf8))) == ViewerConfig(), "viewer.json: empty object")

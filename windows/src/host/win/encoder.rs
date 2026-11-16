@@ -387,6 +387,13 @@ impl Encoder {
         }
     }
 
+    /// Collects output an async encoder finished after `encode` stopped waiting for it (a slow
+    /// encoder's frame would otherwise stay unread while the screen is static). Never blocks.
+    pub fn poll(&mut self) -> Result<Vec<EncodedFrame>> {
+        unsafe { self.pump()? };
+        Ok(std::mem::take(&mut self.pending))
+    }
+
     /// Async MFTs: handle every queued event without waiting.
     unsafe fn pump(&mut self) -> Result<()> {
         loop {

@@ -9,7 +9,7 @@
 use super::capture::{primary_output, Acquired, Device, Duplicator, Output};
 use super::convert::Converter;
 use super::cursor::{self, CursorShared};
-use super::encoder::{self, Encoder};
+use super::encoder::{self, EncodedFrame, Encoder};
 use super::hr;
 use super::inject::Injector;
 use crate::handshake::fingerprint;
@@ -202,6 +202,8 @@ struct Pipe {
     has_frame: bool,
     dirty: bool,
     frame_us: u64,
+    /// Capture time of the frame last handed to the encoder (for output that comes out late).
+    encoded_us: u64,
     next_due: Instant,
 }
 
@@ -283,9 +285,26 @@ impl Video {
         }
         let keyframe = self.control.keyframe.load(Ordering::SeqCst);
         if !(p.has_frame && (p.dirty || keyframe) && Instant::now() >= p.next_due) {
+            // Nothing new to encode: still collect a frame the encoder finished late, or the
+            // viewer would keep the previous picture until the screen changes again.
+            let late = match p.enc.as_mut().map(|e| e.poll()) {
+                Some(Ok(f)) => f,
+                Some(Err(e)) => {
+                    log(&format!("session {}: encoder poll failed ({}); re-creating the encoder", self.id, hr(&e)));
+                    p.enc = None;
+                    p.enc_params = None;
+                    self.control.reconfig.store(true, Ordering::SeqCst);
+                    self.control.keyframe.store(true, Ordering::SeqCst);
+                    return;
+                }
+                None => Vec::new(),
+            };
+            let capture_us = p.encoded_us;
+            self.send_frames(late, capture_us);
             return;
         }
         let (Some(conv), Some(enc), Some(src)) = (p.conv.as_mut(), p.enc.as_mut(), p.dup.frame.clone()) else { return };
+        p.encoded_us = p.frame_us;
         let r = conv.convert(&src).and_then(|nv12| enc.encode(&nv12, keyframe, p.frame_us));
         p.dirty = false;
         p.next_due = Instant::now() + Duration::from_micros(1_000_000 / fps as u64);
@@ -301,6 +320,11 @@ impl Video {
             }
         };
         let capture_us = p.frame_us;
+        self.send_frames(frames, capture_us);
+    }
+
+    /// Sends encoded access units as VideoFrames (`capture_us` = when their capture happened).
+    fn send_frames(&mut self, frames: Vec<EncodedFrame>, capture_us: u64) {
         for f in frames {
             if f.keyframe {
                 self.control.keyframe.store(false, Ordering::SeqCst);
@@ -372,5 +396,5 @@ fn build_pipe() -> Result<Pipe, String> {
     let out = primary_output().map_err(|e| format!("no output: {}", hr(&e)))?;
     let dev = Device::new(&out.adapter).map_err(|e| format!("D3D11 device: {}", hr(&e)))?;
     let dup = Duplicator::new(&dev, &out).map_err(|e| format!("Desktop Duplication: {}", hr(&e)))?;
-    Ok(Pipe { out, dev, dup, conv: None, enc: None, enc_params: None, has_frame: false, dirty: false, frame_us: 0, next_due: Instant::now() })
+    Ok(Pipe { out, dev, dup, conv: None, enc: None, enc_params: None, has_frame: false, dirty: false, frame_us: 0, encoded_us: 0, next_due: Instant::now() })
 }
