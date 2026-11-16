@@ -114,6 +114,11 @@ pub struct Config {
     /// The Mac display last chosen in the display picker, per target (`pin_target`), by stable
     /// identity (PROTOCOL.md §3.5). Absent = the host's default display.
     pub last_display: BTreeMap<String, crate::displays::DisplayIdentity>,
+    /// Saved connections (Connections window, `--connection`; see `connections`). The active
+    /// one is mirrored into `host` / `accept_incoming`.
+    pub connections: Vec<crate::connections::SavedConnection>,
+    /// Id of the saved connection `host` came from (None = no saved connection in use).
+    pub active_connection: Option<String>,
 }
 
 impl Default for Config {
@@ -143,6 +148,8 @@ impl Default for Config {
             last_monitor: None,
             windows: BTreeMap::new(),
             last_display: BTreeMap::new(),
+            connections: Vec::new(),
+            active_connection: None,
         }
     }
 }
@@ -313,6 +320,8 @@ pub fn parse(text: &str) -> Loaded {
     field!(last_monitor);
     field!(windows);
     field!(last_display);
+    field!(connections);
+    field!(active_connection);
     if c.listen_port == 0 {
         c.listen_port = d.listen_port;
         bad.push("listen_port");
@@ -334,6 +343,24 @@ pub fn parse(text: &str) -> Loaded {
     }
     if c.download_dir.as_deref().is_some_and(|h| h.trim().is_empty()) {
         c.download_dir = None;
+    }
+    // Drop entries without an id (hand edits); a later duplicate id is renumbered.
+    let before = c.connections.len();
+    c.connections.retain(|s| !s.id.trim().is_empty());
+    if c.connections.len() != before {
+        bad.push("connections");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..c.connections.len() {
+        if !seen.insert(c.connections[i].id.clone()) {
+            c.connections[i].id = crate::connections::next_id(&c);
+            seen.insert(c.connections[i].id.clone());
+            out.needs_save = true;
+        }
+    }
+    // A `host` from the Set up dialog, a hand edit or an older viewer becomes a saved connection.
+    if crate::connections::sync_from_host(&mut c) {
+        out.needs_save = true;
     }
     c.version = CONFIG_VERSION;
     if !bad.is_empty() {
@@ -636,6 +663,9 @@ mod tests {
             false,
             true,
         );
+        // Loading turns `host` into the active saved connection; a synced config round-trips.
+        assert!(crate::connections::sync_from_host(&mut c));
+        assert_eq!(c.connections.len(), 1);
         let back = parse(&to_json(&c));
         assert_eq!(back.config, c);
         assert!(!back.needs_save);

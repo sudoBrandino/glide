@@ -1,13 +1,15 @@
 //! glide-client: Glide remote desktop viewer.
 //!
-//! Usage: glide-client [host[:port] [--no-listen] | --listen [PORT]] [--mode fast|sharp|hybrid]
-//!                     [--no-ctrl-as-cmd] [--bench SECONDS] [--probe] [--forget-host] [--identity]
+//! Usage: glide-client [host[:port] [--no-listen] | --listen [PORT] | --connection NAME]
+//!                     [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--bench SECONDS] [--probe]
+//!                     [--forget-host] [--identity] [--list-connections]
 //! With no target, the viewer uses %APPDATA%\Glide\config.json (default: listen on 7420). With
 //! the Mac's address it dials the Mac and also listens, so either side may connect. A plain
 //! launch with nothing set up (or from outside the install folder) opens the setup dialog.
 //! Security v2: no passwords; the viewer pairs with the host once (docs/PROTOCOL.md §2).
 
 use glide::config::{self, Store, TargetSpec};
+use glide::connections;
 use glide::net::{Auth, Connection, PairPrompt, PairingUi};
 use glide::protocol::{self, ClientMsg, Mode};
 use std::process::ExitCode;
@@ -47,9 +49,13 @@ pub struct Args {
     audio: Option<bool>,
     /// Headless WASAPI check (plays digital silence only), seconds.
     audio_selftest: Option<f64>,
+    /// Use this saved connection (id, name or address) and make it the active one.
+    connection: Option<String>,
+    /// Print the saved connections and exit.
+    list_connections: bool,
 }
 
-const USAGE: &str = "usage: glide-client [host[:port] [--no-listen] | --listen [PORT]] [options...]
+const USAGE: &str = "usage: glide-client [host[:port] [--no-listen] | --listen [PORT] | --connection NAME] [options...]
 
   (no target)        use the config file: dial its \"host\" if set (and listen, see below), else
                      listen on its \"listen_port\" (default 7420). Opens the setup dialog when
@@ -60,6 +66,9 @@ const USAGE: &str = "usage: glide-client [host[:port] [--no-listen] | --listen [
   --no-listen        with a host: dial only
   --listen [PORT]    reverse connect: listen on 0.0.0.0:PORT (default 7420) and let the host
                      dial in (glide-host --connect); same protocol
+  --connection NAME  use a saved connection (name, id or address; see the Connections window)
+                     and make it the default for later launches too
+  --list-connections print the saved connections and exit
   --setup            open the setup dialog (Mac address, firewall, start at sign-in, install)
   --mode M           fast = 4:2:0 only; sharp = 4:4:4 every frame; hybrid = 4:2:0 while moving +
                      4:4:4 refinement at rest. Default: config, else hybrid if this PC decodes
@@ -142,6 +151,8 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Strin
                 };
                 a.listen = Some(port);
             }
+            "--connection" => a.connection = Some(it.next().filter(|v| !v.trim().is_empty()).ok_or("--connection needs NAME")?),
+            "--list-connections" => a.list_connections = true,
             "-h" | "--help" | "/?" => return Err(String::new()),
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             s => {
@@ -152,7 +163,50 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Strin
             }
         }
     }
+    if a.connection.is_some() && (a.host.is_some() || a.listen.is_some()) {
+        return Err("--connection picks the target: don't also give a host or --listen".into());
+    }
     Ok(a)
+}
+
+/// `--connection`: make the saved connection matching `query` the active one (so it is also the
+/// default for later launches). Returns its name; the error lists what is saved.
+fn use_connection(c: &mut config::Config, query: &str) -> Result<String, String> {
+    let Some(s) = connections::find(c, query) else {
+        let names: Vec<String> = c.connections.iter().filter(|s| s.is_supported()).map(|s| format!("“{}”", s.name)).collect();
+        return Err(if names.is_empty() {
+            format!("no saved connection “{query}” (none saved yet: add one with Connections… in the Glide or tray menu)")
+        } else {
+            format!("no saved connection “{query}”; saved: {}", names.join(", "))
+        });
+    };
+    let (id, name) = (s.id.clone(), s.name.clone());
+    connections::activate(c, &id)?;
+    Ok(name)
+}
+
+/// `--list-connections`: one line per saved connection, `*` marking the active one.
+fn connections_text(c: &config::Config) -> String {
+    if c.connections.is_empty() {
+        return "no saved connections (add one with Connections… in the Glide or tray menu)\n".into();
+    }
+    let mut out = String::new();
+    for s in &c.connections {
+        let active = if c.active_connection.as_deref() == Some(s.id.as_str()) { '*' } else { ' ' };
+        let mut notes = Vec::new();
+        if let Some(g) = &s.group {
+            notes.push(format!("group {g}"));
+        }
+        if !s.is_supported() {
+            notes.push(format!("{} (not supported here)", s.platform));
+        } else if s.pairing(c).is_some() {
+            notes.push("paired".into());
+        } else {
+            notes.push("not paired".into());
+        }
+        out.push_str(&format!("{active} {:<4} {}  —  {}  ({})\n", s.id, s.name, s.address_label(), notes.join(", ")));
+    }
+    out
 }
 
 /// Console pairing prompt (headless --bench, non-Windows). GLIDE_PAIR_CONFIRM=yes|no answers it
@@ -269,11 +323,27 @@ fn main() -> ExitCode {
     if std::env::var_os("GLIDE_PASSWORD").is_some() {
         eprintln!("note: GLIDE_PASSWORD is ignored: Glide v2 pairs keys instead of using a password");
     }
+    if args.list_connections {
+        print!("{}", connections_text(&store.config));
+        return ExitCode::SUCCESS;
+    }
+    // Before resolving the target, which reads the active connection through `host`.
+    if let Some(q) = &args.connection {
+        let mut res = Ok(String::new());
+        store.update(|c| res = use_connection(c, q));
+        match res {
+            Ok(name) => eprintln!("using saved connection “{name}”"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
 
     // Visual setup (GUI launches only): nothing set up yet, an exe outside the install folder,
     // or --setup. It may install and relaunch the installed copy (then this process exits).
     #[cfg(windows)]
-    if args.bench.is_none() && !args.forget_host && !args.identity && !args.after_setup && (args.setup || (args.host.is_none() && args.listen.is_none())) {
+    if args.bench.is_none() && !args.forget_host && !args.identity && !args.after_setup && (args.setup || (args.host.is_none() && args.listen.is_none() && args.connection.is_none())) {
         match glide::win::setup::at_startup(&mut store, args.setup) {
             glide::win::setup::Startup::Continue => {}
             glide::win::setup::Startup::Exit => return ExitCode::SUCCESS,
@@ -281,7 +351,9 @@ fn main() -> ExitCode {
     }
     let target = config::resolve_target(args.host.as_deref(), args.listen, args.no_listen, &store.config);
     let pin_target = config::pin_target(&target);
-    let pin_fallback = config::pin_fallback(&target);
+    // Saved connections carry their own pins; the listen-mode fallback only still applies to a
+    // target that isn't one (a host on the command line).
+    let pin_fallback = config::pin_fallback(&target).filter(|_| glide::connections::use_pin_fallback(&store.config, &pin_target));
     if args.forget_host {
         match store.forget_host(&pin_target) {
             Some(p) => eprintln!("forgot host key {} for {pin_target} ({})", p.key, p.name),
@@ -528,6 +600,44 @@ mod tests {
         assert!(p(&["--setup"]).unwrap().setup);
         assert_eq!(config::resolve_mode(a.mode, &c, true).0, Mode::Fast);
         assert!(a.ctrl_as_cmd.unwrap_or(c.ctrl_as_cmd));
+    }
+
+    #[test]
+    fn connection_args() {
+        let a = p(&["--connection", "Studio Mac", "--mode", "fast"]).unwrap();
+        assert_eq!(a.connection.as_deref(), Some("Studio Mac"));
+        assert!(p(&["--connection", "x", "--no-listen"]).is_ok(), "dial only still applies");
+        assert!(p(&["--connection"]).is_err());
+        assert!(p(&["--connection", " "]).is_err());
+        assert!(p(&["--connection", "x", "mac.local"]).is_err(), "two targets");
+        assert!(p(&["mac.local", "--connection", "x"]).is_err());
+        assert!(p(&["--connection", "x", "--listen"]).is_err());
+        assert!(p(&["--list-connections"]).unwrap().list_connections);
+    }
+
+    #[test]
+    fn use_connection_activates_and_lists() {
+        use glide::connections::{add, Draft};
+        let mut c = config::Config::default();
+        assert!(use_connection(&mut c, "x").unwrap_err().contains("none saved yet"));
+        assert!(connections_text(&c).starts_with("no saved connections"));
+        let d = |name: &str, addr: &str| Draft { name: name.into(), address: addr.into(), ..Draft::new_default() };
+        let studio = add(&mut c, &d("Studio Mac", "192.168.1.20")).unwrap();
+        let laptop = add(&mut c, &Draft { group: "Home".into(), accept_incoming: false, ..d("Laptop", "10.0.0.5:7421") }).unwrap();
+        assert_eq!(c.active_connection.as_deref(), Some(studio.as_str()), "the first one added is active");
+        // By name (any case), then the target follows it.
+        assert_eq!(use_connection(&mut c, "laptop").unwrap(), "Laptop");
+        assert_eq!(c.active_connection.as_deref(), Some(laptop.as_str()));
+        assert_eq!(config::resolve_target(None, None, false, &c), TargetSpec::Connect("10.0.0.5:7421".into()));
+        // By address and by id.
+        assert_eq!(use_connection(&mut c, "192.168.1.20").unwrap(), "Studio Mac");
+        assert_eq!(config::resolve_target(None, None, false, &c), TargetSpec::Both { host: "192.168.1.20".into(), port: 7420 });
+        assert_eq!(use_connection(&mut c, &laptop).unwrap(), "Laptop");
+        let e = use_connection(&mut c, "nope").unwrap_err();
+        assert!(e.contains("“Studio Mac”") && e.contains("“Laptop”"), "{e}");
+        let text = connections_text(&c);
+        assert!(text.contains("  c1   Studio Mac  —  192.168.1.20  (not paired)"), "{text}");
+        assert!(text.contains("* c2   Laptop  —  10.0.0.5:7421  (group Home, not paired)"), "{text}");
     }
 
 }

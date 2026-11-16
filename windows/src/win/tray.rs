@@ -1,9 +1,10 @@
 //! Notification-area (tray) icon: tooltip = window title; left click brings the viewer to
-//! the front; right click opens Connect / Disconnect / Reconnect / Stats / Mute / received files /
-//! cancel file transfer / Allow the Mac to pair / Set up / Open config / Forget host (unpair) /
-//! Quit. `notify` shows a notification balloon (file transfer results). Commands arrive at the
+//! the front; right click opens Connect / Disconnect / Reconnect / Connect to (saved connections) /
+//! Stats / Mute / received files / cancel file transfer / Allow the Mac to pair / Connections /
+//! Set up / Open config / Forget host (unpair) / Quit. `notify` shows a notification balloon (file transfer results). Commands arrive at the
 //! viewer window as WM_COMMAND.
 
+use std::cell::RefCell;
 use std::sync::OnceLock;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -24,6 +25,7 @@ pub enum MenuCmd {
     Quit,
     SetUp,
     AllowPairing,
+    Connections,
 }
 
 /// What the menu shows (enabled/checked state).
@@ -39,10 +41,13 @@ pub struct MenuState {
     /// Listening and not paired: minutes left in the inbound pairing window (0 = closed), which
     /// "Allow the Mac to pair" (re)opens. None = hide the item.
     pub allow_pairing: Option<u64>,
+    /// "Connect to" submenu: saved connections as `connections::quick_list` returns them
+    /// (id, name, active). Empty = no submenu.
+    pub connections: Vec<(String, String, bool)>,
 }
 
 const BASE: u16 = 0x4100;
-const CMDS: [MenuCmd; 12] = [
+const CMDS: [MenuCmd; 13] = [
     MenuCmd::Connect,
     MenuCmd::Disconnect,
     MenuCmd::Reconnect,
@@ -55,7 +60,21 @@ const CMDS: [MenuCmd; 12] = [
     MenuCmd::Quit,
     MenuCmd::SetUp,
     MenuCmd::AllowPairing,
+    MenuCmd::Connections,
 ];
+
+/// "Connect to" items: `CONNECT_BASE` + position in the list shown. Well above `BASE + CMDS.len()`
+/// so new commands never collide, and below the Glide menu's `menu_model` ids' 0xE000 range.
+const CONNECT_BASE: u16 = 0x4180;
+/// Most "Connect to" items (keeps the range clear of anything else).
+pub const MAX_CONNECTIONS: usize = 32;
+
+thread_local! {
+    /// Connection ids in the order the last tray menu showed them. The click arrives as a
+    /// WM_COMMAND after the menu closed, so it is resolved against what the user actually saw,
+    /// not against a list that might have changed since.
+    static SHOWN_CONNECTIONS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
 
 impl MenuCmd {
     fn id(self) -> u16 {
@@ -67,7 +86,16 @@ impl MenuCmd {
 }
 
 pub fn is_menu_id(id: u16) -> bool {
-    MenuCmd::from_id(id).is_some()
+    MenuCmd::from_id(id).is_some() || connection_for_id(id).is_some()
+}
+
+/// The saved connection id behind a "Connect to" item of the last menu shown.
+pub fn connection_for_id(id: u16) -> Option<String> {
+    let i = id.checked_sub(CONNECT_BASE)? as usize;
+    if i >= MAX_CONNECTIONS {
+        return None;
+    }
+    SHOWN_CONNECTIONS.with(|v| v.borrow().get(i).cloned())
 }
 
 /// "TaskbarCreated" (Explorer restarted → re-add the icon).
@@ -189,6 +217,19 @@ fn show_menu(hwnd: HWND, st: &MenuState) {
         item(MenuCmd::Connect, "&Connect", gray(!paused));
         item(MenuCmd::Disconnect, "&Disconnect", gray(paused));
         item(MenuCmd::Reconnect, "&Reconnect\tCtrl+Alt+Shift+D", gray(paused));
+        let list = &st.connections[..st.connections.len().min(MAX_CONNECTIONS)];
+        SHOWN_CONNECTIONS.with(|v| *v.borrow_mut() = list.iter().map(|(id, _, _)| id.clone()).collect());
+        if !list.is_empty() {
+            if let Ok(sub) = CreatePopupMenu() {
+                for (i, (_, name, active)) in list.iter().enumerate() {
+                    let t: Vec<u16> = name.replace('&', "&&").encode_utf16().chain(std::iter::once(0)).collect();
+                    let check = if *active { MF_CHECKED } else { MF_UNCHECKED };
+                    let _ = AppendMenuW(sub, MF_STRING | check, (CONNECT_BASE + i as u16) as usize, PCWSTR(t.as_ptr()));
+                }
+                // One saved connection: nothing to switch to, but still show which one it is.
+                let _ = AppendMenuW(m, MF_POPUP | gray(list.len() < 2), sub.0 as usize, w!("Connect t&o"));
+            }
+        }
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         item(MenuCmd::ToggleHud, "&Stats overlay\tCtrl+Alt+Shift+H", if hud_on { MF_CHECKED } else { MF_UNCHECKED });
         if let Some(muted) = st.audio {
@@ -207,6 +248,7 @@ fn show_menu(hwnd: HWND, st: &MenuState) {
             };
             item(MenuCmd::AllowPairing, &text, MF_ENABLED);
         }
+        item(MenuCmd::Connections, "Co&nnections…", MF_ENABLED);
         item(MenuCmd::SetUp, "Set &up…", MF_ENABLED);
         item(MenuCmd::OpenConfig, "Open &config file", MF_ENABLED);
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);

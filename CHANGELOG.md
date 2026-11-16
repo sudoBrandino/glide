@@ -24,6 +24,11 @@ changed for them, not how. Delete empty subsections when the release is cut.
   cursor. Command, Control and Option on the Mac map to Control, Windows and Alt on the PC. The PC
   listens on port 7421, so it can run next to the existing viewer. Audio, clipboard, file transfer
   and the sharp 4:4:4 layer are not in this direction yet. See `docs/WINDOWS_HOST.md`.
+- **Windows viewer, saved connections:** the viewer remembers the Macs you connect to. *Connections…*
+  in the Glide menu and the tray lists them (grouped, with pairing state and last use) and switches
+  between them; the tray's **Connect to** submenu switches in one click. `--connection NAME` starts
+  with a saved connection (and makes it the default), `--list-connections` prints them. The Mac
+  address you already set up becomes the first saved connection.
 
 ## [0.3.1] - 2026-11-15
 
