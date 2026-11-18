@@ -118,6 +118,9 @@ cmd_host() {
   local got; got="$("$bin" --version)"
   [[ "$got" == "glide-host $VERSION ("*")"* ]] || die "glide-host --version says '$got', expected $VERSION"
   echo "$got"
+  [[ -x "$app/Contents/MacOS/glide-viewer" ]] || die "Glide Host.app holds no glide-viewer"
+  [[ "$(lipo -archs "$app/Contents/MacOS/glide-viewer")" == "$archs" ]] \
+    || die "glide-viewer is built for $(lipo -archs "$app/Contents/MacOS/glide-viewer"), glide-host for $archs"
   [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" == "$VERSION" ]] \
     || die "Info.plist CFBundleShortVersionString != $VERSION"
   local zip="$OUT/Glide-Host-$VERSION-macos-$arch_name.zip"
@@ -162,15 +165,21 @@ cmd_viewer() {
   say "viewer: cross-build $TARGET"
   (cd "$ROOT/windows" && cargo build --locked --release --target "$TARGET")
   local exe="$ROOT/windows/target/$TARGET/release/glide-client.exe"
-  [[ -f "$exe" ]] || die "build produced no $exe"
-  # Static CRT (+crt-static in windows/.cargo/config.toml): no MinGW runtime DLLs allowed.
-  if command -v x86_64-w64-mingw32-objdump >/dev/null; then
-    if x86_64-w64-mingw32-objdump -p "$exe" | grep -iE 'DLL Name: (libgcc|libwinpthread|libstdc)'; then
-      die "glide-client.exe links MinGW runtime DLLs"
+  local host_exe="$ROOT/windows/target/$TARGET/release/glide-host.exe"
+  local e
+  for e in "$exe" "$host_exe"; do
+    [[ -f "$e" ]] || die "build produced no $e"
+    # Static CRT (+crt-static in windows/.cargo/config.toml): no MinGW runtime DLLs allowed.
+    if command -v x86_64-w64-mingw32-objdump >/dev/null; then
+      if x86_64-w64-mingw32-objdump -p "$e" | grep -iE 'DLL Name: (libgcc|libwinpthread|libstdc)'; then
+        die "$(basename "$e") links MinGW runtime DLLs"
+      fi
     fi
-  fi
+  done
   local stage; stage="$(mktemp -d)"
   cp "$exe" "$stage/glide-client.exe"
+  # The Windows host (a Mac controls this PC, docs/WINDOWS_HOST.md), in the same zip.
+  cp "$host_exe" "$stage/glide-host.exe"
   # Text files for Notepad: CRLF line endings.
   sed 's/$/\r/' "$ROOT/LICENSE" > "$stage/LICENSE.txt"
   sed 's/$/\r/' > "$stage/README.txt" <<EOF
@@ -189,12 +198,16 @@ The first connection pairs this PC with the Mac: both screens show the same 6-di
 confirm on both only if they match. Settings: %APPDATA%\\Glide\\config.json.
 Requires a GPU with HEVC hardware decode and the "HEVC Video Extensions" from the Microsoft Store.
 
+To control this PC from a Mac instead (preview), run glide-host.exe here and glide-viewer on the
+Mac (it comes with Glide Host). The PC listens on TCP port 7421; pair from its tray icon with
+"Pair New Mac...". Guide: https://github.com/sudoBrandino/glide/blob/v$VERSION/docs/WINDOWS_HOST.md
+
 Install guide (SmartScreen, firewall, pairing, troubleshooting):
 https://github.com/sudoBrandino/glide/blob/v$VERSION/docs/INSTALL.md
 All viewer options: glide-client.exe --help
 EOF
   rm -f "$OUT/$VIEWER_ZIP"
-  (cd "$stage" && zip -X -q "$OUT/$VIEWER_ZIP" glide-client.exe README.txt LICENSE.txt)
+  (cd "$stage" && zip -X -q "$OUT/$VIEWER_ZIP" glide-client.exe glide-host.exe README.txt LICENSE.txt)
   rm -rf "$stage"
   echo "wrote $OUT/$VIEWER_ZIP"
 }
@@ -222,7 +235,7 @@ cmd_notes() {
         echo "| \`$(basename "$z")\` | Mac host as a zip (install script, Homebrew), $desc. Not notarized |"
       fi
     done
-    echo "| \`$VIEWER_ZIP\` | Windows viewer: \`glide-client.exe\`, Windows 10/11 x64 |"
+    echo "| \`$VIEWER_ZIP\` | Windows viewer \`glide-client.exe\`, and \`glide-host.exe\` to control this PC from a Mac (preview). Windows 10/11 x64 |"
     echo "| \`SHA256SUMS\` | Checksums: \`shasum -a 256 -c SHA256SUMS\` (Mac) or \`Get-FileHash\` (Windows) |"
     echo
     echo "## Install"
@@ -233,6 +246,10 @@ cmd_notes() {
     echo "the two permissions, the connection and pairing."
     echo
     echo "**Windows:** download the viewer zip, run \`glide-client.exe\` and follow its setup window."
+    echo
+    echo "**Controlling a PC from a Mac (preview):** run \`glide-host.exe\` from the same zip on the PC and"
+    echo "\`glide-viewer\` on the Mac. It ships inside Glide Host: Homebrew puts it on PATH, otherwise run"
+    echo "\`\"/Applications/Glide Host.app/Contents/MacOS/glide-viewer\"\`. See [WINDOWS_HOST.md](https://github.com/sudoBrandino/glide/blob/v$VERSION/docs/WINDOWS_HOST.md)."
     echo
     echo "From a terminal instead (same result): \`curl -fsSL https://raw.githubusercontent.com/sudoBrandino/glide/v$VERSION/install.sh | bash\`,"
     echo "or \`brew install --cask sudobrandino/glide/glide-host\` (then \`glide-setup\`). Windows, in PowerShell:"
