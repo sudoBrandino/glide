@@ -25,22 +25,31 @@ if [[ -z "${GLIDE_BUILD_COMMIT:-}" ]]; then
 fi
 
 BINS=()
+# glide-viewer (control a Windows PC from this Mac, docs/WINDOWS_HOST.md) ships in the same app,
+# so Homebrew and the install script put both on PATH.
+VIEWER_BINS=()
 if [[ -z "${GLIDE_HOST_ARCHS:-}" ]]; then
   (cd "$ROOT/mac" && swift build -c release --build-system native >/dev/null)
   BINS+=("$ROOT/mac/.build/release/glide-host")
+  VIEWER_BINS+=("$ROOT/mac/.build/release/glide-viewer")
 else
   for arch in $GLIDE_HOST_ARCHS; do
-    (cd "$ROOT/mac" && swift build -c release --build-system native --product glide-host \
-      --triple "$arch-apple-macosx14.0" >/dev/null)
+    for product in glide-host glide-viewer; do
+      (cd "$ROOT/mac" && swift build -c release --build-system native --product "$product" \
+        --triple "$arch-apple-macosx14.0" >/dev/null)
+    done
     BINS+=("$ROOT/mac/.build/$arch-apple-macosx/release/glide-host")
+    VIEWER_BINS+=("$ROOT/mac/.build/$arch-apple-macosx/release/glide-viewer")
   done
 fi
 rm -rf "$OUT"
 mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
 if [[ ${#BINS[@]} -gt 1 ]]; then
   lipo -create -output "$OUT/Contents/MacOS/glide-host" "${BINS[@]}"
+  lipo -create -output "$OUT/Contents/MacOS/glide-viewer" "${VIEWER_BINS[@]}"
 else
   cp "${BINS[0]}" "$OUT/Contents/MacOS/glide-host"
+  cp "${VIEWER_BINS[0]}" "$OUT/Contents/MacOS/glide-viewer"
 fi
 cat > "$OUT/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -112,6 +121,9 @@ if [[ -n "${GLIDE_SIGN_KEYCHAIN:-}" ]]; then
   fi
   SIGN_ID="$_id_hash"
 fi
+# Nested code first: the bundle's signature seals glide-viewer, which needs its own signature.
+codesign --force "${SIGN_FLAGS[@]}" --sign "$SIGN_ID" --identifier "${GLIDE_BUNDLE_ID%.host}.viewer" \
+  "$OUT/Contents/MacOS/glide-viewer"
 codesign --force "${SIGN_FLAGS[@]}" --sign "$SIGN_ID" --identifier "$GLIDE_BUNDLE_ID" "$OUT"
 codesign --verify --strict --verbose=1 "$OUT" 2>&1 | tail -1
 codesign -dr - "$OUT" 2>&1 | grep designated

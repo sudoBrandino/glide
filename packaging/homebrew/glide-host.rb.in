@@ -27,6 +27,7 @@ cask "glide-host" do
   app "Glide Host.app"
   binary "#{appdir}/Glide Host.app/Contents/Resources/glide-setup"
   binary "#{appdir}/Glide Host.app/Contents/MacOS/glide-host"
+  binary "#{appdir}/Glide Host.app/Contents/MacOS/glide-viewer"
 
   # The app is signed ad hoc and not notarized, so Gatekeeper refuses to start it while it carries
   # Homebrew's quarantine flag.
@@ -46,5 +47,8 @@ cask "glide-host" do
       glide-setup
     It starts Glide Host at login and walks you through Screen Recording and
     Accessibility (each new build needs them again), the connection and pairing.
+
+    To control a Windows PC from this Mac instead (preview), run glide-host.exe
+    on the PC and `glide-viewer` here. See docs/WINDOWS_HOST.md.
   EOS
 end

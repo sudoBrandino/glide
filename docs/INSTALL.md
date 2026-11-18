@@ -11,6 +11,10 @@ Glide has two parts:
 | **Host** (`Glide Host.app`) | The Mac you want to control: macOS 14 or later, Apple silicon | `Glide-Host-<version>-macos-arm64.dmg` (or `.zip`) |
 | **Viewer** (`glide-client.exe`) | The Windows PC you control it from: Windows 10/11 x64 | `Glide-Viewer-<version>-windows-x64.zip` |
 
+To control a Windows PC from a Mac instead (preview), the same two downloads carry the other
+side: `glide-host.exe` is in the Windows zip and `glide-viewer` is inside `Glide Host.app`
+(Homebrew links it). See [WINDOWS_HOST.md](WINDOWS_HOST.md).
+
 The host and the viewer must be the same release, or at least speak the same protocol version.
 `glide-host --version` and `glide-client.exe --version` print both.
 
