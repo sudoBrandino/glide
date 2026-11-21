@@ -236,6 +236,17 @@ final class DisplayModeController: @unchecked Sendable {
 
     func setRestoreOnDisconnect(_ on: Bool) { persist { $0.restoreOnDisconnect = on } }
 
+    /// Settings → Reset: the policy back to its defaults (automatic, Retina on 4K viewers, restore
+    /// on disconnect). A mode still to be restored is kept.
+    func resetPreferences() {
+        persist { $0.mode = nil; $0.highDPIViewer = nil; $0.restoreOnDisconnect = nil }
+        sessionPreference = nil
+        userOverride = false
+        log("display: policy reset to defaults")
+        _ = applyPolicy(reason: "settings reset")
+        NotificationCenter.default.post(name: Self.preferenceChanged, object: nil)
+    }
+
     /// Restore the pre-Glide mode immediately (menu action). Mid-session this also stops
     /// auto-switching for the rest of the session.
     func restoreNow(reason: String) {

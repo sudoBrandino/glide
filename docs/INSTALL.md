@@ -297,15 +297,21 @@ listen and dial at the same time, so one direction that your network allows is e
 | | Mac (host) | PC (viewer) |
 |---|---|---|
 | **Listens** | Always, on port 7420 | On port 7420, unless **Let the Mac connect to this PC** is off (`"accept_incoming": false`, `--no-listen`) |
-| **Dials the other** | Once it has the PC's address: setup window, or `glide-host --set-connect PC-ADDRESS:7420` then menu bar → Restart Glide Host | Once it has the Mac's address: setup window, `"host": "MAC-ADDRESS:7420"` in `config.json`, or `glide-client.exe MAC-ADDRESS` |
+| **Dials the other** | Once it has the PC's address: **Settings → Connection** or the setup window, or `glide-host --set-connect PC-ADDRESS:7420` then menu bar → Restart Glide Host | Once it has the Mac's address: setup window, `"host": "MAC-ADDRESS:7420"` in `config.json`, or `glide-client.exe MAC-ADDRESS` |
 
 - Usually it is enough to give the viewer the Mac's address. If only the Mac can reach the PC (for
   example a Mac on a restricted network segment), also give the Mac the PC's address, and allow
   the viewer through Windows Firewall.
-- `--set-connect` saves the PC's address in `~/Library/Application Support/Glide/host.json`
-  (`"connect"`). The host redials every 2 seconds while disconnected. To stop dialing, clear it in
-  the setup window, or remove `"connect"` from `host.json` and restart the host. With
-  `"listen": false` as well, nothing listens on the Mac: only the Mac connects.
+- The PC's address is saved in `~/Library/Application Support/Glide/host.json` (`"connect"`). The
+  host redials every 2 seconds while disconnected. Menu bar → **Stop Connecting to PC** stops it
+  until the next start; to stop for good, clear the address in **Settings → Connection** (or the
+  setup window).
+- To keep the address but only connect when you ask, turn off **Connect out to the PC
+  automatically when Glide Host starts** in **Settings → Connection** (`"connectAtLaunch": false`).
+  Glide Host then still listens, and menu bar → **Connect to PC** (or **Connect Now** in Settings)
+  dials it.
+- With **Accept connections from the PC** off (`"listen": false`, needs the PC's address), nothing
+  listens on the Mac: only the Mac connects. That one applies after a restart.
 - A viewer that listens accepts only the first Mac that pairs with it (it pins that address), or
   the addresses in `"allowed_peers"` in `config.json`.
 - The viewer keeps its window open across disconnects and reconnects on its own.
@@ -339,8 +345,8 @@ What you see on the Mac itself:
 Quitting or restarting Glide Host ends the mirror, puts the monitor's mode back and removes the
 virtual display. Nothing Glide changes survives logging out.
 
-To turn it off: menu bar → **Virtual Display** → untick **Use a Virtual Display Sized to the
-Viewer**, or in
+To turn it off: **Settings → Display**, or menu bar → **Virtual Display** → untick **Use a
+Virtual Display Sized to the Viewer**, or in
 `~/Library/Application Support/Glide/host.json`:
 
 ```json
