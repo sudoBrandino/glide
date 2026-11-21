@@ -40,7 +40,7 @@ struct Ctx {
 static CTX: OnceLock<Ctx> = OnceLock::new();
 
 /// `<Downloads>\Glide` (the user's real Downloads folder, even if relocated).
-fn default_download_dir() -> PathBuf {
+pub(super) fn default_download_dir() -> PathBuf {
     let known = unsafe {
         SHGetKnownFolderPath(&FOLDERID_Downloads, KNOWN_FOLDER_FLAG(0), None).ok().map(|p| {
             let s = p.to_string().unwrap_or_default();

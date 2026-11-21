@@ -29,6 +29,12 @@ changed for them, not how. Delete empty subsections when the release is cut.
   between them; the tray's **Connect to** submenu switches in one click. `--connection NAME` starts
   with a saved connection (and makes it the default), `--list-connections` prints them. The Mac
   address you already set up becomes the first saved connection.
+- **Windows viewer, Settings window:** *Settings…* in the Glide menu and the tray now opens a real
+  settings window instead of the config file: start at sign-in, connecting right away at sign-in,
+  stream mode, keyboard and scrolling, audio, clipboard, file transfer (folder and limits), the
+  listen port, allowed Mac addresses, paired Macs (unpair) and this viewer's key fingerprint. Typed
+  values are checked before they are saved; most changes apply at once, and Glide offers to restart
+  for the few that need it. The config file is still one click away (Advanced).
 
 ## [0.3.1] - 2026-11-15
 

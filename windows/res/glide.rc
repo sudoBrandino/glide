@@ -26,6 +26,14 @@
 #define LVS_NOSORTHEADER  0x8000
 #define CBS_DROPDOWN      0x2
 #define CBS_AUTOHSCROLL   0x40
+#define CBS_DROPDOWNLIST  0x3
+#define LBS_NOTIFY        0x1
+#define LBS_NOINTEGRALHEIGHT 0x100
+#define ES_MULTILINE      0x4
+#define ES_AUTOVSCROLL    0x40
+#define ES_READONLY       0x800
+#define ES_WANTRETURN     0x1000
+#define ES_NUMBER         0x2000
 #define IDOK              1
 #define IDCANCEL          2
 #define VOS_NT_WINDOWS32  0x40004L
@@ -73,6 +81,12 @@
 #define IDC_CE_ACCEPT    1405
 #define IDC_CE_FAVORITE  1406
 #define IDC_CE_ERROR     1407
+// Settings: the page list, one group box per page (1501 + page), the status line and Apply; each
+// page's controls are 1600 + 20 * page .. + 19 (win/settings.rs shows the current page's).
+#define IDD_SETTINGS     106
+#define IDC_ST_PAGES     1500
+#define IDC_ST_STATUS    1590
+#define IDC_ST_APPLY     1591
 
 IDI_GLIDE ICON "glide.ico"
 1 24 "glide.manifest"
@@ -162,6 +176,98 @@ BEGIN
     LTEXT           "", IDC_CE_ERROR, 10, 151, 260, 18, SS_NOPREFIX
     DEFPUSHBUTTON   "&Save", IDOK, 162, 174, 52, 14, WS_TABSTOP | WS_GROUP
     PUSHBUTTON      "Cancel", IDCANCEL, 218, 174, 52, 14, WS_TABSTOP
+END
+
+// Settings (win/settings.rs): a page list on the left; every page's controls are in this
+// template, on top of each other, and only the selected page's are shown. Texts that depend on
+// state are set at runtime. Keep this file ASCII.
+IDD_SETTINGS DIALOGEX 0, 0, 420, 262
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | DS_SETFOREGROUND | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "Glide: Settings"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LISTBOX         IDC_ST_PAGES, 8, 8, 92, 226, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER | WS_TABSTOP | WS_GROUP
+    GROUPBOX        "General", 1501, 108, 4, 304, 206
+    GROUPBOX        "Picture", 1502, 108, 4, 304, 206
+    GROUPBOX        "Keyboard and mouse", 1503, 108, 4, 304, 206
+    GROUPBOX        "Audio", 1504, 108, 4, 304, 206
+    GROUPBOX        "Clipboard", 1505, 108, 4, 304, 206
+    GROUPBOX        "Files", 1506, 108, 4, 304, 206
+    GROUPBOX        "Network and security", 1507, 108, 4, 304, 206
+    GROUPBOX        "Advanced", 1508, 108, 4, 304, 206
+
+    // General
+    AUTOCHECKBOX    "&Start Glide when I sign in", 1600, 118, 20, 286, 12, WS_TABSTOP | WS_GROUP
+    AUTOCHECKBOX    "&Connect to the Mac right away when Glide starts at sign-in", 1601, 130, 34, 274, 12, WS_TABSTOP
+    LTEXT           "Off: Glide starts in the notification area and waits until you choose Connect.", 1602, 130, 48, 274, 18
+    AUTOCHECKBOX    "&Pin the connection bar (always show it at the top)", 1603, 118, 72, 286, 12, WS_TABSTOP
+    AUTOCHECKBOX    "Show the s&tats overlay (Ctrl+Alt+Shift+H)", 1604, 118, 88, 286, 12, WS_TABSTOP
+
+    // Picture
+    LTEXT           "Stream &mode:", 1620, 118, 20, 120, 10
+    COMBOBOX        1621, 118, 31, 140, 80, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP | WS_GROUP
+    LTEXT           "", 1622, 118, 49, 286, 28, SS_NOPREFIX
+    LTEXT           "Glide remembers which Mac display you picked for each Mac (Glide menu, Display).", 1623, 118, 84, 286, 18
+    PUSHBUTTON      "&Forget remembered displays", 1624, 118, 104, 110, 14, WS_TABSTOP
+    LTEXT           "", 1625, 234, 107, 170, 12, SS_NOPREFIX
+
+    // Keyboard and mouse
+    AUTOCHECKBOX    "&Ctrl acts as Command, Win as Control", 1640, 118, 20, 286, 12, WS_TABSTOP | WS_GROUP
+    LTEXT           "Ctrl+C, Ctrl+V and the other shortcuts you know from Windows then work on the Mac. Alt is Option either way.", 1641, 130, 34, 274, 18
+    AUTOCHECKBOX    "&Natural scrolling (reverse the wheel and touchpad)", 1642, 118, 60, 286, 12, WS_TABSTOP
+    LTEXT           "Content moves with your fingers, like a Mac set to natural scrolling.", 1643, 130, 74, 274, 18
+
+    // Audio
+    AUTOCHECKBOX    "&Play the Mac's sound on this PC", 1660, 118, 20, 286, 12, WS_TABSTOP | WS_GROUP
+    AUTOCHECKBOX    "&Muted (Ctrl+Alt+Shift+A)", 1661, 130, 34, 274, 12, WS_TABSTOP
+    LTEXT           "", 1662, 118, 54, 286, 18, SS_NOPREFIX
+
+    // Clipboard
+    AUTOCHECKBOX    "&Share the clipboard with the Mac (text and images)", 1680, 118, 20, 286, 12, WS_TABSTOP | WS_GROUP
+    AUTOCHECKBOX    "Also share items marked &private, such as copied passwords", 1681, 130, 34, 274, 12, WS_TABSTOP
+    LTEXT           "Password managers mark what they copy as private so that clipboard tools leave it alone. With this on, Glide sends it to the other computer too.", 1682, 130, 48, 274, 28
+
+    // Files
+    AUTOCHECKBOX    "&File transfer (drag and drop, Send files to the Mac)", 1700, 118, 20, 286, 12, WS_TABSTOP | WS_GROUP
+    AUTOCHECKBOX    "A&ccept files the Mac sends", 1701, 130, 34, 274, 12, WS_TABSTOP
+    LTEXT           "Sa&ve received files in:", 1702, 118, 54, 200, 10
+    EDITTEXT        1703, 118, 65, 180, 14, ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP | WS_GROUP
+    PUSHBUTTON      "&Browse...", 1704, 302, 65, 50, 14, WS_TABSTOP
+    PUSHBUTTON      "&Default", 1705, 356, 65, 48, 14, WS_TABSTOP
+    LTEXT           "Largest transfer (&GB):", 1706, 118, 90, 100, 10
+    EDITTEXT        1707, 222, 88, 50, 14, ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP | WS_GROUP
+    LTEXT           "Most f&iles per transfer:", 1708, 118, 108, 100, 10
+    EDITTEXT        1709, 222, 106, 50, 14, ES_AUTOHSCROLL | ES_NUMBER | WS_BORDER | WS_TABSTOP | WS_GROUP
+    LTEXT           "The limits apply both ways: a bigger transfer is refused.", 1710, 118, 126, 286, 18
+
+    // Network and security
+    LTEXT           "&Listen port:", 1720, 118, 20, 60, 10
+    EDITTEXT        1721, 180, 18, 40, 14, ES_AUTOHSCROLL | ES_NUMBER | WS_BORDER | WS_TABSTOP | WS_GROUP
+    LTEXT           "Glide uses 7420. The Mac must use the same port.", 1722, 226, 20, 178, 10
+    AUTOCHECKBOX    "Let the &Mac connect to this PC", 1723, 118, 36, 286, 12, WS_TABSTOP | WS_GROUP
+    LTEXT           "Allowed Mac a&ddresses, one per line. Empty: the first Mac that connects is remembered.", 1724, 118, 54, 286, 10
+    EDITTEXT        1725, 118, 65, 286, 30, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_BORDER | WS_TABSTOP | WS_GROUP
+    LTEXT           "Pai&red Macs:", 1726, 118, 100, 200, 10
+    CONTROL         "", 1727, "SysListView32", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_BORDER | WS_TABSTOP, 118, 111, 230, 50
+    PUSHBUTTON      "&Unpair", 1728, 352, 111, 52, 14, WS_TABSTOP
+    LTEXT           "This viewer's &key:", 1729, 118, 166, 200, 10
+    EDITTEXT        1730, 118, 177, 230, 14, ES_AUTOHSCROLL | ES_READONLY | WS_BORDER | WS_TABSTOP | WS_GROUP
+    PUSHBUTTON      "C&opy", 1731, 352, 177, 52, 14, WS_TABSTOP
+    LTEXT           "The Mac shows it under Paired Viewers.", 1732, 118, 194, 286, 10
+
+    // Advanced
+    LTEXT           "Settings are saved in:", 1740, 118, 20, 286, 10
+    EDITTEXT        1741, 118, 31, 286, 14, ES_AUTOHSCROLL | ES_READONLY | WS_BORDER | WS_TABSTOP | WS_GROUP
+    PUSHBUTTON      "&Open config file...", 1742, 118, 50, 100, 14, WS_TABSTOP
+    LTEXT           "Changes made in the file apply when Glide restarts. Saving here before then overwrites them.", 1743, 118, 68, 286, 18
+    PUSHBUTTON      "&Reset to defaults...", 1744, 118, 94, 100, 14, WS_TABSTOP
+    LTEXT           "Resets the settings on every page. Saved connections, pairings and allowed addresses stay.", 1745, 118, 112, 286, 18
+
+    LTEXT           "", IDC_ST_STATUS, 108, 214, 304, 20, SS_NOPREFIX
+    DEFPUSHBUTTON   "OK", IDOK, 254, 240, 50, 14, WS_TABSTOP | WS_GROUP
+    PUSHBUTTON      "Cancel", IDCANCEL, 308, 240, 50, 14, WS_TABSTOP
+    PUSHBUTTON      "&Apply", IDC_ST_APPLY, 362, 240, 50, 14, WS_TABSTOP | WS_DISABLED
 END
 
 VS_VERSION_INFO VERSIONINFO

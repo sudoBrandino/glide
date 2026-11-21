@@ -18,6 +18,7 @@ pub mod probe;
 pub mod prompt;
 pub mod render;
 pub mod scanout;
+pub mod settings;
 pub mod setup;
 pub mod tray;
 

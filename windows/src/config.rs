@@ -73,6 +73,8 @@ pub struct Config {
     /// The user chose to run the viewer from this exe without installing it (setup dialog), so
     /// starting it from there doesn't offer to install again.
     pub portable_exe: Option<String>,
+    /// When Glide starts at sign-in, connect right away (off: wait until the user chooses Connect).
+    pub connect_at_signin: bool,
     /// "fast" | "sharp" | "hybrid"; None = automatic (hybrid if 4:4:4 decode works).
     pub mode: Option<String>,
     /// Ctrl → Command, Win → Control, Alt → Option (menu → Input; `--no-ctrl-as-cmd`).
@@ -129,6 +131,7 @@ impl Default for Config {
             host: None,
             accept_incoming: true,
             portable_exe: None,
+            connect_at_signin: false,
             mode: None,
             ctrl_as_cmd: true,
             natural_scrolling: false,
@@ -301,6 +304,7 @@ pub fn parse(text: &str) -> Loaded {
     field!(host);
     field!(accept_incoming);
     field!(portable_exe);
+    field!(connect_at_signin);
     field!(mode);
     field!(ctrl_as_cmd);
     field!(natural_scrolling);

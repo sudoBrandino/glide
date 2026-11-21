@@ -191,13 +191,13 @@ fn run_value_get() -> Option<String> {
 }
 
 /// Starts at sign-in now: the Run value, or install.ps1's Startup shortcut.
-fn autostart_on() -> bool {
+pub(super) fn autostart_on() -> bool {
     run_value_get().is_some() || startup_shortcut().is_some_and(|p| p.exists())
 }
 
 /// Turn start-at-sign-in on (Run value → `exe`, no arguments) or off. An install.ps1 Startup
 /// shortcut is removed either way (it may carry old arguments, and two entries start twice).
-fn set_autostart(on: bool, exe: &Path) -> Result<(), String> {
+pub(super) fn set_autostart(on: bool, exe: &Path) -> Result<(), String> {
     if let Some(s) = startup_shortcut().filter(|p| p.exists()) {
         let _ = std::fs::remove_file(s);
     }

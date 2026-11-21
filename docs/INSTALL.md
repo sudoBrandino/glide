@@ -265,7 +265,7 @@ run it from a Command Prompt or PowerShell window. `glide-client.exe --help` lis
 and [`windows/README.md`](../windows/README.md) documents the config file and all flags.
 
 Settings are in `%APPDATA%\Glide\config.json`, which is created on first run. The tray icon →
-**Open config file** opens it.
+**Settings…** edits them; its **Advanced** page opens the file itself.
 
 ## 4. Pair and connect
 
