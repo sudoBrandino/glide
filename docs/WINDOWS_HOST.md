@@ -86,10 +86,39 @@ group with favorites first. Type in the search field to filter by name, address 
 These follow the same rules as the Windows viewer's Connections window. An address that doesn't
 parse, or a connection whose `platform` this viewer doesn't know, is listed but can't be opened.
 
-**Disconnect** (Connection → Disconnect, ⇧⌘D, or closing the session window) ends the session and
-returns to the Connections window, also when the session was started from the command line.
-Quit with ⌘Q. While a session is streaming, keyboard shortcuts go to the PC, so use the menu bar
-with the mouse.
+**Disconnect** (⌃⌥⇧Q, Connection → Disconnect, or closing the session window) ends the session
+and returns to the Connections window, also when the session was started from the command line.
+Quit with ⌘Q when no session has the keyboard.
+
+### Session shortcuts
+
+While a session is streaming, every key goes to the PC, ⌘Q and ⌘Tab included. These shortcuts
+are the exception: the viewer takes them first and never sends them, with or without the
+Accessibility permission, and in full screen.
+
+| Shortcut | What it does |
+|---|---|
+| ⌃⌥⇧Q | Disconnect: back to the Connections window |
+| ⌃⌥⇧F | Enter or leave full screen |
+| ⌃⌥⇧K | Release the keyboard: keys and system shortcuts (⌘Tab, ⌘Space, ⌘Q) stay on the Mac until you click the session window, switch back to it, or press ⌃⌥⇧K again |
+| ⌃⌥⇧D | Reconnect |
+| ⌃⌥⇧Space | The session menu at the pointer (Disconnect, Reconnect, full screen, Release Keyboard, Connections…, Settings…) |
+
+- They're Control + Option + Shift + key on the **physical Mac keys**, whatever the
+  [modifier mapping](#keyboard-mapping). Mapped, that chord would have reached the PC as
+  Windows+Alt+Shift, which Windows doesn't use; unmapped, as Ctrl+Alt+Shift, the chord the Windows
+  viewer reserves for its own hotkeys. The letters follow the Windows viewer where the action is
+  the same (F, K, D, Space). ⌘⌥⇧ is not reserved: it arrives as Ctrl+Alt+Shift, which Windows
+  apps use.
+- The letter is the key labelled with it on your keyboard layout (on AZERTY, ⌃⌥⇧Q is the key
+  marked Q), the same key the menus show. On a layout without Latin letters, the US positions apply.
+- So the PC never sees part of the chord, a Control, Option or Shift press is held back until
+  the next key, click or scroll, or until you let go of it; a modifier tapped on its own still
+  arrives (tapping Control still opens Start). If a key is already held down, modifiers go
+  straight through, and the PC then sees them before the shortcut fires.
+- The Connection and View menus and Settings list them, and a hint appears for a few seconds
+  when a session starts streaming and when it enters full screen.
+- With VoiceOver on, ⌃⌥ is the VoiceOver modifier, so VoiceOver may take these first.
 
 **Settings** (Glide Viewer → Settings…, ⌘,):
 
@@ -97,6 +126,7 @@ with the mouse.
   [Keyboard mapping](#keyboard-mapping).
 - **Open sessions in full screen** (`startFullScreen`, off by default). `--fullscreen` forces it
   for one run.
+- **Session shortcuts:** the list above, for reference.
 - **This Mac's viewer key:** the fingerprint the PC shows in its pairing dialog, with a **Copy**
   button, and a button that shows `viewer.json` in Finder.
 

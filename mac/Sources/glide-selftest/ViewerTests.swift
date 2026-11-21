@@ -15,6 +15,7 @@ func viewerTests() throws {
     try viewerSettingsTests()
     try viewerIdentityTests()
     macKeymapTests()
+    viewerShortcutTests()
     try viewerMessageTests()
     viewerPointerTests()
     viewerScrollTests()

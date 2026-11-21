@@ -9,24 +9,60 @@ protocol KeySink: AnyObject {
     /// True while keys should go to the host (streaming, and the viewer window is key).
     var capturingKeys: Bool { get }
     func sendKey(usage: UInt16, down: Bool)
+    /// A session shortcut (⌃⌥⇧+key) was pressed while capturing. Called from inside the event
+    /// tap or the local monitor: defer anything that tears down windows or the capture.
+    func shortcut(_ s: ViewerShortcut)
 }
 
 /// Keyboard capture while the viewer window is focused: NSEvent key events through a local
 /// monitor (before menus see them), and, with Accessibility permission, a CGEventTap that also
 /// takes system shortcuts (⌘Tab, ⌘Space, …) before macOS acts on them. Without the permission
 /// those shortcuts stay with this Mac.
+///
+/// Both paths go through `ShortcutKeyFilter`: the session shortcuts (⌃⌥⇧Q, F, K, D, Space) are
+/// taken here and never reach the PC, and the Control/Option/Shift presses that make them up are
+/// held back until they turn out not to be one.
 final class KeyCapture {
     weak var sink: KeySink?
     var remap: Bool
     private var monitor: Any?
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
+    private var filter = ShortcutKeyFilter()
+    private var layoutObserver: NSObjectProtocol?
 
     init(remap: Bool) { self.remap = remap }
 
     deinit { stop() }
 
+    /// The current shortcut keys for this keyboard layout (menus use the same characters).
+    static func currentBindings() -> ShortcutBindings {
+        guard let src = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+              let ptr = TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData) else { return .ansi }
+        let data = Unmanaged<CFData>.fromOpaque(ptr).takeUnretainedValue() as Data
+        let kbType = UInt32(LMGetKbdType())
+        return data.withUnsafeBytes { raw -> ShortcutBindings in
+            guard let layout = raw.baseAddress?.assumingMemoryBound(to: UCKeyboardLayout.self) else { return .ansi }
+            return ShortcutBindings.resolve { code in
+                var dead: UInt32 = 0
+                var chars = [UniChar](repeating: 0, count: 4)
+                var n = 0
+                let st = UCKeyTranslate(layout, code, UInt16(kUCKeyActionDown), 0, kbType, OptionBits(kUCKeyTranslateNoDeadKeysBit),
+                                        &dead, chars.count, &n, &chars)
+                guard st == noErr, n > 0 else { return nil }
+                return String(utf16CodeUnits: chars, count: n)
+            }
+        }
+    }
+
     func start() {
+        filter.bindings = KeyCapture.currentBindings()
+        if layoutObserver == nil {
+            layoutObserver = DistributedNotificationCenter.default().addObserver(
+                forName: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String), object: nil, queue: .main) { [weak self] _ in
+                self?.filter.bindings = KeyCapture.currentBindings()
+            }
+        }
         if monitor == nil {
             monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] e in
                 guard let self else { return e }
@@ -37,6 +73,7 @@ final class KeyCapture {
     }
 
     func stop() {
+        if let o = layoutObserver { DistributedNotificationCenter.default().removeObserver(o); layoutObserver = nil }
         if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
         if let t = tap { CGEvent.tapEnable(tap: t, enable: false) }
         if let s = tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), s, .commonModes) }
@@ -73,26 +110,54 @@ final class KeyCapture {
         KBGetLayoutType(Int16(truncatingIfNeeded: UInt32(LMGetKbdType()))) == OSType(kKeyboardISO)
     }
 
-    /// One key event. Returns true when it was sent to the host (swallow it here).
+    /// Capture stopped or the PC was told to release everything: forget held and held-back keys.
+    func reset() { filter.reset() }
+
+    /// Sends the held-back Control/Option/Shift presses before a click or scroll they apply to.
+    func flushModifiers() { deliver(filter.flush()) }
+
+    /// One key event. Returns true when it was consumed here (sent to the host, or a shortcut).
     func handleKey(code: UInt16, type: CGEventType, flags: UInt64) -> Bool {
-        guard let sink, sink.capturingKeys else { return false }
+        guard let sink else { return false }
+        guard sink.capturingKeys else {
+            // Whatever was held back or swallowed is moot once keys stay on this Mac.
+            filter.reset()
+            return false
+        }
         switch type {
-        case .keyDown, .keyUp:
-            if let u = MacKeymap.hidUsage(forMacKeyCode: code, iso: isISO, remap: remap) { sink.sendKey(usage: u, down: type == .keyDown) }
+        case .keyDown:
+            deliver(filter.keyDown(code, flags: flags))
+            return true
+        case .keyUp:
+            deliver(filter.keyUp(code))
             return true
         case .flagsChanged:
             if code == MacKeymap.capsLockKeyCode {
                 // macOS reports Caps Lock once per press (lock state): press + release toggles it on the PC too.
+                deliver(filter.flush())
                 sink.sendKey(usage: 0x39, down: true)
                 sink.sendKey(usage: 0x39, down: false)
                 return true
             }
-            guard let down = MacKeymap.modifierIsDown(keyCode: code, flags: flags),
-                  let u = MacKeymap.hidUsage(forMacKeyCode: code, iso: false, remap: remap) else { return true }
-            sink.sendKey(usage: u, down: down)
+            guard let down = MacKeymap.modifierIsDown(keyCode: code, flags: flags) else { return true }
+            deliver(filter.modifier(code, down: down))
             return true
         default:
             return false
+        }
+    }
+
+    private func deliver(_ out: [ShortcutKeyFilter.Output]) {
+        guard let sink else { return }
+        for o in out {
+            switch o {
+            case let .send(code, down):
+                // Modifiers have no ISO variant.
+                let iso = HIDKeymap.modifier(forMacKeyCode: code) == nil && isISO
+                if let u = MacKeymap.hidUsage(forMacKeyCode: code, iso: iso, remap: remap) { sink.sendKey(usage: u, down: down) }
+            case let .shortcut(s):
+                sink.shortcut(s)
+            }
         }
     }
 
