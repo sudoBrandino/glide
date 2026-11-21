@@ -29,6 +29,17 @@ changed for them, not how. Delete empty subsections when the release is cut.
   between them; the tray's **Connect to** submenu switches in one click. `--connection NAME` starts
   with a saved connection (and makes it the default), `--list-connections` prints them. The Mac
   address you already set up becomes the first saved connection.
+- **Mac viewer, Connections and Settings windows (preview).** `glide-viewer` now has a full
+  connection manager: the saved PCs with address, pairing state and last use, grouped, with
+  favorites first and a search field. Connect with Return or a double-click; add, edit (name,
+  address, port, group, favorite), duplicate, remove and unpair from buttons or the right-click
+  menu. Remove and Unpair ask first, and removing a connection also forgets its pairing unless
+  another connection uses the same address, as in the Windows viewer. **Settings…** (⌘,) holds the
+  modifier mapping (applied to a running session at once), a new **Open sessions in full screen**
+  option, and this Mac's viewer key fingerprint with a Copy button. The app has standard Glide
+  Viewer, Edit and Window menus. Disconnect (⇧⌘D, or closing the session window) returns to the
+  Connections window instead of quitting; launching with no arguments opens that window and never
+  connects on its own.
 
 ### Changed
 

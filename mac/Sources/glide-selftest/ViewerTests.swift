@@ -11,6 +11,8 @@ func viewerTests() throws {
     print("mac viewer:")
     viewerTargetTests()
     try viewerConfigTests()
+    try viewerConnectionTests()
+    try viewerSettingsTests()
     try viewerIdentityTests()
     macKeymapTests()
     try viewerMessageTests()
@@ -38,7 +40,7 @@ private func viewerTargetTests() {
 private func viewerConfigTests() throws {
     let key = Data(repeating: 0xab, count: 32)
     var c = ViewerConfig()
-    check(c.remapModifiers && c.connections.isEmpty && c.pinnedHosts.isEmpty, "viewer.json: defaults")
+    check(c.remapModifiers && !c.startFullScreen && c.connections.isEmpty && c.pinnedHosts.isEmpty, "viewer.json: defaults")
     let pc = c.add(name: "Gaming PC", address: "192.168.1.20")
     c.add(name: "Studio Mac", address: "studio.local", platform: "mac")
     c.connections[0].group = "Home"
@@ -267,4 +269,158 @@ private func viewerScrollTests() {
     for _ in 0..<48 { if let v = s.add(dx: 0, dy: 1, precise: true) { total += v.dy } }
     check(abs(total - 1) <= 1.0 / 120 + 1e-5, "scroll: 48 × 1 pt adds up to one notch (\(total))")
     check(s.add(dx: .nan, dy: 1, precise: false) == nil, "scroll: NaN ignored")
+}
+
+// The Connections window's model (ViewerConnections.swift), mirroring windows/src/connections.rs.
+private func viewerConnectionTests() throws {
+    let key = Data(repeating: 0xab, count: 32)
+    var c = ViewerConfig()
+    func draft(_ name: String, _ address: String, port: String = "", group: String = "", favorite: Bool = false) -> ConnectionDraft {
+        ConnectionDraft(name: name, address: address, port: port, group: group, favorite: favorite)
+    }
+    func field(_ r: Result<ValidConnection, ConnectionDraftError>) -> ConnectionField? {
+        if case let .failure(e) = r { return e.field }
+        return nil
+    }
+    func value(_ r: Result<ValidConnection, ConnectionDraftError>) -> ValidConnection? { try? r.get() }
+
+    // Validation: trimmed, blank name filled from the address, port folded in, bad input pointed at.
+    let v = value(c.validate(draft("  Gaming   PC ", " 192.168.1.20 ", port: " 9000 ", group: "  Home   office ")))
+    check(v?.name == "Gaming PC" && v?.address == "192.168.1.20:9000" && v?.group == "Home office", "connections: draft cleaned up, port folded into the address")
+    check(value(c.validate(draft("", "192.168.1.20")))?.name == "192.168.1.20" && value(c.validate(draft("", "192.168.1.20")))?.address == "192.168.1.20",
+          "connections: blank name = address; no port stays portless (platform default applies)")
+    check(value(c.validate(draft("X", "pc.local:8000")))?.address == "pc.local:8000" && value(c.validate(draft("X", "pc.local:8000", port: "8000")))?.address == "pc.local:8000",
+          "connections: port in the address, or in both when they agree")
+    check(value(c.validate(draft("X", "fe80::1")))?.address == "[fe80::1]" && value(c.validate(draft("X", "fe80::1", port: "7421")))?.address == "[fe80::1]:7421",
+          "connections: IPv6 kept in brackets")
+    check(value(c.validate(draft("X", "pc", group: "  ")))?.group == nil, "connections: blank group = none")
+    check(field(c.validate(draft("X", ""))) == .address && field(c.validate(draft("X", "http://pc"))) == .address
+          && field(c.validate(draft("X", "my pc"))) == .address && field(c.validate(draft("X", "pc:0"))) == .address,
+          "connections: empty / URL / spaced / bad-port addresses refused")
+    check(field(c.validate(draft("X", "pc", port: "0"))) == .port && field(c.validate(draft("X", "pc", port: "70000"))) == .port
+          && field(c.validate(draft("X", "pc", port: "abc"))) == .port && field(c.validate(draft("X", "pc:8000", port: "9000"))) == .port,
+          "connections: bad port field, or two different ports")
+    check(field(c.validate(draft(String(repeating: "n", count: 65), "pc"))) == .name && value(c.validate(draft(String(repeating: "n", count: 64), "pc"))) != nil
+          && field(c.validate(draft("X", "pc", group: String(repeating: "g", count: 65)))) == .group, "connections: name / group at most 64 characters")
+
+    // Add, then duplicate names are refused (case-insensitive), except the one being edited.
+    guard case let .success(pc) = c.addConnection(draft("Gaming PC", "192.168.1.20", group: "Home")),
+          case let .success(laptop) = c.addConnection(draft("Laptop", "10.0.0.5", port: "7500", favorite: true)) else {
+        check(false, "connections: add")
+        return
+    }
+    check(pc.platform == "windows" && laptop.address == "10.0.0.5:7500" && laptop.favorite && c.connections.count == 2, "connections: add stores a Windows connection")
+    check(field(c.validate(draft("gaming pc", "1.2.3.4"))) == .name && value(c.validate(draft("gaming pc", "1.2.3.4"), editing: pc.id)) != nil,
+          "connections: duplicate name refused, own name fine when editing")
+    if case .success = c.addConnection(draft("GAMING PC", "1.2.3.4")) { check(false, "connections: add refuses a duplicate name") }
+
+    // Edit form round trip: the address splits into host and port.
+    let form = ConnectionDraft(saved: laptop)
+    check(form.address == "10.0.0.5" && form.port == "7500" && form.favorite && form.name == "Laptop", "connections: edit form splits address and port")
+    check(ConnectionDraft(saved: SavedConnection(name: "V6", address: "[fe80::1]:9")).address == "[fe80::1]"
+          && ConnectionDraft(saved: SavedConnection(name: "P", address: "pc")).port == "", "connections: edit form for IPv6 / portless")
+
+    // Update keeps id, platform and last use; a missing id fails.
+    c.connections[0].lastConnected = "2026-11-15T22:00:00Z"
+    c.connections[0].platform = "mac"
+    if case let .failure(e) = c.updateConnection(id: pc.id, draft("Gaming Rig", "192.168.1.21", port: "7421", favorite: true)) { check(false, "connections: update \(e)") }
+    let up = c.connections[0]
+    check(up.id == pc.id && up.name == "Gaming Rig" && up.address == "192.168.1.21:7421" && up.group == nil && up.favorite
+          && up.platform == "mac" && up.lastConnected == "2026-11-15T22:00:00Z", "connections: update replaces the form's fields only")
+    if case .success = c.updateConnection(id: "nope", draft("Y", "pc")) { check(false, "connections: update of a removed connection fails") }
+    if case .success = c.updateConnection(id: laptop.id, draft("gaming rig", "pc")) { check(false, "connections: rename onto another name refused") }
+    c.connections[0].platform = "windows"
+
+    // Duplicate: "(copy)", "(copy 2)", new id, never used.
+    let d1 = c.duplicateConnection(id: pc.id), d2 = c.duplicateConnection(id: pc.id)
+    let names = c.connections.map(\.name)
+    check(names == ["Gaming Rig", "Laptop", "Gaming Rig (copy)", "Gaming Rig (copy 2)"], "connections: duplicate names \(names)")
+    let copy = c.connections.first { $0.id == d1 }
+    check(d1 != nil && d1 != pc.id && d1 != d2 && copy?.lastConnected == nil && copy?.address == up.address && copy?.favorite == true,
+          "connections: duplicate gets a new id and no last use")
+    check(c.duplicateConnection(id: "nope") == nil, "connections: duplicate of a missing id")
+
+    // Pairing state, unpair, and remove forgetting the pin only when no other connection shares it.
+    let rig = ViewerTarget.parse("192.168.1.21:7421")!
+    c.pin(rig, key: key, name: "GAMING-PC", at: Date(timeIntervalSince1970: 1_700_000_000))
+    check(c.pairing(for: c.connections[0])?.name == "GAMING-PC" && c.pairing(for: c.connections[1]) == nil, "connections: pairing found by address")
+    let removedCopy = c.removeConnection(id: d1!)
+    check(removedCopy == RemovedConnection(name: "Gaming Rig (copy)", unpaired: false) && c.pinnedKey(for: rig) == key,
+          "connections: removing one of two connections to an address keeps the pin")
+    _ = c.removeConnection(id: d2!)
+    let removed = c.removeConnection(id: pc.id)
+    check(removed == RemovedConnection(name: "Gaming Rig", unpaired: true) && c.pinnedKey(for: rig) == nil, "connections: removing the last one forgets the pin")
+    check(c.removeConnection(id: pc.id) == nil, "connections: remove of a missing id")
+    let lt = ViewerTarget.parse("10.0.0.5:7500")!
+    c.pin(lt, key: key, name: "", at: Date())
+    check(c.unpair(id: laptop.id) && c.pinnedKey(for: lt) == nil && !c.unpair(id: laptop.id) && !c.unpair(id: "nope"), "connections: unpair forgets the pin once")
+    check(c.connections.map(\.name) == ["Laptop"], "connections: unpair keeps the connection")
+
+    // Rows: grouped (ungrouped first, groups A-Z), favorites first, then by name; filter; status texts.
+    let now = Date(timeIntervalSince1970: 1_800_000_000)  // 2027-01-15T08:00:00Z
+    var r = ViewerConfig()
+    r.connections = [
+        SavedConnection(id: "1", name: "zeta", address: "10.0.0.1", group: "Office"),
+        SavedConnection(id: "2", name: "Alpha", address: "10.0.0.2", group: "office", lastConnected: "2027-01-15T07:59:30Z"),
+        SavedConnection(id: "3", name: "Mid", address: "10.0.0.3", favorite: true),
+        SavedConnection(id: "4", name: "Beta", address: "10.0.0.4", lastConnected: "2027-01-14T07:00:00Z"),
+        SavedConnection(id: "5", name: "Fav", address: "10.0.0.5", group: "Home", favorite: true),
+        SavedConnection(id: "6", name: "Other", platform: "linux", address: "10.0.0.6"),
+        SavedConnection(id: "7", name: "Studio", platform: "mac", address: "studio.local"),
+        SavedConnection(id: "8", name: "Broken", address: "bad:port"),
+    ]
+    r.pin(ViewerTarget.parse("10.0.0.3")!, key: key, name: "MID-PC", at: now)
+    r.pin(ViewerTarget.parse("10.0.0.4")!, key: key, name: " ", at: now)
+    r.pin(ViewerTarget.parse("studio.local:7420")!, key: key, name: "Studio Mac", at: now)
+    r.pinnedHosts["10.0.0.6:7421"] = PinnedHostEntry(key: key.hex, name: "x", paired: "")
+    let rows = r.connectionRows(now: now)
+    check(rows.map(\.id) == ["3", "4", "8", "6", "7", "5", "2", "1"], "connections: row order \(rows.map(\.id))")
+    let byID = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
+    check(byID["3"]?.status == "Paired with MID-PC" && byID["3"]?.paired == true && byID["4"]?.status == "Paired" && byID["1"]?.status == "Not paired yet",
+          "connections: pairing status texts")
+    check(byID["6"]?.supported == false && byID["6"]?.paired == false && byID["6"]?.status == "Not supported by this viewer", "connections: unknown platform shown, not usable")
+    check(byID["8"]?.supported == false && byID["8"]?.status == "Invalid address" && byID["8"]?.address == "bad:port", "connections: invalid address shown as is")
+    check(byID["7"]?.supported == true && byID["7"]?.status == "Paired with Studio Mac" && byID["7"]?.address == "studio.local:7420",
+          "connections: Mac connection uses port 7420")
+    check(byID["2"]?.lastUsed == "Just now" && byID["4"]?.lastUsed == "Yesterday" && byID["1"]?.lastUsed == "Never",
+          "connections: last used texts")
+    check(r.connectionRows(filter: " OFFICE ", now: now).map(\.id) == ["2", "1"] && r.connectionRows(filter: "10.0.0.5", now: now).map(\.id) == ["5"]
+          && r.connectionRows(filter: "studio", now: now).map(\.id) == ["7"] && r.connectionRows(filter: "nothing", now: now).isEmpty,
+          "connections: filter by group, address, name")
+    check(r.connectionGroups == ["Home", "Office"], "connections: distinct groups, case-insensitive \(r.connectionGroups)")
+
+    // Relative times, as the Windows viewer shows them.
+    func rel(_ secondsAgo: Int) -> String { ViewerConfig.relativeTime(ViewerConfig.timestamp(now.addingTimeInterval(TimeInterval(-secondsAgo))), now: now) }
+    check(rel(0) == "Just now" && rel(59) == "Just now" && rel(60) == "1 minute ago" && rel(150) == "2 minutes ago" && rel(3600) == "1 hour ago"
+          && rel(86399) == "23 hours ago" && rel(86400) == "Yesterday" && rel(172_800) == "2 days ago" && rel(29 * 86400) == "29 days ago",
+          "connections: relative times")
+    check(rel(40 * 86400) == "2026-12-06" && rel(-100) == "Just now" && ViewerConfig.relativeTime("garbage", now: now) == "Unknown",
+          "connections: old dates, future, unparsable")
+
+    // Through ViewerStore-style read-modify-write: what Remove/Unpair change persists.
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("glide-viewer-conn-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try ViewerPaths.ensureDirectory(dir)
+    let url = dir.appendingPathComponent("viewer.json")
+    try ConfigFile.write(r, to: url)
+    try ConfigFile.update(url, defaults: { ViewerConfig() }) { (v: inout ViewerConfig) in
+        _ = v.removeConnection(id: "3")
+        v.unpair(id: "7")
+        _ = v.duplicateConnection(id: "4")
+    }
+    let after = try ConfigFile.read(ViewerConfig.self, from: url)
+    check(after?.connections.count == 8 && after?.pinnedHosts["10.0.0.3:7421"] == nil && after?.pinnedHosts["studio.local:7420"] == nil
+          && after?.pinnedHosts["10.0.0.4:7421"] != nil && after?.connections.last?.name == "Beta (copy)", "connections: changes persisted")
+}
+
+private func viewerSettingsTests() throws {
+    // startFullScreen: new in this version; older files without it read as off, and round-trip.
+    let old = try JSONDecoder().decode(ViewerConfig.self, from: Data("{\"remapModifiers\":false}".utf8))
+    check(!old.remapModifiers && !old.startFullScreen, "settings: file without startFullScreen reads as off")
+    var c = ViewerConfig()
+    c.startFullScreen = true
+    c.remapModifiers = false
+    let back = try JSONDecoder().decode(ViewerConfig.self, from: try JSONEncoder().encode(c))
+    check(back.startFullScreen && !back.remapModifiers, "settings: startFullScreen / remapModifiers round trip")
+    check((try? JSONDecoder().decode(ViewerConfig.self, from: Data("{\"startFullScreen\":1}".utf8))) == nil, "settings: wrong type refused")
 }

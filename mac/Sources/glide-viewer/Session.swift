@@ -496,7 +496,7 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         retryWork?.cancel()
         retryWork = nil
         phase = .stopped
-        setStatus(message.map { "\($0)\n\nUse Connection → Reconnect to try again." } ?? "Disconnected.")
+        setStatus(message.map { "\($0)\n\nUse Connection → Reconnect to try again, or Disconnect to go back to your connections." } ?? "Disconnected.")
     }
 
     @objc func reconnect(_ sender: Any?) {
@@ -504,6 +504,14 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         backoff.reset()
         phase = .idle
         connect()
+    }
+
+    /// Settings changed the modifier remap: applies from the next key. Held keys are released
+    /// first, so a modifier pressed under the old mapping doesn't stay down on the PC.
+    func setRemap(_ on: Bool) {
+        guard keys.remap != on else { return }
+        releaseAll()
+        keys.remap = on
     }
 
     func close() {
