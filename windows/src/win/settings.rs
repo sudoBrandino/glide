@@ -598,6 +598,9 @@ unsafe fn commit(h: HWND, ctx: &Ctx) -> bool {
         }
     }
     super::app::update_store(|c| logic::apply(c, &before, &after));
+    // `apply` may have moved pins (a listen-port change re-keys listen-mode pairings): show the
+    // pairings as saved, or the moved one would drop out of the list until Settings reopens.
+    after.paired = super::app::store_snapshot().config.pinned_hosts.keys().cloned().collect();
     super::app::apply_live_settings(ctx.owner, &ch.live);
     eprintln!("settings: saved (live {:?}, restart {:?})", ch.live, ch.restart);
     {

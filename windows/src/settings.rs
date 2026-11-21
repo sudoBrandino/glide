@@ -263,7 +263,11 @@ pub fn validate(d: &Draft) -> Result<Settings, (Field, String)> {
         return Err((Field::DownloadDir, "Choose a full folder path, such as D:\\Downloads\\Glide (Browse…), or leave it empty for the default.".into()));
     };
 
-    s.file_max_total_bytes = parse_gb(&d.max_size_gb).map_err(|e| (Field::MaxSize, e))?;
+    // Untouched (still the text the saved value formats to): keep the exact saved bytes, so a
+    // value with more precision than the field shows ("0.125") doesn't drift to "0.12" on OK.
+    if d.max_size_gb.trim() != format_gb(d.values.file_max_total_bytes) {
+        s.file_max_total_bytes = parse_gb(&d.max_size_gb).map_err(|e| (Field::MaxSize, e))?;
+    }
     s.file_max_files = match d.max_files.trim().parse::<u64>() {
         Ok(n) if (1..=MAX_FILES as u64).contains(&n) => n as u32,
         _ => return Err((Field::MaxFiles, format!("The most files per transfer must be a whole number from 1 to {MAX_FILES}."))),
@@ -576,6 +580,18 @@ mod tests {
         assert_eq!(v.allowed_peers, vec!["192.168.1.50", "192.168.1.0/24"]);
         d.download_dir = "   ".into();
         assert_eq!(validate(&d).unwrap().download_dir, None);
+    }
+
+    #[test]
+    fn untouched_size_keeps_exact_bytes() {
+        let mut s = Settings::from_config(&Config::default(), false);
+        s.file_max_total_bytes = (1 << 30) / 8; // 0.125 GB, shown as "0.12"
+        let d = Draft::from_settings(&s);
+        assert_eq!(d.max_size_gb, "0.12");
+        assert_eq!(validate(&d).unwrap().file_max_total_bytes, (1 << 30) / 8);
+        let mut d2 = d.clone();
+        d2.max_size_gb = "0.25".into();
+        assert_eq!(validate(&d2).unwrap().file_max_total_bytes, 1 << 28);
     }
 
     #[test]
