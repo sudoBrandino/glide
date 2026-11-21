@@ -68,6 +68,11 @@ pub struct Options {
     /// Clipboard sync switch at startup (config "clipboard" / --no-clipboard); toggled at runtime
     /// from the menu. ClientHello advertises clipboard support only while it is on.
     pub clipboard: bool,
+    /// Open Disconnected (no dialing, no listening) until Connect: started at sign-in with config
+    /// `connect_at_signin` off (`signin::start_paused`). The window opens at normal size.
+    pub start_paused: bool,
+    /// The Mac's saved name or address, for the paused status line (`signin::connect_label`).
+    pub connect_label: String,
 }
 
 /// How the viewer reaches the host. The session thread retries forever.
@@ -101,6 +106,8 @@ const WM_APP_HOTKEY: u32 = WM_APP + 6;
 const WM_APP_PAIR: u32 = WM_APP + 7;
 /// Tray icon callback (see `tray`).
 pub(super) const WM_APP_TRAY: u32 = WM_APP + 8;
+/// Enter while paused (posted from the keyboard hook): Connect.
+const WM_APP_CONNECT: u32 = WM_APP + 9;
 const TITLE_TIMER: usize = 1;
 const EXIT_TIMER: usize = 2;
 const VIEW_TIMER: usize = 3;
@@ -171,8 +178,13 @@ struct Shared {
     repair: AtomicBool,
     /// Ctrl+Alt+Shift+D: the current connection was dropped on purpose; reconnect immediately.
     reconnect: AtomicBool,
-    /// Tray "Disconnect": stay disconnected (and stop listening) until "Connect".
+    /// Tray "Disconnect" (or started at sign-in): stay disconnected (and stop listening) until
+    /// "Connect".
     paused: AtomicBool,
+    /// Started paused: the inbound pairing window opens on the first Connect instead of at startup.
+    open_pairing_on_connect: AtomicBool,
+    /// The Mac's saved name or address, for the paused status line until a connection names it.
+    connect_label: String,
     /// Interrupts a pending accept (quit or pause).
     abort_accept: AtomicBool,
     /// Listen or both mode: inbound peers are untrusted until authenticated.
@@ -291,6 +303,13 @@ struct UiState {
     test_actions: Vec<TestStep>,
     /// Mouse buttons whose down went to the connection bar (their ups aren't forwarded either).
     bar_buttons: u8,
+    /// Enter connected while paused: its repeats and key-up are ours too.
+    enter_connects: bool,
+    /// The current left press is the one that activated the window (it doesn't Connect).
+    activation_click: bool,
+    /// Started at sign-in over a remembered fullscreen/maximized placement, shown windowed: don't
+    /// save that as the new placement until the user resizes, maximizes or toggles fullscreen.
+    placement_hold: bool,
     tray: Option<tray::Tray>,
     /// The last tray balloon was "files received": clicking it shows them in Explorer.
     balloon_shows_files: bool,
@@ -507,6 +526,16 @@ fn run_input_batch(shared: &Shared, batch: Vec<InputCmd>) -> bool {
 
 fn host_has(flag: u32) -> bool {
     ui().shared.input_caps.load(Ordering::Relaxed) & flag != 0
+}
+
+/// Paused and not connected: Enter or a click in the window connects (`signin::paused_status`).
+fn paused_idle() -> bool {
+    ui().shared.paused.load(Ordering::Relaxed) && !connected()
+}
+
+/// Ctrl, Alt, Shift or Win is down (Alt+Enter is fullscreen, not Connect).
+fn modifier_held() -> bool {
+    [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN].iter().any(|k| unsafe { GetAsyncKeyState(k.0 as i32) } as u16 & 0x8000 != 0)
 }
 
 /// Keys go to the Mac (connected, keyboard not released).
@@ -991,6 +1020,23 @@ fn handle_key(hwnd: HWND, vk: u32, scan: u32, extended: bool, down: bool) -> boo
     if scan & 0x200 != 0 {
         return true;
     }
+    // Paused (Disconnected, e.g. started at sign-in): a plain Enter connects. Nothing is forwarded
+    // while paused, so this never takes a key from the Mac.
+    if vk == VK_RETURN.0 as u32 {
+        if down && paused_idle() && !modifier_held() {
+            STATE.with(|s| s.borrow_mut().enter_connects = true);
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_APP_CONNECT, WPARAM(0), LPARAM(0));
+            }
+            return true;
+        }
+        if STATE.with(|s| s.borrow().enter_connects) {
+            if !down {
+                STATE.with(|s| s.borrow_mut().enter_connects = false);
+            }
+            return true; // its repeats and release
+        }
+    }
     // Media keys (reported by virtual key): volume stays on this PC, where the Mac's audio plays;
     // play/pause/next/previous/stop go to the Mac when the host takes them (§3.6 ConsumerKey).
     if let Some(m) = input::media_key(vk) {
@@ -1207,7 +1253,11 @@ fn set_focus_state(hwnd: HWND, active: bool) {
             SetTimer(Some(hwnd), DESKTOP_TIMER, DESKTOP_TICK_MS, None);
         }
     } else {
-        STATE.with(|s| s.borrow_mut().desktop_tick = None);
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.desktop_tick = None;
+            s.enter_connects = false; // its key-up goes elsewhere now
+        });
         unsafe {
             let _ = KillTimer(Some(hwnd), DESKTOP_TIMER);
         }
@@ -1312,6 +1362,18 @@ fn button(hwnd: HWND, lparam: LPARAM, b: u8, down: bool) {
     }
     if !down && STATE.with(|s| std::mem::take(&mut s.borrow_mut().bar_buttons) & (1 << b) != 0) {
         return;
+    }
+    // Paused: a left click in the window connects, except the click that activated the window
+    // (someone just bringing it to the front). Its release is eaten like a bar click's.
+    if down && b == protocol::MOUSE_LEFT && nothing_held && !rel {
+        let activating = STATE.with(|s| std::mem::take(&mut s.borrow_mut().activation_click));
+        if paused_idle() {
+            if !activating {
+                STATE.with(|s| s.borrow_mut().bar_buttons |= 1 << b);
+                set_paused(hwnd, false);
+            }
+            return;
+        }
     }
     if !rel {
         send_move(hwnd, lparam);
@@ -1509,7 +1571,8 @@ fn update_title(hwnd: HWND) {
 
     // Title: just who we're looking at (stats live in the HUD, Ctrl+Alt+Shift+H).
     let mut t = match &status {
-        Some(st) => format!("Glide — {st}"),
+        // The first line: the paused status has a second one for the window only.
+        Some(st) => format!("Glide — {}", st.lines().next().unwrap_or_default()),
         None => format!("{host_name} — Glide"),
     };
     if kb_released && status.is_none() {
@@ -1655,6 +1718,7 @@ fn do_action(hwnd: HWND, a: Action) {
         }
         Action::OpenMenu => open_menu(hwnd, menu::Anchor::Cursor),
         Action::ToggleFullscreen => {
+            STATE.with(|s| s.borrow_mut().placement_hold = false);
             toggle_fullscreen(hwnd);
             schedule_view_check(hwnd);
             remember_placement(hwnd);
@@ -1947,13 +2011,30 @@ fn set_paused(hwnd: HWND, paused: bool) {
         }
         toast("Disconnected");
     } else {
+        if sh.open_pairing_on_connect.swap(false, Ordering::Relaxed) {
+            sh.inbound_pairing.lock().unwrap().open(Instant::now());
+        }
         toast("Connecting…");
     }
     update_title(hwnd);
 }
 
+/// The status line while paused: whom Connect reaches, and how.
+fn paused_status(target: &Target, shared: &Shared, ever_connected: bool) -> String {
+    match target {
+        Target::Listen(port) => crate::signin::paused_status(crate::signin::PausedTarget::Listen(*port)),
+        Target::Connect(_) | Target::Both { .. } => {
+            let name = if ever_connected { shared.host_name.lock().unwrap().clone() } else { shared.connect_label.clone() };
+            crate::signin::paused_status(crate::signin::PausedTarget::Mac(&name))
+        }
+    }
+}
+
 /// Save the window's normal rect, maximized and fullscreen state for its current monitor.
 fn remember_placement(hwnd: HWND) {
+    if STATE.with(|s| s.borrow().placement_hold) {
+        return;
+    }
     unsafe {
         if IsIconic(hwnd).as_bool() {
             return;
@@ -2208,6 +2289,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             schedule_view_check(hwnd);
             track_normal_rect(hwnd);
+            if wparam.0 as u32 == SIZE_MAXIMIZED {
+                STATE.with(|s| s.borrow_mut().placement_hold = false);
+            }
             SetTimer(Some(hwnd), PLACEMENT_TIMER, 1000, None);
             if relative() {
                 confine_cursor(hwnd);
@@ -2215,6 +2299,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_MOVE | WM_DISPLAYCHANGE | WM_EXITSIZEMOVE => {
+            if msg == WM_EXITSIZEMOVE {
+                STATE.with(|s| s.borrow_mut().placement_hold = false); // the user moved or resized it
+            }
             if relative() {
                 confine_cursor(hwnd);
             }
@@ -2268,6 +2355,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
             LRESULT(0)
+        }
+        WM_APP_CONNECT => {
+            if paused_idle() {
+                set_paused(hwnd, false);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEACTIVATE => {
+            // A left click in the client area of an inactive window: it only activates (doesn't
+            // Connect). Sent before that click's WM_LBUTTONDOWN.
+            let left_in_client = (lparam.0 & 0xFFFF) as u32 == HTCLIENT && ((lparam.0 >> 16) & 0xFFFF) as u32 == WM_LBUTTONDOWN;
+            STATE.with(|s| s.borrow_mut().activation_click = left_in_client);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_APP_HOTKEY => {
             if let Some(a) = Action::from_u8(wparam.0 as u8) {
@@ -2681,7 +2781,7 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
             // Tray "Disconnect": stop listening too, so the host can't reconnect until "Connect".
             listener = None;
             note = None;
-            set_status(&shared, &tx, hwnd_raw, Some("Disconnected — use the tray icon to connect".into()));
+            set_status(&shared, &tx, hwnd_raw, Some(paused_status(&connector.target, &shared, ever_connected)));
             if sleep_or_quit(&shared, Duration::from_millis(200)) {
                 return;
             }
@@ -3263,6 +3363,10 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     let initial_status = match &connector.target {
+        Target::Listen(port) if opts.start_paused => crate::signin::paused_status(crate::signin::PausedTarget::Listen(*port)),
+        Target::Connect(_) | Target::Both { .. } if opts.start_paused => {
+            crate::signin::paused_status(crate::signin::PausedTarget::Mac(&opts.connect_label))
+        }
         Target::Listen(port) => format!("Waiting for host on port {port}…"),
         Target::Connect(addr) | Target::Both { addr, .. } => format!("Connecting to {addr}…"),
     };
@@ -3272,11 +3376,20 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         has444: opts.has444,
         repair: AtomicBool::new(false),
         reconnect: AtomicBool::new(false),
-        paused: AtomicBool::new(false),
+        paused: AtomicBool::new(opts.start_paused),
+        open_pairing_on_connect: AtomicBool::new(opts.start_paused),
+        connect_label: opts.connect_label.clone(),
         abort_accept: AtomicBool::new(false),
         listening: matches!(connector.target, Target::Listen(_) | Target::Both { .. }),
         just_pinned: Mutex::new(None),
-        inbound_pairing: Mutex::new(peers::PairingWindow::opened_at(Instant::now())),
+        // Started paused: nobody can connect yet, so the window opens on the first Connect.
+        inbound_pairing: Mutex::new({
+            let mut w = peers::PairingWindow::opened_at(Instant::now());
+            if opts.start_paused {
+                w.close(Instant::now());
+            }
+            w
+        }),
         just_paired: Mutex::new(None),
         pin_target: connector.pin_target.clone(),
         pin_fallback: connector.pin_fallback.clone(),
@@ -3320,6 +3433,17 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         let ms = placement::monitors();
         config::choose_placement(&opts.store.config, &ms, placement::cursor_monitor_index(&ms))
     };
+    // Started at sign-in without connecting: the remembered monitor and size, but never
+    // fullscreen or maximized over the desktop someone just signed in to.
+    let mut placement_hold = false;
+    let restore = restore.map(|mut p| {
+        if opts.start_paused && (p.fullscreen || p.maximized) {
+            p.fullscreen = false;
+            p.maximized = false;
+            placement_hold = true;
+        }
+        p
+    });
     let _ = UI.set(UiCtx {
         ctrl_as_cmd: AtomicBool::new(opts.ctrl_as_cmd),
         natural_scrolling: AtomicBool::new(opts.store.config.natural_scrolling),
@@ -3334,6 +3458,7 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         s.hud_on = hud_on;
+        s.placement_hold = placement_hold;
         // GLIDE_TEST_ACTIONS=hud,mode,... (test hook): run these actions one per tick.
         s.test_actions = crate::util::test_hook("GLIDE_TEST_ACTIONS")
             .map(|v| v.split(',').filter_map(TestStep::parse).rev().collect())
@@ -3376,7 +3501,7 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         let mut rc = RECT { left: 0, top: 0, right: cw, bottom: ch };
         let dpi = GetDpiForSystem();
         let _ = AdjustWindowRectExForDpi(&mut rc, style, false, WINDOW_EX_STYLE(0), dpi);
-        let title: Vec<u16> = format!("Glide — {initial_status}").encode_utf16().chain(std::iter::once(0)).collect();
+        let title: Vec<u16> = format!("Glide — {}", initial_status.lines().next().unwrap_or_default()).encode_utf16().chain(std::iter::once(0)).collect();
         // Restore the remembered placement (last monitor) if any, else centered on the cursor monitor.
         let (x, y, w, h) = match &restore {
             Some(p) => (p.rect.l, p.rect.t, p.rect.w(), p.rect.h()),

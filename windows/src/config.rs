@@ -73,7 +73,10 @@ pub struct Config {
     /// The user chose to run the viewer from this exe without installing it (setup dialog), so
     /// starting it from there doesn't offer to install again.
     pub portable_exe: Option<String>,
-    /// When Glide starts at sign-in, connect right away (off: wait until the user chooses Connect).
+    /// When Windows starts the viewer at sign-in (the Run value passes `--startup`), connect right
+    /// away. Off (the default): it opens disconnected — no dialing, no listening for the Mac —
+    /// until Connect (Glide menu, tray, Enter or a click in the window). Launches by hand always
+    /// connect. See `signin::start_paused`.
     pub connect_at_signin: bool,
     /// "fast" | "sharp" | "hybrid"; None = automatic (hybrid if 4:4:4 decode works).
     pub mode: Option<String>,

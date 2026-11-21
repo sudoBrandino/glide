@@ -128,7 +128,7 @@ BEGIN
     PUSHBUTTON      "&Allow in Windows Firewall", IDC_SU_FIREWALL, 182, 99, 108, 14, WS_TABSTOP
     LTEXT           "", IDC_SU_FW_STATUS, 22, 116, 268, 26
     LTEXT           "", IDC_SU_THIS_PC, 22, 144, 268, 26
-    AUTOCHECKBOX    "&Start Glide when I sign in", IDC_SU_AUTOSTART, 10, 176, 280, 12, WS_TABSTOP | WS_GROUP
+    AUTOCHECKBOX    "&Start Glide when I sign in (opens without connecting)", IDC_SU_AUTOSTART, 10, 176, 280, 12, WS_TABSTOP | WS_GROUP
     AUTOCHECKBOX    "&Install Glide Viewer on this PC", IDC_SU_INSTALL, 10, 192, 280, 12, WS_TABSTOP
     LTEXT           "", IDC_SU_INSTALL_NOTE, 22, 205, 268, 18
     DEFPUSHBUTTON   "&Connect", IDOK, 184, 228, 52, 14, WS_TABSTOP | WS_GROUP

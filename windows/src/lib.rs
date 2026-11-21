@@ -30,6 +30,7 @@ pub mod peers;
 pub mod protocol;
 pub mod settings;
 pub mod setup;
+pub mod signin;
 pub mod util;
 pub mod version;
 
