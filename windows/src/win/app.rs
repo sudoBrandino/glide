@@ -1352,6 +1352,11 @@ fn button(hwnd: HWND, lparam: LPARAM, b: u8, down: bool) {
     let (x, y) = lparam_xy(lparam);
     let nothing_held = STATE.with(|s| s.borrow().buttons_down == 0);
     let rel = relative();
+    if down {
+        // A press of a button whose swallowed release never arrived (released outside the
+        // window without capture): forget it, so this press's release isn't swallowed instead.
+        STATE.with(|s| s.borrow_mut().bar_buttons &= !(1 << b));
+    }
     if down && nothing_held && !rel && cbar::hit(hwnd, x, y) {
         STATE.with(|s| s.borrow_mut().bar_buttons |= 1 << b);
         if b == protocol::MOUSE_LEFT {
@@ -1361,6 +1366,11 @@ fn button(hwnd: HWND, lparam: LPARAM, b: u8, down: bool) {
         return;
     }
     if !down && STATE.with(|s| std::mem::take(&mut s.borrow_mut().bar_buttons) & (1 << b) != 0) {
+        if STATE.with(|s| s.borrow().buttons_down == 0) {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+        }
         return;
     }
     // Paused: a left click in the window connects, except the click that activated the window
@@ -1370,6 +1380,11 @@ fn button(hwnd: HWND, lparam: LPARAM, b: u8, down: bool) {
         if paused_idle() {
             if !activating {
                 STATE.with(|s| s.borrow_mut().bar_buttons |= 1 << b);
+                // Capture until the release, so it is swallowed even if it happens outside the
+                // window (otherwise it would swallow the first forwarded release instead).
+                unsafe {
+                    SetCapture(hwnd);
+                }
                 set_paused(hwnd, false);
             }
             return;
@@ -1787,7 +1802,7 @@ fn do_action(hwnd: HWND, a: Action) {
             update_title(hwnd);
         }
         Action::Reconnect => {
-            sh.paused.store(false, Ordering::Relaxed);
+            resume(sh);
             let cur = sh.sender.lock().unwrap().clone();
             match cur {
                 Some(s) => {
@@ -2011,12 +2026,19 @@ fn set_paused(hwnd: HWND, paused: bool) {
         }
         toast("Disconnected");
     } else {
-        if sh.open_pairing_on_connect.swap(false, Ordering::Relaxed) {
-            sh.inbound_pairing.lock().unwrap().open(Instant::now());
-        }
+        resume(sh);
         toast("Connecting…");
     }
     update_title(hwnd);
+}
+
+/// Leave the paused state (Connect, Enter / click, the reconnect hotkey or menu item). The first
+/// resume after a paused start opens the inbound pairing window that startup deferred.
+fn resume(sh: &Shared) {
+    sh.paused.store(false, Ordering::Relaxed);
+    if sh.open_pairing_on_connect.swap(false, Ordering::Relaxed) {
+        sh.inbound_pairing.lock().unwrap().open(Instant::now());
+    }
 }
 
 /// The status line while paused: whom Connect reaches, and how.
