@@ -64,6 +64,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub enum Startup {
     /// Run the viewer (with the possibly updated config).
     Continue,
+    /// The dialog was shown and the user clicked Connect: run the viewer and connect, even when
+    /// it was started at sign-in (which otherwise opens disconnected).
+    Connect,
     /// The installed copy was started: exit this process.
     Exit,
 }
@@ -429,7 +432,7 @@ pub fn at_startup(store: &mut Store, forced: bool) -> Startup {
             }
         }
     }
-    Startup::Continue
+    Startup::Connect
 }
 
 /// "Set up…" (Glide menu / tray): Connect saves, then restarts the viewer with the new settings

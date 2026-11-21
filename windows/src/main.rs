@@ -351,7 +351,8 @@ fn main() -> ExitCode {
     if args.bench.is_none() && !args.forget_host && !args.identity {
         glide::win::setup::migrate_signin_entry();
     }
-    let start_paused = glide::signin::start_paused(args.startup, store.config.connect_at_signin);
+    #[allow(unused_mut)]
+    let mut start_paused = glide::signin::start_paused(args.startup, store.config.connect_at_signin);
     if start_paused {
         eprintln!("started at sign-in: not connecting until Connect (config \"connect_at_signin\" turns this off)");
     }
@@ -362,6 +363,8 @@ fn main() -> ExitCode {
     if args.bench.is_none() && !args.forget_host && !args.identity && !args.after_setup && (args.setup || (args.host.is_none() && args.listen.is_none() && args.connection.is_none())) {
         match glide::win::setup::at_startup(&mut store, args.setup) {
             glide::win::setup::Startup::Continue => {}
+            // Clicking Connect in the setup dialog is the user asking to connect, sign-in or not.
+            glide::win::setup::Startup::Connect => start_paused = false,
             glide::win::setup::Startup::Exit => return ExitCode::SUCCESS,
         }
     }
