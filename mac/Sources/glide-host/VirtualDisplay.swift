@@ -214,6 +214,13 @@ final class VirtualDisplayManager: @unchecked Sendable {
         if on { _ = setArrangement(streamingArrangement()) } else { _ = setArrangement(.none) }
     }
 
+    /// Settings → Reset: every host.json `virtualDisplay` key back to its default (on, per session,
+    /// mirrored). A connected viewer keeps its display until it disconnects.
+    func resetPreferences() {
+        persist { $0 = VirtualDisplayConfig() }
+        reconfigure(reason: "settings reset")
+    }
+
     /// Remove the display now (no viewer connected).
     func removeNow() { perform(lifecycle.removeRequested(), reason: "menu") }
 

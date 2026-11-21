@@ -3,17 +3,6 @@ import Foundation
 import GlideCore
 import UserNotifications
 
-/// host.json `"files": {"enabled": true, "receive": true, "downloadDir": "~/Downloads/Glide",
-/// "maxTotalBytes": 8589934592, "maxFiles": 10000}` (PROTOCOL.md §6).
-struct FileSettings: Codable {
-    var enabled: Bool?
-    /// Accept files dropped on the viewer window.
-    var receive: Bool?
-    var downloadDir: String?
-    var maxTotalBytes: UInt64?
-    var maxFiles: Int?
-}
-
 /// Resolved file-transfer settings.
 struct HostFileConfig {
     var enabled = true

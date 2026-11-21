@@ -17,6 +17,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         var selectDisplay: (UInt32) -> Void = { _ in }
         /// The setup window (Setup.swift).
         var showSetup: () -> Void = {}
+        /// The Settings window (Settings.swift).
+        var showSettings: () -> Void = {}
+        /// Dial the saved PC address now (host.json `connect`), or stop dialing.
+        var connectNow: () -> Void = {}
+        var stopDialing: () -> Void = {}
     }
 
     let menu = NSMenu()
@@ -41,6 +46,12 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     // Actions
     private let disconnectItem = NSMenuItem(title: "Disconnect Viewer", action: #selector(disconnect), keyEquivalent: "")
     private let pauseItem = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: "")
+    /// "Connect to PC (addr)" while a saved address isn't being dialed; "Stop Connecting to PC".
+    private let dialItem = NSMenuItem(title: "Connect to PC", action: #selector(toggleDial), keyEquivalent: "")
+    /// host.json `connect`, re-read on every refresh (the setup and Settings windows change it).
+    var savedConnect: () -> String? = {
+        ((try? ConfigFile.read(HostConfig.self, from: HostConfig.url)) ?? nil)?.connect
+    }
     private let pairItem = NSMenuItem(title: "Pair New Viewer…", action: #selector(togglePairing), keyEquivalent: "")
     private let viewersItem = NSMenuItem(title: "Paired Viewers", action: nil, keyEquivalent: "")
     private let viewersMenu = NSMenu()
@@ -101,7 +112,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             menu.addItem(i)
         }
         menu.addItem(.separator())
-        for i in [disconnectItem, pauseItem] { i.target = self; menu.addItem(i) }
+        for i in [disconnectItem, pauseItem, dialItem] { i.target = self; menu.addItem(i) }
         menu.addItem(.separator())
         pairItem.target = self
         menu.addItem(pairItem)
@@ -181,6 +192,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(virtualItem)
 
         menu.addItem(.separator())
+        add("Settings…", #selector(showSettings)).keyEquivalent = ","
         add("Set Up Glide Host…", #selector(showSetup))
         add("Open Log", #selector(openLog))
         menu.addItem(withTitle: "Glide Host \(GlideVersion.display)", action: nil, keyEquivalent: "").isEnabled = false
@@ -204,10 +216,12 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         return parts.isEmpty ? "" : "Latency: " + parts.joined(separator: " · ") + " ms"
     }
 
-    private func add(_ title: String, _ sel: Selector) {
+    @discardableResult
+    private func add(_ title: String, _ sel: Selector) -> NSMenuItem {
         let i = NSMenuItem(title: title, action: sel, keyEquivalent: "")
         i.target = self
         menu.addItem(i)
+        return i
     }
 
     // MARK: Refresh
@@ -278,6 +292,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
         disconnectItem.isEnabled = s.viewer != nil
         refreshFiles(s)
+        if s.dialTarget != nil && s.viewer == nil && !s.paused {
+            dialItem.title = "Stop Connecting to PC"
+            dialItem.isHidden = false
+        } else if s.dialTarget == nil, s.viewer == nil, !s.paused, let pc = savedConnect() {
+            dialItem.title = "Connect to PC (\(pc))"
+            dialItem.isHidden = false
+        } else { dialItem.isHidden = true }
         pauseItem.title = s.paused ? (s.dialTarget != nil ? "Resume Dialing" : "Resume") : (s.dialTarget != nil ? "Pause Dialing" : "Pause (Refuse Connections)")
 
         // Display submenu
@@ -611,6 +632,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     }
 
     @objc private func showSetup() { actions.showSetup() }
+    @objc private func showSettings() { actions.showSettings() }
+
+    @objc private func toggleDial() {
+        if HostStatus.shared.snapshot.dialTarget != nil { log("menu: stop connecting to the PC"); actions.stopDialing() }
+        else { log("menu: connect to the PC"); actions.connectNow() }
+        refresh()
+    }
 
     @objc private func restart() {
         log("menu: restart (launchd relaunches the host)")

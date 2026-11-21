@@ -18,6 +18,20 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ### Added
 
+- **Mac host: a Settings window.** Menu bar → **Settings…** (⌘,), or the setup window's
+  **Settings…** button, gathers everything Glide Host keeps in one place: start at login, the PC's
+  address, listening, display mode and virtual display, paired viewers (with key, pairing date,
+  Unpair and Pair New Viewer), clipboard, audio and file transfer (with the received-files folder),
+  and **Reset Settings**, which keeps your paired viewers. Display changes apply at once, sharing
+  changes from the next connection.
+- **Mac host: connecting out to the PC is now optional at startup.** Turn off **Connect out to the
+  PC automatically when Glide Host starts** (Settings → Connection, host.json
+  `"connectAtLaunch": false`) to keep the PC's address without dialing it at login; the menu bar's
+  new **Connect to PC** item (or **Connect Now** in Settings) dials it when you want, and **Stop
+  Connecting to PC** stops it. The default is unchanged: a saved address is dialed at startup.
+- **Mac host: clipboard sync and audio can be switched off** on the Mac (Settings → Sharing,
+  host.json `"clipboard": {"enabled": false}` and `"audio": {"enabled": false}`).
+
 - **Control a Windows PC from a Mac (preview).** Glide now works in the other direction too: run
   `glide-host.exe` on the PC and `glide-viewer` on the Mac. It pairs the same way (a 6-digit code
   confirmed on both screens) and streams hardware H.264/HEVC with keyboard, mouse and the PC's
@@ -29,6 +43,11 @@ changed for them, not how. Delete empty subsections when the release is cut.
   between them; the tray's **Connect to** submenu switches in one click. `--connection NAME` starts
   with a saved connection (and makes it the default), `--list-connections` prints them. The Mac
   address you already set up becomes the first saved connection.
+
+### Fixed
+
+- **Mac host:** a PC address given as a bare IPv6 address (`fe80::1`, no brackets) was dialed as
+  host `fe80`, port 1. It is now dialed on port 7420; use `[fe80::1]:PORT` for another port.
 
 ## [0.3.1] - 2026-11-15
 

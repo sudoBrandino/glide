@@ -16,6 +16,8 @@ final class SetupModel: ObservableObject {
         var setDialTarget: (String?) -> Void = { _ in }
         var openPairing: () -> Void = {}
         var cancelPairing: () -> Void = {}
+        /// The Settings window (Settings.swift).
+        var showSettings: () -> Void = {}
     }
 
     enum Check: Equatable { case ok, missing, unknown }
@@ -140,7 +142,8 @@ final class SetupModel: ObservableObject {
         do {
             let c = try HostConfig.update { $0.connect = t.isEmpty ? nil : t }
             savedPC = c.connect
-            actions.setDialTarget(c.connect)
+            // With "connect automatically at startup" off (Settings), saving only stores the address.
+            if c.connect == nil || c.dialsAtLaunch { actions.setDialTarget(c.connect) }
         } catch {
             self.error = HostConfig.notSavedText(error, what: "the PC's address")
         }
@@ -235,6 +238,7 @@ struct SetupView: View {
             if let b = m.busy { ProgressView().controlSize(.small); Text(b).foregroundStyle(.secondary) }
             Spacer()
             if m.installer == nil {
+                Button("Settings…") { m.actions.showSettings() }
                 Button(m.allDone ? "Done" : "Finish Later") { if m.finish() { close() } }
                     .keyboardShortcut(m.allDone ? .defaultAction : .cancelAction)
             } else {
@@ -407,14 +411,13 @@ final class SetupWindowController: NSObject, NSWindowDelegate {
         model.start()
         // A menu-bar app: become a regular app while the window is open, so it gets a Dock icon,
         // Cmd-Tab and keyboard focus.
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
+        AppWindows.opened()
         window.makeKeyAndOrderFront(nil)
     }
 
     func windowWillClose(_ notification: Notification) {
         model.stop()
-        NSApp.setActivationPolicy(.accessory)
+        AppWindows.closed(window)
         if model.installer != nil { NSApp.terminate(nil) }
     }
 

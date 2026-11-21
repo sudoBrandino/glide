@@ -259,8 +259,14 @@ only takes effect after the host restarts. The LaunchAgent restarts it on its ow
 | `pairedViewers` | Viewers allowed to connect: `name`, public `key`, `paired` date (see Pairing below) |
 | `salt`, `password` | v1 leftovers: no longer used (kept so a rollback to v1 still works) |
 | `connect` | The PC's address (`HOST[:PORT]`). If it is set, the host dials the viewer as well as listening |
+| `connectAtLaunch` | `false`: don't dial `connect` when the host starts; menu bar → Connect to PC dials it (default `true`; `--connect` always dials) |
 | `listen` | `false`: don't listen while `connect` is set, so nothing on the Mac accepts connections (default `true`) |
-| `clipboard` | `{"syncConcealed": false}`. `true` also syncs password-manager (concealed) pasteboard items to the viewer |
+| `clipboard` | `{"enabled": true, "syncConcealed": false}`. `enabled: false` turns clipboard sync off; `syncConcealed: true` also syncs password-manager (concealed) pasteboard items to the viewer |
+| `audio` | `{"enabled": true}`. `false` doesn't send the Mac's sound (like `GLIDE_NO_AUDIO=1`) |
+
+Every key is optional, and **Settings…** in the menu bar (⌘,) edits all of them except the v1
+leftovers. Display, virtual display and the login item apply at once; clipboard, audio and file
+transfer from the next connection; `listen` after a restart.
 
 ```sh
 H=~/Applications/Glide\ Host.app/Contents/MacOS/glide-host
@@ -340,10 +346,18 @@ hooks.
 `Glide Host.app` (built by `tools/make-host-app.sh`, installed as a LaunchAgent by
 `tools/install-host.sh`) shows a menu-bar item: state icon (waiting / dialing / connected / paused /
 problem), viewer name + IP, stream mode, resolution, fps / Mbps / encode ms, and actions (Disconnect,
-Pause, Send Files to Viewer…, Recent Transfers, Pair New Viewer…, Paired Viewers ▸ name ▸ Remove…,
-Display Mode, Virtual Display, Open Log, Restart, Quit Until Next Login — plain Quit would just be relaunched by the
+Pause, Connect to PC / Stop Connecting to PC, Send Files to Viewer…, Recent Transfers, Pair New Viewer…, Paired Viewers ▸ name ▸ Remove…,
+Display Mode, Virtual Display, Settings… (⌘,), Open Log, Restart, Quit Until Next Login — plain Quit would just be relaunched by the
 agent's KeepAlive). The last security event ("Rejected unknown viewer …", "Paired …") is shown as an
 info row.
+
+**Settings…** (⌘,, also in the setup window) opens a Settings window with everything the host
+keeps: start at login and the log (General); the PC's address, whether to connect out to it
+automatically at startup, Connect Now / Stop Connecting, and listening (Connection); display mode
+and virtual display (Display); paired viewers with their key and pairing date, Unpair and Pair New
+Viewer (Viewers); clipboard, audio and file transfer with the received-files folder (Sharing); and
+the config folder and Reset Settings, which keeps paired viewers, this Mac's key and the login item
+(Advanced). `glide-host --settings-preview OUT.png --tab NAME` renders a tab without a server.
 
 ## File transfer
 
