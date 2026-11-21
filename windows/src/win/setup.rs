@@ -199,13 +199,13 @@ fn run_value_get() -> Option<String> {
 }
 
 /// Starts at sign-in now: the Run value, or install.ps1's Startup shortcut.
-fn autostart_on() -> bool {
+pub(super) fn autostart_on() -> bool {
     run_value_get().is_some() || startup_shortcut().is_some_and(|p| p.exists())
 }
 
 /// Turn start-at-sign-in on (Run value → `exe --startup`) or off. An install.ps1 Startup
 /// shortcut is removed either way (it may carry old arguments, and two entries start twice).
-fn set_autostart(on: bool, exe: &Path) -> Result<(), String> {
+pub(super) fn set_autostart(on: bool, exe: &Path) -> Result<(), String> {
     if let Some(s) = startup_shortcut().filter(|p| p.exists()) {
         let _ = std::fs::remove_file(s);
     }
@@ -346,8 +346,13 @@ fn fix_shortcut_arguments(exe: &Path) {
 }
 
 pub(super) fn spawn(exe: &Path) -> Result<(), String> {
+    spawn_args(exe, &["--after-setup".to_string()])
+}
+
+/// Start `exe` with exactly these arguments (from its own folder).
+pub(super) fn spawn_args(exe: &Path, args: &[String]) -> Result<(), String> {
     let mut c = std::process::Command::new(exe);
-    c.arg("--after-setup");
+    c.args(args);
     if let Some(d) = exe.parent() {
         c.current_dir(d);
     }
