@@ -134,7 +134,19 @@ pub fn show(hwnd: HWND) {
         );
         let t = wide(&text);
         if unsafe { MessageBoxW(Some(hwnd), PCWSTR(t.as_ptr()), TITLE, MB_YESNO | MB_ICONQUESTION) } == IDYES {
-            super::connections::restart(hwnd);
+            // Keep this run's launch arguments (a Mac address or --listen on the command line wins
+            // over the saved connection), so the restart reopens the same target.
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            match super::setup::spawn_args(&super::setup::current_exe(), &logic::restart_args(&args)) {
+                Ok(()) => unsafe {
+                    let _ = DestroyWindow(hwnd);
+                },
+                Err(e) => {
+                    eprintln!("settings: restart: {e}");
+                    let t = wide(&e);
+                    unsafe { MessageBoxW(Some(hwnd), PCWSTR(t.as_ptr()), TITLE, MB_OK | MB_ICONWARNING) };
+                }
+            }
         } else {
             eprintln!("settings: restart later for {}", logic::join_words(&restart));
         }

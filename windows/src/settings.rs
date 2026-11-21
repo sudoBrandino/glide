@@ -239,6 +239,15 @@ fn parse_gb(text: &str) -> Result<u64, String> {
     Ok((v * GIB).round() as u64)
 }
 
+/// The arguments for the restart Settings offers: this run's own (so a Mac address or `--listen`
+/// given on the command line keeps winning over the saved connection), without the one-shot
+/// launch flags, plus `--after-setup` (don't open the setup dialog again). `--startup` is dropped
+/// too: someone is at the PC changing settings, so the restarted viewer connects.
+pub fn restart_args(current: &[String]) -> Vec<String> {
+    let one_shot = ["--setup", "--after-setup", crate::signin::STARTUP_FLAG];
+    current.iter().filter(|a| !one_shot.contains(&a.as_str())).cloned().chain(std::iter::once("--after-setup".to_string())).collect()
+}
+
 /// Does `s` look like a full Windows folder path ("C:\…", "\\server\share", or starting with an
 /// environment variable such as "%USERPROFILE%\…")?
 pub fn looks_like_folder(s: &str) -> bool {
@@ -580,6 +589,14 @@ mod tests {
         assert_eq!(v.allowed_peers, vec!["192.168.1.50", "192.168.1.0/24"]);
         d.download_dir = "   ".into();
         assert_eq!(validate(&d).unwrap().download_dir, None);
+    }
+
+    #[test]
+    fn restart_keeps_the_launch_target() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(restart_args(&[]), v(&["--after-setup"]));
+        assert_eq!(restart_args(&v(&["10.0.0.5", "--no-audio"])), v(&["10.0.0.5", "--no-audio", "--after-setup"]));
+        assert_eq!(restart_args(&v(&["--listen", "--startup", "--after-setup", "--setup"])), v(&["--listen", "--after-setup"]));
     }
 
     #[test]

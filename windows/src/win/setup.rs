@@ -346,8 +346,13 @@ fn fix_shortcut_arguments(exe: &Path) {
 }
 
 pub(super) fn spawn(exe: &Path) -> Result<(), String> {
+    spawn_args(exe, &["--after-setup".to_string()])
+}
+
+/// Start `exe` with exactly these arguments (from its own folder).
+pub(super) fn spawn_args(exe: &Path, args: &[String]) -> Result<(), String> {
     let mut c = std::process::Command::new(exe);
-    c.arg("--after-setup");
+    c.args(args);
     if let Some(d) = exe.parent() {
         c.current_dir(d);
     }
