@@ -202,6 +202,6 @@ public enum ViewerStatusText {
 
     public static func hostKeyChanged(host: String, presented: Data) -> String {
         "HOST KEY CHANGED for \(host) (now \(GlideHandshake.fingerprint(presented))). This could be an impersonation attempt. "
-            + "If you reset or reinstalled Glide on the PC, run glide-viewer --forget \(host), then pair again."
+            + "If you reset or reinstalled Glide on the PC, unpair it in Connections (or run glide-viewer --forget \(host)), then pair again."
     }
 }
