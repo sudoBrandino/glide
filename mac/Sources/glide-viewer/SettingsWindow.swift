@@ -110,7 +110,10 @@ final class SettingsController: NSObject {
 
     private func save(_ change: @escaping (inout ViewerConfig) -> Void) {
         var saved: ViewerConfig?
-        if let err = ViewerStore.update({ c in change(&c); saved = c }) {
+        let err = ViewerStore.update({ c in change(&c); saved = c })
+        // `update` runs the closure before writing: a failed write must not reach the session.
+        if err != nil { saved = nil }
+        if let err {
             let a = NSAlert()
             a.messageText = "Can't save viewer.json"
             a.informativeText = "\(err)"
