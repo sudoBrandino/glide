@@ -14,6 +14,8 @@ import SwiftUI
 final class SetupModel: ObservableObject {
     struct Actions {
         var setDialTarget: (String?) -> Void = { _ in }
+        /// Dialing a PC now (at launch, or Connect Now with connect-at-launch off).
+        var isDialing: () -> Bool = { false }
         var openPairing: () -> Void = {}
         var cancelPairing: () -> Void = {}
         /// The Settings window (Settings.swift).
@@ -142,8 +144,9 @@ final class SetupModel: ObservableObject {
         do {
             let c = try HostConfig.update { $0.connect = t.isEmpty ? nil : t }
             savedPC = c.connect
-            // With "connect automatically at startup" off (Settings), saving only stores the address.
-            if c.connect == nil || c.dialsAtLaunch { actions.setDialTarget(c.connect) }
+            // With "connect automatically at startup" off (Settings), saving only stores the
+            // address, unless Glide is already dialing (Connect Now): then it dials the new one.
+            if c.connect == nil || c.dialsAtLaunch || actions.isDialing() { actions.setDialTarget(c.connect) }
         } catch {
             self.error = HostConfig.notSavedText(error, what: "the PC's address")
         }

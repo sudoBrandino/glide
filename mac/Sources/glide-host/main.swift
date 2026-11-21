@@ -635,6 +635,7 @@ func showSetup() {
     guard !hostTestMode else { return }
     let ctl = SetupWindowController.shared ?? SetupWindowController(model: SetupModel(installer: nil, actions: .init(
         setDialTarget: { server.setDialTarget($0) },
+        isDialing: { server.isDialing },
         openPairing: { pairing.openWindow(source: "setup window") },
         cancelPairing: { pairing.cancelWindow(source: "setup window") },
         showSettings: { showSettings() })))
