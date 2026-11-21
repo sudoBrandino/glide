@@ -194,9 +194,10 @@ impl FirewallStatus {
     }
 }
 
-/// The value stored under the Run key: the quoted exe path.
+/// The value stored under the Run key: the quoted exe path and `--startup`, so a sign-in launch
+/// opens without connecting (config `connect_at_signin`, see `signin`).
 pub fn run_value(exe: &Path) -> String {
-    format!("\"{}\"", exe.display())
+    format!("\"{}\" {}", exe.display(), crate::signin::STARTUP_FLAG)
 }
 
 #[cfg(test)]
@@ -271,7 +272,7 @@ mod tests {
         assert!(!FirewallStatus::parse("allow=0 block=0 public=0").unwrap().ok());
         assert_eq!(FirewallStatus::parse("garbage"), None);
         assert_eq!(FirewallStatus::parse("allow=x"), None);
-        assert_eq!(run_value(Path::new("C:\\a b\\g.exe")), "\"C:\\a b\\g.exe\"");
+        assert_eq!(run_value(Path::new("C:\\a b\\g.exe")), "\"C:\\a b\\g.exe\" --startup");
     }
 
     #[test]

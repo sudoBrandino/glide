@@ -29,6 +29,7 @@ pub mod noise;
 pub mod peers;
 pub mod protocol;
 pub mod setup;
+pub mod signin;
 pub mod util;
 pub mod version;
 

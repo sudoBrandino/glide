@@ -6,7 +6,8 @@
 //! - **Let the Mac connect to this PC** (config `accept_incoming`; with an address the viewer
 //!   dials *and* listens, see `app::both_round`) + **Allow in Windows Firewall**: one elevated
 //!   PowerShell step (UAC shield) that removes Block rules for the exe and adds an Allow rule.
-//! - **Start Glide when I sign in** (HKCU Run value).
+//! - **Start Glide when I sign in** (HKCU Run value, with `--startup`: it opens without connecting
+//!   unless config `connect_at_signin`; see `crate::signin`).
 //! - **Install Glide Viewer on this PC** when the exe runs from somewhere else (Downloads): copy to
 //!   `%LOCALAPPDATA%\Glide` (or the folder the Start Menu shortcut points to), create the Start
 //!   Menu shortcut, close an installed viewer that is running (asks first), start the installed
@@ -63,6 +64,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub enum Startup {
     /// Run the viewer (with the possibly updated config).
     Continue,
+    /// The dialog was shown and the user clicked Connect: run the viewer and connect, even when
+    /// it was started at sign-in (which otherwise opens disconnected).
+    Connect,
     /// The installed copy was started: exit this process.
     Exit,
 }
@@ -148,10 +152,14 @@ fn read_shortcut(lnk: PathBuf) -> Option<(PathBuf, String)> {
 
 /// Create (or overwrite) a .lnk to `target` with no arguments (the config says where to connect).
 fn write_shortcut(lnk: PathBuf, target: PathBuf) -> Result<(), String> {
+    write_shortcut_with_args(lnk, target, String::new())
+}
+
+fn write_shortcut_with_args(lnk: PathBuf, target: PathBuf, args: String) -> Result<(), String> {
     with_com(move || unsafe {
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(|e| e.to_string())?;
         link.SetPath(PCWSTR(wide(&target.to_string_lossy()).as_ptr())).map_err(|e| e.to_string())?;
-        link.SetArguments(w!("")).map_err(|e| e.to_string())?;
+        link.SetArguments(PCWSTR(wide(&args).as_ptr())).map_err(|e| e.to_string())?;
         if let Some(dir) = target.parent() {
             let _ = link.SetWorkingDirectory(PCWSTR(wide(&dir.to_string_lossy()).as_ptr()));
         }
@@ -195,7 +203,7 @@ fn autostart_on() -> bool {
     run_value_get().is_some() || startup_shortcut().is_some_and(|p| p.exists())
 }
 
-/// Turn start-at-sign-in on (Run value → `exe`, no arguments) or off. An install.ps1 Startup
+/// Turn start-at-sign-in on (Run value → `exe --startup`) or off. An install.ps1 Startup
 /// shortcut is removed either way (it may carry old arguments, and two entries start twice).
 fn set_autostart(on: bool, exe: &Path) -> Result<(), String> {
     if let Some(s) = startup_shortcut().filter(|p| p.exists()) {
@@ -214,6 +222,32 @@ fn set_autostart(on: bool, exe: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// At startup: a sign-in entry written before `--startup` existed (Run value, or an older
+/// install.ps1's Startup shortcut) gets it, so sign-in opens without connecting. Only entries
+/// that start this exe: an older copy elsewhere wouldn't know the flag (`signin` has the rules).
+pub fn migrate_signin_entry() {
+    let exe = current_exe();
+    if let Some(v) = run_value_get().and_then(|v| crate::signin::migrate_run_value(&v, &exe)) {
+        let name = wide(logic::RUN_VALUE);
+        let w = wide(&v);
+        let r = unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, PCWSTR(name.as_ptr()), REG_SZ.0, Some(w.as_ptr().cast()), (w.len() * 2) as u32) };
+        if r == ERROR_SUCCESS {
+            eprintln!("setup: sign-in entry now opens Glide without connecting ({v})");
+        } else {
+            eprintln!("setup: can't update the sign-in entry ({})", windows::core::Error::from(r.to_hresult()));
+        }
+    }
+    let Some(lnk) = startup_shortcut().filter(|p| p.exists()) else { return };
+    if let Some((target, args)) = read_shortcut(lnk.clone()) {
+        if let Some(new_args) = crate::signin::migrate_shortcut_args(&target, &args, &exe) {
+            match write_shortcut_with_args(lnk, target, new_args) {
+                Ok(()) => eprintln!("setup: Startup shortcut now opens Glide without connecting"),
+                Err(e) => eprintln!("setup: can't update the Startup shortcut: {e}"),
+            }
+        }
+    }
 }
 
 fn message(owner: Option<HWND>, text: &str, flags: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
@@ -398,7 +432,7 @@ pub fn at_startup(store: &mut Store, forced: bool) -> Startup {
             }
         }
     }
-    Startup::Continue
+    Startup::Connect
 }
 
 /// "Set up…" (Glide menu / tray): Connect saves, then restarts the viewer with the new settings

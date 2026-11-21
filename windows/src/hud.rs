@@ -131,7 +131,7 @@ pub fn lines(i: &HudInfo) -> Vec<String> {
     let mut v = Vec::with_capacity(8);
     v.push(format!("Glide · {}", i.host_name));
     if let Some(s) = &i.status {
-        v.push(s.clone());
+        v.extend(s.lines().map(String::from));
         v.push(format!("view {}x{}", i.view.0, i.view.1));
         return v;
     }
