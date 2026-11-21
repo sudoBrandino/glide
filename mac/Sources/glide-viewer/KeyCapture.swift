@@ -116,6 +116,10 @@ final class KeyCapture {
     /// Sends the held-back Control/Option/Shift presses before a click or scroll they apply to.
     func flushModifiers() { deliver(filter.flush()) }
 
+    /// A click in the session: sends held-back modifiers first, and tracks drags (modifiers
+    /// pressed during one go straight through).
+    func mouseButton(_ button: UInt8, down: Bool) { deliver(filter.pointerButton(button, down: down)) }
+
     /// One key event. Returns true when it was consumed here (sent to the host, or a shortcut).
     func handleKey(code: UInt16, type: CGEventType, flags: UInt64) -> Bool {
         guard let sink else { return false }

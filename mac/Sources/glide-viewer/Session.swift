@@ -665,8 +665,9 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
     func pointerMoved(x: Float, y: Float) { send(.mouseMove(x: x, y: y)) }
 
     func mouseButton(_ button: UInt8, down: Bool) {
-        // Held-back Control/Option/Shift apply to the click (Shift-click, Ctrl-click).
-        if capturingKeys { keys.flushModifiers() }
+        // Held-back Control/Option/Shift apply to the click (Shift-click, Ctrl-click); the filter
+        // also tracks the button so modifiers pressed mid-drag reach the PC at once.
+        keys.mouseButton(button, down: down)
         send(.mouseButton(button: button, down: down))
     }
 

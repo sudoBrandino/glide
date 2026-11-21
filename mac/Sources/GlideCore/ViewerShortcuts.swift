@@ -155,6 +155,9 @@ public struct ShortcutKeyFilter {
     /// Keys whose remaining events are dropped: shortcut keys (their repeats and release), and
     /// held-back modifiers a shortcut used up (their release).
     private var swallowed = Set<UInt16>()
+    /// Mouse buttons down in the session: while one is (a drag), modifiers go straight through,
+    /// since the drag's moves would otherwise reach the PC without them (Shift to constrain).
+    private var buttons = Set<UInt8>()
 
     public init(bindings: ShortcutBindings = .ansi) { self.bindings = bindings }
 
@@ -162,10 +165,15 @@ public struct ShortcutKeyFilter {
     public mutating func keyDown(_ code: UInt16, flags: UInt64) -> [Output] {
         if swallowed.contains(code) { return [] }  // auto-repeat of a shortcut key
         if let s = bindings.match(keyCode: code, flags: flags) {
+            // The key was already down on the PC (held before the chord, now repeating): release
+            // it there before its remaining events are swallowed, or it would stay held.
+            var out: [Output] = []
+            if forwarded.remove(code) != nil { out.append(.send(keyCode: code, down: false)) }
             swallowed.insert(code)
             swallowed.formUnion(heldBack)
             heldBack.removeAll()
-            return [.shortcut(s)]
+            out.append(.shortcut(s))
+            return out
         }
         var out = flush()
         forwarded.insert(code)
@@ -184,7 +192,7 @@ public struct ShortcutKeyFilter {
         if down {
             if heldBack.contains(code) || forwarded.contains(code) { return [] }  // duplicate event
             swallowed.remove(code)
-            if ShortcutChord.isChordModifier(keyCode: code) && forwarded.isEmpty {
+            if ShortcutChord.isChordModifier(keyCode: code) && forwarded.isEmpty && buttons.isEmpty {
                 heldBack.append(code)
                 return []
             }
@@ -214,8 +222,16 @@ public struct ShortcutKeyFilter {
         return out
     }
 
+    /// A mouse button went down or up in the session. Sends the held-back modifiers first (they
+    /// apply to the click: Shift-click, Ctrl-click).
+    public mutating func pointerButton(_ button: UInt8, down: Bool) -> [Output] {
+        if down { buttons.insert(button) } else { buttons.remove(button) }
+        return flush()
+    }
+
     /// Forget everything (capture stopped; the PC was told to release all keys).
     public mutating func reset() {
+        buttons.removeAll()
         heldBack.removeAll()
         forwarded.removeAll()
         swallowed.removeAll()

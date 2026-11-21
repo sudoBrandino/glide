@@ -122,4 +122,13 @@ func viewerShortcutTests() {
     // Duplicate modifier-down events don't double up.
     let dup = run(true) { f in [f.modifier(lShift, down: true), f.modifier(lShift, down: true), f.keyDown(kA, flags: shift)] }
     check(dup == ["+E1", "+04"], "shortcuts: a repeated modifier down is sent once \(dup)")
+    // Mid-drag, a modifier reaches the PC at once (the drag's moves need it), and is released.
+    let drag = run(true) { f in [f.pointerButton(1, down: true), f.modifier(lShift, down: true), f.pointerButton(1, down: false), f.modifier(lShift, down: false)] }
+    check(drag == ["+E1", "-E1"], "shortcuts: Shift pressed during a drag is sent at once \(drag)")
+    // F held before the chord: its repeat fires the shortcut, and F is released on the PC first.
+    let heldF = run(true) { f in [f.keyDown(kF, flags: 0), f.modifier(lCtrl, down: true), f.modifier(lOpt, down: true), f.modifier(lShift, down: true),
+                                  f.keyDown(kF, flags: chord), f.keyUp(kF)] }
+    check(heldF.first == "+09" && heldF.contains("-09") && heldF.contains("!toggleFullScreen")
+          && heldF.firstIndex(of: "-09")! < heldF.firstIndex(of: "!toggleFullScreen")! && heldF.filter { $0 == "-09" }.count == 1,
+          "shortcuts: a key held before the chord is released on the PC before its shortcut \(heldF)")
 }
