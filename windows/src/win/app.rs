@@ -341,6 +341,67 @@ pub(super) fn update_store(f: impl FnOnce(&mut config::Config)) {
     ui().store.lock().unwrap().update(f);
 }
 
+/// This viewer's key fingerprint (Settings → Network & security).
+static VIEWER_FINGERPRINT: OnceLock<String> = OnceLock::new();
+
+pub(super) fn viewer_fingerprint() -> String {
+    VIEWER_FINGERPRINT.get().cloned().unwrap_or_default()
+}
+
+/// What the Settings window needs to know about this run: its pin targets, whether audio
+/// playback is running, and whether this PC decodes HEVC 4:4:4.
+pub(super) fn settings_running() -> (crate::settings::Running, bool) {
+    let sh = &ui().shared;
+    let pins = std::iter::once(sh.pin_target.clone()).chain(sh.pin_fallback.clone()).collect();
+    (crate::settings::Running { pins, audio: sh.audio.is_some() }, sh.has444)
+}
+
+/// Settings window (OK / Apply): the config is already saved; switch what applies at once.
+pub(super) fn apply_live_settings(hwnd: HWND, changes: &[crate::settings::Live]) {
+    use crate::settings::Live;
+    for &l in changes {
+        match l {
+            Live::Hud(on) => {
+                STATE.with(|s| s.borrow_mut().hud_on = on);
+                update_title(hwnd);
+            }
+            Live::BarPinned(on) => cbar::set_pinned(hwnd, on),
+            Live::Mode(m) => {
+                let (next, _) = config::resolve_mode(m, &config::Config::default(), ui().shared.has444);
+                if next != current_mode() {
+                    switch_mode(hwnd, next, false);
+                }
+            }
+            Live::CtrlAsCmd(on) => {
+                if ui().ctrl_as_cmd.load(Ordering::Relaxed) != on {
+                    release_all(hwnd); // held keys were sent with the old mapping
+                    ui().ctrl_as_cmd.store(on, Ordering::Relaxed);
+                }
+            }
+            Live::NaturalScrolling(on) => ui().natural_scrolling.store(on, Ordering::Relaxed),
+            Live::AudioMuted(muted) => {
+                if let Some(a) = ui().shared.audio.as_ref().filter(|a| a.muted() != muted) {
+                    a.set_muted(muted);
+                    send(ClientMsg::AudioEnable { enabled: !muted });
+                    update_title(hwnd);
+                }
+            }
+            Live::Clipboard(on) => {
+                if clipboard::is_active() != on {
+                    clipboard::set_active(hwnd, on);
+                    if on && connected() && !clipboard::negotiated() {
+                        do_action(hwnd, Action::Reconnect);
+                    }
+                }
+            }
+            Live::ClipboardSecrets(on) => clipboard::set_sync_secrets(on),
+        }
+    }
+    if !changes.is_empty() {
+        toast("Settings saved");
+    }
+}
+
 /// Messages from the UI thread go through this queue to the "glide-input" thread, so neither the
 /// UI thread nor the low-level keyboard hook running on it ever blocks on a full socket (behind a
 /// file upload, or a link that silently dropped). A hook that stalls freezes the keyboard of the
@@ -1781,6 +1842,11 @@ fn select_display(id: u32, st: &DisplayState) {
 
 /// Switch the stream mode (SetMode), remembered in the config and used for reconnects.
 fn set_mode(hwnd: HWND, next: Mode) {
+    switch_mode(hwnd, next, true);
+}
+
+/// `set_mode`; `persist` false when the config already says what to use (Settings: Automatic).
+fn switch_mode(hwnd: HWND, next: Mode, persist: bool) {
     let sh = &ui().shared;
     if next != Mode::Fast && !sh.has444 {
         toast("Only Fast mode — this PC can't decode HEVC 4:4:4");
@@ -1788,7 +1854,9 @@ fn set_mode(hwnd: HWND, next: Mode) {
     }
     sh.mode.store(next as u8, Ordering::Relaxed);
     sh.stats.showing_sharp.store(0, Ordering::Relaxed);
-    ui().store.lock().unwrap().update(|c| c.set_mode(next));
+    if persist {
+        ui().store.lock().unwrap().update(|c| c.set_mode(next));
+    }
     if connected() {
         eprintln!("mode -> {} (SetMode)", next.name());
         send(ClientMsg::SetMode { mode: next as u8, bitrate_kbps: 0, max_fps: 0 });
@@ -1894,10 +1962,7 @@ fn run_menu_cmd(hwnd: HWND, c: Cmd) {
         }
         Cmd::SetUp => set_up(hwnd),
         Cmd::Connections => manage_connections(hwnd),
-        Cmd::Settings => match ui().store.lock().unwrap().path() {
-            Some(p) => tray::open_in_editor(&p),
-            None => toast("No config file (APPDATA not set)"),
-        },
+        Cmd::Settings => super::settings::show(hwnd),
         Cmd::OpenMenu => open_menu(hwnd, menu::Anchor::Cursor),
         Cmd::SendFiles | Cmd::SendFolder => {
             if let Some(t) = files::pick_and_send(hwnd, c == Cmd::SendFolder) {
@@ -2373,13 +2438,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 Some(tray::MenuCmd::Disconnect) => set_paused(hwnd, true),
                 Some(tray::MenuCmd::Reconnect) => do_action(hwnd, Action::Reconnect),
                 Some(tray::MenuCmd::ToggleHud) => do_action(hwnd, Action::ToggleHud),
-                Some(tray::MenuCmd::OpenConfig) => {
-                    let path = ui().store.lock().unwrap().path();
-                    match path {
-                        Some(p) => tray::open_in_editor(&p),
-                        None => toast("No config file (APPDATA not set)"),
-                    }
-                }
+                Some(tray::MenuCmd::Settings) => super::settings::show(hwnd),
                 Some(tray::MenuCmd::ToggleMute) => toggle_mute(hwnd),
                 Some(tray::MenuCmd::ForgetHost) => forget_host(hwnd),
                 Some(tray::MenuCmd::CancelFiles) => do_action(hwnd, Action::CancelFiles),
@@ -3321,6 +3380,7 @@ fn run_connection(mut conn: Connection, shared: &Arc<Shared>, tx: &mpsc::Sender<
 }
 
 pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
+    let _ = VIEWER_FINGERPRINT.set(connector.identity.fingerprint());
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }

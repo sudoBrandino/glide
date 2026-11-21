@@ -17,8 +17,9 @@ The wire protocol is defined in `../docs/PROTOCOL.md`.
 | `src/clipboard.rs` | Clipboard sync logic without Win32: CRLF↔LF, echo guard, DIB↔PNG (`png` crate). Unit-tested. |
 | `src/files.rs` | File transfer (PROTOCOL.md §6) without Win32: name sanitizer, receiver (temp → SHA-256 → no-overwrite rename), sender (folder walk, chunking), `Service` (transfers + ack window). Unit-tested, incl. a two-service loopback. |
 | `src/annexb.rs`, `src/bench.rs` | Annex-B access-unit splitting, and the headless benchmark driver. |
+| `src/settings.rs` | The Settings window's model, platform independent: settings read from the config, validation of the typed fields, which changes apply at once and which need a restart, writing only the changed fields back. Unit-tested. |
 | `src/setup.rs` | Setup logic, platform independent: install folder, "offer to install?", Mac address check and port test, this PC's address, the firewall PowerShell (check + elevated allow). |
-| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain, text panels), `app` (window, input, cursor, fullscreen, hotkeys, the session loop incl. both mode), `clipboard` (clipboard listener/apply), `files` (drag & drop, notifications, open folder), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`, `dpapi` (identity key encryption), `prompt` (pairing dialog), `setup` (setup dialog, self-install, firewall, start at sign-in), `placement` (monitors), `tray`. |
+| `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain, text panels), `app` (window, input, cursor, fullscreen, hotkeys, the session loop incl. both mode), `clipboard` (clipboard listener/apply), `files` (drag & drop, notifications, open folder), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`, `dpapi` (identity key encryption), `prompt` (pairing dialog), `settings` (Settings window), `setup` (setup dialog, self-install, firewall, start at sign-in), `placement` (monitors), `tray`. |
 | `src/host/`, `src/bin/glide-host.rs` | **glide-host.exe**, the Windows host (a Mac controls this PC, see below). Platform independent and unit-tested: `trust` (host.json, pairing window, host key), `auth` (host side of the handshake, pairing, rate limiting; tested end to end against the viewer's `net::Connection`), `stream` (validated viewer messages), `input` (HID → scancode, wheel, absolute mouse), `video` (sizes, codec, bitrate, Annex-B, cursor bitmaps). Windows only, `src/host/win/`: `capture` (DXGI Desktop Duplication), `convert` (D3D11 video processor, BGRA → NV12), `encoder` (Media Foundation H.264/HEVC MFT), `inject` (SendInput), `cursor`, `confirm` (pairing dialog), `tray`, `session`. |
 | `res/`, `build.rs` | Icon, manifest (themed controls, PerMonitorV2), pairing dialog and version info, linked into the exe: MinGW `windres` for the GNU target, `rc.exe` (via `embed-resource`) for MSVC. Regenerate the icon with `../tools/make_icon.py`. |
 | `assets/` | Small clips embedded in the exe for `--probe`. Regenerate them with `../tools/make_streams.sh --clips-only`. |
@@ -120,10 +121,46 @@ saves the choice and restarts the viewer onto it (like **Connect** in the setup 
 - Test hook (`--features test-hooks` builds only): `GLIDE_CONNS_DUMP=x.bmp` saves a capture of the
   Connections window after about 0.5 s and closes it.
 
+### Settings window
+
+Glide menu, system menu or tray → *Settings…*. A page list on the left; **OK**, **Cancel** and
+**Apply** at the bottom. Nothing is saved before OK or Apply (that includes Unpair, Forget
+remembered displays and Reset to defaults).
+
+| Page | Settings (config key) |
+|---|---|
+| General | Start Glide when I sign in (the `HKCU\…\Run` value, as in Set up), Connect to the Mac right away when Glide starts at sign-in (`connect_at_signin`, off by default), pin the connection bar (`bar_pinned`), stats overlay (`hud`) |
+| Picture | Stream mode: Automatic, Hybrid, Fast or Sharp (`mode`; Automatic = `null`), with a line about each and a note when this PC can't decode HEVC 4:4:4; Forget remembered displays (`last_display`) |
+| Keyboard & mouse | Ctrl acts as Command (`ctrl_as_cmd`), natural scrolling (`natural_scrolling`) |
+| Audio | Play the Mac's sound (`audio`), muted (`audio_muted`) |
+| Clipboard | Share the clipboard (`clipboard`), also share items marked private (`clipboard_sync_secrets`, with a warning that turns red while it is on) |
+| Files | File transfer (`file_transfer`), accept files the Mac sends (`file_receive`), the download folder (`download_dir`: Browse…, Default), the largest transfer in GB and the most files per transfer (`file_max_total_bytes`, `file_max_files`) |
+| Network & security | Listen port (`listen_port`), let the Mac connect to this PC (`accept_incoming` of the current connection), allowed Mac addresses (`allowed_peers`, one IP or CIDR per line), paired Macs (`pinned_hosts`) with Unpair, this viewer's key fingerprint with Copy |
+| Advanced | Where the config file is, *Open config file…* (Notepad, the old *Settings…* behavior), *Reset to defaults…* (keeps saved connections, pairings, allowed addresses and start at sign-in) |
+
+- **Validation:** the port (1–65535), the limits (0.01–16384 GB, 1–1,000,000 files), the folder
+  (a full path, `%VARIABLE%\…` allowed, empty = `<Downloads>\Glide`) and each allowed address are
+  checked on OK / Apply. A bad value opens its page, focuses the field and shows the reason in red.
+- **Applied at once:** stats overlay, connection bar, stream mode (sent to the Mac like the menu
+  does), Ctrl→Command, natural scrolling, mute, clipboard sharing (it reconnects when the
+  connection didn't negotiate it), private items, allowed addresses (checked on the next
+  connection), forgotten displays.
+- **After a restart:** turning the Mac's sound on or off, everything on the Files page, the listen
+  port, letting the Mac connect, and unpairing the Mac Glide is using. The status line says so, and
+  when the window closes Glide offers to restart (the same restart as *Connect* in Set up).
+- Changing the listen port keeps a pairing made while the Mac connected to this PC
+  (`pinned_hosts` / `last_display` under `listen:PORT` move to the new port). The Mac must then use
+  that port too.
+- Only the settings that changed are written, so a pin or an allowed address the running session
+  adds while the window is open is kept.
+- Test hook (`--features test-hooks` builds only): `GLIDE_SETTINGS_DUMP=x.bmp` prints the settings
+  as text, saves a capture of every page (`x-1.bmp` … `x-8.bmp`) after about 0.5 s and closes the
+  window.
+
 ### Config file, identity and pairing
 
 Settings live in `%APPDATA%\Glide\config.json` (set `GLIDE_CONFIG_DIR` to use another folder). The file
-is created on first run and rewritten when settings change. Edit it by hand, or use the tray icon → *Open config file*.
+is created on first run and rewritten when settings change. Most of it is in the Settings window (see above); edit the rest by hand (Settings → Advanced → *Open config file…*).
 
 ```json
 {
@@ -195,7 +232,7 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   - **Pre-auth timeout:** a peer that hasn't completed the handshake after 5 s is disconnected.
 
   These limit who may start a handshake; the host's pinned key is what authenticates it.
-- **Tray icon:** Connect / Disconnect / Reconnect, Stats overlay, Mute, Allow the Mac to pair (listening and not paired), Set up…, Open config file, Forget host (unpair)…, Quit.
+- **Tray icon:** Connect / Disconnect / Reconnect, Stats overlay, Mute, Allow the Mac to pair (listening and not paired), Connections…, Set up…, Settings…, Forget host (unpair)…, Quit.
   - *Disconnect* also stops listening, so the host can't reconnect until you choose *Connect*
     (or press Enter / click in the window). Started at sign-in, the viewer begins in this state
     (see *Start at sign-in*).
@@ -287,7 +324,7 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
     - Toggles: Mute audio, Clipboard sync, Stats overlay, Fullscreen, Release keyboard, Pin connection bar.
     - Input ▸ Ctrl as Command (Win as Control), Natural scrolling, Relative mouse (games, 3D). The first two are saved
       (`ctrl_as_cmd`, `natural_scrolling`).
-    - Actions: Refresh picture, Reconnect, Disconnect/Connect, Send files… (disabled until file transfer lands), Settings… (opens `config.json`).
+    - Actions: Refresh picture, Reconnect, Disconnect/Connect, Send files… (disabled until file transfer lands), Settings… (the Settings window).
   - **Clipboard sync** can be switched at runtime and is saved as `"clipboard"`. Off means the clipboard listener is removed and nothing is sent or applied; the next ClientHello also stops advertising clipboard support. Turning it on during a session that started with it off reconnects once, to negotiate it.
   - **System menu:** the main items are also in the window's system menu (title-bar right-click, or Alt+Space while the keyboard is released): Glide menu…, Stream mode ▸, Mute audio, Stats overlay, Fullscreen, Refresh picture, Reconnect, Settings….
 - **Stats HUD** (off by default): a small translucent panel in the top-left corner. It shows:

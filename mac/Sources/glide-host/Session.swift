@@ -388,7 +388,9 @@ final class Session: @unchecked Sendable {
             displayAssertion = Power.preventDisplaySleep()
             log("session \(id): '\(name)' (\(GlideHandshake.fingerprint(viewerKey ?? Data()))) authenticated from \(peer) (proto v\(version), view \(vw)x\(vh)\(viewW != Int(vw) || viewH != Int(vh) ? " -> \(viewW)x\(viewH)" : ""), caps \(caps.rawValue), mode \(mode), fps \(maxFps))")
             displaysEnabled = caps.contains(.displays)
-            if caps.contains(.clipboard) {
+            if caps.contains(.clipboard) && !settings.clipboardEnabled {
+                log("session \(id): clipboard sync off on this host (Settings → Sharing)")
+            } else if caps.contains(.clipboard) {
                 clipboard = ClipboardSync(sessionId: id, syncConcealed: settings.clipboardSyncConcealed) { [weak self] c in self?.send(.clipboard(c)) }
             }
             if caps.contains(.files) && settings.files.enabled {
@@ -548,10 +550,12 @@ final class Session: @unchecked Sendable {
         Task { await self.captureLoop(p) }
     }
 
-    /// System audio for viewers that advertise it (§3.2). GLIDE_NO_AUDIO=1 turns it off host-side.
+    /// System audio for viewers that advertise it (§3.2). host.json `audio.enabled: false` or
+    /// GLIDE_NO_AUDIO=1 turns it off host-side.
     private func setUpAudio(_ p: VideoPipeline, maxInFlight: Int) {
-        guard ProcessInfo.processInfo.environment["GLIDE_NO_AUDIO"] != "1" else {
-            log("session \(id): audio disabled on this host (GLIDE_NO_AUDIO=1)")
+        let envOff = ProcessInfo.processInfo.environment["GLIDE_NO_AUDIO"] == "1"
+        guard !envOff && settings.audioEnabled else {
+            log("session \(id): audio disabled on this host (\(envOff ? "GLIDE_NO_AUDIO=1" : "Settings → Sharing"))")
             audioOff = true  // tell the viewer right after ServerHello
             HostStatus.shared.audio(id: id, "off")
             return

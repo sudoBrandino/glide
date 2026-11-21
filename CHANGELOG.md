@@ -18,6 +18,20 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ### Added
 
+- **Mac host: a Settings window.** Menu bar → **Settings…** (⌘,), or the setup window's
+  **Settings…** button, gathers everything Glide Host keeps in one place: start at login, the PC's
+  address, listening, display mode and virtual display, paired viewers (with key, pairing date,
+  Unpair and Pair New Viewer), clipboard, audio and file transfer (with the received-files folder),
+  and **Reset Settings**, which keeps your paired viewers. Display changes apply at once, sharing
+  changes from the next connection.
+- **Mac host: connecting out to the PC is now optional at startup.** Turn off **Connect out to the
+  PC automatically when Glide Host starts** (Settings → Connection, host.json
+  `"connectAtLaunch": false`) to keep the PC's address without dialing it at login; the menu bar's
+  new **Connect to PC** item (or **Connect Now** in Settings) dials it when you want, and **Stop
+  Connecting to PC** stops it. The default is unchanged: a saved address is dialed at startup.
+- **Mac host: clipboard sync and audio can be switched off** on the Mac (Settings → Sharing,
+  host.json `"clipboard": {"enabled": false}` and `"audio": {"enabled": false}`).
+
 - **Control a Windows PC from a Mac (preview).** Glide now works in the other direction too: run
   `glide-host.exe` on the PC and `glide-viewer` on the Mac. It pairs the same way (a 6-digit code
   confirmed on both screens) and streams hardware H.264/HEVC with keyboard, mouse and the PC's
@@ -29,6 +43,12 @@ changed for them, not how. Delete empty subsections when the release is cut.
   between them; the tray's **Connect to** submenu switches in one click. `--connection NAME` starts
   with a saved connection (and makes it the default), `--list-connections` prints them. The Mac
   address you already set up becomes the first saved connection.
+- **Windows viewer, Settings window:** *Settings…* in the Glide menu and the tray now opens a real
+  settings window instead of the config file: start at sign-in, connecting right away at sign-in,
+  stream mode, keyboard and scrolling, audio, clipboard, file transfer (folder and limits), the
+  listen port, allowed Mac addresses, paired Macs (unpair) and this viewer's key fingerprint. Typed
+  values are checked before they are saved; most changes apply at once, and Glide offers to restart
+  for the few that need it. The config file is still one click away (Advanced).
 - **Mac viewer, Connections and Settings windows (preview).** `glide-viewer` now has a full
   connection manager: the saved PCs with address, pairing state and last use, grouped, with
   favorites first and a search field. Connect with Return or a double-click; add, edit (name,
@@ -55,8 +75,13 @@ changed for them, not how. Delete empty subsections when the release is cut.
   without connecting: the window and tray icon are there, but it doesn't dial the Mac or wait for
   it until you press Enter or click in the window, or choose **Connect** in the Glide menu or the
   tray. Starting it yourself still connects right away. Existing sign-in entries switch over by
-  themselves the next time the viewer starts. To connect at sign-in as before, set
-  `"connect_at_signin": true` in `%APPDATA%\Glide\config.json`.
+  themselves the next time the viewer starts. To connect at sign-in as before, turn on
+  **Connect to the Mac right away when Glide starts at sign-in** in Settings → General.
+
+### Fixed
+
+- **Mac host:** a PC address given as a bare IPv6 address (`fe80::1`, no brackets) was dialed as
+  host `fe80`, port 1. It is now dialed on port 7420; use `[fe80::1]:PORT` for another port.
 
 ## [0.3.1] - 2026-11-15
 

@@ -12,42 +12,26 @@ struct HostSettings {
     var bitrateKbps = 0
     var maxWidth = 3840
     var maxInFlightBytes = 6 * 1024 * 1024
+    /// host.json `clipboard.enabled`: sync the clipboard with the viewer.
+    var clipboardEnabled = true
     /// host.json `clipboard.syncConcealed`: also sync password-manager (concealed) items.
     var clipboardSyncConcealed = false
+    /// host.json `audio.enabled` (and not `GLIDE_NO_AUDIO=1`): send system audio.
+    var audioEnabled = true
     /// host.json `files` (PROTOCOL.md §6).
     var files = HostFileConfig()
+
+    /// The host.json parts a Session reads when it starts (Settings window: next connection).
+    mutating func applySharing(_ c: HostConfig) {
+        clipboardEnabled = c.clipboard?.isEnabled ?? true
+        clipboardSyncConcealed = c.clipboard?.syncsConcealed ?? false
+        audioEnabled = c.audio?.isEnabled ?? true
+        files = HostFileConfig(c.files)
+    }
 }
 
-/// host.json `"clipboard": {"syncConcealed": false}` (PROTOCOL.md §5).
-struct ClipboardSettings: Codable {
-    /// Send pasteboard items marked org.nspasteboard.ConcealedType (passwords). Default false.
-    var syncConcealed: Bool?
-}
-
-/// host.json (`~/Library/Application Support/Glide`, or $GLIDE_HOST_CONFIG_DIR).
-struct HostConfig: Codable {
-    /// v1 leftovers: no longer used (security v2 pairs keys), but kept untouched in the file so a
-    /// rollback to the v1 host still finds its password.
-    var salt: String?
-    var password: String?
-    /// The PC to dial (`--connect` overrides). The host listens as well unless `listen` is false.
-    var connect: String?
-    /// false: don't listen while a PC address is set (nothing on this Mac accepts connections;
-    /// THREAT_MODEL.md "Dial-out mode"). Default true.
-    var listen: Bool? = nil
-    /// Display-mode policy (DisplayModeController.swift).
-    var display: DisplaySettings? = nil
-    /// Clipboard sync options (ClipboardSync.swift).
-    var clipboard: ClipboardSettings? = nil
-    /// Viewers allowed to connect (security v2 pairing).
-    var pairedViewers: [PairedViewer]? = nil
-    /// File transfer options (HostFiles.swift).
-    var files: FileSettings? = nil
-    /// Optional virtual display sized to the viewer (VirtualDisplay.swift, docs/VIRTUAL_DISPLAY.md).
-    var virtualDisplay: VirtualDisplayConfig? = nil
-    /// The version whose setup window was last finished (Setup.swift); nil = never.
-    var setupVersion: String? = nil
-
+/// host.json reading and writing (the struct and its decisions are in GlideCore/HostConfig.swift).
+extension HostConfig {
     static var dir: URL {
         let base: URL
         if let d = ProcessInfo.processInfo.environment["GLIDE_HOST_CONFIG_DIR"], !d.isEmpty {
@@ -120,6 +104,8 @@ func usage() -> Never {
            glide-host --set-connect HOST[:PORT] (save the PC's address: the host dials it as well as listening)
            glide-host --login-item on|off|status (start this app at login, like the setup window's button)
            glide-host --setup-preview OUT.png [--installer] (render the setup window to a PNG; no server)
+           glide-host --settings-preview OUT.png [--tab NAME] [--dark] (render a Settings tab to a PNG: general,
+                                                connection, display, viewers, sharing, advanced; no server)
            glide-host --drag-helper-preview     (open System Settings' Screen Recording list with the
                                                 drag-into-the-list panel for 90 s; no server)
            glide-host --selftest-ui [--out DIR] (print the status menu per state + display-mode picks; no capture)
@@ -224,6 +210,18 @@ if let out = takeValue("--setup-preview") {  // offscreen render; never listens 
     exit(0)
 }
 
+if let out = takeValue("--settings-preview") {  // offscreen render; never listens, captures or writes
+    _ = NSApplication.shared
+    let tab = takeValue("--tab").flatMap(SettingsModel.Tab.init(rawValue:)) ?? .general
+    TrustStore.shared.load(((try? ConfigFile.read(HostConfig.self, from: HostConfig.url)) ?? nil) ?? HostConfig())
+    HostStatus.shared.update { $0.listenPort = 7420; $0.hostFingerprint = "eed3 85a2 4ef7 976a" }
+    let m = SettingsModel(actions: .init())
+    m.tab = tab
+    m.refresh()
+    print(SettingsWindowController.renderPreview(m, to: out, dark: args.contains("--dark")) ? "wrote \(out)" : "render failed")
+    exit(0)
+}
+
 if args.contains("--drag-helper-preview") {  // opens System Settings' Screen Recording list; never listens or captures
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
@@ -260,15 +258,14 @@ log("pairing: \(TrustStore.shared.list.count) paired viewer(s)\(TrustStore.share
 
 var settings = HostSettings(identity: identity)
 if let v = takeValue("--port"), let n = UInt16(v) { settings.port = n }
-settings.clipboardSyncConcealed = config.clipboard?.syncConcealed ?? false
-settings.files = HostFileConfig(config.files)
+settings.applySharing(config)
 if let v = ProcessInfo.processInfo.environment["GLIDE_FPS"], let n = Int(v), n > 0 { settings.fps = n }  // LaunchAgent-friendly
 if let v = takeValue("--fps"), let n = Int(v) { settings.fps = n }
 if let v = takeValue("--bitrate-kbps"), let n = Int(v) { settings.bitrateKbps = n }
 if let v = takeValue("--max-width"), let n = Int(v) { settings.maxWidth = n }
 if let v = takeValue("--display"), let n = UInt32(v) { ActiveDisplay.pinned = n }
-let connectTarget = takeValue("--connect") ?? config.connect
-let noListen = args.contains("--no-listen") || config.listen == false
+let cliConnect = takeValue("--connect")
+let noListenFlag = args.contains("--no-listen")
 args.removeAll { $0 == "--no-listen" }
 guard args.isEmpty else { print("unknown arguments: \(args)"); usage() }
 
@@ -311,7 +308,9 @@ if !hostTestMode && !showSetupAtLaunch && !AXIsProcessTrustedWithOptions([kAXTru
 
 // Listener
 final class Server: @unchecked Sendable {
-    let settings: HostSettings
+    private var settingsValue: HostSettings
+    /// What the next session starts with (`updateSharing` changes it; a running session keeps its own).
+    var settings: HostSettings { lock.lock(); defer { lock.unlock() }; return settingsValue }
     let listener: NWListener
     /// Active session + connections still authenticating (an unauthenticated connection never
     /// touches the active session; see SessionRegistry).
@@ -332,7 +331,7 @@ final class Server: @unchecked Sendable {
     private var waitingForPairing = false
 
     init(settings: HostSettings) throws {
-        self.settings = settings
+        settingsValue = settings
         listener = try NWListener(using: SecureChannel.tcpParameters(), on: NWEndpoint.Port(rawValue: settings.port)!)
     }
 
@@ -358,19 +357,7 @@ final class Server: @unchecked Sendable {
         if let t { dial(host: t.host, port: t.port) } else { log("dialer: off") }
     }
 
-    /// "host", "host:port" or "[v6]:port" → (host, port); nil for an empty string.
-    static func parseTarget(_ s: String) -> (host: String, port: UInt16)? {
-        let s = s.trimmingCharacters(in: .whitespaces)
-        guard !s.isEmpty else { return nil }
-        if s.hasPrefix("["), let close = s.firstIndex(of: "]") {
-            let host = String(s[s.index(after: s.startIndex)..<close])
-            let rest = s[s.index(after: close)...]
-            return (host, rest.hasPrefix(":") ? UInt16(rest.dropFirst()) ?? 7420 : 7420)
-        }
-        let parts = s.split(separator: ":")
-        if parts.count == 2 { return (String(parts[0]), UInt16(parts[1]) ?? 7420) }
-        return (s, 7420)  // a bare name, or an IPv6 address without brackets
-    }
+    static func parseTarget(_ s: String) -> (host: String, port: UInt16)? { DialPolicy.parseTarget(s) }
 
     /// Shown (menu, setup window) while dialing waits for the pairing window.
     static let waitingForPairingText = "waiting until pairing is opened on this Mac"
@@ -556,6 +543,15 @@ final class Server: @unchecked Sendable {
         s.start()
     }
 
+    /// Settings window: clipboard, audio and file-transfer options for the next session.
+    func updateSharing(_ c: HostConfig) {
+        lock.lock(); settingsValue.applySharing(c); let s = settingsValue; lock.unlock()
+        log("settings: next session: clipboard \(s.clipboardEnabled ? "on" : "off")\(s.clipboardSyncConcealed ? " (concealed too)" : ""), audio \(s.audioEnabled ? "on" : "off"), files \(s.files.enabled ? "on" : "off") (receiving \(s.files.receive ? "on" : "off") into \(s.files.downloadDir.path))")
+    }
+
+    /// Whether the dialer has a PC to dial (setDialTarget with an address).
+    var isDialing: Bool { lock.lock(); defer { lock.unlock() }; return dialTarget != nil }
+
     /// Ends the active session (menu). In dial mode the host redials after 2 s.
     func disconnect() { current?.end() }
 
@@ -625,7 +621,10 @@ let statusMenu = StatusMenu(actions: .init(disconnect: { server.disconnect() }, 
                                            sendFiles: { server.current?.sendFiles($0) ?? false },
                                            cancelFiles: { server.current?.cancelFiles() },
                                            selectDisplay: { server.current?.selectDisplay($0, by: .host) },
-                                           showSetup: { showSetup() }),
+                                           showSetup: { showSetup() },
+                                           showSettings: { showSettings() },
+                                           connectNow: { if let pc = HostConfig.load().connect { server.setDialTarget(pc) } },
+                                           stopDialing: { server.setDialTarget(nil) }),
                             showStatusItem: !hostTestMode)
 HostNotifier.shared.setUp()
 statusMenu.downloadDir = settings.files.downloadDir
@@ -636,9 +635,32 @@ func showSetup() {
     guard !hostTestMode else { return }
     let ctl = SetupWindowController.shared ?? SetupWindowController(model: SetupModel(installer: nil, actions: .init(
         setDialTarget: { server.setDialTarget($0) },
+        isDialing: { server.isDialing },
         openPairing: { pairing.openWindow(source: "setup window") },
-        cancelPairing: { pairing.cancelWindow(source: "setup window") })))
+        cancelPairing: { pairing.cancelWindow(source: "setup window") },
+        showSettings: { showSettings() })))
     SetupWindowController.shared = ctl
+    ctl.show()
+}
+/// The Settings window (Settings.swift): menu bar → Settings… (⌘,), or the setup window.
+func showSettings() {
+    guard !hostTestMode else { return }
+    let ctl = SettingsWindowController.shared ?? SettingsWindowController(model: SettingsModel(actions: .init(
+        setDialTarget: { server.setDialTarget($0) },
+        isDialing: { server.isDialing },
+        openPairing: { pairing.openWindow(source: "settings window") },
+        cancelPairing: { pairing.cancelWindow(source: "settings window") },
+        removeViewer: { v in
+            let gone = TrustStore.shared.remove(matching: v.key)
+            for g in gone { log("pairing: removed viewer “\(g.name)” (\(g.fingerprint)) via settings window") }
+            server.endSessions(of: gone.compactMap(\.keyData))
+        },
+        sharingChanged: { c in
+            server.updateSharing(c)
+            statusMenu.downloadDir = HostFileConfig(c.files).downloadDir
+        },
+        showSetup: { showSetup() })))
+    SettingsWindowController.shared = ctl
     ctl.show()
 }
 pairing.instanceCommand = { line in
@@ -662,10 +684,11 @@ if showSetupAtLaunch { DispatchQueue.main.async { showSetup() } }
 
 // Always listen; also dial the PC when its address is known. Whichever direction the network
 // allows connects (the dialer stays idle while a viewer that dialed in is connected).
-if connectTarget == nil || !noListen { server.start() } else { log("server: not listening (listen: false); dialing only") }
+if config.listensAtLaunch(cli: cliConnect, noListenFlag: noListenFlag) { server.start() } else { log("server: not listening (listen: false); dialing only") }
 // After an update the login item may be registered but refused by launchd (Instance.swift).
 if !hostTestMode { DispatchQueue.main.async { Instance.reviveLoginItemIfNeeded() } }
-if let target = connectTarget { server.setDialTarget(target) }
+if let target = config.launchDialTarget(cli: cliConnect) { server.setDialTarget(target) }
+else if let saved = config.connect { log("dialer: not dialing \(saved) at launch (connectAtLaunch is off); menu bar → Connect to PC, or Settings → Connection, dials it") }
 // SIGTERM (launchctl, install scripts) and SIGINT: give the Mac its display arrangement back,
 // remove the virtual display and restore the monitor's own mode before exiting (a mirror set whose
 // master vanishes is dissolved by macOS, which can leave the monitor in another mode). Handled on

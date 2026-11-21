@@ -1,7 +1,7 @@
 //! Notification-area (tray) icon: tooltip = window title; left click brings the viewer to
 //! the front; right click opens Connect / Disconnect / Reconnect / Connect to (saved connections) /
 //! Stats / Mute / received files / cancel file transfer / Allow the Mac to pair / Connections /
-//! Set up / Open config / Forget host (unpair) / Quit. `notify` shows a notification balloon (file transfer results). Commands arrive at the
+//! Set up / Settings / Forget host (unpair) / Quit. `notify` shows a notification balloon (file transfer results). Commands arrive at the
 //! viewer window as WM_COMMAND.
 
 use std::cell::RefCell;
@@ -18,7 +18,7 @@ pub enum MenuCmd {
     Reconnect,
     ToggleHud,
     ToggleMute,
-    OpenConfig,
+    Settings,
     ForgetHost,
     CancelFiles,
     OpenDownloads,
@@ -53,7 +53,7 @@ const CMDS: [MenuCmd; 13] = [
     MenuCmd::Reconnect,
     MenuCmd::ToggleHud,
     MenuCmd::ToggleMute,
-    MenuCmd::OpenConfig,
+    MenuCmd::Settings,
     MenuCmd::ForgetHost,
     MenuCmd::CancelFiles,
     MenuCmd::OpenDownloads,
@@ -250,7 +250,7 @@ fn show_menu(hwnd: HWND, st: &MenuState) {
         }
         item(MenuCmd::Connections, "Co&nnections…", MF_ENABLED);
         item(MenuCmd::SetUp, "Set &up…", MF_ENABLED);
-        item(MenuCmd::OpenConfig, "Open &config file", MF_ENABLED);
+        item(MenuCmd::Settings, "S&ettings…", MF_ENABLED);
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         match &st.paired {
             Some(name) => item(MenuCmd::ForgetHost, &format!("&Forget host “{}” (unpair)…", name.replace('&', "&&")), MF_ENABLED),

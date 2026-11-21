@@ -498,6 +498,7 @@ fileHardeningTests()
 instanceRoleTests()
 installPlanTests()
 do { try configFileTests() } catch { failures += 1; print("  FAIL config file threw \(error)") }
+do { try hostSettingsTests() } catch { failures += 1; print("  FAIL host settings threw \(error)") }
 do { try sessionLifecycleTests() } catch { failures += 1; print("  FAIL session lifecycle threw \(error)") }
 do { try viewerTests() } catch { failures += 1; print("  FAIL mac viewer threw \(error)") }
 fuzzTests(vectorsDir: URL(fileURLWithPath: CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "../docs/test-vectors.json").deletingLastPathComponent())
