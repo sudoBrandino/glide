@@ -67,7 +67,10 @@ opening the new one registers it again (replacing it from the setup window does 
 2. The setup window offers to **install** it (into `%LOCALAPPDATA%\Glide`, with a Start menu
    entry), asks for the **Mac's address** (with a **Test** button), and, if the Mac should be able
    to connect to the PC, **Allow in Windows Firewall** (one administrator prompt). **Start Glide
-   when I sign in** is optional.
+   when I sign in** is optional: at sign-in the viewer opens without connecting, and connects
+   when you press Enter or click in its window (or choose **Connect** in the Glide menu or the
+   tray). Set `"connect_at_signin": true` in `%APPDATA%\Glide\config.json` to connect right away
+   instead. Starting it yourself from the Start menu always connects.
 3. **Connect.** The first time, the pairing window shows the code to compare with the Mac.
 
 Open the setup window again from the Glide menu or the tray icon → **Set up…**.

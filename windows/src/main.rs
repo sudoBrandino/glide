@@ -2,7 +2,7 @@
 //!
 //! Usage: glide-client [host[:port] [--no-listen] | --listen [PORT] | --connection NAME]
 //!                     [--mode fast|sharp|hybrid] [--no-ctrl-as-cmd] [--bench SECONDS] [--probe]
-//!                     [--forget-host] [--identity] [--list-connections]
+//!                     [--forget-host] [--identity] [--list-connections] [--startup]
 //! With no target, the viewer uses %APPDATA%\Glide\config.json (default: listen on 7420). With
 //! the Mac's address it dials the Mac and also listens, so either side may connect. A plain
 //! launch with nothing set up (or from outside the install folder) opens the setup dialog.
@@ -53,6 +53,9 @@ pub struct Args {
     connection: Option<String>,
     /// Print the saved connections and exit.
     list_connections: bool,
+    /// Started by Windows at sign-in (the Run value): open paused unless config
+    /// `connect_at_signin` (see `signin`).
+    startup: bool,
 }
 
 const USAGE: &str = "usage: glide-client [host[:port] [--no-listen] | --listen [PORT] | --connection NAME] [options...]
@@ -70,6 +73,8 @@ const USAGE: &str = "usage: glide-client [host[:port] [--no-listen] | --listen [
                      and make it the default for later launches too
   --list-connections print the saved connections and exit
   --setup            open the setup dialog (Mac address, firewall, start at sign-in, install)
+  --startup          what the sign-in entry passes: open the window without connecting (until
+                     Connect) unless config \"connect_at_signin\" is true
   --mode M           fast = 4:2:0 only; sharp = 4:4:4 every frame; hybrid = 4:2:0 while moving +
                      4:4:4 refinement at rest. Default: config, else hybrid if this PC decodes
                      HEVC 4:4:4, else fast
@@ -153,6 +158,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Strin
             }
             "--connection" => a.connection = Some(it.next().filter(|v| !v.trim().is_empty()).ok_or("--connection needs NAME")?),
             "--list-connections" => a.list_connections = true,
+            glide::signin::STARTUP_FLAG => a.startup = true,
             "-h" | "--help" | "/?" => return Err(String::new()),
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             s => {
@@ -340,6 +346,16 @@ fn main() -> ExitCode {
         }
     }
 
+    // Sign-in entries written before `--startup` existed get it (only ones that start this exe).
+    #[cfg(windows)]
+    if args.bench.is_none() && !args.forget_host && !args.identity {
+        glide::win::setup::migrate_signin_entry();
+    }
+    let start_paused = glide::signin::start_paused(args.startup, store.config.connect_at_signin);
+    if start_paused {
+        eprintln!("started at sign-in: not connecting until Connect (config \"connect_at_signin\" turns this off)");
+    }
+
     // Visual setup (GUI launches only): nothing set up yet, an exe outside the install folder,
     // or --setup. It may install and relaunch the installed copy (then this process exits).
     #[cfg(windows)]
@@ -383,6 +399,8 @@ fn main() -> ExitCode {
         TargetSpec::Connect(h) | TargetSpec::Both { host: h, .. } => h.clone(),
         TargetSpec::Listen(p) => format!("listen:{p}"),
     };
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    let connect_label = glide::signin::connect_label(&store.config, args.host.is_some() || args.listen.is_some(), &host);
     let ctrl_as_cmd = args.ctrl_as_cmd.unwrap_or(store.config.ctrl_as_cmd);
 
     // Capabilities: HEVC 4:2:0 + H.264 always; HEVC 4:4:4 only if this machine can decode it.
@@ -464,6 +482,8 @@ fn main() -> ExitCode {
                 audio_muted: store.config.audio_muted,
                 latency_test: args.latency_test,
                 clipboard: args.clipboard.unwrap_or(store.config.clipboard),
+                start_paused,
+                connect_label,
                 store,
             };
             return match glide::win::app::run(Connector { target, identity, pin_target, pin_fallback, hello }, opts) {
@@ -613,6 +633,21 @@ mod tests {
         assert!(p(&["mac.local", "--connection", "x"]).is_err());
         assert!(p(&["--connection", "x", "--listen"]).is_err());
         assert!(p(&["--list-connections"]).unwrap().list_connections);
+    }
+
+    #[test]
+    fn startup_flag() {
+        assert!(!p(&[]).unwrap().startup);
+        let a = p(&["--startup"]).unwrap();
+        assert!(a.startup && a.host.is_none());
+        // An old install.ps1 shortcut put the Mac's address in front of it.
+        let a = p(&["192.168.1.50", "--startup"]).unwrap();
+        assert!(a.startup);
+        assert_eq!(a.host.as_deref(), Some("192.168.1.50"));
+        // What the Run value passes is exactly what the parser takes.
+        let v = glide::setup::run_value(std::path::Path::new("C:\\x\\glide-client.exe"));
+        let (_, rest) = glide::signin::split_run_value(&v).unwrap();
+        assert!(p(&rest.split_whitespace().collect::<Vec<_>>()).unwrap().startup);
     }
 
     #[test]

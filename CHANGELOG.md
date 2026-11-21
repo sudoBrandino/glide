@@ -30,6 +30,15 @@ changed for them, not how. Delete empty subsections when the release is cut.
   with a saved connection (and makes it the default), `--list-connections` prints them. The Mac
   address you already set up becomes the first saved connection.
 
+### Changed
+
+- **Windows viewer, start at sign-in:** when Windows starts the viewer at sign-in, it now opens
+  without connecting: the window and tray icon are there, but it doesn't dial the Mac or wait for
+  it until you press Enter or click in the window, or choose **Connect** in the Glide menu or the
+  tray. Starting it yourself still connects right away. Existing sign-in entries switch over by
+  themselves the next time the viewer starts. To connect at sign-in as before, set
+  `"connect_at_signin": true` in `%APPDATA%\Glide\config.json`.
+
 ## [0.3.1] - 2026-11-15
 
 Fixes from a fresh-install test on a MacBook. Protocol version 2 (unchanged). Screen Recording and
