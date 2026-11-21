@@ -152,7 +152,7 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
         $lnk.Save()
     }
 
-    # The exe the sign-in entry starts (the Run value holds it in double quotes), or $null.
+    # The exe the sign-in entry starts (the Run value holds it in double quotes, then --startup), or $null.
     function Get-RunExe {
         try { $v = (Get-ItemProperty -Path $RunKey -Name $RunValue -ErrorAction Stop).$RunValue } catch { return $null }
         if ($v -match '^"([^"]+)"') { return $Matches[1] }
@@ -165,7 +165,9 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
         # An older Startup shortcut may carry old arguments, and two entries would start it twice.
         if (Test-Path $Startup) { Remove-Item $Startup -Force }
         if ($On) {
-            New-ItemProperty -Path $RunKey -Name $RunValue -Value ('"' + $Exe + '"') -PropertyType String -Force | Out-Null
+            # --startup: sign-in opens the viewer without connecting, until Connect (the viewer's
+            # config "connect_at_signin": true connects right away instead).
+            New-ItemProperty -Path $RunKey -Name $RunValue -Value ('"' + $Exe + '" --startup') -PropertyType String -Force | Out-Null
         } else {
             Remove-ItemProperty -Path $RunKey -Name $RunValue -ErrorAction SilentlyContinue
         }
@@ -450,13 +452,13 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
                 Ok 'the viewer only dials; it does not listen'
             }
 
-            # 4. Shortcut and sign-in entry, both without arguments.
+            # 4. Shortcut (no arguments) and sign-in entry (--startup: opens without connecting).
             Set-Shortcut $StartMenu $exe
             Ok 'Start menu: Glide Viewer'
             $autostartNow = Get-Autostart
-            if (Confirm 'Start the viewer when you sign in to Windows?' ($autostartNow -or $accept)) {
+            if (Confirm 'Open the viewer when you sign in to Windows? (It waits for you to click Connect.)' ($autostartNow -or $accept)) {
                 Set-Autostart $true $exe
-                Ok 'starts at sign-in'
+                Ok 'opens at sign-in, without connecting until you click Connect'
             } elseif ($autostartNow) {
                 Set-Autostart $false $exe
                 Ok 'no longer starts at sign-in'

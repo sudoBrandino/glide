@@ -61,8 +61,9 @@ tray icon (*Set up…*), and `--setup` opens it.
   for TCP 7420 on Private and Domain networks. The dialog checks the rules (and warns when the network
   is set to Public) without elevation.
 - **This PC's address**: to type into the Mac's setup window when only Mac → PC connections work.
-- **Start Glide when I sign in**: the `HKCU\…\Run` value "Glide Viewer" (an install.ps1 Startup
-  shortcut is replaced, since it may carry old arguments).
+- **Start Glide when I sign in (opens without connecting)**: the `HKCU\…\Run` value "Glide Viewer",
+  `"<exe>" --startup` (an install.ps1 Startup shortcut is replaced, since it may carry old
+  arguments). See *Start at sign-in* below.
 - **Install Glide Viewer on this PC** (shown when running from elsewhere): copies the exe (and
   README.txt/LICENSE.txt beside it) to `%LOCALAPPDATA%\Glide`, or to the folder the Start Menu
   shortcut "Glide Viewer.lnk" already points to; writes that shortcut; closes a running viewer first
@@ -73,6 +74,25 @@ tray icon (*Set up…*), and `--setup` opens it.
   config decides.
 - Test hooks (builds with `--features test-hooks` only, see below): `GLIDE_SETUP_DUMP=x.bmp` saves a
   capture of the dialog; `GLIDE_SETUP_ANSWER=connect|cancel` presses a button after about 0.5 s.
+
+### Start at sign-in
+
+The sign-in entry (setup dialog or install.ps1) starts the viewer with `--startup`. With it the
+viewer opens **disconnected**: the window (normal size, never fullscreen or maximized) and the tray
+icon are up, but it doesn't dial the Mac or listen for it. The status line says so and how to
+connect: press **Enter** or **click** in the window (a click that only brings the window to the
+front doesn't count), or choose **Connect** in the Glide menu or the tray. *Connections…* picks
+another Mac first. Set `"connect_at_signin": true` in the config to connect at sign-in as before. If the window was last fullscreen or
+maximized, it opens windowed at sign-in, and that preference is kept for later launches until you
+resize, maximize or toggle fullscreen.
+
+Launching the viewer yourself (Start menu, double-click, a command line with or without a target)
+never passes `--startup` and connects right away.
+
+Older sign-in entries without the flag (the Run value, or an older install.ps1's Startup folder
+shortcut) are rewritten with it when the viewer starts, but only when they start this same exe:
+an older copy elsewhere wouldn't know the option. Started paused, the inbound pairing window opens
+at the first Connect instead of at startup.
 
 ### Saved connections
 
@@ -114,6 +134,7 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   "connections": [],        // saved connections (see Saved connections); the active one sets "host"
   "active_connection": null, // id of the saved connection in use ("c1"), or null
   "portable_exe": null,     // an exe the user chose to run without installing (setup dialog)
+  "connect_at_signin": false, // true = connect when started at sign-in (--startup); false = wait for Connect
   "mode": null,             // "fast" | "hybrid" | "sharp"; null = auto (hybrid if 4:4:4 decodes)
   "ctrl_as_cmd": true,       // Ctrl → Command, Win → Control (menu → Input)
   "natural_scrolling": false, // reverse the wheel/touchpad direction sent to the Mac (menu → Input)
@@ -156,7 +177,7 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
   - First connection to a host: the Mac must be in pairing mode (Glide menu → *Pair New Viewer…*, or `glide-host --pair`). A dialog shows a 6-digit code and both key fingerprints; click *Codes Match — Pair* only if the Mac shows the same code, and confirm there too. The host key is then pinned in `pinned_hosts`.
   - The dialog names the address it is pairing with: the address dialed, or, when the Mac connected to this PC, the IP that connection came from. *Cancel* is the default button, *Codes Match — Pair* stays disabled for a second after the dialog appears (and again when it is activated from the keyboard), so a Return or Space typed just then can't confirm it. It doesn't take the keyboard from another app: its taskbar button flashes instead.
   - Not paired yet / Mac not in pairing mode: the window says so ("the Mac isn't accepting pairing — … Pair New Viewer…") and keeps retrying, so opening the pairing window on the Mac is enough. The Mac's handshake says whether its pairing window is open; while it is closed the viewer doesn't send a pair request at all.
-  - **Inbound pairing window:** an unpaired viewer accepts a pairing started by a Mac that *connects to this PC* only for 15 minutes after Glide starts (which includes the setup dialog's *Connect*), after *Set up…* is opened, after *Forget host*, or after tray → *Allow the Mac to pair*. Outside it, such a connection is closed before the pairing prompt and the status line says how to allow it. This keeps first setup working on a network where only the Mac can connect (start the viewer, then open *Pair New Viewer…* on the Mac), without letting any host on the LAN raise the prompt at any time. One successful pairing closes the window. Pairing when this PC dials the Mac, and re-pairing a host whose key is already pinned, don't need it.
+  - **Inbound pairing window:** an unpaired viewer accepts a pairing started by a Mac that *connects to this PC* only for 15 minutes after Glide starts (which includes the setup dialog's *Connect*), after *Set up…* is opened, after *Forget host*, or after tray → *Allow the Mac to pair* (started at sign-in without connecting: from the first *Connect*). Outside it, such a connection is closed before the pairing prompt and the status line says how to allow it. This keeps first setup working on a network where only the Mac can connect (start the viewer, then open *Pair New Viewer…* on the Mac), without letting any host on the LAN raise the prompt at any time. One successful pairing closes the window. Pairing when this PC dials the Mac, and re-pairing a host whose key is already pinned, don't need it.
   - A different host key than the pinned one: "HOST KEY CHANGED …", and the viewer never reveals its own key to it. If the Mac was really reset: tray → *Forget host (unpair)…*, then pair again.
   - If the Mac removed this viewer, the next attempt asks to pair again (still requiring the pinned Mac key).
   - Pre-auth limits: until the host has proven its pairing commitment the 5 s pre-auth deadline applies (wall clock); the pairing dialog then has 120 s in total.
@@ -175,7 +196,9 @@ is created on first run and rewritten when settings change. Edit it by hand, or 
 
   These limit who may start a handshake; the host's pinned key is what authenticates it.
 - **Tray icon:** Connect / Disconnect / Reconnect, Stats overlay, Mute, Allow the Mac to pair (listening and not paired), Set up…, Open config file, Forget host (unpair)…, Quit.
-  - *Disconnect* also stops listening, so the host can't reconnect until you choose *Connect*.
+  - *Disconnect* also stops listening, so the host can't reconnect until you choose *Connect*
+    (or press Enter / click in the window). Started at sign-in, the viewer begins in this state
+    (see *Start at sign-in*).
   - Left-click brings the window to the front.
 
 

@@ -418,7 +418,8 @@ impl Renderer {
     pub fn set_overlay(&mut self, text: Option<&str>, px: i32) -> Result<()> {
         self.overlay = None;
         let Some(text) = text else { return Ok(()) };
-        self.overlay = Some(self.make_panel(&[text], px, &PanelStyle::STATUS)?);
+        let lines: Vec<&str> = if text.is_empty() { vec![text] } else { text.lines().collect() };
+        self.overlay = Some(self.make_panel(&lines, px, &PanelStyle::STATUS)?);
         Ok(())
     }
 
