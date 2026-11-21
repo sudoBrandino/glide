@@ -60,7 +60,45 @@ default:
 | Option | Alt |
 
 so Mac shortcuts such as ⌘C, ⌘V and ⌘Tab-like habits land on their Windows equivalents.
-`--no-remap` (or `"remapModifiers": false` in `viewer.json`) sends keys as they are.
+Turn off **Map Mac modifier keys to PC keys** in Settings (`"remapModifiers": false` in
+`viewer.json`) to send keys as they are; the change applies to a running session at once.
+`--no-remap` turns mapping off for one run.
+
+## Using the Mac viewer
+
+`glide-viewer` with no arguments opens the **Connections** window and never connects on its own.
+`glide-viewer NAME|HOST[:PORT]` connects straight away (`--pair`, `--no-remap`, `--fullscreen`),
+and `glide-viewer --forget HOST[:PORT]` unpairs from the command line.
+
+**Connections** (Connection → Connections…, ⌘0) lists the saved connections with their address,
+pairing state ("Paired with GAMING-PC", "Not paired yet") and when each was last used, grouped by
+group with favorites first. Type in the search field to filter by name, address or group.
+
+| Action | How | What it does |
+|---|---|---|
+| Connect | Return, double-click, **Connect** | Opens a session window; the Connections window hides |
+| Add | **Add…**, Connection → New Connection… (⌘N) | Name, address, port (blank = 7421), group, favorite |
+| Edit | **Edit…**, right-click | Same form. A blank name becomes the address; names are unique (case-insensitive) |
+| Duplicate | **Duplicate**, right-click | A copy named "NAME (copy)", never used |
+| Remove | **Remove…**, Delete key, right-click | Asks first. Also forgets the pinned PC key, unless another saved connection uses the same address |
+| Unpair | **Unpair…**, right-click | Asks first. Forgets the pinned PC key; the next connection pairs again with a 6-digit code |
+
+These follow the same rules as the Windows viewer's Connections window. An address that doesn't
+parse, or a connection whose `platform` this viewer doesn't know, is listed but can't be opened.
+
+**Disconnect** (Connection → Disconnect, ⇧⌘D, or closing the session window) ends the session and
+returns to the Connections window, also when the session was started from the command line.
+Quit with ⌘Q. While a session is streaming, keyboard shortcuts go to the PC, so use the menu bar
+with the mouse.
+
+**Settings** (Glide Viewer → Settings…, ⌘,):
+
+- **Map Mac modifier keys to PC keys** (`remapModifiers`, on by default): see
+  [Keyboard mapping](#keyboard-mapping).
+- **Open sessions in full screen** (`startFullScreen`, off by default). `--fullscreen` forces it
+  for one run.
+- **This Mac's viewer key:** the fingerprint the PC shows in its pairing dialog, with a **Copy**
+  button, and a button that shows `viewer.json` in Finder.
 
 ## Files
 
@@ -88,12 +126,14 @@ so Mac shortcuts such as ⌘C, ⌘V and ⌘Tab-like habits land on their Windows
     }
   ],
   "pinnedHosts": { "192.168.1.20:7421": { "key": "…", "name": "GAMING-PC", "paired": "2026-11-15T22:00:00Z" } },
-  "remapModifiers": true
+  "remapModifiers": true,
+  "startFullScreen": false
 }
 ```
 
-`platform` names the host's OS (`"windows"` or `"mac"`); a connection manager uses it to choose
-defaults such as the port and the modifier mapping. `address` is `HOST[:PORT]` in one string. The
+`platform` names the host's OS (`"windows"` or `"mac"`); the viewer uses it to choose the default
+port (7421 for Windows, 7420 for a Mac). Connections added in the Connections window are
+`"windows"`; editing one keeps its platform. Older files without `startFullScreen` read as off. `address` is `HOST[:PORT]` in one string. The
 fields match the saved connections in the Windows viewer's `config.json` (`id`, `name`,
 `platform`, `address`, `group`, `favorite`, `last_connected`), so both connection lists behave
 the same way.

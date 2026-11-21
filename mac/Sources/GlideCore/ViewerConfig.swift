@@ -156,12 +156,16 @@ public struct ViewerConfig: Codable, Equatable, Sendable {
     public var pinnedHosts: [String: PinnedHostEntry]
     /// Command → Control, Control → Windows, Option → Alt (docs/WINDOWS_HOST.md "Keyboard mapping").
     public var remapModifiers: Bool
+    /// Open session windows in full screen (Settings; `--fullscreen` forces it for one run).
+    public var startFullScreen: Bool
 
-    public init(connections: [SavedConnection] = [], pinnedHosts: [String: PinnedHostEntry] = [:], remapModifiers: Bool = true) {
+    public init(connections: [SavedConnection] = [], pinnedHosts: [String: PinnedHostEntry] = [:], remapModifiers: Bool = true,
+                startFullScreen: Bool = false) {
         self.connections = connections; self.pinnedHosts = pinnedHosts; self.remapModifiers = remapModifiers
+        self.startFullScreen = startFullScreen
     }
 
-    enum CodingKeys: String, CodingKey { case connections, pinnedHosts, remapModifiers }
+    enum CodingKeys: String, CodingKey { case connections, pinnedHosts, remapModifiers, startFullScreen }
 
     /// Missing keys get defaults; a value of the wrong type throws, so `ConfigFile` refuses to
     /// write over a file it can't fully understand (it may hold pins).
@@ -170,6 +174,7 @@ public struct ViewerConfig: Codable, Equatable, Sendable {
         connections = try c.decodeIfPresent([SavedConnection].self, forKey: .connections) ?? []
         pinnedHosts = try c.decodeIfPresent([String: PinnedHostEntry].self, forKey: .pinnedHosts) ?? [:]
         remapModifiers = try c.decodeIfPresent(Bool.self, forKey: .remapModifiers) ?? true
+        startFullScreen = try c.decodeIfPresent(Bool.self, forKey: .startFullScreen) ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -177,6 +182,7 @@ public struct ViewerConfig: Codable, Equatable, Sendable {
         try c.encode(connections, forKey: .connections)
         try c.encode(pinnedHosts, forKey: .pinnedHosts)
         try c.encode(remapModifiers, forKey: .remapModifiers)
+        try c.encode(startFullScreen, forKey: .startFullScreen)
     }
 
     public static func timestamp(_ d: Date) -> String { ISO8601DateFormatter().string(from: d) }
