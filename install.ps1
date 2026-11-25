@@ -251,13 +251,14 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
     }
 
     function Stop-Viewer {
-        $procs = @(Get-Process -Name 'glide-client' -ErrorAction SilentlyContinue)
+        # glide-host.exe (control this PC from a Mac) ships in the same zip and folder.
+        $procs = @(Get-Process -Name 'glide-client', 'glide-host' -ErrorAction SilentlyContinue)
         if ($procs.Count -eq 0) { return $true }
-        Info 'The viewer is running. It has to close to be replaced.'
+        Info 'Glide is running (the viewer or glide-host.exe). It has to close to be replaced.'
         if (-not (Confirm 'Close it now?' $true)) { return $false }
         $procs | Stop-Process -Force
         $procs | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
-        Ok 'closed the viewer'
+        Ok 'closed Glide'
         return $true
     }
 
@@ -492,6 +493,7 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
         $exe = Join-Path $target $ExeName
         if (Test-Path $exe) {
             Remove-Item $exe -Force
+            Remove-Item (Join-Path $target 'glide-host.exe') -Force -ErrorAction SilentlyContinue
             # The zip's text files, but only if they are ours (the folder may hold other files).
             $readme = Join-Path $target 'README.txt'
             if ((Test-Path $readme) -and ((Get-Content $readme -TotalCount 1) -like 'Glide viewer*')) {

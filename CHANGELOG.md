@@ -16,6 +16,12 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-18
+
+Saved connections on the Windows viewer, and a first preview of the reverse direction: controlling
+a Windows PC from a Mac. Protocol version 2 (unchanged). Screen Recording and Accessibility grants
+from 0.3.x carry over.
+
 ### Added
 
 - **Mac host: a Settings window.** Menu bar → **Settings…** (⌘,), or the setup window's
@@ -82,6 +88,12 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 - **Mac host:** a PC address given as a bare IPv6 address (`fe80::1`, no brackets) was dialed as
   host `fe80`, port 1. It is now dialed on port 7420; use `[fe80::1]:PORT` for another port.
+
+### Changed
+
+- **Downloads:** the Windows zip now also holds `glide-host.exe`, and Glide Host for the Mac now
+  also holds `glide-viewer` (Homebrew links it as `glide-viewer`). `install.ps1` installs and
+  updates both Windows programs together.
 
 ## [0.3.1] - 2026-11-15
 
@@ -377,7 +389,8 @@ These matter only if you ran a development build from before this release (proto
 - A paired Mac that floods the viewer with video-configuration messages can make the viewer
   unresponsive until it disconnects (see [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)).
 
-[Unreleased]: https://github.com/sudoBrandino/glide/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/sudoBrandino/glide/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/sudoBrandino/glide/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/sudoBrandino/glide/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/sudoBrandino/glide/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sudoBrandino/glide/releases/tag/v0.2.0
