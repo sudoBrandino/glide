@@ -29,7 +29,7 @@ enum Instance {
     static let launchdLabel: String? = HostInstance.launchdLabel(xpcServiceName: ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"])
 
     static var bundlePath: String { Bundle.main.bundlePath }
-    static var bundleID: String { Bundle.main.bundleIdentifier ?? "io.github.sudobrandino.glide.host" }
+    static var bundleID: String { Bundle.main.bundleIdentifier ?? "dev.brandino.glide.host" }
     /// True when running from an .app bundle (not a bare `swift build` binary).
     static var isAppBundle: Bool { bundlePath.hasSuffix(".app") }
 
@@ -163,6 +163,23 @@ enum Instance {
         case onViaScript
         case needsApproval
         case off
+        /// An organization's installer put a system-wide LaunchAgent in /Library/LaunchAgents
+        /// (same label): it starts Glide Host at login for every user, and the app must not
+        /// register its own login item next to it.
+        case managed
+    }
+
+    /// `/Library/LaunchAgents/<bundle id>.plist`, installed by the organization's .pkg.
+    /// `$GLIDE_SYSTEM_AGENTS_DIR` overrides the folder (tests).
+    static var systemAgentURL: URL {
+        let dir = ProcessInfo.processInfo.environment["GLIDE_SYSTEM_AGENTS_DIR"].flatMap { $0.isEmpty ? nil : $0 } ?? "/Library/LaunchAgents"
+        return URL(fileURLWithPath: dir, isDirectory: true).appendingPathComponent("\(bundleID).plist")
+    }
+
+    static var hasSystemAgent: Bool { FileManager.default.fileExists(atPath: systemAgentURL.path) }
+
+    struct ManagedLoginItem: LocalizedError {
+        var errorDescription: String? { "Glide Host is started at login by your organization (\(Instance.systemAgentURL.path)); its login item can't be changed here." }
     }
 
     static var loginService: SMAppService { SMAppService.agent(plistName: "\(bundleID).plist") }
@@ -171,6 +188,7 @@ enum Instance {
     }
 
     static var loginItem: LoginItem {
+        if hasSystemAgent { return .managed }
         switch loginService.status {
         case .enabled: return .on
         case .requiresApproval: return .needsApproval
@@ -183,11 +201,13 @@ enum Instance {
     /// Register the bundled LaunchAgent (Contents/Library/LaunchAgents). launchd starts it right
     /// away; that instance takes over from this one (see `resolveRole`).
     static func enableLoginItem() throws {
+        guard !hasSystemAgent else { throw ManagedLoginItem() }
         try loginService.register()
         log("login item: registered (\(loginService.status.rawValue))")
     }
 
     static func disableLoginItem() throws {
+        guard !hasSystemAgent else { throw ManagedLoginItem() }
         try loginService.unregister()
         log("login item: unregistered")
     }
@@ -198,7 +218,7 @@ enum Instance {
     /// refuses a newer build with EX_CONFIG until it registers again. Registering again starts it,
     /// and it takes over from this copy (handoff). Call once this host's control socket is up.
     static func reviveLoginItemIfNeeded() {
-        guard launchdLabel == nil, isAppBundle, loginService.status == .enabled else { return }
+        guard launchdLabel == nil, isAppBundle, !hasSystemAgent, loginService.status == .enabled else { return }
         log("login item: on, but not running; registering it again (it starts and takes over from this copy)")
         do {
             try loginService.unregister()

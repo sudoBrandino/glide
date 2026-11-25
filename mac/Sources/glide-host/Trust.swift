@@ -109,6 +109,9 @@ final class PairingController: NSObject, @unchecked Sendable {
     var onOpen: (() -> Void)?
     /// Show the menu-bar alert (false for --selftest-ui / tests).
     var showAlerts = true
+    /// Org policy (ENTERPRISE.md §7, `allow_local_pairing`, `lan_mode`): may the window open?
+    var pairingAllowed: () -> Bool = { true }
+    static let pairingOffText = "Pairing new viewers is turned off by your organization"
 
     private let lock = NSLock()
     private var pending: PendingPairing?
@@ -122,6 +125,11 @@ final class PairingController: NSObject, @unchecked Sendable {
     // MARK: Window
 
     func openWindow(source: String, duration: TimeInterval = PairingWindow.defaultDuration) {
+        guard pairingAllowed() else {
+            log("pairing: not opening the window (\(source)): turned off by the organization's policy")
+            HostStatus.shared.note(Self.pairingOffText, warning: true)
+            return
+        }
         window.open(duration: duration)
         backoff.reset()
         let until = Date().addingTimeInterval(duration)
@@ -294,6 +302,7 @@ final class PairingController: NSObject, @unchecked Sendable {
         let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
         switch parts.first ?? "" {
         case "open":
+            guard pairingAllowed() else { c.send("error \(Self.pairingOffText.lowercased())"); return }
             openWindow(source: "glide-host --pair")
             c.send("ok open \(Int(PairingWindow.defaultDuration))")
         case "wait":

@@ -43,6 +43,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private let warningItem = NSMenuItem()
     /// Last security event (rejected viewer, paired, v1 viewer).
     private let noteItem = NSMenuItem()
+    /// "Managed by Example Corp" (Glide Cloud, ENTERPRISE.md).
+    private let managedItem = NSMenuItem()
     // Actions
     private let disconnectItem = NSMenuItem(title: "Disconnect Viewer", action: #selector(disconnect), keyEquivalent: "")
     private let pauseItem = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: "")
@@ -107,7 +109,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private func buildMenu() {
         menu.autoenablesItems = false
         menu.delegate = self
-        for i in [headerItem, viewerItem, streamItem, resolutionItem, statsItem, latencyItem, detailItem, warningItem, noteItem] {
+        for i in [headerItem, managedItem, viewerItem, streamItem, resolutionItem, statsItem, latencyItem, detailItem, warningItem, noteItem] {
             i.isEnabled = false
             menu.addItem(i)
         }
@@ -233,8 +235,22 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         statusItem?.button?.toolTip = "Glide Host — \(Self.phaseTitle(phase))"
 
         headerItem.title = "Glide Host — \(Self.phaseTitle(phase))"
+        if let u = s.viewer?.cloudUser {
+            // Managed session: a persistent indicator of who is connected (ENTERPRISE.md §3.2).
+            headerItem.title = "\(u.label) is connected"
+            statusItem?.button?.toolTip = "Glide Host — \(u.label) is connected"
+        } else if let who = s.pendingApproval {
+            headerItem.title = "\(who) is asking to connect…"
+        }
+        if let m = s.managed {
+            var t = m.summary
+            if m.updateRequired { t += " — update required (minimum \(m.minAppVersion ?? "?"))" }
+            else if !m.lanAllowed { t += " — LAN connections off" }
+            managedItem.title = t
+            managedItem.isHidden = false
+        } else { managedItem.isHidden = true }
         if let v = s.viewer {
-            viewerItem.title = "Viewer: \(v.name) (\(v.address))"
+            viewerItem.title = v.cloudUser != nil ? "Via Glide Cloud: \(v.permissions?.summary ?? "")" : "Viewer: \(v.name) (\(v.address))"
             if let c = v.video {
                 let chroma = v.hybrid ? "4:2:0 + 4:4:4 refine" : (c.chroma == .yuv444 ? "4:4:4" : "4:2:0")
                 let mode = v.hybrid ? "Hybrid" : (c.chroma == .yuv444 ? "Sharp" : "Fast")
@@ -276,7 +292,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         } else { noteItem.isHidden = true }
 
         // Pairing
-        if let who = s.pairingWith {
+        let pairingAllowed = s.managed?.pairingAllowed ?? true
+        if !pairingAllowed {
+            pairItem.title = "Pair New Viewer… (turned off by \(s.managed?.orgName ?? "your organization"))"
+            pairItem.isEnabled = false
+        } else if let who = s.pairingWith {
             pairItem.title = "Pairing with “\(who)” — compare the code…"
             pairItem.isEnabled = false
         } else if let until = s.pairingUntil, until > Date() {
@@ -291,8 +311,12 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         rebuildViewers(s.pairedViewers, hostFingerprint: s.hostFingerprint)
 
         disconnectItem.isEnabled = s.viewer != nil
+        disconnectItem.title = s.viewer?.cloudUser != nil ? "End Session" : "Disconnect Viewer"
         refreshFiles(s)
-        if s.dialTarget != nil && s.viewer == nil && !s.paused {
+        let lanAllowed = s.managed?.lanAllowed ?? true
+        if !lanAllowed {
+            dialItem.isHidden = true
+        } else if s.dialTarget != nil && s.viewer == nil && !s.paused {
             dialItem.title = "Stop Connecting to PC"
             dialItem.isHidden = false
         } else if s.dialTarget == nil, s.viewer == nil, !s.paused, let pc = savedConnect() {
