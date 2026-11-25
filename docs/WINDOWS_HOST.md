@@ -42,6 +42,27 @@ other can't handle.
 See [`windows/README.md`](../windows/README.md) for `glide-host.exe` flags, the tray menu and the
 console commands.
 
+## Managed mode
+
+In an organization using Glide Cloud ([`ENTERPRISE.md`](ENTERPRISE.md)), Group Policy or Intune sets
+`CloudURL` and `EnrollmentToken` under `HKLM\SOFTWARE\Policies\Glide`. `glide-host.exe` then enrolls the PC,
+stays connected to the organization's hub over HTTPS (system proxy and certificate store, through WinHTTP)
+and accepts **relayed** sessions from signed-in users the organization's policies allow, without pairing
+and without an open inbound port:
+
+- With `approval: required` the PC asks "NAME (email) from your organization asks to see and control this
+  PC" (Decline is the default; it declines by itself after 50 s). Otherwise it accepts unless another
+  session is running.
+- The viewer key the cloud grants is accepted for that one session only, and never added to the paired
+  Macs.
+- The session's permissions apply here too: a view-only session can't send input, and clipboard and file
+  data are refused in directions the session doesn't allow.
+- While a managed session runs, the tray says "NAME (email) is connected" and offers **End session**.
+- The organization can turn LAN mode off (the host stops listening on 7421) and local pairing off (Pair New
+  Mac… is disabled). `DisableLANMode` = 1 in the policy key turns LAN mode off locally.
+
+See [`windows/README.md`](../windows/README.md#managed-mode-glide-cloud) for the details.
+
 ## Ports
 
 The Windows host listens on **TCP 7421** by default, not 7420. A PC that also runs the Windows

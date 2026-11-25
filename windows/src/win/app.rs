@@ -3727,8 +3727,21 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
         toast(m);
     }
     if let Some(a) = super::managed::agent() {
-        // Sign-in, settings or the host list changed: refresh the title (and the status line).
-        a.set_on_change(Box::new(move || post(hwnd_raw, WM_APP_CLOSED)));
+        // Sign-in, settings or the host list changed: refresh the title (and the status line). LAN
+        // mode turned off: stop listening / dialing now, and end a LAN session.
+        a.set_on_change(Box::new(move || {
+            if !super::managed::lan_allowed() {
+                let sh = &ui().shared;
+                sh.abort_accept.store(true, Ordering::Relaxed);
+                if super::managed::active().is_none() {
+                    if let Some(s) = sh.sender.lock().unwrap().clone() {
+                        sh.reconnect.store(true, Ordering::Relaxed);
+                        close_connection(s, None);
+                    }
+                }
+            }
+            post(hwnd_raw, WM_APP_CLOSED);
+        }));
     }
 
     // --- render thread

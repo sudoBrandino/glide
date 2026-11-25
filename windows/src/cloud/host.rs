@@ -470,8 +470,9 @@ impl HostAgent {
             a.end();
         }
         self.stop.store(true, Ordering::SeqCst);
-        // Back to unmanaged LAN behavior (no org settings any more).
-        (self.hooks.settings)(&Settings::default());
+        // The last org settings stay in force for this run (a revoked device doesn't get LAN
+        // access back that the organization had turned off); a restart without the policy is
+        // unmanaged again.
         self.ui.notice("This PC was removed from your organization's Glide Cloud.");
     }
 }
