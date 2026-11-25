@@ -84,6 +84,8 @@ do { identity = try ViewerIdentity.loadOrCreate() } catch {
     exit(1)
 }
 print("glide-viewer \(GlideVersion.display), identity \(GlideHandshake.fingerprint(identity.publicKey.rawRepresentation))")
+// Managed mode (docs/ENTERPRISE.md): enrollment and sign-in from the managed settings.
+ManagedViewer.shared.prepare(identity: identity)
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     let options: Options
@@ -91,6 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var list: ConnectionListController?
     private var settings: SettingsController?
     private var session: ViewerSession?
+    private var signIn: SignInController?
 
     init(options: Options, identity: Curve25519.KeyAgreement.PrivateKey) {
         self.options = options
@@ -106,6 +109,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             guard let r = cfg.resolve(t) else {
                 print("not a saved connection or HOST[:PORT]: \(t)")
                 exit(2)
+            }
+            if let why = ManagedViewer.shared.lanBlockedReason {
+                print("LAN connections are \(why); not connecting to \(t)")
+                showList()
+                return
             }
             let name = cfg.connections.first { $0.id == r.connectionID }?.name
             open(target: r.target, connectionID: r.connectionID, label: (name?.isEmpty == false ? name : nil) ?? r.target.display, config: cfg)
@@ -123,9 +131,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             let cfg = (try? ViewerStore.load()) ?? ViewerConfig()
             self.open(target: t, connectionID: c.id, label: c.name.isEmpty ? t.display : c.name, config: cfg)
         }
+        l.onConnectCloud = { [weak self] host, viewOnly in
+            guard let self else { return }
+            self.list?.window.orderOut(nil)
+            self.openCloud(host, viewOnly: viewOnly)
+        }
+        l.onSignIn = { [weak self] in self?.showSignIn(nil) }
         list = l
         return l
     }
+
+    /// A managed session with one of the organization's hosts (ENTERPRISE.md §5.3).
+    private func openCloud(_ host: CloudHost, viewOnly: Bool) {
+        session?.close()
+        let cfg = (try? ViewerStore.load()) ?? ViewerConfig()
+        let target = ViewerTarget(host: "relay:" + host.id, port: 0)
+        let s = ViewerSession(target: target, connectionID: nil, label: PairedViewer.displayName(host.name), identity: identity,
+                              remap: cfg.remapModifiers && !options.noRemap, forcePair: false,
+                              fullscreen: options.fullscreen || cfg.startFullScreen, cloud: CloudConnector(host: host, viewOnly: viewOnly))
+        s.onEnd = { [weak self, weak s] in
+            guard let self, let s, self.session === s else { return }
+            self.session = nil
+            self.showList()
+        }
+        session = s
+        s.start()
+    }
+
+    @objc private func showSignIn(_ sender: Any?) {
+        if let s = signIn { s.window.makeKeyAndOrderFront(nil); return }
+        let s = SignInController()
+        s.onClose = { [weak self] in self?.signIn = nil }
+        signIn = s
+        s.start()
+    }
+
+    @objc private func signOut(_ sender: Any?) { ManagedViewer.shared.signOut() }
 
     private func showList() { connectionList().show() }
 
@@ -175,6 +216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if settings == nil {
             let s = SettingsController(fingerprint: GlideHandshake.fingerprint(identity.publicKey.rawRepresentation),
                                        noRemapFlag: options.noRemap, fullscreenFlag: options.fullscreen)
+            s.onSignIn = { [weak self] in self?.showSignIn(nil) }
             s.onChange = { [weak self] cfg in
                 guard let self else { return }
                 self.session?.setRemap(cfg.remapModifiers && !self.options.noRemap)
@@ -196,6 +238,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         switch item.action {
         case #selector(disconnect(_:)), #selector(reconnect(_:)): return session != nil
+        case #selector(showSignIn(_:)):
+            item.isHidden = !ManagedViewer.shared.isManaged || ManagedViewer.shared.isSignedIn
+            return ManagedViewer.shared.isEnrolled
+        case #selector(signOut(_:)):
+            item.isHidden = !ManagedViewer.shared.isSignedIn
+            return true
         default: return true
         }
     }
@@ -219,6 +267,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         add(app, "About Glide Viewer", #selector(showAbout(_:)), target: self)
         app.addItem(.separator())
         add(app, "Settings…", #selector(showSettings(_:)), ",", target: self)
+        app.addItem(.separator())
+        add(app, "Sign In to Your Organization…", #selector(showSignIn(_:)), target: self)
+        add(app, "Sign Out of Your Organization", #selector(signOut(_:)), target: self)
         app.addItem(.separator())
         let services = NSMenu(title: "Services")
         app.addItem(withTitle: "Services", action: nil, keyEquivalent: "").submenu = services

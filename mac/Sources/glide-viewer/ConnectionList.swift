@@ -12,6 +12,10 @@ final class ConnectionListController: NSObject, NSTableViewDataSource, NSTableVi
     private enum Item {
         case header(String)
         case row(ConnectionRow)
+        /// Glide Cloud (ENTERPRISE.md): a host the signed-in user may reach.
+        case cloud(CloudHost)
+        /// Glide Cloud: a line of explanation (not signed in, no hosts, an error).
+        case cloudInfo(String)
     }
 
     let window: NSWindow
@@ -23,12 +27,19 @@ final class ConnectionListController: NSObject, NSTableViewDataSource, NSTableVi
     private let duplicateButton = NSButton(title: "Duplicate", target: nil, action: nil)
     private let removeButton = NSButton(title: "Remove…", target: nil, action: nil)
     private let unpairButton = NSButton(title: "Unpair…", target: nil, action: nil)
+    /// "Sign In…" / "Sign Out" for the organization (hidden when not managed).
+    private let orgButton = NSButton(title: "Sign In…", target: nil, action: nil)
+    private var hostRefresh: Timer?
     private var items: [Item] = []
     private var config = ViewerConfig()
     private var editor: ConnectionEditor?
 
     /// The user picked a connection (only supported ones are passed).
     var onConnect: ((SavedConnection) -> Void)?
+    /// The user picked one of the organization's hosts (`viewOnly`: Connect View Only).
+    var onConnectCloud: ((CloudHost, Bool) -> Void)?
+    /// "Sign In…" (the app shows the sign-in window).
+    var onSignIn: (() -> Void)?
 
     private enum Column: String, CaseIterable {
         case name, address, status, lastUsed
@@ -101,14 +112,14 @@ final class ConnectionListController: NSObject, NSTableViewDataSource, NSTableVi
         let add = NSButton(title: "Add…", target: self, action: #selector(addClicked(_:)))
         for (b, sel) in [(editButton, #selector(editClicked(_:))), (duplicateButton, #selector(duplicateClicked(_:))),
                          (removeButton, #selector(removeClicked(_:))), (unpairButton, #selector(unpairClicked(_:))),
-                         (connectButton, #selector(connectClicked(_:)))] {
+                         (connectButton, #selector(connectClicked(_:))), (orgButton, #selector(orgClicked(_:)))] {
             b.target = self
             b.action = sel
         }
         connectButton.keyEquivalent = "\r"
         unpairButton.toolTip = "Forget the PC's pinned key on this Mac. The next connection pairs again with a 6-digit code."
         removeButton.toolTip = "Delete the saved connection (and its pairing, unless another connection uses the same address)."
-        let buttons = NSStackView(views: [add, editButton, duplicateButton, removeButton, unpairButton, NSView(), connectButton])
+        let buttons = NSStackView(views: [add, editButton, duplicateButton, removeButton, unpairButton, NSView(), orgButton, connectButton])
         buttons.orientation = .horizontal
         buttons.spacing = 8
         buttons.translatesAutoresizingMaskIntoConstraints = false
@@ -131,10 +142,20 @@ final class ConnectionListController: NSObject, NSTableViewDataSource, NSTableVi
             buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
         ])
         w.contentView = content
+        NotificationCenter.default.addObserver(forName: ManagedViewer.changed, object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.editor == nil else { return }
+            self.reload()
+        }
         reload()
     }
 
     func show() {
+        ManagedViewer.shared.refreshHosts()
+        hostRefresh?.invalidate()
+        hostRefresh = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            guard let self, self.window.isVisible else { return }
+            ManagedViewer.shared.refreshHosts()
+        }
         reload()
         if !window.isVisible && !window.setFrameUsingName("GlideViewerConnections") { window.center() }
         window.makeKeyAndOrderFront(nil)
@@ -144,7 +165,7 @@ final class ConnectionListController: NSObject, NSTableViewDataSource, NSTableVi
 
     /// Re-reads viewer.json and redraws, keeping the selection (or selecting `select`).
     func reload(select: String? = nil) {
-        let keep = select ?? selectedRow?.id
+        let keep = select ?? selectedRow?.id ?? selectedCloud.map { "cloud:" + $0.id }
         // A file that can't be read is reported in the list itself, not with an alert: this runs
         // whenever the window becomes key, which closing an alert would trigger again.
         var loadError: Error?
@@ -165,9 +186,15 @@ final class ConnectionListController: NSObject, NSTableViewDataSource, NSTableVi
             lastGroup = r.group
             items.append(.row(r))
         }
+        appendCloudItems()
         table.reloadData()
-        let target = items.firstIndex { if case let .row(r) = $0 { return r.id == keep } else { return false } }
-            ?? items.firstIndex { if case .row = $0 { return true } else { return false } }
+        let target = items.firstIndex {
+            switch $0 {
+            case let .row(r): return r.id == keep
+            case let .cloud(h): return "cloud:" + h.id == keep
+            default: return false
+            }
+        } ?? items.firstIndex { if case .row = $0 { return true } else { return false } }
         if let target {
             table.selectRowIndexes(IndexSet(integer: target), byExtendingSelection: false)
             table.scrollRowToVisible(target)
@@ -176,6 +203,8 @@ final class ConnectionListController: NSObject, NSTableViewDataSource, NSTableVi
         }
         if let loadError {
             empty.stringValue = "Can't read viewer.json: \(loadError)\nFix or move the file (it may hold pinned host keys), then reopen this window."
+        } else if config.connections.isEmpty && ManagedViewer.shared.isManaged {
+            empty.stringValue = ""
         } else if config.connections.isEmpty {
             empty.stringValue = "No saved connections yet.\nClick Add… and enter the address of the PC running glide-host.exe."
         } else if rows.isEmpty {
@@ -189,6 +218,37 @@ final class ConnectionListController: NSObject, NSTableViewDataSource, NSTableVi
 
     private var selectedRow: ConnectionRow? { row(at: table.selectedRow) }
 
+    private var selectedCloud: CloudHost? { cloudHost(at: table.selectedRow) }
+
+    private func cloudHost(at i: Int) -> CloudHost? {
+        guard i >= 0, i < items.count, case let .cloud(h) = items[i] else { return nil }
+        return h
+    }
+
+    /// The organization's section: its hosts once signed in, else what to do.
+    private func appendCloudItems() {
+        let mv = ManagedViewer.shared
+        orgButton.isHidden = !mv.isManaged
+        orgButton.title = mv.isSignedIn ? "Sign Out" : "Sign In…"
+        orgButton.isEnabled = mv.isEnrolled
+        guard mv.isManaged else { return }
+        var header = "\(mv.orgName) — Glide Cloud"
+        if let u = mv.user { header += " — \(u.label)" }
+        items.append(.header(header))
+        if !mv.isEnrolled {
+            items.append(.cloudInfo(mv.status?.summary ?? "Connecting to Glide Cloud…"))
+        } else if !mv.isSignedIn {
+            items.append(.cloudInfo("Sign in to \(mv.orgName) to see the computers you can reach."))
+        } else if mv.hosts.isEmpty {
+            items.append(.cloudInfo(mv.hostsError.map { "Can't load the list: \($0)" } ?? (mv.refreshing ? "Loading…" : "No computers are available to you.")))
+        } else {
+            if mv.policy.updateRequired {
+                items.append(.cloudInfo("Update Glide Viewer: \(mv.orgName) requires version \(mv.policy.minAppVersion ?? "?") or later."))
+            }
+            for h in mv.hosts { items.append(.cloud(h)) }
+        }
+    }
+
     private func row(at i: Int) -> ConnectionRow? {
         guard i >= 0, i < items.count, case let .row(r) = items[i] else { return nil }
         return r
@@ -198,7 +258,8 @@ final class ConnectionListController: NSObject, NSTableViewDataSource, NSTableVi
 
     private func updateButtons() {
         let r = selectedRow
-        connectButton.isEnabled = r?.supported == true
+        let lanBlocked = ManagedViewer.shared.lanBlockedReason != nil
+        connectButton.isEnabled = (r?.supported == true && !lanBlocked) || (selectedCloud.map { $0.online && !ManagedViewer.shared.policy.updateRequired } ?? false)
         editButton.isEnabled = r != nil
         duplicateButton.isEnabled = r != nil
         removeButton.isEnabled = r != nil
@@ -214,16 +275,66 @@ final class ConnectionListController: NSObject, NSTableViewDataSource, NSTableVi
         return false
     }
 
+    private func textCell(_ tableView: NSTableView, _ id: String) -> NSTableCellView {
+        (tableView.makeView(withIdentifier: NSUserInterfaceItemIdentifier("cell-" + id), owner: self) as? NSTableCellView) ?? {
+            let c = NSTableCellView()
+            c.identifier = NSUserInterfaceItemIdentifier("cell-" + id)
+            let tf = NSTextField(labelWithString: "")
+            tf.lineBreakMode = .byTruncatingTail
+            tf.translatesAutoresizingMaskIntoConstraints = false
+            c.addSubview(tf)
+            c.textField = tf
+            NSLayoutConstraint.activate([
+                tf.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 2),
+                tf.trailingAnchor.constraint(equalTo: c.trailingAnchor, constant: -2),
+                tf.centerYAnchor.constraint(equalTo: c.centerYAnchor),
+            ])
+            return c
+        }()
+    }
+
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
         if case .header = items[row] { return 20 }
         return tableView.rowHeight
     }
 
-    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { self.row(at: row) != nil }
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        if self.row(at: row) != nil || cloudHost(at: row) != nil { return true }
+        if row >= 0, row < items.count, case .cloudInfo = items[row] { return true }
+        return false
+    }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard row >= 0, row < items.count else { return nil }
         switch items[row] {
+        case let .cloudInfo(text):
+            guard tableColumn?.identifier.rawValue == Column.name.rawValue else { return nil }
+            let cell = textCell(tableView, "cloudinfo")
+            cell.textField?.stringValue = text
+            cell.textField?.textColor = .secondaryLabelColor
+            cell.textField?.font = NSFont.systemFont(ofSize: 13)
+            cell.toolTip = text
+            return cell
+        case let .cloud(h):
+            guard let id = tableColumn?.identifier.rawValue, let col = Column(rawValue: id) else { return nil }
+            let cell = textCell(tableView, id)
+            var color = NSColor.labelColor
+            let text: String
+            switch col {
+            case .name: text = h.name
+            case .address: text = "Glide Cloud · " + (h.platform == "macos" ? "Mac" : h.platform == "windows" ? "PC" : h.platform)
+            case .status:
+                text = h.permissions.summary + (h.approval == .required ? " · asks first" : "")
+                color = .secondaryLabelColor
+            case .lastUsed:
+                if h.online { text = "Online"; color = .systemGreen }
+                else { text = "Offline"; color = .secondaryLabelColor }
+            }
+            cell.textField?.stringValue = text
+            cell.textField?.textColor = color
+            cell.textField?.font = col == .name ? NSFont.systemFont(ofSize: 13, weight: .medium) : NSFont.systemFont(ofSize: 13)
+            cell.toolTip = col == .name ? "\(h.name)\n\(h.permissions.summary)\(h.tags.isEmpty ? "" : "\nTags: " + h.tags.joined(separator: ", "))" : nil
+            return cell
         case let .header(g):
             let c = NSTableCellView()
             let t = NSTextField(labelWithString: g)
@@ -244,9 +355,9 @@ final class ConnectionListController: NSObject, NSTableViewDataSource, NSTableVi
             case .name: text = r.favorite ? "★ \(r.name)" : r.name
             case .address: text = r.address
             case .status:
-                text = r.status
+                text = ManagedViewer.shared.lanBlockedReason.map { "LAN \($0)" } ?? r.status
                 if !r.paired { color = .secondaryLabelColor }
-                if !r.supported { color = .systemRed }
+                if !r.supported || ManagedViewer.shared.lanBlockedReason != nil { color = .systemRed }
             case .lastUsed:
                 text = r.lastUsed
                 color = .secondaryLabelColor
@@ -284,6 +395,16 @@ final class ConnectionListController: NSObject, NSTableViewDataSource, NSTableVi
         if clicked >= 0, row(at: clicked) != nil, clicked != table.selectedRow {
             table.selectRowIndexes(IndexSet(integer: clicked), byExtendingSelection: false)
         }
+        if let h = cloudHost(at: clicked >= 0 ? clicked : table.selectedRow) {
+            let ok = h.online && !ManagedViewer.shared.policy.updateRequired
+            menu.addItem(withTitle: "Connect", action: ok ? #selector(connectClicked(_:)) : nil, keyEquivalent: "").target = self
+            if h.permissions.control {
+                menu.addItem(withTitle: "Connect View Only", action: ok ? #selector(connectViewOnly(_:)) : nil, keyEquivalent: "").target = self
+            }
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "Refresh List", action: #selector(refreshCloud(_:)), keyEquivalent: "").target = self
+            return
+        }
         guard let r = row(at: clicked >= 0 ? clicked : table.selectedRow) else {
             menu.addItem(withTitle: "Add…", action: #selector(addClicked(_:)), keyEquivalent: "").target = self
             return
@@ -307,7 +428,20 @@ final class ConnectionListController: NSObject, NSTableViewDataSource, NSTableVi
     // MARK: Actions
 
     @objc func connectClicked(_ sender: Any?) {
+        if let h = selectedCloud {
+            guard h.online else { showError("“\(h.name)” is offline", "It isn't connected to Glide Cloud right now."); return }
+            onConnectCloud?(h, false)
+            return
+        }
+        if table.selectedRow >= 0, table.selectedRow < items.count, case .cloudInfo = items[table.selectedRow] {
+            if ManagedViewer.shared.isEnrolled && !ManagedViewer.shared.isSignedIn { onSignIn?() }
+            return
+        }
         guard let r = selectedRow, let c = saved(r) else { return }
+        if let why = ManagedViewer.shared.lanBlockedReason {
+            showError("Can't connect to “\(r.name)”", "LAN connections are \(why). Use your organization's list below.")
+            return
+        }
         guard r.supported else {
             showError("Can't connect to “\(r.name)”", r.status == "Invalid address"
                 ? "“\(c.address)” is not a valid address. Edit the connection to fix it."
@@ -315,6 +449,26 @@ final class ConnectionListController: NSObject, NSTableViewDataSource, NSTableVi
             return
         }
         onConnect?(c)
+    }
+
+    @objc private func connectViewOnly(_ sender: Any?) {
+        if let h = selectedCloud, h.online { onConnectCloud?(h, true) }
+    }
+
+    @objc private func refreshCloud(_ sender: Any?) { ManagedViewer.shared.refreshHosts() }
+
+    @objc private func orgClicked(_ sender: Any?) {
+        let mv = ManagedViewer.shared
+        if mv.isSignedIn {
+            let a = NSAlert()
+            a.messageText = "Sign out of \(mv.orgName)?"
+            a.informativeText = "This Mac stops showing your organization's computers until you sign in again."
+            a.addButton(withTitle: "Sign Out")
+            a.addButton(withTitle: "Cancel")
+            a.beginSheetModal(for: window) { r in if r == .alertFirstButtonReturn { mv.signOut() } }
+        } else {
+            onSignIn?()
+        }
     }
 
     @objc func addClicked(_ sender: Any?) {
