@@ -5,8 +5,8 @@
 # Lifecycle: `glide-setup` (install.sh inside the app) installs and starts the LaunchAgent; the
 # cask's steps run in Homebrew's sandbox, which can't. `uninstall launchctl` stops the host and
 # removes the agent on uninstall and also on upgrade (Homebrew skips only `signal` on upgrades).
-# That suits ad-hoc-signed builds: every new build needs its Screen Recording and Accessibility
-# grants again, and `glide-setup` does both. The caveat says so.
+# `glide-setup` after an upgrade restarts the host (and, for ad-hoc-signed builds, which need
+# their Screen Recording and Accessibility grants again, asks for them). The caveat says so.
 cask "glide-host" do
   version "@VERSION@"
   sha256 "@SHA256@"
@@ -28,13 +28,19 @@ cask "glide-host" do
   binary "#{appdir}/Glide Host.app/Contents/Resources/glide-setup"
   binary "#{appdir}/Glide Host.app/Contents/MacOS/glide-host"
 
-  # The app is signed ad hoc and not notarized, so Gatekeeper refuses to start it while it carries
-  # Homebrew's quarantine flag.
+  # Releases built without the project's Developer ID are signed ad hoc and not notarized, so
+  # Gatekeeper refuses to start them while they carry Homebrew's quarantine flag. Harmless for a
+  # notarized app.
   postflight_steps do
     run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{appdir}}/Glide Host.app"], must_succeed: false
   end
 
-  uninstall launchctl: "io.github.sudobrandino.glide.host"
+  # The current bundle id and the one releases up to 0.3.x used (an upgrade from those moves the
+  # host to the new id; glide-setup then asks for the permissions once more).
+  uninstall launchctl: [
+    "dev.brandino.glide.host",
+    "io.github.sudobrandino.glide.host",
+  ]
 
   zap trash: [
     "~/Library/Application Support/Glide",
@@ -45,6 +51,6 @@ cask "glide-host" do
     Run this now, and again after every upgrade:
       glide-setup
     It starts Glide Host at login and walks you through Screen Recording and
-    Accessibility (each new build needs them again), the connection and pairing.
+    Accessibility, the connection and pairing.
   EOS
 end

@@ -39,14 +39,18 @@ cask.
 
 - Installs `Glide Host.app` to `/Applications` and links `glide-setup` and `glide-host` into
   Homebrew's `bin`.
-- Removes the quarantine flag (the app is signed ad hoc and not notarized).
+- Removes the quarantine flag (needed for releases built without the project's Developer ID,
+  which are signed ad hoc and not notarized; harmless for notarized ones).
 - Leaves the LaunchAgent to `glide-setup`: cask steps run in Homebrew's sandbox (with a
   temporary `$HOME`), where they can't install or start a per-user agent.
-- `uninstall launchctl` stops the host and removes the agent, on `brew uninstall` and also on
-  `brew upgrade` (Homebrew skips only `signal` directives on upgrades). Because releases are
-  signed ad hoc, each new build needs its Screen Recording and Accessibility grants again anyway,
-  so the caveat asks for `glide-setup` after every upgrade; it restarts the host and re-requests
-  the grants. `brew uninstall --zap` also removes the settings, the pairings and the log.
+- `uninstall launchctl` stops the host and removes the agent (under the current bundle id,
+  `dev.brandino.glide.host`, and the one releases up to 0.3.x used), on `brew uninstall` and also
+  on `brew upgrade` (Homebrew skips only `signal` directives on upgrades). So the caveat asks for
+  `glide-setup` after every upgrade: it restarts the host and, for ad-hoc-signed builds (each new
+  build needs its Screen Recording and Accessibility grants again), re-requests the grants.
+  `brew uninstall --zap` also removes the settings, the pairings and the log.
+- Organizations deploying with an MDM use the `.pkg` instead (see
+  [`docs/DEPLOYMENT.md`](../../docs/DEPLOYMENT.md)); `glide-setup` leaves a `.pkg` install alone.
 
 ## Checking a change to the template
 

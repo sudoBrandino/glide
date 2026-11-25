@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for Glide Host.app (tools/make-host-app.sh). Deliberately empty:
+  every hardened-runtime exception stays off.
+
+  What the host does, and why none of it needs an entitlement:
+  - Screen and system-audio capture (ScreenCaptureKit, SCStream with capturesAudio): gated by the
+    Screen Recording privacy permission (TCC), not by an entitlement. System audio comes through
+    SCStream, not the microphone, so com.apple.security.device.audio-input is not needed.
+  - Keyboard and mouse injection (CGEvent posting to the HID event tap) and AXIsProcessTrusted:
+    gated by Accessibility (TCC; PostEvent is covered by it).
+  - The virtual display: CoreGraphics' private CGVirtualDisplay classes, looked up at run time
+    (NSClassFromString) in a system framework. Library validation only restricts loading
+    non-Apple, differently signed code; nothing is loaded from outside the app or the OS, so
+    com.apple.security.cs.disable-library-validation stays off. No private symbols are linked.
+  - Networking (TCP listen/dial on the LAN, HTTPS to Glide Cloud): not sandboxed, so no network
+    entitlements; macOS 15+ asks for Local Network access using NSLocalNetworkUsageDescription.
+  - Login item (SMAppService), clipboard, files in ~/Downloads, spawning /usr/bin/open: no
+    entitlement.
+  - No JIT, no unsigned executable memory, no DYLD_* variables, no debugger attachment, no Apple
+    Events: the matching com.apple.security.cs.* / automation.apple-events stay off.
+
+  App Sandbox is not used: a sandboxed app can't post events to other apps or run as the
+  per-user LaunchAgent the installers set up.
+-->
+<plist version="1.0">
+<dict/>
+</plist>
