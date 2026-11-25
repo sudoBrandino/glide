@@ -5,6 +5,7 @@
 //! behind `LocalConfirm` (a dialog on Windows, a script in tests).
 
 use super::trust::{display_name, Claim, PairingVote, PairingWindow, TrustStore, VoteOutcome, CONFIRM_TIMEOUT};
+use crate::cloud::grants::{Grant, GrantStore};
 use crate::crypto::{CryptoError, Opener, Sealer};
 use crate::handshake::*;
 use crate::identity::Identity;
@@ -54,6 +55,13 @@ pub struct HostCtx {
     pub preauth_timeout: Duration,
     pub confirm_timeout: Duration,
     next_id: AtomicU64,
+    /// Managed mode: viewer keys the cloud granted for one session each (docs/ENTERPRISE.md §6.3).
+    /// In memory only; never written to host.json.
+    pub grants: Arc<GrantStore>,
+    /// Org setting `allow_local_pairing` (and LAN mode): false = the pairing window can't open.
+    local_pairing: AtomicBool,
+    /// Org setting `lan_mode` / `DisableLANMode`: false = LAN connections are refused.
+    lan: AtomicBool,
 }
 
 impl HostCtx {
@@ -67,14 +75,40 @@ impl HostCtx {
             preauth_timeout: PREAUTH_TIMEOUT,
             confirm_timeout: CONFIRM_TIMEOUT,
             next_id: AtomicU64::new(1),
+            grants: Arc::new(GrantStore::default()),
+            local_pairing: AtomicBool::new(true),
+            lan: AtomicBool::new(true),
         }
     }
 
     /// Opens the pairing window ("Pair New Mac…", `--pair`) and forgets all rate limiting: the
-    /// viewer about to pair may have been refused a moment ago (§2.5).
-    pub fn open_pairing(&self, duration: Duration) {
+    /// viewer about to pair may have been refused a moment ago (§2.5). Returns false (and opens
+    /// nothing) when the organization turned local pairing off.
+    pub fn open_pairing(&self, duration: Duration) -> bool {
+        if !self.local_pairing_allowed() {
+            super::log("pairing is turned off by your organization (Glide Cloud setting allow_local_pairing)");
+            return false;
+        }
         self.window.open(Instant::now(), duration);
         *self.backoff.lock().unwrap() = Backoff::default();
+        true
+    }
+
+    pub fn local_pairing_allowed(&self) -> bool {
+        self.local_pairing.load(Ordering::SeqCst) && self.lan_allowed()
+    }
+
+    pub fn lan_allowed(&self) -> bool {
+        self.lan.load(Ordering::SeqCst)
+    }
+
+    /// Applies org settings (managed mode). Turning pairing off closes an open window.
+    pub fn set_policy(&self, lan: bool, local_pairing: bool) {
+        self.lan.store(lan, Ordering::SeqCst);
+        self.local_pairing.store(local_pairing, Ordering::SeqCst);
+        if !self.local_pairing_allowed() {
+            self.window.close();
+        }
     }
 
     pub fn next_conn_id(&self) -> u64 {
@@ -107,6 +141,8 @@ pub struct Authed {
     /// This connection paired the viewer.
     pub paired_now: bool,
     pub conn_id: u64,
+    /// Managed session: the grant this viewer was admitted with (permissions, user).
+    pub grant: Option<Grant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,12 +264,12 @@ pub fn accept(stream: TcpStream, peer: IpAddr, ctx: &HostCtx) -> Result<Authed, 
     let peer = canonical(peer);
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    let r = accept_inner(&stream, peer, ctx, id);
+    let r = accept_inner(&stream, peer, ctx, id, None);
     match r {
-        Ok((sealer, opener, viewer_key, viewer_name, hello, paired_now)) => {
+        Ok((sealer, opener, viewer_key, viewer_name, hello, paired_now, grant)) => {
             ctx.backoff.lock().unwrap().succeeded(peer);
             let _ = stream.set_read_timeout(None);
-            Ok(Authed { stream, sealer, opener, peer, viewer_key, viewer_name, hello, paired_now, conn_id: id })
+            Ok(Authed { stream, sealer, opener, peer, viewer_key, viewer_name, hello, paired_now, conn_id: id, grant })
         }
         Err(f) => {
             if f.charged() {
@@ -248,9 +284,32 @@ pub fn accept(stream: TcpStream, peer: IpAddr, ctx: &HostCtx) -> Result<Authed, 
     }
 }
 
-type Accepted = (Sealer, Opener, [u8; 32], String, Hello, bool);
+/// Managed session (docs/ENTERPRISE.md §6.3, §6.6): runs the host side on the loopback end of the
+/// relay bridge for `session_id`. Only the viewer key granted for that session is accepted (the
+/// grant is used up), never a pairing and never a key from host.json. A connection the host
+/// dialed out: nothing is charged to the inbound rate limiter (PROTOCOL.md §2.5).
+pub fn accept_relay(stream: TcpStream, session_id: &str, ctx: &HostCtx) -> Result<Authed, Failure> {
+    let id = ctx.next_conn_id();
+    let peer = IpAddr::from([127, 0, 0, 1]);
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    match accept_inner(&stream, peer, ctx, id, Some(session_id)) {
+        Ok((sealer, opener, viewer_key, viewer_name, hello, paired_now, grant)) => {
+            let _ = stream.set_read_timeout(None);
+            Ok(Authed { stream, sealer, opener, peer, viewer_key, viewer_name, hello, paired_now, conn_id: id, grant })
+        }
+        Err(f) => {
+            super::log(&format!("conn {id}: managed session {session_id}: {f}"));
+            ctx.grants.cancel(session_id);
+            close_gracefully(&stream);
+            Err(f)
+        }
+    }
+}
 
-fn accept_inner(s: &TcpStream, peer: IpAddr, ctx: &HostCtx, id: u64) -> Result<Accepted, Failure> {
+type Accepted = (Sealer, Opener, [u8; 32], String, Hello, bool, Option<Grant>);
+
+fn accept_inner(s: &TcpStream, peer: IpAddr, ctx: &HostCtx, id: u64, relay: Option<&str>) -> Result<Accepted, Failure> {
     let until = Instant::now() + ctx.preauth_timeout;
     let blocked = || ctx.backoff.lock().unwrap().blocked(peer, Instant::now());
     let mut pre = [0u8; CLIENT_PREAMBLE_LEN];
@@ -284,7 +343,8 @@ fn accept_inner(s: &TcpStream, peer: IpAddr, ctx: &HostCtx, id: u64) -> Result<A
         Err(e) => return Err(err(format!("handshake: {e}"))),
     };
     let n_h = hs.nonce;
-    let open = ctx.window.is_open(Instant::now());
+    // A relay connection never pairs: its msg2 says the window is closed.
+    let open = relay.is_none() && ctx.local_pairing_allowed() && ctx.window.is_open(Instant::now());
     write_all(s, &hs.write_msg2(if open { HOST_FLAG_PAIRING_OPEN } else { 0 }))?;
     // EOF here = the viewer has another key pinned for this address (or its pairing gate said no).
     let msg3 = read_frame(s, until).map_err(|e| err(format!("viewer left after msg2 ({e})")))?;
@@ -300,7 +360,23 @@ fn accept_inner(s: &TcpStream, peer: IpAddr, ctx: &HostCtx, id: u64) -> Result<A
     };
     let mut paired_now = false;
     let mut hello_until = until;
-    if info.pair_request() {
+    let mut grant = None;
+    if let Some(sid) = relay {
+        if info.pair_request() {
+            super::log(&format!("conn {id}: managed session {sid}: viewer “{name}” ({fp}) asked to pair; refused"));
+            return Err(reject(&mut sealer, AUTH_PAIRING_CLOSED));
+        }
+        match ctx.grants.take(sid, &vkey, Instant::now()) {
+            Ok(g) => {
+                super::log(&format!("conn {id}: managed session {sid}: “{name}” ({fp}) admitted by grant for {}", g.user.label()));
+                grant = Some(g);
+            }
+            Err(e) => {
+                super::log(&format!("conn {id}: managed session {sid}: rejected viewer “{name}” ({fp}): {e}"));
+                return Err(reject(&mut sealer, AUTH_UNKNOWN_VIEWER));
+            }
+        }
+    } else if info.pair_request() {
         match ctx.window.claim(id, Instant::now()) {
             Claim::Closed => {
                 super::log(&format!("conn {id}: viewer “{name}” ({fp}) at {peer} asked to pair, but pairing isn't open (glide-host --pair)"));
@@ -343,7 +419,7 @@ fn accept_inner(s: &TcpStream, peer: IpAddr, ctx: &HostCtx, id: u64) -> Result<A
     match ClientMsg::decode(&pt) {
         Ok(ClientMsg::ClientHello { version, codec_caps, view_w, view_h, mode, max_fps, client_name }) => {
             let hello = Hello { version, codec_caps, view_w, view_h, mode, max_fps, client_name };
-            Ok((sealer, opener, vkey, name, hello, paired_now))
+            Ok((sealer, opener, vkey, name, hello, paired_now, grant))
         }
         Ok(m) => Err(err(format!("expected ClientHello, got {}", short(&m)))),
         Err(e) => Err(err(format!("bad message instead of ClientHello: {e}"))),
@@ -444,6 +520,12 @@ pub fn serve(listener: TcpListener, ctx: Arc<HostCtx>, on_authed: Arc<dyn Fn(Aut
                 continue;
             }
         };
+        if !ctx.lan_allowed() {
+            // LAN mode turned off (managed mode): stop listening. The caller woke us up.
+            drop(stream);
+            super::log("LAN connections are turned off by your organization; not listening");
+            return Ok(());
+        }
         if active.load(Ordering::SeqCst) >= MAX_PREAUTH_CONNECTIONS {
             super::log(&format!("{}: too many handshakes in progress; closing", addr.ip()));
             drop(stream);
@@ -795,5 +877,123 @@ mod tests {
                 assert_eq!(g("sas"), sas_text(sas_code(&est.handshake_hash, &info.nonce, &n_h)));
             }
         }
+    }
+
+    // ---------------------------------------------------------------- managed sessions (grants)
+
+    fn grant_for(session_id: &str, key: [u8; 32]) -> Grant {
+        Grant {
+            session_id: session_id.into(),
+            viewer_key: key,
+            viewer_name: "Viewer PC".into(),
+            user: crate::cloud::api::User { id: "usr_1".into(), email: "ada@example.com".into(), name: "Ada".into(), groups: None },
+            permissions: crate::cloud::Permissions { control: false, ..Default::default() },
+            expires: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    /// The real viewer through two relay bridges (fake relay in between) against `accept_relay`.
+    fn run_relay(ctx: &Arc<HostCtx>, session_id: &str, a: &crate::net::Auth) -> (Result<Connection, ConnectError>, Result<Option<Grant>, Failure>) {
+        use crate::cloud::bridge;
+        use crate::cloud::transport::{fake::pair, WebSocket, WsMsg};
+        let (viewer_ws, host_ws) = pair();
+        host_ws.send(WsMsg::Text(r#"{"type":"peer_joined"}"#.into())).unwrap(); // to the viewer
+        viewer_ws.send(WsMsg::Text(r#"{"type":"peer_joined"}"#.into())).unwrap(); // to the host
+        let (c2, sid) = (ctx.clone(), session_id.to_string());
+        let h = thread::spawn(move || {
+            let (stream, b) = bridge::open(host_ws, &|| {}).unwrap();
+            let r = accept_relay(stream, &sid, &c2).map(|mut au| {
+                let cfg = crate::protocol::VideoConfig { width: 1280, height: 720, codec: crate::protocol::Codec::H264, chroma: 0, color: 0, scale: 1.0 };
+                let m = HostMsg::ServerHello { version: 2, host_name: "WIN-PC".into(), config: cfg };
+                (&au.stream).write_all(&au.sealer.seal(&m.encode())).unwrap();
+                let _ = au.opener.read_record(&mut au.stream, &mut Vec::new());
+                au.grant
+            });
+            b.close();
+            r
+        });
+        let (stream, b) = bridge::open(viewer_ws, &|| {}).unwrap();
+        let r = Connection::from_stream(stream, a, &hello());
+        if let Ok(c) = &r {
+            c.stop();
+        }
+        let out = h.join().unwrap();
+        b.close();
+        (r, out)
+    }
+
+    #[test]
+    fn granted_viewer_is_accepted_once_without_pairing_and_never_persisted() {
+        let (ctx, script) = ctx(Some(true));
+        let viewer = Identity::generate();
+        ctx.grants.insert(grant_for("ses_1", viewer.public()), Instant::now());
+        let mut a = viewer_auth(&viewer, Some(ctx.identity.public()), TestUi::new(true));
+        a.target = crate::cloud::relay_target("ses_1");
+        let (r, out) = run_relay(&ctx, "ses_1", &a);
+        let c = r.unwrap();
+        assert!(!c.paired, "no pairing");
+        assert_eq!(c.host_key, ctx.identity.public());
+        let g = out.unwrap().expect("admitted by grant");
+        assert_eq!((g.user.email.as_str(), g.permissions.control), ("ada@example.com", false));
+        assert!(script.asked.lock().unwrap().is_empty(), "nobody was asked");
+        assert!(!ctx.trust.is_paired(&viewer.public()), "never written to the paired viewers");
+        assert!(ctx.trust.list().is_empty());
+        assert!(ctx.grants.is_empty(), "the grant is used up");
+        // Single use: the same session again is refused as an unknown viewer.
+        let (r, out) = run_relay(&ctx, "ses_1", &a);
+        assert!(r.err().unwrap().is_unknown_viewer());
+        assert_eq!(out.err(), Some(Failure::Rejected(AUTH_UNKNOWN_VIEWER)));
+        // Relay failures are not charged to the inbound rate limiter.
+        assert!(ctx.backoff.lock().unwrap().blocked("127.0.0.1".parse().unwrap(), Instant::now()).is_none());
+    }
+
+    #[test]
+    fn relay_refuses_other_keys_paired_keys_and_pairing() {
+        let (ctx, _) = ctx(Some(true));
+        let granted = Identity::generate();
+        let other = Identity::generate();
+        // A key paired over the LAN doesn't get in through the relay without a grant.
+        ctx.trust.add("lan", &other.public()).unwrap();
+        ctx.grants.insert(grant_for("ses_2", granted.public()), Instant::now());
+        let mut a = viewer_auth(&other, Some(ctx.identity.public()), TestUi::new(true));
+        a.target = crate::cloud::relay_target("ses_2");
+        let (r, out) = run_relay(&ctx, "ses_2", &a);
+        assert!(r.err().unwrap().is_unknown_viewer());
+        assert_eq!(out.err(), Some(Failure::Rejected(AUTH_UNKNOWN_VIEWER)));
+        assert!(ctx.grants.is_empty(), "a wrong key uses the grant up");
+        // A grant for another session doesn't help.
+        ctx.grants.insert(grant_for("ses_3", granted.public()), Instant::now());
+        let mut a = viewer_auth(&granted, Some(ctx.identity.public()), TestUi::new(true));
+        a.target = crate::cloud::relay_target("ses_4");
+        let (r, _) = run_relay(&ctx, "ses_4", &a);
+        assert!(r.err().unwrap().is_unknown_viewer());
+        // An unpinned viewer asking to pair over the relay: the window reads closed even if open.
+        ctx.open_pairing(Duration::from_secs(60));
+        let a = viewer_auth(&granted, None, TestUi::new(true));
+        let (r, _) = run_relay(&ctx, "ses_3", &a);
+        assert!(matches!(r.err().unwrap(), ConnectError::HostPairingClosed));
+    }
+
+    #[test]
+    fn org_settings_gate_pairing_and_lan() {
+        let (ctx, _) = ctx(Some(true));
+        assert!(ctx.open_pairing(Duration::from_secs(60)));
+        ctx.set_policy(true, false);
+        assert!(!ctx.window.is_open(Instant::now()), "turning pairing off closes the window");
+        assert!(!ctx.open_pairing(Duration::from_secs(60)));
+        assert!(!ctx.window.is_open(Instant::now()));
+        ctx.set_policy(false, true);
+        assert!(!ctx.local_pairing_allowed(), "no LAN, no LAN pairing");
+        assert!(!ctx.lan_allowed());
+        // serve() stops listening once LAN mode is off (woken by a connection).
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let c2 = ctx.clone();
+        let h = thread::spawn(move || serve(l, c2, Arc::new(|_| {})));
+        let _wake = TcpStream::connect(addr).unwrap();
+        assert!(h.join().unwrap().is_ok());
+        assert!(TcpStream::connect(addr).is_err(), "no longer listening");
+        ctx.set_policy(true, true);
+        assert!(ctx.open_pairing(Duration::from_secs(60)));
     }
 }

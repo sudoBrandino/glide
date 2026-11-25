@@ -124,6 +124,100 @@ impl LocalConfirm for ConsoleConfirm {
     }
 }
 
+fn on_off(b: bool) -> &'static str {
+    if b {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+/// The LAN listeners. Managed mode can turn LAN mode off (and on again) at runtime: then the host
+/// stops listening altogether (docs/ENTERPRISE.md §7), not just refusing connections.
+struct Lan {
+    addrs: Vec<String>,
+    explicit_bind: bool,
+    /// Local addresses of the running listeners (empty = not listening).
+    bound: Mutex<Vec<std::net::SocketAddr>>,
+    ctx: Arc<HostCtx>,
+    on_authed: Arc<dyn Fn(Authed) + Send + Sync>,
+}
+
+impl Lan {
+    /// Binds and serves every address (once). Returns what it listens on.
+    fn start(&self) -> Result<Vec<String>, String> {
+        let mut bound = self.bound.lock().unwrap();
+        if !bound.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut listeners = Vec::new();
+        let mut names = Vec::new();
+        for a in &self.addrs {
+            match TcpListener::bind(a) {
+                Ok(l) => {
+                    listeners.push(l);
+                    names.push(a.clone());
+                }
+                // [::] may share 0.0.0.0's port (dual-stack) or IPv6 may be off: not fatal.
+                Err(e) if !self.explicit_bind && a.starts_with('[') => log(&format!("not listening on {a}: {e}")),
+                Err(e) => return Err(format!("cannot listen on {a}: {e}")),
+            }
+        }
+        for l in listeners {
+            if let Ok(a) = l.local_addr() {
+                bound.push(a);
+            }
+            let (ctx, on_authed) = (self.ctx.clone(), self.on_authed.clone());
+            std::thread::spawn(move || {
+                if let Err(e) = serve(l, ctx, on_authed) {
+                    log(&format!("listener stopped: {e}"));
+                }
+            });
+        }
+        Ok(names)
+    }
+
+    /// Stops listening: `serve` returns at its next accept once LAN mode is off, so wake it.
+    fn stop(&self) {
+        let bound: Vec<_> = self.bound.lock().unwrap().drain(..).collect();
+        for mut a in bound {
+            if a.ip().is_unspecified() {
+                a.set_ip(if a.is_ipv4() { std::net::Ipv4Addr::LOCALHOST.into() } else { std::net::Ipv6Addr::LOCALHOST.into() });
+            }
+            let _ = std::net::TcpStream::connect_timeout(&a, Duration::from_secs(1));
+        }
+    }
+
+    /// Listen exactly while LAN mode is allowed.
+    fn sync(&self) {
+        if self.ctx.lan_allowed() {
+            match self.start() {
+                Ok(n) if !n.is_empty() => log(&format!("LAN connections are on: listening on {}", n.join(", "))),
+                Ok(_) => {}
+                Err(e) => log(&format!("LAN connections: {e}")),
+            }
+        } else {
+            let was = !self.bound.lock().unwrap().is_empty();
+            self.stop();
+            if was {
+                log("LAN connections are off: stopped listening");
+            }
+        }
+    }
+}
+
+/// Managed-mode prompt where there is no dialog (non-Windows builds): every request needing
+/// approval is declined.
+#[cfg(not(windows))]
+struct NoPrompt;
+
+#[cfg(not(windows))]
+impl glide::cloud::host::HostUi for NoPrompt {
+    fn approve(&self, _o: &glide::cloud::api::SessionOffer, _cancel: Arc<AtomicBool>) -> glide::cloud::host::Approval {
+        glide::cloud::host::Approval::Decline
+    }
+}
+
 fn default_name() -> String {
     #[cfg(windows)]
     {
@@ -229,69 +323,152 @@ fn main() -> ExitCode {
         Some(b) => vec![format!("{b}:{port}")],
         None => vec![format!("0.0.0.0:{port}"), format!("[::]:{port}")],
     };
-    let mut listeners = Vec::new();
-    let mut bound = Vec::new();
-    for a in &addrs {
-        match TcpListener::bind(a) {
-            Ok(l) => {
-                listeners.push(l);
-                bound.push(a.clone());
-            }
-            // [::] may share 0.0.0.0's port (dual-stack) or IPv6 may be off: not fatal.
-            Err(e) if bind.is_none() && a.starts_with('[') => log(&format!("not listening on {a}: {e}")),
-            Err(e) => {
-                eprintln!("glide-host: cannot listen on {a}: {e}");
-                return ExitCode::FAILURE;
-            }
+    // Managed mode (Glide Cloud, docs/ENTERPRISE.md): the organization's policy, if any.
+    let managed = match glide::cloud::managed::load() {
+        Ok(m) => m,
+        Err(e) => {
+            log(&format!("managed configuration ignored: {e}"));
+            None
         }
+    };
+    if managed.as_ref().is_some_and(|m| m.disable_lan_mode) {
+        ctx.set_policy(false, false);
+        log("LAN connections are turned off by policy (DisableLANMode)");
     }
-    log(&format!("glide-host {} “{host_name}” listening on {} (key {fp})", env!("CARGO_PKG_VERSION"), bound.join(", ")));
     log(&format!("config: {}", cfg_path.display()));
     if args.test_mode {
         log("TEST MODE: no screen capture and no input injection");
-    }
-    let paired = ctx.trust.list();
-    if paired.is_empty() && !args.pair {
-        log("no paired Mac yet: choose Pair New Mac… in the tray menu, type `pair` here (or start with --pair), then connect from the Mac");
-    }
-    if args.pair {
-        ctx.open_pairing(PAIRING_WINDOW);
-        log("pairing window open for 2 minutes");
     }
 
     let slot = Arc::new(SessionSlot::default());
     #[cfg(windows)]
     let opts = Arc::new(glide::host::win::session::SessionOpts { host_name: host_name.clone(), bitrate_kbps: args.bitrate });
-    let on_authed: Arc<dyn Fn(Authed) + Send + Sync> = {
-        let (slot, ctx, test_mode, host_name) = (slot.clone(), ctx.clone(), args.test_mode, host_name.clone());
+    // Runs one authenticated session (LAN or managed) in the slot. `authorized` is asked every
+    // 2 s while it streams.
+    let run_session: Arc<dyn Fn(Authed, Box<dyn Fn() -> bool + Send>) + Send + Sync> = {
+        let (slot, test_mode, host_name) = (slot.clone(), args.test_mode, host_name.clone());
         #[cfg(windows)]
         let opts = opts.clone();
-        Arc::new(move |a: Authed| {
+        Arc::new(move |a: Authed, authorized: Box<dyn Fn() -> bool + Send>| {
             let id = a.conn_id;
             let stop = slot.enter(id, Duration::from_secs(10));
             if test_mode {
+                let _ = &authorized;
                 run_test_session(a, &host_name, stop);
             } else {
                 #[cfg(windows)]
-                glide::host::win::session::run(a, &opts, &ctx.trust, stop);
+                glide::host::win::session::run(a, &opts, &*authorized, stop);
                 #[cfg(not(windows))]
                 {
+                    let _ = &authorized;
                     log("screen capture is only implemented on Windows; running as --test-mode");
                     run_test_session(a, &host_name, stop);
                 }
             }
-            let _ = &ctx;
             slot.leave(id);
         })
     };
+    let on_authed: Arc<dyn Fn(Authed) + Send + Sync> = {
+        let (ctx, run_session) = (ctx.clone(), run_session.clone());
+        Arc::new(move |a: Authed| {
+            let (ctx2, key) = (ctx.clone(), a.viewer_key);
+            run_session(a, Box::new(move || ctx2.trust.is_paired(&key) && ctx2.lan_allowed()));
+        })
+    };
+    let lan = Arc::new(Lan { addrs: addrs.clone(), explicit_bind: bind.is_some(), bound: Mutex::new(Vec::new()), ctx: ctx.clone(), on_authed: on_authed.clone() });
+
+    // Managed mode: enroll, hub, approval prompts, relayed sessions.
+    let local_disable = managed.as_ref().is_some_and(|m| m.disable_lan_mode);
+    let cloud = match (managed.filter(|m| m.has_cloud()), glide::cloud::platform_http()) {
+        (Some(m), Some(http)) => {
+            use glide::cloud::{enroll, host as chost, settings, store};
+            let facts = enroll::DeviceFacts {
+                kind: enroll::Kind::Host,
+                public_key: ctx.identity.public(),
+                name: m.device_name.clone().unwrap_or_else(|| host_name.clone()),
+                os_version: glide::cloud::os_version(),
+                app_version: settings::app_version().into(),
+            };
+            log(&format!("managed by Glide Cloud at {}", m.cloud_url));
+            let st = store::Store::new(&dir, enroll::Kind::Host.file(), store::platform_seal());
+            #[cfg(windows)]
+            let ui: Arc<dyn chost::HostUi> = Arc::new(glide::host::win::confirm::CloudPrompt);
+            #[cfg(not(windows))]
+            let ui: Arc<dyn chost::HostUi> = Arc::new(NoPrompt);
+            let hooks = chost::HostHooks {
+                busy: Box::new({
+                    let slot = slot.clone();
+                    move || slot.busy()
+                }),
+                run_session: Box::new({
+                    let (ctx, run_session) = (ctx.clone(), run_session.clone());
+                    move |stream, active: Arc<chost::ActiveSession>| match glide::host::auth::accept_relay(stream, &active.session_id, &ctx) {
+                        Ok(a) => {
+                            log(&format!("managed session {}: {}", active.session_id, active.label()));
+                            active.authenticated();
+                            let live = active.clone();
+                            run_session(a, Box::new(move || live.live()));
+                        }
+                        Err(e) => log(&format!("managed session {}: handshake failed: {e}", active.session_id)),
+                    }
+                }),
+                settings: Box::new({
+                    let (ctx, lan) = (ctx.clone(), lan.clone());
+                    move |s: &glide::cloud::Settings| {
+                        let (l, p) = (settings::lan_allowed(Some(s), local_disable), settings::local_pairing_allowed(Some(s), local_disable));
+                        if l != ctx.lan_allowed() || p != ctx.local_pairing_allowed() {
+                            log(&format!("organization settings: LAN connections {}, local pairing {}", on_off(l), on_off(p)));
+                        }
+                        ctx.set_policy(l, p);
+                        lan.sync();
+                    }
+                }),
+            };
+            Some(chost::start(m, st, http, facts, ctx.grants.clone(), ui, hooks))
+        }
+        (Some(_), None) => {
+            log("managed mode needs Windows (WinHTTP); running unmanaged");
+            None
+        }
+        _ => None,
+    };
+
+    if ctx.lan_allowed() {
+        match lan.start() {
+            Ok(bound) => log(&format!("glide-host {} “{host_name}” listening on {} (key {fp})", env!("CARGO_PKG_VERSION"), bound.join(", "))),
+            Err(e) => {
+                eprintln!("glide-host: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        let paired = ctx.trust.list();
+        if paired.is_empty() && !args.pair {
+            log("no paired Mac yet: choose Pair New Mac… in the tray menu, type `pair` here (or start with --pair), then connect from the Mac");
+        }
+    } else {
+        log(&format!("glide-host {} “{host_name}” (key {fp}): LAN connections are off; managed sessions only", env!("CARGO_PKG_VERSION")));
+    }
+    if args.pair && ctx.open_pairing(PAIRING_WINDOW) {
+        log("pairing window open for 2 minutes");
+    }
     #[cfg(windows)]
     {
         use glide::host::win::tray::{start, TrayActions};
-        let (c1, c2, c3, c4, slot2) = (ctx.clone(), ctx.clone(), ctx.clone(), ctx.clone(), slot.clone());
+        let (c1, c2, c3, c4, c5, slot2) = (ctx.clone(), ctx.clone(), ctx.clone(), ctx.clone(), ctx.clone(), slot.clone());
+        let (k1, k2, k3, k4) = (cloud.clone(), cloud.clone(), cloud.clone(), cloud.clone());
         start(TrayActions {
             pair: Box::new(move || {
-                c1.open_pairing(PAIRING_WINDOW);
-                log("pairing window open for 2 minutes (Pair New Mac…): connect from the Mac now");
+                if c1.open_pairing(PAIRING_WINDOW) {
+                    log("pairing window open for 2 minutes (Pair New Mac…): connect from the Mac now");
+                }
+            }),
+            pairing_allowed: Box::new(move || c5.local_pairing_allowed()),
+            cloud_status: Box::new(move || k1.as_ref().map(|c| c.status())),
+            cloud_session: Box::new(move || k2.as_ref().and_then(|c| c.active()).map(|a| a.label())),
+            end_session: Box::new(move || {
+                if let Some(c) = &k3 {
+                    c.end_session();
+                }
             }),
             pairing_left: Box::new(move || c2.window.remaining(std::time::Instant::now()).map(|d| d.as_secs())),
             paired: Box::new(move || c3.trust.list().into_iter().map(|v| (v.name.clone(), v.fingerprint(), v.key.clone())).collect()),
@@ -302,18 +479,14 @@ fn main() -> ExitCode {
             config_path: cfg_path.clone(),
             quit: Box::new(move || {
                 log("quitting");
+                if let Some(c) = &k4 {
+                    c.end_session();
+                    c.stop();
+                }
                 slot2.stop_current();
                 std::thread::sleep(Duration::from_millis(500));
                 std::process::exit(0);
             }),
-        });
-    }
-    for l in listeners {
-        let (ctx, on_authed) = (ctx.clone(), on_authed.clone());
-        std::thread::spawn(move || {
-            if let Err(e) = serve(l, ctx, on_authed) {
-                log(&format!("listener stopped: {e}"));
-            }
         });
     }
 
@@ -327,9 +500,23 @@ fn main() -> ExitCode {
         match line.trim().to_ascii_lowercase().as_str() {
             "" => {}
             "pair" => {
-                ctx.open_pairing(PAIRING_WINDOW);
-                log("pairing window open for 2 minutes: connect from the Mac now");
+                if ctx.open_pairing(PAIRING_WINDOW) {
+                    log("pairing window open for 2 minutes: connect from the Mac now");
+                }
             }
+            "end" => match cloud.as_ref().and_then(|c| c.active()) {
+                Some(_) => cloud.as_ref().unwrap().end_session(),
+                None => eprintln!("no managed session is running"),
+            },
+            "status" => match &cloud {
+                Some(c) => {
+                    println!("{}", c.status());
+                    if let Some(a) = c.active() {
+                        println!("{}", a.label());
+                    }
+                }
+                None => println!("not managed (no Glide Cloud policy)"),
+            },
             "paired" => print_paired(&ctx.trust.list()),
             x if x.starts_with("unpair ") => match ctx.trust.remove(line.trim()[7..].trim()) {
                 Ok(r) if r.is_empty() => eprintln!("no paired Mac by that name or key"),
@@ -337,11 +524,15 @@ fn main() -> ExitCode {
                 Err(e) => eprintln!("{e}"),
             },
             "quit" | "exit" => {
+                if let Some(c) = &cloud {
+                    c.end_session();
+                    c.stop();
+                }
                 slot.stop_current();
                 std::thread::sleep(Duration::from_millis(300));
                 return ExitCode::SUCCESS;
             }
-            other => eprintln!("unknown command {other:?} (pair, paired, unpair NAME|KEY, quit)"),
+            other => eprintln!("unknown command {other:?} (pair, paired, unpair NAME|KEY, status, end, quit)"),
         }
     }
     // No console (stdin closed, e.g. started detached): keep serving.

@@ -58,6 +58,8 @@ struct SenderState {
     epoch: Instant,
     /// Why the connection closed on the send side (first write error).
     error: Mutex<Option<String>>,
+    /// Managed session: which plaintexts may be sent (`cloud::perms`); unset = everything.
+    filter: std::sync::OnceLock<crate::cloud::perms::PlainFilter>,
 }
 
 impl Sender {
@@ -78,13 +80,24 @@ impl Sender {
                 writing_since: AtomicU64::new(0),
                 epoch: Instant::now(),
                 error: Mutex::new(None),
+                filter: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Restricts what this connection may send (all clones share it; set once, before use).
+    /// A refused message fails with `PermissionDenied` and the connection stays up.
+    pub fn set_filter(&self, f: crate::cloud::perms::PlainFilter) {
+        let _ = self.state.filter.set(f);
     }
 
     fn write_locked(&self, g: &mut SenderInner, pt: &[u8]) -> std::io::Result<()> {
         if self.is_closed() {
             return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "connection closed"));
+        }
+        if self.state.filter.get().is_some_and(|f| !f(pt)) {
+            // Not allowed in this (managed) session: nothing is written, the connection stays up.
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "not allowed in this session"));
         }
         // Seal under the lock so record order on the wire == counter order.
         let rec = g.sealer.seal(pt);
@@ -452,6 +465,8 @@ pub struct Connection {
     pub paired: bool,
     reader: Option<(BufReader<TcpStream>, Opener)>,
     stop: Arc<AtomicBool>,
+    /// Managed session: which host records are accepted (`cloud::perms`); None = all.
+    inbound_filter: Option<crate::cloud::perms::PlainFilter>,
 }
 
 #[derive(Debug)]
@@ -565,6 +580,16 @@ fn is_eof(e: &std::io::Error) -> bool {
         e.kind(),
         std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
     )
+}
+
+/// A host record a managed session doesn't allow was dropped. A file offer gets a polite decline
+/// (status 1, receiving turned off) so the host doesn't wait for an answer.
+fn refused_inbound(pt: &[u8], sender: &Sender) {
+    use crate::protocol::{FileMsg, MSG_FILE_OFFER};
+    if pt.first() == Some(&MSG_FILE_OFFER) && pt.len() >= 5 {
+        let id = u32::from_le_bytes([pt[1], pt[2], pt[3], pt[4]]);
+        let _ = sender.send(&ClientMsg::File(FileMsg::Answer { id, status: 1, detail: "not allowed by your organization".into() }));
+    }
 }
 
 /// Parse `host`, `host:port`, `[v6]:port`; default port 7420.
@@ -855,7 +880,16 @@ impl Connection {
             paired: pairing,
             reader: Some((reader, opener)),
             stop: Arc::new(AtomicBool::new(false)),
+            inbound_filter: None,
         })
+    }
+
+    /// Managed session (docs/ENTERPRISE.md §6.3): enforce `perms` on what this viewer sends and
+    /// what it accepts. Call before `spawn_receiver`.
+    pub fn restrict(&mut self, perms: crate::cloud::Permissions) {
+        use crate::cloud::perms::{filter, Flow};
+        self.sender.set_filter(filter(perms, Flow::FromViewer));
+        self.inbound_filter = Some(filter(perms, Flow::FromHost));
     }
 
     /// Start the receive thread. Pongs are folded into `self.clock` before being
@@ -868,6 +902,7 @@ impl Connection {
         let clock = self.clock.clone();
         let stop = self.stop.clone();
         let sender = self.sender.clone();
+        let inbound = self.inbound_filter.clone();
         thread::Builder::new()
             .name("glide-recv".into())
             .spawn(move || {
@@ -887,6 +922,10 @@ impl Connection {
                             return;
                         }
                     };
+                    if inbound.as_ref().is_some_and(|f| !f(&pt)) {
+                        refused_inbound(&pt, &sender);
+                        continue;
+                    }
                     match HostMsg::decode(pt) {
                         Ok(msg) => {
                             if let HostMsg::Pong { client_time_us, host_time_us } = msg {
@@ -1000,6 +1039,57 @@ pub(crate) mod tests {
         let r = Connection::connect(&addr.to_string(), a, &hello());
         let out = h.join().unwrap();
         (r, out)
+    }
+
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+    impl Write for Shared {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn records(buf: &Shared, key: &[u8; 32]) -> Vec<ClientMsg> {
+        let mut o = crate::crypto::Opener::new(key);
+        let data = buf.0.lock().unwrap().clone();
+        let mut r = &data[..];
+        let mut out = Vec::new();
+        let mut b = Vec::new();
+        while !r.is_empty() {
+            out.push(ClientMsg::decode(&o.read_record(&mut r, &mut b).unwrap()).unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn managed_session_send_filter_and_inbound_decline() {
+        use crate::cloud::{perms, Direction, Permissions};
+        let key = [9u8; 32];
+        let buf = Shared::default();
+        let s = Sender::with_writer(Box::new(buf.clone()), None, Sealer::new(&key));
+        let p = Permissions { control: false, clipboard: Direction::ToViewer, files: Direction::ToViewer, audio: true };
+        s.set_filter(perms::filter(p, perms::Flow::FromViewer));
+        let e = s.send(&ClientMsg::Key { hid_usage: 4, down: true }).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!s.is_closed(), "a refused message doesn't end the connection");
+        s.send(&ClientMsg::Ping { client_time_us: 1 }).unwrap();
+        // A host file offer the session refuses gets a decline, which the filter lets through.
+        let offer = crate::protocol::HostMsg::File(crate::protocol::FileMsg::Offer { id: crate::protocol::FILE_HOST_ID_BIT | 3, total_bytes: 1, files: vec![] }).encode();
+        let p2 = Permissions { control: true, clipboard: Direction::Off, files: Direction::ToHost, audio: false };
+        assert!(!p2.allows(perms::Flow::FromHost, &offer));
+        let s2 = Sender::with_writer(Box::new(buf.clone()), None, Sealer::new(&key));
+        s2.set_filter(perms::filter(p2, perms::Flow::FromViewer));
+        // (s2 has its own counter: read its records separately)
+        buf.0.lock().unwrap().clear();
+        refused_inbound(&offer, &s2);
+        match &records(&buf, &key)[..] {
+            [ClientMsg::File(crate::protocol::FileMsg::Answer { id, status: 1, .. })] => assert_eq!(*id, crate::protocol::FILE_HOST_ID_BIT | 3),
+            other => panic!("{:?}", other.len()),
+        }
     }
 
     #[test]

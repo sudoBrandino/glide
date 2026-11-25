@@ -156,6 +156,20 @@ fn ctx() -> Option<&'static Ctx> {
     CTX.get().filter(|c| c.enabled)
 }
 
+/// Top-level names of the transfer being sent (managed-mode audit, `session.file_sent`).
+static SENDING_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Queue `paths`, unless a managed session doesn't allow files toward the host (the transport
+/// filter would refuse them anyway; this says why). Returns the refusal to show.
+fn send_checked(c: &Ctx, paths: Vec<PathBuf>) -> Option<String> {
+    if super::managed::active().is_some_and(|a| !a.permissions.effective().files.to_host()) {
+        return Some("Your organization doesn't allow sending files in this session".into());
+    }
+    *SENDING_NAMES.lock().unwrap() = paths.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
+    c.service.send_paths(paths);
+    None
+}
+
 /// Session thread: a connection is up.
 pub fn connected(sender: Sender) {
     let Some(c) = ctx() else { return };
@@ -218,7 +232,9 @@ pub fn on_drop(hdrop: HDROP) -> Option<String> {
     }
     let first = paths[0].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let what = if paths.len() == 1 { format!("“{first}”") } else { format!("{} items", paths.len()) };
-    c.service.send_paths(paths);
+    if let Some(refused) = send_checked(c, paths) {
+        return Some(refused);
+    }
     Some(format!("Sending {what} to the Mac…"))
 }
 
@@ -263,7 +279,9 @@ pub fn pick_and_send(hwnd: HWND, folders: bool) -> Option<String> {
         [one] => format!("“{}”", one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
         many => format!("{} items", many.len()),
     };
-    c.service.send_paths(paths);
+    if let Some(refused) = send_checked(c, paths) {
+        return Some(refused);
+    }
     Some(format!("Sending {what} to the Mac…"))
 }
 
@@ -349,6 +367,8 @@ pub fn take_notices() -> Vec<Shown> {
         .into_iter()
         .filter_map(|n| match n {
             Notice::Received { files, bytes, dir, items } => {
+                let names: Vec<String> = items.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
+                super::managed::audit(|q, sid| q.files(sid, false, files, bytes, &names));
                 let where_ = dir.display().to_string();
                 *c.last_received.lock().unwrap() = Some((dir, items));
                 Some(Shown {
@@ -356,7 +376,11 @@ pub fn take_notices() -> Vec<Shown> {
                     balloon: Some((format!("Received {} from the Mac", count_files(files)), format!("Saved to {where_}. Click to show in Explorer."))),
                 })
             }
-            Notice::Sent { files, bytes } => Some(Shown { toast: format!("Sent {} ({}) to the Mac", count_files(files), human_bytes(bytes)), balloon: None }),
+            Notice::Sent { files, bytes } => {
+                let names = std::mem::take(&mut *SENDING_NAMES.lock().unwrap());
+                super::managed::audit(|q, sid| q.files(sid, true, files, bytes, &names));
+                Some(Shown { toast: format!("Sent {} ({}) to the Mac", count_files(files), human_bytes(bytes)), balloon: None })
+            }
             Notice::Started { .. } => None, // the progress line takes over
             Notice::Failed(m) => Some(Shown { toast: m.clone(), balloon: Some(("Glide file transfer".into(), m)) }),
             Notice::Info(m) => Some(Shown { toast: m, balloon: None }),

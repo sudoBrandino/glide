@@ -39,6 +39,10 @@ const IDC_CN_DUPLICATE: i32 = 1304;
 const IDC_CN_REMOVE: i32 = 1305;
 const IDC_CN_UNPAIR: i32 = 1306;
 const IDC_CN_STATUS: i32 = 1307;
+/// Managed mode: Sign in… / Sign out of the organization.
+const IDC_CN_ORG: i32 = 1308;
+/// The organization's host list arrived (background refresh).
+const WM_CN_ORG: u32 = WM_APP + 2;
 
 const IDD_CONN_EDIT: u16 = 105;
 const IDC_CE_NAME: i32 = 1400;
@@ -106,6 +110,7 @@ pub fn manage(hwnd: HWND) {
         refreshing: Cell::new(false),
         restart: Cell::new(false),
         connect: RefCell::new(None),
+        connect_org: RefCell::new(None),
         icons: RefCell::new(Vec::new()),
     };
     let r = unsafe {
@@ -119,6 +124,12 @@ pub fn manage(hwnd: HWND) {
     }
     if r == -1 {
         eprintln!("connections window unavailable: {}", windows::core::Error::from_thread());
+        return;
+    }
+    if let Some(host) = ctx.connect_org.borrow_mut().take() {
+        // A managed session (Glide Cloud): runs in this viewer, no restart. A pending restart
+        // (edited saved connections) waits until the session thread is back to LAN mode.
+        super::managed::start(host);
         return;
     }
     let connect = ctx.connect.borrow_mut().take();
@@ -156,7 +167,42 @@ struct Ctx {
     restart: Cell<bool>,
     /// Connect was chosen: switch to this id after the window closes.
     connect: RefCell<Option<String>>,
+    /// Connect to an organization host (managed mode) after the window closes.
+    connect_org: RefCell<Option<crate::cloud::api::HostEntry>>,
     icons: RefCell<Vec<HICON>>,
+}
+
+/// An organization host's row (managed mode).
+fn is_org(r: &Row) -> bool {
+    r.id.starts_with(crate::cloud::viewer::ROW_PREFIX)
+}
+
+/// Fetch the organization's hosts in the background, then refresh the list (WM_CN_ORG).
+fn refresh_org_hosts(h: HWND) {
+    let Some(a) = super::managed::agent().cloned() else { return };
+    if a.signed_in().is_none() {
+        return;
+    }
+    let hh = h.0 as isize;
+    std::thread::spawn(move || {
+        if let Err(e) = a.refresh_hosts() {
+            eprintln!("organization hosts: {e}");
+        }
+        unsafe {
+            let _ = PostMessageW(Some(HWND(hh as *mut _)), WM_CN_ORG, WPARAM(0), LPARAM(0));
+        }
+    });
+}
+
+/// The Organization button: Sign in… / Sign out (hidden when not managed).
+unsafe fn sync_org_button(h: HWND) {
+    match super::managed::agent() {
+        None => show(h, IDC_CN_ORG, false),
+        Some(a) => {
+            show(h, IDC_CN_ORG, true);
+            set_text(h, IDC_CN_ORG, if a.signed_in().is_some() { "Sign &out" } else { "Sign &in…" });
+        }
+    }
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -307,7 +353,10 @@ unsafe fn selected(h: HWND, ctx: &Ctx) -> Option<Row> {
 unsafe fn refresh(h: HWND, ctx: &Ctx, prefer: Option<String>) {
     let c = snapshot();
     let filter = get_text(h, IDC_CN_SEARCH);
-    let rows = logic::rows(&c, &filter, SystemTime::now());
+    let mut rows = logic::rows(&c, &filter, SystemTime::now());
+    if let Some(a) = super::managed::agent().filter(|a| a.signed_in().is_some()) {
+        rows.extend(crate::cloud::viewer::host_rows(&a.hosts(), &a.org_name(), &filter, SystemTime::now()));
+    }
     *ctx.rows.borrow_mut() = rows.clone();
     let lv = list(h);
     ctx.refreshing.set(true);
@@ -381,16 +430,27 @@ unsafe fn refresh(h: HWND, ctx: &Ctx, prefer: Option<String>) {
 /// Enable the buttons and describe the selection in the status line.
 unsafe fn update_selection(h: HWND, ctx: &Ctx) {
     let sel = selected(h, ctx);
-    let any = sel.is_some();
-    enable(h, IDOK.0, sel.as_ref().is_some_and(can_connect));
+    let org_sel = sel.as_ref().is_some_and(is_org);
+    let any = sel.is_some() && !org_sel;
+    enable(h, IDOK.0, sel.as_ref().is_some_and(|r| if is_org(r) { r.supported } else { can_connect(r) }));
     enable(h, IDC_CN_EDIT, any);
     enable(h, IDC_CN_DUPLICATE, any);
     enable(h, IDC_CN_REMOVE, any);
-    enable(h, IDC_CN_UNPAIR, sel.as_ref().is_some_and(|r| r.paired));
+    enable(h, IDC_CN_UNPAIR, !org_sel && sel.as_ref().is_some_and(|r| r.paired));
+    sync_org_button(h);
 
     let total = snapshot().connections.len();
     let shown = ctx.rows.borrow().len();
+    let org_line = super::managed::status_line();
     let mut text = match &sel {
+        Some(r) if is_org(r) => {
+            let mut parts = vec![r.name.clone(), r.status.clone()];
+            if let Some(l) = &org_line {
+                parts.push(l.clone());
+            }
+            parts.join(" · ")
+        }
+        _ if total == 0 && org_line.is_some() => format!("{}. Sign in to see your organization's computers.", org_line.clone().unwrap_or_default()),
         _ if total == 0 => "No saved connections yet. Click Add… to add your Mac.".to_string(),
         _ if shown == 0 => format!("No connection matches “{}”.", get_text(h, IDC_CN_SEARCH).trim()),
         None => format!("{total} saved connection{}. Select one to connect to it, edit or remove it.", if total == 1 { "" } else { "s" }),
@@ -417,6 +477,15 @@ unsafe fn update_selection(h: HWND, ctx: &Ctx) {
 
 unsafe fn do_connect(h: HWND, ctx: &Ctx) {
     let Some(r) = selected(h, ctx) else { return };
+    if is_org(&r) {
+        let id = &r.id[crate::cloud::viewer::ROW_PREFIX.len()..];
+        let host = super::managed::agent().and_then(|a| a.hosts().into_iter().find(|x| x.id == id));
+        if let Some(host) = host.filter(|x| x.online) {
+            *ctx.connect_org.borrow_mut() = Some(host);
+            let _ = EndDialog(h, IDOK.0 as isize);
+        }
+        return;
+    }
     if !can_connect(&r) {
         return;
     }
@@ -539,6 +608,7 @@ unsafe extern "system" fn conns_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             set_icons(h, ctx);
             setup_list(h);
             refresh(h, ctx, None);
+            refresh_org_hosts(h);
             let _ = SetForegroundWindow(h);
             if crate::util::test_hook("GLIDE_CONNS_DUMP").is_some() {
                 SetTimer(Some(h), HOOK_TIMER, 500, None);
@@ -547,6 +617,13 @@ unsafe extern "system" fn conns_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let target = if ctx.rows.borrow().is_empty() { IDC_CN_ADD } else { IDC_CN_LIST };
             let _ = SetFocus(Some(item(h, target)));
             0
+        }
+        WM_CN_ORG => {
+            if let Some(ctx) = ctx_of::<Ctx>(h) {
+                let keep = selected(h, ctx).map(|r| r.id);
+                refresh(h, ctx, keep);
+            }
+            1
         }
         WM_TIMER if wp.0 == HOOK_TIMER => {
             let _ = KillTimer(Some(h), HOOK_TIMER);
@@ -612,6 +689,21 @@ unsafe extern "system" fn conns_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 IDC_CN_DUPLICATE => do_duplicate(h, ctx),
                 IDC_CN_REMOVE => do_remove(h, ctx),
                 IDC_CN_UNPAIR => do_unpair(h, ctx),
+                IDC_CN_ORG => {
+                    match super::managed::agent().map(|a| a.signed_in().is_some()) {
+                        Some(true) => super::managed::sign_out(h),
+                        Some(false) => super::managed::sign_in(h),
+                        None => {}
+                    }
+                    // Sign-out runs in the background: refresh now and once it is through.
+                    refresh(h, ctx, None);
+                    refresh_org_hosts(h);
+                    let hh = h.0 as isize;
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(1500));
+                        let _ = PostMessageW(Some(HWND(hh as *mut _)), WM_CN_ORG, WPARAM(0), LPARAM(0));
+                    });
+                }
                 x if x == IDCANCEL.0 => {
                     let _ = EndDialog(h, IDCANCEL.0 as isize);
                 }

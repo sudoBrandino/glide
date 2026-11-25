@@ -372,6 +372,8 @@ unsafe fn sync(h: HWND, ctx: &Ctx) {
     let v = &d.values;
     enable(h, IDC_CONNECT_AT_SIGNIN, v.autostart);
     enable(h, IDC_SIGNIN_NOTE, v.autostart);
+    // A per-machine (MSI) install manages sign-in start itself.
+    enable(h, IDC_AUTOSTART, !super::setup::deployed());
     set_text(h, IDC_MODE_HELP, &logic::mode_help(v.mode, ctx.has444));
     let saved_displays = ctx.saved.borrow().remembered_displays;
     enable(h, IDC_FORGET_DISPLAYS, v.remembered_displays > 0);

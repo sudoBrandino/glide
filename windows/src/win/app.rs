@@ -2426,8 +2426,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 hud_on: STATE.with(|s| s.borrow().hud_on),
                 paired,
                 files: files::enabled().then(files::busy),
-                allow_pairing,
+                allow_pairing: allow_pairing.filter(|_| super::managed::local_pairing_allowed()),
                 connections,
+                org: super::managed::agent().map(|a| tray::OrgState {
+                    line: a.status_line(),
+                    signed_in: a.signed_in().is_some(),
+                    session: super::managed::active().map(|s| s.host_name),
+                }),
             };
             tray::on_notify(hwnd, lparam, &st);
             LRESULT(0)
@@ -2449,6 +2454,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 Some(tray::MenuCmd::SetUp) => set_up(hwnd),
                 Some(tray::MenuCmd::AllowPairing) => allow_inbound_pairing(true),
                 Some(tray::MenuCmd::Connections) => manage_connections(hwnd),
+                Some(tray::MenuCmd::OrgSignIn) => super::managed::sign_in(hwnd),
+                Some(tray::MenuCmd::OrgSignOut) => super::managed::sign_out(hwnd),
                 None => {
                     if let Some(id) = tray::connection_for_id((wparam.0 & 0xFFFF) as u16) {
                         super::connections::switch_to(hwnd, &id);
@@ -2747,12 +2754,17 @@ fn set_status(shared: &Shared, tx: &mpsc::Sender<RenderCmd>, hwnd_raw: isize, te
     }
 }
 
-/// Sleep up to `d`, returning early (true) if quit was requested.
+/// Sleep up to `d`, returning early (true) if quit was requested. A managed session that was just
+/// started also cuts the wait short (returns false).
 fn sleep_or_quit(shared: &Shared, d: Duration) -> bool {
     let end = Instant::now() + d;
+    let managed_before = super::managed::busy();
     while Instant::now() < end {
         if shared.quit.load(Ordering::Relaxed) {
             return true;
+        }
+        if !managed_before && super::managed::busy() {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -2798,6 +2810,34 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
     loop {
         if shared.quit.load(Ordering::Relaxed) {
             return;
+        }
+        // Managed mode (Glide Cloud): a relayed session runs once, never redialed.
+        if let Some(ms) = super::managed::take_pending() {
+            listener = None;
+            shared.paused.store(false, Ordering::Relaxed);
+            if run_managed(ms, &connector, &shared, &tx, hwnd_raw, &pairing) {
+                return;
+            }
+            note = None;
+            continue;
+        }
+        if let Some(line) = super::managed::status() {
+            // A request in progress ("Waiting for Studio to approve…") or how the last one ended.
+            listener = None;
+            set_status(&shared, &tx, hwnd_raw, Some(line));
+            if sleep_or_quit(&shared, Duration::from_millis(200)) {
+                return;
+            }
+            continue;
+        }
+        if !super::managed::lan_allowed() {
+            // LAN mode off (org setting or DisableLANMode): neither listen nor dial.
+            listener = None;
+            set_status(&shared, &tx, hwnd_raw, Some(super::managed::idle_line()));
+            if sleep_or_quit(&shared, Duration::from_millis(500)) {
+                return;
+            }
+            continue;
         }
         if shared.paused.load(Ordering::Relaxed) {
             // Tray "Disconnect": stop listening too, so the host can't reconnect until "Connect".
@@ -2846,18 +2886,28 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
         set_status(&shared, &tx, hwnd_raw, Some(text));
 
         // Trust state for this attempt: the pinned host key (if paired) and our identity.
+        let may_pair = super::managed::local_pairing_allowed();
         let auth = Auth {
             identity: connector.identity.clone(),
             name: hello_name(&connector.hello),
             target: shared.pin_target.clone(),
             pinned: ui().store.lock().unwrap().config.pinned_key_or(&shared.pin_target, shared.pin_fallback.as_deref()),
-            request_pairing: shared.repair.load(Ordering::Relaxed),
+            request_pairing: shared.repair.load(Ordering::Relaxed) && may_pair,
             pairing: pairing.clone(),
             inbound_pairing: {
                 let sh = shared.clone();
-                Arc::new(move || sh.inbound_pairing.lock().unwrap().is_open(Instant::now()))
+                Arc::new(move || super::managed::local_pairing_allowed() && sh.inbound_pairing.lock().unwrap().is_open(Instant::now()))
             },
         };
+        if auth.pinned.is_none() && !may_pair {
+            // Not paired with this Mac, and the organization turned local pairing off.
+            listener = None;
+            set_status(&shared, &tx, hwnd_raw, Some(format!("Not paired with {host}, and your organization turned off pairing with new computers.")));
+            if sleep_or_quit(&shared, Duration::from_secs(1)) {
+                return;
+            }
+            continue;
+        }
         let hello = hello_for(&connector.hello, &shared);
         // Admission control dropped a connection (wrong address, backing off): say so, instead of
         // leaving the user to wonder why the Mac can't connect.
@@ -3022,6 +3072,91 @@ fn session_thread(connector: Connector, shared: Arc<Shared>, tx: mpsc::Sender<Re
             }
         }
     }
+}
+
+/// Make the session thread drop what it is doing (a LAN connection, dialing, listening) so a
+/// managed session can start (`managed::start`).
+pub(super) fn begin_managed() {
+    let sh = &ui().shared;
+    sh.abort_accept.store(true, Ordering::Relaxed);
+    if let Some(s) = sh.sender.lock().unwrap().clone() {
+        sh.reconnect.store(true, Ordering::Relaxed);
+        close_connection(s, None);
+    }
+}
+
+/// Runs one managed (relayed) session on the bridge's loopback stream: the handshake with the host
+/// key Glide Cloud named pinned for `relay:<session_id>` (memory only, no pairing), the session's
+/// permissions enforced on both directions, then the normal session. Returns true on quit.
+fn run_managed(
+    ms: crate::cloud::viewer::ManagedSession,
+    connector: &Connector,
+    shared: &Arc<Shared>,
+    tx: &mpsc::Sender<RenderCmd>,
+    hwnd_raw: isize,
+    pairing: &Arc<GuiPairing>,
+) -> bool {
+    let crate::cloud::viewer::ManagedSession { stream, session_id, host_key, host_name, permissions, bridge } = ms;
+    set_status(shared, tx, hwnd_raw, Some(format!("Connecting to {host_name} through Glide Cloud…")));
+    let auth = Auth {
+        identity: connector.identity.clone(),
+        name: hello_name(&connector.hello),
+        target: crate::cloud::relay_target(&session_id),
+        pinned: Some(host_key),
+        request_pairing: false,
+        pairing: pairing.clone(),
+        inbound_pairing: Arc::new(|| false),
+    };
+    let hello = match hello_for(&connector.hello, shared) {
+        ClientMsg::ClientHello { version, codec_caps, view_w, view_h, mode, max_fps, client_name } => {
+            ClientMsg::ClientHello { version, codec_caps: permissions.filter_caps(codec_caps), view_w, view_h, mode, max_fps, client_name }
+        }
+        other => other,
+    };
+    let mut conn = match Connection::from_stream(stream, &auth, &hello) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("managed session {session_id}: {e}");
+            bridge.close();
+            let reason = bridge.close_reason().filter(|(c, _)| *c >= 4000).map(|(c, _)| crate::cloud::api::close::describe(c).to_string());
+            let text = reason.unwrap_or_else(|| e.user_message(&host_name));
+            if let Some(a) = super::managed::agent() {
+                a.audit.client_error(Some(&session_id), "handshake", &e.to_string());
+            }
+            super::managed::ended(&session_id, false);
+            super::managed::set_note(format!("Couldn't connect to {host_name}: {text}"));
+            return false;
+        }
+    };
+    conn.restrict(permissions);
+    eprintln!("managed session {session_id} with {host_name}: {}", permissions_line(permissions));
+    super::managed::set_active(Some(super::managed::Active { session_id: session_id.clone(), host_name: host_name.clone(), permissions }));
+    let reason = run_connection(conn, shared, tx, hwnd_raw);
+    super::managed::set_active(None);
+    bridge.close();
+    bridge.join();
+    let by_user = shared.paused.load(Ordering::Relaxed) || shared.reconnect.swap(false, Ordering::Relaxed) || super::managed::busy() || reason.is_none();
+    super::managed::ended(&session_id, by_user);
+    match reason {
+        None => true,
+        Some(r) => {
+            let why = match bridge.close_reason() {
+                Some((c, _)) if c >= 4000 => crate::cloud::api::close::describe(c).to_string(),
+                _ if by_user => "you ended it".into(),
+                _ => short_error(&r),
+            };
+            if !super::managed::busy() {
+                super::managed::set_note(format!("The session with {host_name} ended ({why})."));
+            }
+            false
+        }
+    }
+}
+
+/// What a managed session allows, from the viewer's side (log line).
+fn permissions_line(p: crate::cloud::Permissions) -> String {
+    let p = p.effective();
+    format!("control {}, clipboard {}, files {}, audio {}", p.control, p.clipboard.name(), p.files.name(), p.audio)
 }
 
 impl Target {
@@ -3590,6 +3725,23 @@ pub fn run(connector: Connector, opts: Options) -> Result<(), String> {
     clipboard::init(hwnd);
     if let Some(m) = files::init(hwnd, &ui().store.lock().unwrap().config.clone()) {
         toast(m);
+    }
+    if let Some(a) = super::managed::agent() {
+        // Sign-in, settings or the host list changed: refresh the title (and the status line). LAN
+        // mode turned off: stop listening / dialing now, and end a LAN session.
+        a.set_on_change(Box::new(move || {
+            if !super::managed::lan_allowed() {
+                let sh = &ui().shared;
+                sh.abort_accept.store(true, Ordering::Relaxed);
+                if super::managed::active().is_none() {
+                    if let Some(s) = sh.sender.lock().unwrap().clone() {
+                        sh.reconnect.store(true, Ordering::Relaxed);
+                        close_connection(s, None);
+                    }
+                }
+            }
+            post(hwnd_raw, WM_APP_CLOSED);
+        }));
     }
 
     // --- render thread

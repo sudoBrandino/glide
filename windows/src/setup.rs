@@ -41,6 +41,18 @@ pub fn offer_install(exe: &Path, install_dir: &Path, portable_exe: Option<&str>)
     !in_dir && !portable
 }
 
+/// The exe runs from a per-machine install (the MSI puts it under Program Files): the installer
+/// handles the location, sign-in start and the firewall, so the viewer doesn't offer them.
+/// `env` gives `ProgramFiles`, `ProgramW6432` and `ProgramFiles(x86)`.
+pub fn machine_installed(exe: &Path, env: impl Fn(&str) -> Option<String>) -> bool {
+    let e = exe.to_string_lossy().replace('/', "\\");
+    let e = e.strip_prefix("\\\\?\\").unwrap_or(&e).to_lowercase();
+    ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"].iter().filter_map(|k| env(k)).filter(|d| !d.trim().is_empty()).any(|d| {
+        let d = d.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+        e.starts_with(&format!("{d}\\"))
+    })
+}
+
 /// Check what the user typed as the Mac's address: a host name or IP, optional `:port`.
 /// Returns the trimmed address (port kept as typed).
 pub fn normalize_address(input: &str) -> Result<String, String> {
@@ -218,6 +230,20 @@ mod tests {
         assert!(offer_install(dl, inst_dir, None));
         assert!(offer_install(dl, inst_dir, Some("C:\\Other\\glide-client.exe")));
         assert!(!offer_install(dl, inst_dir, Some("c:/users/me/downloads/glide-client.exe")), "chose to run it from there");
+    }
+
+    #[test]
+    fn per_machine_install_is_recognized() {
+        let env = |k: &str| match k {
+            "ProgramFiles" => Some("C:\\Program Files".to_string()),
+            "ProgramFiles(x86)" => Some("C:\\Program Files (x86)\\".to_string()),
+            _ => None,
+        };
+        assert!(machine_installed(Path::new("C:\\Program Files\\Glide\\glide-client.exe"), env));
+        assert!(machine_installed(Path::new("\\\\?\\c:\\program files (x86)\\Glide\\glide-client.exe"), env));
+        assert!(!machine_installed(Path::new("C:\\Program Files Extra\\glide-client.exe"), env));
+        assert!(!machine_installed(Path::new("C:\\Users\\me\\Downloads\\glide-client.exe"), env));
+        assert!(!machine_installed(Path::new("C:\\Program Files\\Glide\\glide-client.exe"), |_| None));
     }
 
     #[test]

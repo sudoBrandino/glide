@@ -18,6 +18,7 @@ The wire protocol is defined in `../docs/PROTOCOL.md`.
 | `src/files.rs` | File transfer (PROTOCOL.md §6) without Win32: name sanitizer, receiver (temp → SHA-256 → no-overwrite rename), sender (folder walk, chunking), `Service` (transfers + ack window). Unit-tested, incl. a two-service loopback. |
 | `src/annexb.rs`, `src/bench.rs` | Annex-B access-unit splitting, and the headless benchmark driver. |
 | `src/settings.rs` | The Settings window's model, platform independent: settings read from the config, validation of the typed fields, which changes apply at once and which need a restart, writing only the changed fields back. Unit-tested. |
+| `src/cloud/` | Managed mode (Glide Cloud, `../docs/ENTERPRISE.md`): policy, API types, WinHTTP transport, enrollment, hub, relay bridge, session grants, permissions, audit, sign-in. See *Managed mode* below. |
 | `src/setup.rs` | Setup logic, platform independent: install folder, "offer to install?", Mac address check and port test, this PC's address, the firewall PowerShell (check + elevated allow). |
 | `src/win/` | Windows only: `d3d` (device + DXGI device manager), `decoder` (MF decoder MFT), `render` (shaders, swap chain, text panels), `app` (window, input, cursor, fullscreen, hotkeys, the session loop incl. both mode), `clipboard` (clipboard listener/apply), `files` (drag & drop, notifications, open folder), `audio` (WASAPI output), `cursor`, `probe`, `bench_decoder`, `dpapi` (identity key encryption), `prompt` (pairing dialog), `settings` (Settings window), `setup` (setup dialog, self-install, firewall, start at sign-in), `placement` (monitors), `tray`. |
 | `src/host/`, `src/bin/glide-host.rs` | **glide-host.exe**, the Windows host (a Mac controls this PC, see below). Platform independent and unit-tested: `trust` (host.json, pairing window, host key), `auth` (host side of the handshake, pairing, rate limiting; tested end to end against the viewer's `net::Connection`), `stream` (validated viewer messages), `input` (HID → scancode, wheel, absolute mouse), `video` (sizes, codec, bitrate, Annex-B, cursor bitmaps). Windows only, `src/host/win/`: `capture` (DXGI Desktop Duplication), `convert` (D3D11 video processor, BGRA → NV12), `encoder` (Media Foundation H.264/HEVC MFT), `inject` (SendInput), `cursor`, `confirm` (pairing dialog), `tray`, `session`. |
@@ -473,7 +474,8 @@ code. Both users must confirm within 60 s. Without an interactive desktop (SSH) 
 the code the Mac shows, or `no`. One successful pairing closes the window.
 
 **While running.** Tray icon: *Pair New Mac…*, *Paired Macs* ▸ *Remove…*, *Open config file*, *Quit Glide
-Host*. Console commands: `pair`, `paired`, `unpair NAME|KEY`, `quit`. Logs go to the console (stderr). One
+Host* (managed: the organization, the running session and *End session*, see *Managed mode*). Console commands:
+`pair`, `paired`, `unpair NAME|KEY`, `status`, `end`, `quit`. Logs go to the console (stderr). One
 session at a time; a newly authenticated Mac replaces the current one. Failed handshakes and rejected viewers
 back off per address (1 s doubling to 60 s, HostPreamble status 3); opening the pairing window clears that.
 
@@ -497,6 +499,55 @@ the sign-in screen. While one is up the stream pauses (capture fails with an acc
 glide-host logs it, retries every 0.5 s and resumes on its own. Input into windows of elevated programs is also
 blocked unless glide-host runs elevated. Windows Firewall must allow inbound TCP 7421 (Private network). Not yet
 tested on real hardware: rotated monitors, every vendor's encoder MFT.
+
+## Managed mode (Glide Cloud)
+
+Organizations deploy both programs with Group Policy or Intune and point them at their Glide Cloud
+tenant (`../docs/ENTERPRISE.md`). The policy is read at start from `HKLM\SOFTWARE\Policies\Glide`, then
+`HKCU\SOFTWARE\Policies\Glide`: `CloudURL` (REG_SZ, `https://…`; plain `http://` only to a loopback
+address), `EnrollmentToken` (REG_SZ), `DeviceName` (REG_SZ), `Tags` (REG_MULTI_SZ), `DisableLANMode`
+(REG_DWORD). The enrollment values come as one set from the first key that has a `CloudURL` (machine
+policy wins, nothing is mixed between the two); `DisableLANMode` applies if either key sets it.
+
+- **Enrollment.** With no stored enrollment (or one for another `CloudURL`) the program enrolls with the
+  token and its public key. The result is `cloud-viewer.dpapi` / `cloud-host.dpapi` next to `config.json` /
+  `host.json` (DPAPI, current user), with the last org settings, so `lan_mode: false` applies from launch.
+  `401 invalid_enrollment_token` and `409 device_revoked` stop it; anything else is retried (1 s doubling to
+  60 s, ±20 %). A `revoked` hub frame, or a 401 for the device token, deletes the file.
+- **Transport.** WinHTTP: the system proxy (automatic proxy / PAC), the Windows certificate store (an
+  organization's TLS-inspection root works), TLS 1.2+, redirects refused. The hub WebSocket reconnects with
+  the same backoff; heartbeat at the first hub connection, then every 6 h; client audit events (files sent and
+  received, clipboard transfers without contents, a session ended locally, errors) are batched every 10 s.
+- **Viewer.** Tray and Connections window: *Sign in to your organization…* opens the browser on the
+  sign-in page and shows the code it should display; the dialog closes once you approve (device
+  authorization grant). The Connections window then lists the organization's computers in an
+  *Organization* group (online first, "asks for approval", "view only"); the status line shows the
+  organization and who is signed in. **Connect** shows "Waiting for NAME to approve…" while the person at
+  the host decides, then "Connecting … through Glide Cloud". The session runs once: it is never redialed.
+  *Sign out* is in the tray and the Connections window.
+- **Host.** An offer is declined as `busy` while another session runs, as `policy` if the app is older than
+  the org's `min_app_version` or the relay URL isn't the tenant's own; with `approval: required` the PC shows
+  "NAME (email) … asks to see and control this PC" (Decline is the default, Accept is enabled after 1 s, it
+  declines itself after 50 s). While a managed session runs, the tray tooltip says "NAME (email) is
+  connected" (also announced once), and the tray menu has **End session**; console: `status`, `end`.
+- **Trust.** The viewer pins the host key the cloud names for target `relay:<session_id>`, in memory only.
+  The host accepts exactly one Noise session for the session id, from the granted viewer key, never pairs on
+  a relay connection, never writes the key to `pairedViewers`, and doesn't charge the relay connection to the
+  inbound rate limiter.
+- **Permissions.** Enforced on both sides, at the transport (`cloud::perms`): view only drops every input
+  message on the host and stops the viewer sending any; clipboard and file data are refused in a
+  direction the session doesn't allow, whichever side sends (a refused file offer gets a decline); no audio
+  without `audio`. Features a session doesn't allow at all aren't advertised in ClientHello.
+- **Org settings.** `lan_mode: false` (or `DisableLANMode`): no LAN listening or dialing (the host closes
+  its listeners and ends LAN sessions; the viewer stops at once). `allow_local_pairing: false`: the host's
+  pairing window can't open, the viewer won't pair a new Mac or PC.
+- **Per-machine install.** Run from under Program Files (the MSI), or with the HKLM policy key present, the
+  viewer doesn't offer to copy itself to `%LOCALAPPDATA%` and leaves sign-in start and the firewall rule to
+  the installer; with the policy present the setup dialog doesn't open by itself.
+
+Code: `src/cloud/` (platform independent and unit-tested: policy, API types, client, enrollment store,
+hub, relay bridge, grants, permissions, settings, audit, sign-in; `winhttp.rs` is the Windows transport),
+`src/win/managed.rs` (viewer UI glue), `src/host/win/confirm.rs` (approval prompt).
 
 ## Testing without the Mac host
 
