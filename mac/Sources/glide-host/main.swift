@@ -433,7 +433,16 @@ final class Server: @unchecked Sendable {
             switch st {
             case .ready where !sessionStarted:
                 sessionStarted = true
-                self.lock.lock(); self.lastDialError = nil; self.lock.unlock()
+                self.lock.lock()
+                self.lastDialError = nil
+                let current = self.dialGeneration, lan = self.lanAllowed
+                self.lock.unlock()
+                // A dial that was in flight when the target changed or LAN mode turned off is dropped.
+                guard LANGate.adoptsDialed(generation: generation, current: current, lanAllowed: lan) else {
+                    log("dialer: dropping a connection to \(host):\(port) that is no longer wanted\(lan ? "" : " (LAN mode is off)")")
+                    conn.cancel()
+                    return
+                }
                 // Hand the live connection to a Session (it re-installs its own state handler).
                 self.adopt(conn, queue: queue, outbound: true) { [weak self] s in
                     guard let self else { return }
@@ -539,6 +548,13 @@ final class Server: @unchecked Sendable {
         let s = Session(id: id, connection: conn, settings: settings, queue: queue)
         s.outbound = outbound
         configure?(s)
+        // LAN mode is enforced at admission (ENTERPRISE.md §7): a LAN connection accepted by the
+        // listener just before it stopped is refused here.
+        guard LANGate.admits(relaySessionId: s.relaySessionId, lanAllowed: isLANAllowed) else {
+            conn.cancel()
+            return
+        }
+        s.lanAllowed = { [weak self] in self?.isLANAllowed ?? false }
         // A paused host still answers the handshake preamble (status 2) so the viewer can say why.
         s.isPaused = { [weak self] in
             guard let self else { return true }
@@ -557,6 +573,9 @@ final class Server: @unchecked Sendable {
             guard let self else { return }
             self.lock.lock(); let isPaused = self.paused; self.lock.unlock()
             if isPaused { log("server: paused; closing session \(s.id)"); s.end(); return }
+            if !LANGate.admits(relaySessionId: s.relaySessionId, lanAllowed: self.isLANAllowed) {
+                log("server: LAN mode is off; closing LAN session \(s.id)"); s.end(); return
+            }
             // Only now may the new viewer replace the active one.
             let r = self.sessions.authenticated(s)
             if let old = r.replaced { log("server: session \(s.id) replaces session \(old.id)"); old.end() }

@@ -318,6 +318,12 @@ func cloudPolicyTests() {
     check(ManagedPolicy.lanOffReason(settings: OrgSettings(lanMode: false), disableLANMode: false, orgName: "Example") == "turned off by Example",
           "policy: LAN-off reason names the org")
 
+    // LAN mode enforced at admission (listener accept and dial completion), not only at teardown.
+    check(!LANGate.admits(relaySessionId: nil, lanAllowed: false) && LANGate.admits(relaySessionId: nil, lanAllowed: true)
+          && LANGate.admits(relaySessionId: "ses_1", lanAllowed: false), "LAN gate: LAN connections refused while LAN mode is off; relayed ones admitted")
+    check(!LANGate.adoptsDialed(generation: 3, current: 3, lanAllowed: false) && !LANGate.adoptsDialed(generation: 2, current: 3, lanAllowed: true)
+          && LANGate.adoptsDialed(generation: 3, current: 3, lanAllowed: true), "LAN gate: an in-flight dial is dropped after LAN-off or a target change")
+
     let cloud = URL(string: "https://g.example.com")!
     let key = String(repeating: "ab", count: 32)
     func offer(approval: ApprovalMode = .none, relay: String = "wss://g.example.com/v1/relay/ses_1", key k: String = key, expires: String? = nil) -> SessionOffer {

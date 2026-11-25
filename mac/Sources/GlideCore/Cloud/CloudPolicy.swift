@@ -36,6 +36,22 @@ public struct ManagedPolicy: Equatable, Sendable {
     }
 }
 
+/// LAN mode enforced where connections are admitted, not only when it is turned off (§7): a LAN
+/// connection already accepted by the listener, or a dial already in flight, must not slip in.
+public enum LANGate {
+    /// A connection may be adopted / authenticated: a managed (relayed) one always, a LAN one only
+    /// while LAN mode is on.
+    public static func admits(relaySessionId: String?, lanAllowed: Bool) -> Bool {
+        relaySessionId != nil || lanAllowed
+    }
+
+    /// A dial that just connected is adopted only if it is still the current dial (the target
+    /// wasn't changed or stopped meanwhile) and LAN mode is still on.
+    public static func adoptsDialed(generation: Int, current: Int, lanAllowed: Bool) -> Bool {
+        generation == current && lanAllowed
+    }
+}
+
 /// Dotted numeric versions ("0.3.1", "1.0", "0.4.0-beta.2": the suffix is ignored).
 public enum AppVersion {
     public static func components(_ v: String) -> [Int] {

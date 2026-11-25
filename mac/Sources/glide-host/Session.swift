@@ -75,6 +75,9 @@ final class Session: @unchecked Sendable {
     /// opened for. Set before `start()`. Such a connection is accepted only for that session's
     /// grant (never pairing, never a paired key); a LAN connection never uses a grant.
     var relaySessionId: String?
+    /// LAN mode is on (org policy). A LAN connection is refused while it is off (backstop to the
+    /// server's admission check).
+    var lanAllowed: () -> Bool = { true }
     /// The live grants (ManagedHost's store).
     var grants = GrantStore()
     /// Client audit events of a managed session (§9).
@@ -197,6 +200,7 @@ final class Session: @unchecked Sendable {
             if self?.isPaused() == true { return (GlideHandshake.statusPaused, 0) }
             // A bridged managed session: pairing is never open over the relay.
             if self?.relaySessionId != nil { return (GlideHandshake.statusOK, 0) }
+            if let self, !LANGate.admits(relaySessionId: nil, lanAllowed: self.lanAllowed()) { return (GlideHandshake.statusPaused, 0) }
             if !outbound, let left = pc.backoff.blocked(addr) {
                 PeerLog.line(addr, "session \(self?.id ?? 0): \(addr) is rate-limited (\(Int(left.rounded(.up))) s left); refusing")
                 return (GlideHandshake.statusRateLimited, 0)
