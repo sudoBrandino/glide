@@ -81,6 +81,16 @@ struct Init {
     install_dir: PathBuf,
     exe: PathBuf,
     port: u16,
+    /// Installed per machine (Program Files) or deployed by an organization (HKLM Glide policy):
+    /// the installer owns the location, sign-in start and the firewall rule, so the dialog
+    /// offers none of them.
+    deployed: bool,
+}
+
+/// Installed per machine (the MSI, under Program Files) or the organization's Glide policy key
+/// exists in HKLM.
+pub(super) fn deployed() -> bool {
+    logic::machine_installed(&current_exe(), |k| std::env::var(k).ok()) || crate::cloud::managed::registry::RegSource::machine_policy_exists()
 }
 
 /// What the user chose (Connect).
@@ -228,6 +238,9 @@ pub(super) fn set_autostart(on: bool, exe: &Path) -> Result<(), String> {
 /// install.ps1's Startup shortcut) gets it, so sign-in opens without connecting. Only entries
 /// that start this exe: an older copy elsewhere wouldn't know the flag (`signin` has the rules).
 pub fn migrate_signin_entry() {
+    if deployed() {
+        return; // a per-machine install manages sign-in start itself
+    }
     let exe = current_exe();
     if let Some(v) = run_value_get().and_then(|v| crate::signin::migrate_run_value(&v, &exe)) {
         let name = wide(logic::RUN_VALUE);
@@ -367,14 +380,16 @@ fn make_init(store: &Store) -> Init {
     let exe = current_exe();
     let dir = install_dir();
     let c = &store.config;
+    let deployed = deployed();
     Init {
         addr: c.host.clone().unwrap_or_default(),
         accept: c.accept_incoming,
         autostart: autostart_on(),
-        offer_install: logic::offer_install(&exe, &dir, c.portable_exe.as_deref()),
+        offer_install: !deployed && logic::offer_install(&exe, &dir, c.portable_exe.as_deref()),
         install_dir: dir,
         exe,
         port: c.listen_port,
+        deployed,
     }
 }
 
@@ -398,8 +413,9 @@ fn apply(owner: Option<HWND>, init: &Init, ch: &Choice) -> (PathBuf, bool, Optio
     }
     let portable = (init.offer_install && !installed).then(|| init.exe.to_string_lossy().into_owned());
     // Also when on: point it at a newly installed copy, and replace an install.ps1 Startup
-    // shortcut (it may carry old arguments that would override the new settings).
-    if ch.autostart != init.autostart || (ch.autostart && (installed || startup_shortcut().is_some_and(|p| p.exists()))) {
+    // shortcut (it may carry old arguments that would override the new settings). A per-machine
+    // install leaves sign-in start to the installer.
+    if !init.deployed && (ch.autostart != init.autostart || (ch.autostart && (installed || startup_shortcut().is_some_and(|p| p.exists())))) {
         if let Err(e) = set_autostart(ch.autostart, &exe) {
             message(owner, &format!("Start at sign-in: {e}"), MB_OK | MB_ICONWARNING);
         }
@@ -424,6 +440,11 @@ fn save_choice(c: &mut Config, ch: &Choice, portable: Option<String>) {
 pub fn at_startup(store: &mut Store, forced: bool) -> Startup {
     let init = make_init(store);
     if !forced && !store.config.needs_setup() && !init.offer_install {
+        return Startup::Continue;
+    }
+    // Deployed by an organization (HKLM Glide policy): don't pop the LAN setup dialog by itself;
+    // the organization's computers are in Connections… (Set up… stays in the menus).
+    if !forced && crate::cloud::managed::registry::RegSource::machine_policy_exists() {
         return Startup::Continue;
     }
     let Some(ch) = run_dialog(None, init.clone()) else { return Startup::Continue };
@@ -553,6 +574,9 @@ fn run_firewall_check(exe: &Path) -> Option<FirewallStatus> {
 }
 
 unsafe fn start_firewall_check(h: HWND, ctx: &Ctx) {
+    if ctx.init.deployed {
+        return; // the installer manages the firewall rule
+    }
     set_text(h, IDC_SU_FW_STATUS, "Checking Windows Firewall…");
     let exe = firewall_exe(h, ctx);
     let hh = h.0 as isize;
@@ -659,6 +683,12 @@ unsafe extern "system" fn dlg_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             }
             if let Ok(b) = GetDlgItem(Some(h), IDC_SU_FIREWALL) {
                 SendMessageW(b, BCM_SETSHIELD, Some(WPARAM(0)), Some(LPARAM(1)));
+            }
+            if ctx.init.deployed {
+                // The installer owns sign-in start and the firewall rule.
+                show(h, IDC_SU_AUTOSTART, false);
+                show(h, IDC_SU_FIREWALL, false);
+                show(h, IDC_SU_FW_STATUS, false);
             }
             let dpi = GetDpiForWindow(h).max(96);
             let big = GetSystemMetricsForDpi(SM_CXICON, dpi);
