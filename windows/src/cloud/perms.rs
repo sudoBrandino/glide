@@ -37,6 +37,24 @@ impl Permissions {
         }
     }
 
+    /// One line for prompts and status: what the session allows, from the host's point of view.
+    pub fn describe(self) -> String {
+        let p = self.effective();
+        let dir = |d: Direction| match d {
+            Direction::Both => "both ways",
+            Direction::ToHost => "to this computer only",
+            Direction::ToViewer => "from this computer only",
+            Direction::Off => "off",
+        };
+        format!(
+            "{}; clipboard {}; file transfer {}; sound {}",
+            if p.control { "can use the keyboard and mouse" } else { "view only" },
+            dir(p.clipboard),
+            dir(p.files),
+            if p.audio { "on" } else { "off" }
+        )
+    }
+
     /// Codec caps the viewer advertises in ClientHello for this session (features the session
     /// doesn't allow at all are not negotiated).
     pub fn filter_caps(self, caps: u32) -> u32 {
@@ -203,5 +221,10 @@ mod tests {
         assert_eq!(Permissions::default().filter_caps(all), CAP_HEVC_420 | CAP_DISPLAYS);
         // View only with to_viewer clipboard keeps the clipboard cap (host → viewer still allowed).
         assert_eq!(p(false, Direction::ToHost, Direction::Both, true).filter_caps(all), all & !CAP_CLIPBOARD);
+        assert_eq!(
+            p(false, Direction::Both, Direction::ToHost, true).describe(),
+            "view only; clipboard from this computer only; file transfer off; sound on"
+        );
+        assert_eq!(p(true, Direction::Both, Direction::ToHost, false).describe(), "can use the keyboard and mouse; clipboard both ways; file transfer to this computer only; sound off");
     }
 }

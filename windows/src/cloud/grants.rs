@@ -9,8 +9,6 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// Longest a grant waits for its handshake: the relay ticket's lifetime (§6.1).
 pub const MAX_TTL: Duration = Duration::from_secs(120);
-/// Shortest, whatever `expires_at` says (clock skew between this PC and the cloud).
-pub const MIN_TTL: Duration = Duration::from_secs(30);
 /// Most grants held at once (offers are one per session; this only bounds a misbehaving cloud).
 const MAX_GRANTS: usize = 16;
 
@@ -43,12 +41,27 @@ impl std::fmt::Display for GrantError {
     }
 }
 
-/// How long a grant from an offer lives: until `expires_at` (wall clock), within
-/// [`MIN_TTL`, `MAX_TTL`]; `MAX_TTL` when it doesn't parse.
+/// How long a grant from an offer lives: until `expires_at` (wall clock), but never more than
+/// `MAX_TTL`; `MAX_TTL` when it doesn't parse.
 pub fn ttl(expires_at: &str, now: SystemTime) -> Duration {
-    let Some(exp) = crate::connections::parse_rfc3339(expires_at) else { return MAX_TTL };
+    let Some(exp) = parse_time(expires_at) else { return MAX_TTL };
     let now_s = now.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    Duration::from_secs((exp - now_s).max(0) as u64).clamp(MIN_TTL, MAX_TTL)
+    Duration::from_secs((exp - now_s).max(0) as u64).min(MAX_TTL)
+}
+
+/// Seconds since the Unix epoch of an RFC 3339 UTC time ("2026-11-25T10:02:00Z", also with
+/// fractional seconds or "+00:00").
+pub fn parse_time(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (base, rest) = (s.get(..19)?, s.get(19..)?);
+    let rest = match rest.strip_prefix('.') {
+        Some(r) => r.trim_start_matches(|c: char| c.is_ascii_digit()),
+        None => rest,
+    };
+    if !matches!(rest, "Z" | "z" | "+00:00" | "-00:00") {
+        return None;
+    }
+    crate::connections::parse_rfc3339(&format!("{base}Z"))
 }
 
 /// Parses the offer's viewer key (64 hex chars).
@@ -174,8 +187,11 @@ mod tests {
         assert_eq!(s.take("ses_2", &key, now), Err(GrantError::Unknown));
         // TTL bounds.
         assert_eq!(ttl("2025-11-25T11:00:00Z", wall), MAX_TTL);
-        assert_eq!(ttl("2025-11-25T09:00:00Z", wall), MIN_TTL, "clock skew can't make it unusable");
+        assert_eq!(ttl("2025-11-25T09:00:00Z", wall), Duration::ZERO, "already expired");
+        assert_eq!(ttl("2025-11-25T10:00:30.250Z", wall), Duration::from_secs(30), "fractional seconds");
+        assert_eq!(ttl("2025-11-25T10:00:30+00:00", wall), Duration::from_secs(30));
         assert_eq!(ttl("garbage", wall), MAX_TTL);
+        assert_eq!(parse_time("2025-11-25T10:00:00+02:00"), None, "only UTC");
         // Expired grants are purged on insert; the store is bounded.
         for i in 0..40 {
             s.insert(Grant::from_offer(&offer(&format!("ses_x{i}"), &"cd".repeat(32), ""), now, wall).unwrap(), now);

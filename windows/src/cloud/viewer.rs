@@ -61,6 +61,8 @@ pub struct ViewerAgent {
     stop: Arc<AtomicBool>,
     /// Called (from any thread) when status, sign-in, hosts or settings change.
     on_change: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    heartbeat: super::host::Heartbeat,
+    os_version: Mutex<String>,
 }
 
 fn now_s() -> i64 {
@@ -79,6 +81,8 @@ impl ViewerAgent {
             link: Arc::new(HubLink::default()),
             stop: Arc::new(AtomicBool::new(false)),
             on_change: Mutex::new(None),
+            heartbeat: Default::default(),
+            os_version: Mutex::new(String::new()),
         })
     }
 
@@ -94,6 +98,7 @@ impl ViewerAgent {
 
     /// Enroll (retrying) and run the hub, heartbeat and audit flushing in the background.
     pub fn start(self: &Arc<Self>, facts: DeviceFacts) {
+        *self.os_version.lock().unwrap() = facts.os_version.clone();
         let me = self.clone();
         thread::Builder::new()
             .name("glide-cloud".into())
@@ -112,9 +117,7 @@ impl ViewerAgent {
                         }
                         Err(EnrollError::Refused(err)) => {
                             me.set_problem(Some(format!("Your organization refused this PC's enrollment: {err}")));
-                            if !sleep(Duration::from_secs(600)) {
-                                return;
-                            }
+                            return;
                         }
                         Err(err) => {
                             me.set_problem(Some(err.to_string()));
@@ -136,10 +139,8 @@ impl ViewerAgent {
                     let os = facts.os_version.clone();
                     thread::spawn(move || {
                         let sleep = hub::sleeper(me.stop.clone());
-                        let mut last_hb: Option<Instant> = None;
                         loop {
-                            if last_hb.is_none_or(|t| t.elapsed() >= super::host::HEARTBEAT_EVERY) {
-                                last_hb = Some(Instant::now());
+                            if me.heartbeat.due() {
                                 if let Err(e) = c.heartbeat(&HeartbeatRequest { app_version: app_version().into(), os_version: os.clone(), name: None }) {
                                     if e.is_unauthorized() {
                                         me.link.close();
@@ -429,6 +430,12 @@ impl HubHandler for ViewerHub {
     }
     fn connected(&self) {
         log("cloud: hub connected");
+        if self.0.heartbeat.on_connect() {
+            if let Some(c) = self.0.client() {
+                let os = self.0.os_version.lock().unwrap().clone();
+                let _ = c.heartbeat(&HeartbeatRequest { app_version: app_version().into(), os_version: os, name: None });
+            }
+        }
     }
     fn disconnected(&self, why: &str) {
         log(&format!("cloud: hub disconnected ({why})"));

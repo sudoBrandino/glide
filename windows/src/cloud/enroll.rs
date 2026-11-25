@@ -45,8 +45,7 @@ pub enum EnrollError {
     NoToken,
     /// `409 device_revoked`: this device's key was revoked; enrolling it again is refused.
     Revoked,
-    /// The cloud refused the enrollment (bad or expired token, …): retrying won't help until the
-    /// configuration changes.
+    /// `401 invalid_enrollment_token`: retrying won't help until the configuration changes.
     Refused(String),
     /// Couldn't reach the cloud, or a server error: retry later.
     Retry(String),
@@ -110,7 +109,7 @@ pub fn ensure(managed: &ManagedConfig, store: &Store, client: &CloudClient, fact
 fn classify(e: CloudError) -> EnrollError {
     match &e {
         CloudError::Api { status: 409, code, .. } if code == "device_revoked" => EnrollError::Revoked,
-        CloudError::Api { status, .. } if (400..500).contains(status) && *status != 408 && *status != 429 => EnrollError::Refused(e.user_message()),
+        CloudError::Api { status: 401, code, .. } if code == "invalid_enrollment_token" => EnrollError::Refused(e.user_message()),
         _ => EnrollError::Retry(e.to_string()),
     }
 }
@@ -177,8 +176,12 @@ mod tests {
         http.on("POST /v1/enroll", 409, r#"{"error":{"code":"device_revoked","message":"revoked"}}"#);
         assert_eq!(ensure(&m, &store, &client, &f), Err(EnrollError::Revoked));
         http.routes.lock().unwrap().clear();
-        http.on("POST /v1/enroll", 403, r#"{"error":{"code":"invalid_token","message":"The enrollment token is not valid."}}"#);
+        http.on("POST /v1/enroll", 401, r#"{"error":{"code":"invalid_enrollment_token","message":"The enrollment token is not valid."}}"#);
         assert_eq!(ensure(&m, &store, &client, &f), Err(EnrollError::Refused("The enrollment token is not valid.".into())));
+        // Anything else retries (with backoff), even other 4xx answers.
+        http.routes.lock().unwrap().clear();
+        http.on("POST /v1/enroll", 403, r#"{"error":{"code":"forbidden","message":"x"}}"#);
+        assert!(matches!(ensure(&m, &store, &client, &f), Err(EnrollError::Retry(_))));
         http.routes.lock().unwrap().clear();
         http.on("POST /v1/enroll", 503, "");
         assert!(matches!(ensure(&m, &store, &client, &f), Err(EnrollError::Retry(_))));

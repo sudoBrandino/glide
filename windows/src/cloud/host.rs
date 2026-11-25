@@ -25,8 +25,43 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// The approval prompt declines by itself after this long (§6.4).
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(50);
-pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(300);
+/// Heartbeat once on the first hub connect, then this often (the hub itself shows presence).
+pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(6 * 3600);
 pub const AUDIT_FLUSH_EVERY: Duration = Duration::from_secs(10);
+
+/// When to send `POST /v1/device/heartbeat`.
+#[derive(Default)]
+pub struct Heartbeat {
+    last: Mutex<Option<Instant>>,
+}
+
+impl Heartbeat {
+    /// The hub connected: true the first time only.
+    pub fn on_connect(&self) -> bool {
+        let mut l = self.last.lock().unwrap();
+        if l.is_none() {
+            *l = Some(Instant::now());
+            return true;
+        }
+        false
+    }
+
+    /// The periodic check: true every `HEARTBEAT_EVERY` after the first one.
+    pub fn due(&self) -> bool {
+        self.due_at(Instant::now())
+    }
+
+    pub fn due_at(&self, now: Instant) -> bool {
+        let mut l = self.last.lock().unwrap();
+        match *l {
+            Some(t) if now.saturating_duration_since(t) >= HEARTBEAT_EVERY => {
+                *l = Some(now);
+                true
+            }
+            _ => false,
+        }
+    }
+}
 
 /// What the person at the host answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,12 +189,6 @@ pub fn start(managed: ManagedConfig, store: Store, http: Arc<dyn Http>, facts: D
                             return;
                         }
                     }
-                    Err(EnrollError::Refused(e)) => {
-                        c.set_status(&format!("Glide Cloud: enrollment refused: {e}"));
-                        if !sleep(Duration::from_secs(600)) {
-                            return;
-                        }
-                    }
                     Err(e) => {
                         c.set_status(&format!("Glide Cloud: {e}"));
                         return;
@@ -182,6 +211,7 @@ pub fn start(managed: ManagedConfig, store: Store, http: Arc<dyn Http>, facts: D
                 settings: Mutex::new(enrollment.settings.clone().unwrap_or_default()),
                 stop: c.stop.clone(),
                 os_version: facts.os_version.clone(),
+                beat: Heartbeat::default(),
             });
             let _ = c.agent.set(agent.clone());
             agent.spawn_background();
@@ -213,6 +243,7 @@ pub struct HostAgent {
     settings: Mutex<Settings>,
     stop: Arc<AtomicBool>,
     os_version: String,
+    beat: Heartbeat,
 }
 
 /// The hub's view of the agent.
@@ -233,7 +264,9 @@ impl HubHandler for AgentHub {
     }
     fn connected(&self) {
         log("cloud: hub connected");
-        let _ = self.0.heartbeat();
+        if self.0.beat.on_connect() {
+            let _ = self.0.heartbeat();
+        }
     }
     fn disconnected(&self, why: &str) {
         log(&format!("cloud: hub disconnected ({why})"));
@@ -245,11 +278,9 @@ impl HostAgent {
         let me = self.clone();
         thread::spawn(move || {
             let sleep = hub::sleeper(me.stop.clone());
-            let mut last_hb = Instant::now();
             while sleep(AUDIT_FLUSH_EVERY) {
                 let _ = me.audit.flush(&me.client);
-                if last_hb.elapsed() >= HEARTBEAT_EVERY {
-                    last_hb = Instant::now();
+                if me.beat.due() {
                     if let Err(e) = me.heartbeat() {
                         if e.is_unauthorized() {
                             // The hub sees the same 401 on its next upgrade and ends with Revoked.
@@ -304,6 +335,12 @@ impl HostAgent {
             self.answer(&o.session_id, false, Some(decline::POLICY));
             return;
         };
+        // The ticket only ever goes to this cloud's own relay for this session.
+        if let Err(e) = super::client::check_relay_url(&self.client.base, &o.relay_url, &o.session_id) {
+            log(&format!("cloud: declining {}: {e}", o.session_id));
+            self.answer(&o.session_id, false, Some(decline::POLICY));
+            return;
+        }
         if (self.hooks.busy)() || self.active().is_some() || self.accepting.swap(true, Ordering::SeqCst) {
             log(&format!("cloud: declining {}: busy with another session", o.session_id));
             self.answer(&o.session_id, false, Some(decline::BUSY));
@@ -525,6 +562,7 @@ pub(crate) mod tests {
             settings: Mutex::new(Settings::default()),
             stop: Arc::new(AtomicBool::new(false)),
             os_version: "10".into(),
+            beat: Heartbeat::default(),
         });
         let (hub_client, hub_server) = pair();
         agent.link.set_for_test(hub_client);
@@ -587,6 +625,23 @@ pub(crate) mod tests {
         f.agent.handle_offer(o);
         assert_eq!(answers(&f.hub_server)[0]["reason"], "policy");
         assert!(f.sessions.lock().unwrap().is_empty());
+
+        // A relay URL that isn't this cloud's own relay for the session: declined, ticket never sent.
+        let f = fixture(None, false);
+        let mut o = offer("ses_r", "none");
+        o.relay_url = "wss://elsewhere.example.com/v1/relay/ses_r".into();
+        f.agent.handle_offer(o);
+        assert_eq!(answers(&f.hub_server)[0]["reason"], "policy");
+        assert!(f.http.ws_urls.lock().unwrap().is_empty());
+        assert!(f.agent.grants.is_empty());
+
+        // Heartbeat: once on the first connect, then every 6 h.
+        let hb = Heartbeat::default();
+        assert!(!hb.due(), "nothing before the first connect");
+        assert!(hb.on_connect());
+        assert!(!hb.on_connect(), "reconnects don't heartbeat");
+        assert!(!hb.due());
+        assert!(hb.due_at(Instant::now() + HEARTBEAT_EVERY));
     }
 
     #[test]
