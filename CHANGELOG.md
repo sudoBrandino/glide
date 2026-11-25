@@ -57,9 +57,17 @@ changed for them, not how. Delete empty subsections when the release is cut.
   another connection uses the same address, as in the Windows viewer. **Settings…** (⌘,) holds the
   modifier mapping (applied to a running session at once), a new **Open sessions in full screen**
   option, and this Mac's viewer key fingerprint with a Copy button. The app has standard Glide
-  Viewer, Edit and Window menus. Disconnect (⇧⌘D, or closing the session window) returns to the
+  Viewer, Edit and Window menus. Disconnect (⌃⌥⇧Q, or closing the session window) returns to the
   Connections window instead of quitting; launching with no arguments opens that window and never
   connects on its own.
+- **Mac viewer, session shortcuts:** a way out of a streaming session from the keyboard. ⌃⌥⇧Q
+  disconnects, ⌃⌥⇧F toggles full screen, ⌃⌥⇧K releases the keyboard so ⌘Tab and other Mac
+  shortcuts work on the Mac until you click back into the session, ⌃⌥⇧D reconnects, and
+  ⌃⌥⇧Space opens a session menu at the pointer. They are never sent to the PC (the Control, Option
+  and Shift presses included), work with and without the Accessibility permission and in full
+  screen, and follow the physical Mac keys whatever the modifier mapping. The menus and Settings
+  show them, and a short hint appears when a session starts and when it enters full screen.
+  The menus use them as the key equivalents for Disconnect, Reconnect and full screen.
 
 ### Changed
 

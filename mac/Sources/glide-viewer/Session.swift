@@ -95,6 +95,15 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
     private var cursorShapes: [UInt32: HostCursorShape] = [:]
     private var cursorBytes = 0
     private var rttText = ""
+    /// ⌃⌥⇧K: keys stay with this Mac until the user clicks the session (or the window becomes
+    /// key again, or ⌃⌥⇧K once more).
+    private(set) var keyboardReleased = false
+    /// The session menu (⌃⌥⇧Space) is tracking: its keys must reach the menu.
+    private var menuOpen = false
+    private var hintShown = false
+    private let toast = ToastView()
+    /// Builds the session menu (⌃⌥⇧Space); set by the app.
+    var sessionMenu: (() -> NSMenu?)?
 
     init(target: ViewerTarget, connectionID: String?, label: String, identity: Curve25519.KeyAgreement.PrivateKey,
          remap: Bool, forcePair: Bool, fullscreen: Bool) {
@@ -130,6 +139,13 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
             st.centerYAnchor.constraint(equalTo: container.centerYAnchor),
             st.widthAnchor.constraint(lessThanOrEqualTo: container.widthAnchor, constant: -40),
         ])
+        toast.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(toast)
+        NSLayoutConstraint.activate([
+            toast.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            toast.topAnchor.constraint(equalTo: container.topAnchor, constant: 24),
+            toast.widthAnchor.constraint(lessThanOrEqualTo: container.widthAnchor, constant: -40),
+        ])
         w.contentView = container
         window = w
         video = v
@@ -161,8 +177,15 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
     }
 
     private func updateTitle() {
-        let name = hostName.isEmpty ? label : hostName
-        window.title = rttText.isEmpty ? name : "\(name) — \(rttText)"
+        var t = hostName.isEmpty ? label : hostName
+        if !rttText.isEmpty { t += " — \(rttText)" }
+        if keyboardReleased { t += " — keyboard released" }
+        window.title = t
+    }
+
+    /// The shortcut hint, once per session when the stream starts, and on entering full screen.
+    private func showShortcutHint() {
+        toast.show(ShortcutBindings.hint, seconds: 5)
     }
 
     // MARK: Connection
@@ -377,6 +400,10 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
             startPing()
             updateTitle()
             if !window.isKeyWindow { releaseAll() }
+            if !hintShown {
+                hintShown = true
+                showShortcutHint()
+            }
         case let .videoConfig(cfg):
             applyConfig(cfg)
         case let .pong(c, _):
@@ -514,6 +541,33 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         keys.remap = on
     }
 
+    /// ⌃⌥⇧K / Connection → Release Keyboard: stop (or resume) sending keys to the PC. Held
+    /// keys are released on the PC first.
+    func setKeyboardReleased(_ released: Bool) {
+        guard released != keyboardReleased else { return }
+        releaseAll()
+        keyboardReleased = released
+        updateTitle()
+        if released {
+            toast.show("Keyboard released: shortcuts stay on this Mac. Click the session or press \(ShortcutBindings.label(.releaseKeyboard)) to send keys to the PC again.", seconds: 5)
+        } else {
+            toast.show("Keys go to the PC again.", seconds: 2)
+        }
+    }
+
+    func toggleFullScreen() { window.toggleFullScreen(nil) }
+
+    /// ⌃⌥⇧Space: the session menu at the pointer (in the middle when the pointer is elsewhere).
+    func showSessionMenu() {
+        guard !menuOpen, let menu = sessionMenu?() else { return }
+        releaseAll()
+        menuOpen = true
+        let p = video.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        let at = video.bounds.contains(p) ? p : NSPoint(x: video.bounds.midX, y: video.bounds.midY)
+        menu.popUp(positioning: nil, at: at, in: video)
+        menuOpen = false
+    }
+
     func close() {
         drop()
         retryWork?.cancel()
@@ -583,18 +637,49 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
     private func releaseAll() {
         send(.releaseAll)
         scroll.reset()
+        keys.reset()
     }
 
-    var capturingKeys: Bool { phase == .streaming && window.isKeyWindow && NSApp.isActive && window.attachedSheet == nil }
+    var capturingKeys: Bool {
+        phase == .streaming && window.isKeyWindow && NSApp.isActive && window.attachedSheet == nil && !keyboardReleased && !menuOpen
+    }
 
     func sendKey(usage: UInt16, down: Bool) { send(.key(usage: usage, down: down)) }
 
+    func shortcut(_ s: ViewerShortcut) {
+        // From inside the event tap / key monitor: act after it returns (closing the window stops
+        // the capture, and the menu runs its own tracking loop).
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.phase != .stopped || s == .disconnect || s == .reconnect else { return }
+            print("shortcut \(ShortcutBindings.label(s)): \(s.title)")
+            switch s {
+            case .disconnect: self.close()
+            case .reconnect: self.reconnect(nil)
+            case .toggleFullScreen: self.toggleFullScreen()
+            case .releaseKeyboard: self.setKeyboardReleased(true)
+            case .openMenu: self.showSessionMenu()
+            }
+        }
+    }
+
     func pointerMoved(x: Float, y: Float) { send(.mouseMove(x: x, y: y)) }
 
-    func mouseButton(_ button: UInt8, down: Bool) { send(.mouseButton(button: button, down: down)) }
+    func mouseButton(_ button: UInt8, down: Bool) {
+        // Held-back Control/Option/Shift apply to the click (Shift-click, Ctrl-click); the filter
+        // also tracks the button so modifiers pressed mid-drag reach the PC at once.
+        keys.mouseButton(button, down: down)
+        send(.mouseButton(button: button, down: down))
+    }
 
     func scrolled(dx: Double, dy: Double, precise: Bool) {
+        if capturingKeys { keys.flushModifiers() }
         if let n = scroll.add(dx: dx, dy: dy, precise: precise) { send(.mouseWheel(dx: n.dx, dy: n.dy)) }
+    }
+
+    func clickToCapture() -> Bool {
+        guard keyboardReleased, phase == .streaming else { return false }
+        setKeyboardReleased(false)
+        return true
     }
 
     // MARK: Window
@@ -602,6 +687,11 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
     fileprivate func windowResignedKey() {
         // Keys and buttons released elsewhere would otherwise stay held on the PC.
         releaseAll()
+    }
+
+    fileprivate func windowBecameKey() {
+        // Coming back to the session (a click on it, ⌘Tab) ends "keyboard released".
+        if keyboardReleased && phase == .streaming { setKeyboardReleased(false) }
     }
 
     @objc private func screenParametersChanged(_ n: Notification) { sendViewSizeIfChanged() }
@@ -632,6 +722,8 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
 // whole class @MainActor in Swift 5 mode, and the channel callbacks run on `net`.
 extension ViewerSession: NSWindowDelegate {
     func windowDidResignKey(_ notification: Notification) { windowResignedKey() }
+    func windowDidBecomeKey(_ notification: Notification) { windowBecameKey() }
+    func windowDidEnterFullScreen(_ notification: Notification) { showShortcutHint() }
     func windowDidChangeScreen(_ notification: Notification) { sendViewSizeIfChanged() }
     func windowWillClose(_ notification: Notification) { windowClosing() }
 }

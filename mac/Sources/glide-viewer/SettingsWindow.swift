@@ -2,7 +2,7 @@ import AppKit
 import GlideCore
 
 /// Glide Viewer → Settings… (⌘,): the per-viewer preferences in viewer.json (`remapModifiers`,
-/// `startFullScreen`) and this Mac's viewer key fingerprint. Changes are saved at once.
+/// `startFullScreen`), the session shortcuts (read-only), and this Mac's viewer key fingerprint. Changes are saved at once.
 final class SettingsController: NSObject {
     let window: NSWindow
     private let remap = NSButton(checkboxWithTitle: "Map Mac modifier keys to PC keys", target: nil, action: nil)
@@ -49,16 +49,32 @@ final class SettingsController: NSObject {
         let windowTitle = NSTextField(labelWithString: "Sessions")
         windowTitle.font = keyTitle.font
 
+        let shortcutsTitle = NSTextField(labelWithString: "Session shortcuts")
+        shortcutsTitle.font = keyTitle.font
+        let grid = NSGridView(views: ViewerShortcut.allCases.map { s -> [NSView] in
+            let k = NSTextField(labelWithString: ShortcutBindings.label(s))
+            k.font = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+            let d = NSTextField(wrappingLabelWithString: s.help)
+            d.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+            d.preferredMaxLayoutWidth = 320
+            return [k, d]
+        })
+        grid.rowSpacing = 4
+        grid.columnSpacing = 12
+        let shortcutsNote = NSTextField(wrappingLabelWithString: "Control + Option + Shift + key, on this Mac's keys whatever the modifier mapping. They are never sent to the PC, also in full screen; the Connection and View menus show them too.")
+        styleNote(shortcutsNote)
+
         let showFile = NSButton(title: "Show viewer.json in Finder", target: self, action: #selector(showFile(_:)))
         showFile.bezelStyle = .inline
         showFile.controlSize = .small
 
-        let stack = NSStackView(views: [keyboardTitle, remap, remapNote, windowTitle, fullScreen, fullScreenNote, keyTitle, keyRow, keyNote, showFile])
+        let stack = NSStackView(views: [keyboardTitle, remap, remapNote, windowTitle, fullScreen, fullScreenNote, shortcutsTitle, grid, shortcutsNote, keyTitle, keyRow, keyNote, showFile])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 6
         stack.setCustomSpacing(16, after: remapNote)
         stack.setCustomSpacing(16, after: fullScreenNote)
+        stack.setCustomSpacing(16, after: shortcutsNote)
         stack.setCustomSpacing(16, after: keyNote)
         stack.translatesAutoresizingMaskIntoConstraints = false
         let content = NSView()
@@ -71,6 +87,7 @@ final class SettingsController: NSObject {
             stack.widthAnchor.constraint(equalToConstant: 440),
             remapNote.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -20),
             fullScreenNote.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -20),
+            shortcutsNote.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -20),
             keyNote.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
         window.contentView = content
@@ -103,7 +120,7 @@ final class SettingsController: NSObject {
         var r = "Command → Control, Control → Windows, Option → Alt, so ⌘C, ⌘V and ⌘Z do what they do on the Mac. Off: keys are sent as they are (Command → Windows)."
         if noRemapFlag { r += "\nThis run was started with --no-remap, which turns mapping off until you relaunch." }
         remapNote.stringValue = r
-        var f = "New session windows open in full screen. Leave full screen with View → Exit Full Screen."
+        var f = "New session windows open in full screen. Leave or enter it with \(ShortcutBindings.label(.toggleFullScreen))."
         if fullscreenFlag { f += "\nThis run was started with --fullscreen." }
         fullScreenNote.stringValue = f
     }

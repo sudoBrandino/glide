@@ -20,6 +20,8 @@ import GlideCore
 // First connection to a PC: open "Pair New Mac…" on the PC, then compare the 6-digit code shown
 // on both screens. With Accessibility permission, system shortcuts (⌘Tab, ⌘Space) go to the PC
 // while the viewer window is focused.
+// Session shortcuts are never sent to the PC: ⌃⌥⇧Q disconnect, ⌃⌥⇧F full screen, ⌃⌥⇧K release
+// the keyboard, ⌃⌥⇧D reconnect, ⌃⌥⇧Space session menu (docs/WINDOWS_HOST.md).
 
 struct Options {
     var target: String?
@@ -143,6 +145,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             self.session = nil
             self.showList()
         }
+        s.sessionMenu = { [weak self] in self?.makeSessionMenu() }
         session = s
         s.start()
     }
@@ -171,6 +174,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc private func reconnect(_ sender: Any?) { session?.reconnect(sender) }
 
+    @objc private func toggleKeyboard(_ sender: Any?) {
+        guard let s = session else { return }
+        s.setKeyboardReleased(!s.keyboardReleased)
+    }
+
+    @objc private func toggleSessionFullScreen(_ sender: Any?) { session?.toggleFullScreen() }
+
+    @objc private func showSessionMenu(_ sender: Any?) { session?.showSessionMenu() }
+
+    /// ⌃⌥⇧Space: the session's own menu at the pointer (handy in full screen, where the menu bar
+    /// hides).
+    private func makeSessionMenu() -> NSMenu {
+        let m = NSMenu(title: "Glide")
+        m.autoenablesItems = true
+        shortcutItem(m, "Disconnect", #selector(disconnect(_:)), .disconnect)
+        shortcutItem(m, "Reconnect", #selector(reconnect(_:)), .reconnect)
+        m.addItem(.separator())
+        let fs = session?.window.styleMask.contains(.fullScreen) == true
+        shortcutItem(m, fs ? "Exit Full Screen" : "Enter Full Screen", #selector(toggleSessionFullScreen(_:)), .toggleFullScreen)
+        shortcutItem(m, "Release Keyboard", #selector(toggleKeyboard(_:)), .releaseKeyboard)
+        m.addItem(.separator())
+        let c = m.addItem(withTitle: "Connections…", action: #selector(showConnections(_:)), keyEquivalent: "")
+        c.target = self
+        let st = m.addItem(withTitle: "Settings…", action: #selector(showSettings(_:)), keyEquivalent: "")
+        st.target = self
+        return m
+    }
+
+    /// A menu item whose key equivalent is a session shortcut (⌃⌥⇧+key). In a menu it works while
+    /// keys are not being sent to the PC; while they are, KeyCapture takes the same chord first.
+    @discardableResult
+    private func shortcutItem(_ m: NSMenu, _ title: String, _ action: Selector, _ s: ViewerShortcut) -> NSMenuItem {
+        let i = m.addItem(withTitle: title, action: action, keyEquivalent: s.character)
+        i.keyEquivalentModifierMask = [.control, .option, .shift]
+        i.target = self
+        return i
+    }
+
     @objc private func showSettings(_ sender: Any?) {
         if settings == nil {
             let s = SettingsController(fingerprint: GlideHandshake.fingerprint(identity.publicKey.rawRepresentation),
@@ -195,7 +236,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         switch item.action {
-        case #selector(disconnect(_:)), #selector(reconnect(_:)): return session != nil
+        case #selector(disconnect(_:)), #selector(reconnect(_:)), #selector(showSessionMenu(_:)): return session != nil
+        case #selector(toggleSessionFullScreen(_:)):
+            item.title = session?.window.styleMask.contains(.fullScreen) == true ? "Exit Full Screen" : "Enter Full Screen"
+            return session != nil
+        case #selector(toggleKeyboard(_:)):
+            item.title = session?.keyboardReleased == true ? "Capture Keyboard" : "Release Keyboard"
+            return session?.phase == .streaming
         default: return true
         }
     }
@@ -234,8 +281,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         add(conn, "New Connection…", #selector(newConnection(_:)), "n", target: self)
         add(conn, "Connections…", #selector(showConnections(_:)), "0", target: self)
         conn.addItem(.separator())
-        add(conn, "Reconnect", #selector(reconnect(_:)), "r", target: self)
-        add(conn, "Disconnect", #selector(disconnect(_:)), "d", [.command, .shift], target: self)
+        // Session shortcuts (⌃⌥⇧+key): never sent to the PC, so they work while streaming too.
+        shortcutItem(conn, "Reconnect", #selector(reconnect(_:)), .reconnect)
+        shortcutItem(conn, "Disconnect", #selector(disconnect(_:)), .disconnect)
+        conn.addItem(.separator())
+        shortcutItem(conn, "Release Keyboard", #selector(toggleKeyboard(_:)), .releaseKeyboard)
+        shortcutItem(conn, "Session Menu", #selector(showSessionMenu(_:)), .openMenu)
 
         // Text fields (Add / Edit, search) need these for ⌘C / ⌘V / ⌘A to work.
         let edit = submenu("Edit")
@@ -248,7 +299,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         add(edit, "Select All", #selector(NSText.selectAll(_:)), "a")
 
         let view = submenu("View")
-        add(view, "Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control])
+        // NSWindow's own action (nil target): AppKit keeps the title (Enter / Exit) and doesn't
+        // add a second full-screen item.
+        shortcutItem(view, "Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), .toggleFullScreen).target = nil
 
         let window = submenu("Window")
         add(window, "Minimize", #selector(NSWindow.performMiniaturize(_:)), "m")

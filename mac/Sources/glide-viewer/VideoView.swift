@@ -10,6 +10,9 @@ protocol VideoViewInput: AnyObject {
     func pointerMoved(x: Float, y: Float)
     func mouseButton(_ button: UInt8, down: Bool)
     func scrolled(dx: Double, dy: Double, precise: Bool)
+    /// A click while the keyboard is released (⌃⌥⇧K): true if it took the keyboard back, and
+    /// the click is not sent to the PC.
+    func clickToCapture() -> Bool
 }
 
 /// One cursor image from the host (CursorShape, PROTOCOL.md §3), kept so it can be rebuilt at
@@ -29,6 +32,8 @@ final class VideoView: NSView {
     var active = false { didSet { updateCursorImage() } }
 
     private var hostShape: HostCursorShape?
+    /// The button whose down took the keyboard back: its up isn't sent either.
+    private var captureClickButton: Int?
     private var hostCursorVisible = true
     private var cursor: NSCursor = .arrow
     private static let blankCursor: NSCursor = {
@@ -102,6 +107,14 @@ final class VideoView: NSView {
 
     private func button(_ e: NSEvent, _ b: UInt8, _ down: Bool) {
         guard active else { return }
+        if down, input?.clickToCapture() == true {
+            captureClickButton = e.buttonNumber
+            return
+        }
+        if !down, captureClickButton == e.buttonNumber {
+            captureClickButton = nil
+            return
+        }
         pointer(e)
         input?.mouseButton(b, down: down)
     }
