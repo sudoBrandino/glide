@@ -419,6 +419,48 @@ impl ViewerAgent {
     }
 }
 
+/// Row id prefix of organization hosts in the Connections window.
+pub const ROW_PREFIX: &str = "org:";
+
+/// The organization's hosts as Connections-window rows (group "Organization: NAME"), filtered by
+/// name or tag like the saved connections. `supported` = online (Connect is possible).
+pub fn host_rows(hosts: &[HostEntry], org: &str, filter: &str, now: SystemTime) -> Vec<crate::connections::Row> {
+    let f = filter.trim().to_lowercase();
+    hosts
+        .iter()
+        .filter(|h| f.is_empty() || h.name.to_lowercase().contains(&f) || h.tags.iter().any(|t| t.to_lowercase().contains(&f)) || "organization".contains(&f))
+        .map(|h| {
+            let mut status = if h.online { "Online".to_string() } else { "Offline".to_string() };
+            if h.approval == "required" {
+                status.push_str(" · asks for approval");
+            }
+            if !h.permissions.control {
+                status.push_str(" · view only");
+            }
+            let last_used = match (h.online, h.last_seen.as_deref()) {
+                (true, _) => "Now".to_string(),
+                (false, Some(t)) => match super::grants::parse_time(t) {
+                    Some(s) => crate::connections::relative_time(&crate::config::rfc3339_utc(SystemTime::UNIX_EPOCH + Duration::from_secs(s.max(0) as u64)), now),
+                    None => "—".into(),
+                },
+                (false, None) => "—".into(),
+            };
+            crate::connections::Row {
+                id: format!("{ROW_PREFIX}{}", h.id),
+                name: h.name.clone(),
+                address: if h.platform == "macos" { "Mac · Glide Cloud".into() } else { "PC · Glide Cloud".into() },
+                group: format!("Organization: {org}"),
+                status,
+                paired: false,
+                last_used,
+                active: false,
+                favorite: false,
+                supported: h.online,
+            }
+        })
+        .collect()
+}
+
 struct ViewerHub(Arc<ViewerAgent>);
 
 impl HubHandler for ViewerHub {
@@ -471,6 +513,22 @@ mod tests {
         store.save(&e).unwrap();
         let m = ManagedConfig { cloud_url: "https://c.example.com".into(), ..Default::default() };
         (ViewerAgent::new(m, store, http), dir)
+    }
+
+    #[test]
+    fn rows_for_the_connections_window() {
+        let hosts = vec![
+            HostEntry { id: "dev_a".into(), name: "Studio".into(), platform: "macos".into(), online: true, approval: "required".into(), permissions: Permissions { control: true, ..Default::default() }, ..Default::default() },
+            HostEntry { id: "dev_b".into(), name: "Lab PC".into(), platform: "windows".into(), tags: vec!["lab".into()], online: false, last_seen: Some("2026-11-25T09:00:00.000Z".into()), approval: "none".into(), ..Default::default() },
+        ];
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(crate::connections::parse_rfc3339("2026-11-25T10:00:00Z").unwrap() as u64);
+        let r = host_rows(&hosts, "Acme", "", now);
+        assert_eq!(r[0].id, "org:dev_a");
+        assert_eq!((r[0].status.as_str(), r[0].supported, r[0].group.as_str()), ("Online · asks for approval", true, "Organization: Acme"));
+        assert_eq!((r[1].status.as_str(), r[1].supported, r[1].address.as_str()), ("Offline · view only", false, "PC · Glide Cloud"));
+        assert_eq!(r[1].last_used, "1 hour ago");
+        assert_eq!(host_rows(&hosts, "Acme", "lab", now).len(), 1);
+        assert!(host_rows(&hosts, "Acme", "zzz", now).is_empty());
     }
 
     #[test]

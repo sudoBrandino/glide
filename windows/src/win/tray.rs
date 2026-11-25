@@ -26,6 +26,17 @@ pub enum MenuCmd {
     SetUp,
     AllowPairing,
     Connections,
+    OrgSignIn,
+    OrgSignOut,
+}
+
+/// The organization part of the menu (managed mode).
+pub struct OrgState {
+    /// "Acme — signed in as Ada (ada@example.com)".
+    pub line: String,
+    pub signed_in: bool,
+    /// The managed session's host, if one runs.
+    pub session: Option<String>,
 }
 
 /// What the menu shows (enabled/checked state).
@@ -44,10 +55,12 @@ pub struct MenuState {
     /// "Connect to" submenu: saved connections as `connections::quick_list` returns them
     /// (id, name, active). Empty = no submenu.
     pub connections: Vec<(String, String, bool)>,
+    /// Managed mode (Glide Cloud); None = not managed.
+    pub org: Option<OrgState>,
 }
 
 const BASE: u16 = 0x4100;
-const CMDS: [MenuCmd; 13] = [
+const CMDS: [MenuCmd; 15] = [
     MenuCmd::Connect,
     MenuCmd::Disconnect,
     MenuCmd::Reconnect,
@@ -61,6 +74,8 @@ const CMDS: [MenuCmd; 13] = [
     MenuCmd::SetUp,
     MenuCmd::AllowPairing,
     MenuCmd::Connections,
+    MenuCmd::OrgSignIn,
+    MenuCmd::OrgSignOut,
 ];
 
 /// "Connect to" items: `CONNECT_BASE` + position in the list shown. Well above `BASE + CMDS.len()`
@@ -214,6 +229,20 @@ fn show_menu(hwnd: HWND, st: &MenuState) {
             let _ = AppendMenuW(m, MF_STRING | flags, cmd.id() as usize, PCWSTR(t.as_ptr()));
         };
         let gray = |b: bool| if b { MF_GRAYED } else { MF_ENABLED };
+        if let Some(org) = &st.org {
+            let t: Vec<u16> = org.line.replace('&', "&&").encode_utf16().chain(std::iter::once(0)).collect();
+            let _ = AppendMenuW(m, MF_STRING | MF_GRAYED, 0, PCWSTR(t.as_ptr()));
+            if let Some(host) = &org.session {
+                let t: Vec<u16> = format!("Managed session with {}", host.replace('&', "&&")).encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = AppendMenuW(m, MF_STRING | MF_GRAYED, 0, PCWSTR(t.as_ptr()));
+            }
+            if org.signed_in {
+                item(MenuCmd::OrgSignOut, "Sign &out of your organization…", MF_ENABLED);
+            } else {
+                item(MenuCmd::OrgSignIn, "Sign &in to your organization…", MF_ENABLED);
+            }
+            let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+        }
         item(MenuCmd::Connect, "&Connect", gray(!paused));
         item(MenuCmd::Disconnect, "&Disconnect", gray(paused));
         item(MenuCmd::Reconnect, "&Reconnect\tCtrl+Alt+Shift+D", gray(paused));

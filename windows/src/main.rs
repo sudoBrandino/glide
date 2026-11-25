@@ -236,6 +236,39 @@ impl PairingUi for ConsolePairing {
     }
 }
 
+/// Managed mode (Glide Cloud, docs/ENTERPRISE.md): with a Glide policy, enroll this viewer and
+/// connect to the organization in the background (sign-in and hosts are in the tray and the
+/// Connections window). `DisableLANMode` alone just turns LAN connections off.
+#[cfg(windows)]
+fn start_managed_mode(cfg_dir: Option<&std::path::Path>, identity: &glide::identity::Identity) {
+    use glide::cloud::{enroll, managed, settings, store, viewer::ViewerAgent};
+    let m = match managed::load() {
+        Ok(Some(m)) => m,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("warning: managed configuration ignored: {e}");
+            return;
+        }
+    };
+    glide::win::managed::set_local_lan_off(m.disable_lan_mode);
+    if m.disable_lan_mode {
+        eprintln!("LAN connections are turned off by policy (DisableLANMode)");
+    }
+    let (true, Some(dir), Some(http)) = (m.has_cloud(), cfg_dir, glide::cloud::platform_http()) else { return };
+    eprintln!("managed by Glide Cloud at {}", m.cloud_url);
+    let facts = enroll::DeviceFacts {
+        kind: enroll::Kind::Viewer,
+        public_key: identity.public(),
+        name: m.device_name.clone().unwrap_or_else(client_name),
+        os_version: glide::cloud::os_version(),
+        app_version: settings::app_version().into(),
+    };
+    let st = store::Store::new(dir, enroll::Kind::Viewer.file(), store::platform_seal());
+    let agent = ViewerAgent::new(m, st, http);
+    agent.start(facts);
+    glide::win::managed::init(Some(agent));
+}
+
 fn client_name() -> String {
     std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "glide-client".into())
 }
@@ -470,6 +503,7 @@ fn main() -> ExitCode {
     if args.bench.is_none() {
         #[cfg(windows)]
         {
+            start_managed_mode(cfg_dir.as_deref(), &identity);
             use glide::win::app::{Connector, Options, Target};
             let target = match target {
                 TargetSpec::Listen(port) => Target::Listen(port),
