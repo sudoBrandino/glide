@@ -12,6 +12,8 @@
                those programs, Domain and Private profiles; left out when DISABLELANMODE=1
     Autostart  start the viewer at every user's sign-in (HKLM Run); only with AUTOSTART=1 or
                ADDLOCAL=Autostart
+    HostAutostart  start the Windows host at every user's sign-in (HKLM Run), so the PC can be
+               reached through Glide Cloud; only with HOSTAUTOSTART=1 or ADDLOCAL=HostAutostart
 
   Public properties (msiexec /i Glide-X.Y.Z-windows-x64.msi CLOUDURL=… ENROLLMENTTOKEN=… /qn):
     CLOUDURL         → CloudURL (REG_SZ)         Glide Cloud URL, e.g. https://glide.example.com
@@ -19,6 +21,7 @@
     DEVICENAME       → DeviceName (REG_SZ)       optional; default the computer name
     DISABLELANMODE=1 → DisableLANMode (REG_DWORD 1), and no firewall rules
     AUTOSTART=1      → the Autostart feature
+    HOSTAUTOSTART=1  → the HostAutostart feature
   docs/ENTERPRISE.md §11.2 defines the values; packaging/windows/admx/ sets the same ones through
   Group Policy (Tags too). A value given at install is kept across upgrades (read back from the
   registry when the property isn't passed again) and removed on uninstall.
@@ -64,6 +67,7 @@
     <Property Id="DEVICENAME" Secure="yes" />
     <Property Id="DISABLELANMODE" Secure="yes" />
     <Property Id="AUTOSTART" Secure="yes" />
+    <Property Id="HOSTAUTOSTART" Secure="yes" />
 
     <Property Id="SAVED_CLOUDURL" Secure="yes">
       <RegistrySearch Id="FindCloudURL" Root="HKLM" Bitness="always64" Key="SOFTWARE\Policies\Glide" Name="CloudURL" Type="raw" />
@@ -92,6 +96,11 @@
                  Condition="NOT DISABLELANMODE AND SAVED_DISABLELANMODE = &quot;#1&quot;" />
     <SetProperty Id="AUTOSTART" Value="1" After="AppSearch" Sequence="both"
                  Condition="NOT AUTOSTART AND SAVED_AUTOSTART = &quot;#1&quot;" />
+    <Property Id="SAVED_HOSTAUTOSTART" Secure="yes">
+      <RegistrySearch Id="FindHostAutostart" Root="HKLM" Bitness="always64" Key="SOFTWARE\Glide\Installer" Name="HostAutostart" Type="raw" />
+    </Property>
+    <SetProperty Id="HOSTAUTOSTART" Value="1" After="AppSearch" Sequence="both"
+                 Condition="NOT HOSTAUTOSTART AND SAVED_HOSTAUTOSTART = &quot;#1&quot;" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Glide" />
@@ -117,6 +126,11 @@
     <Feature Id="Autostart" Title="Start the viewer at sign-in" Level="1000">
       <Level Value="1" Condition="AUTOSTART = 1" />
       <ComponentRef Id="AutostartViewer" />
+    </Feature>
+
+    <Feature Id="HostAutostart" Title="Start the Windows host at sign-in" Level="1000">
+      <Level Value="1" Condition="HOSTAUTOSTART = 1" />
+      <ComponentRef Id="AutostartHost" />
     </Feature>
   </Package>
 
@@ -167,6 +181,11 @@
         <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run" Name="Glide Viewer"
                        Type="string" Value="&quot;[#GlideClientExe]&quot; --startup" KeyPath="yes" />
         <RegistryValue Root="HKLM" Key="SOFTWARE\Glide\Installer" Name="Autostart" Type="integer" Value="1" />
+      </Component>
+      <Component Id="AutostartHost" Bitness="always64">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run" Name="Glide Host"
+                       Type="string" Value="&quot;[#GlideHostExe]&quot;" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Glide\Installer" Name="HostAutostart" Type="integer" Value="1" />
       </Component>
     </DirectoryRef>
   </Fragment>
