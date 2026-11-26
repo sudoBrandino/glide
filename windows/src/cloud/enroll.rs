@@ -1,7 +1,7 @@
 //! Device enrollment (docs/ENTERPRISE.md §5.1): with no stored enrollment, or one for a different
 //! `CloudURL`, call `POST /v1/enroll` with the managed `EnrollmentToken` and store the result.
 
-use super::api::{EnrollRequest, Settings};
+use super::api::{DeviceInfo, EnrollRequest, Settings};
 use super::client::{CloudClient, CloudError};
 use super::managed::ManagedConfig;
 use super::store::{Enrollment, Store};
@@ -123,6 +123,37 @@ fn classify(e: CloudError) -> EnrollError {
     }
 }
 
+/// `GET /v1/device` (on each hub connection, §6.7): refreshes the device name, tags and org name
+/// in `enrollment` and in the enrollment file. A `401` is returned as is (the device was revoked).
+pub fn refresh_device(store: &Store, client: &CloudClient, enrollment: &mut Enrollment) -> Result<DeviceInfo, CloudError> {
+    let d = client.device()?;
+    let mut changed = false;
+    let mut set = |field: &mut String, v: &str| {
+        if !v.is_empty() && field != v {
+            *field = v.to_string();
+            changed = true;
+        }
+    };
+    set(&mut enrollment.device_name, &d.name);
+    set(&mut enrollment.org_name, &d.org.name);
+    if enrollment.tags != d.tags {
+        enrollment.tags = d.tags.clone();
+        changed = true;
+    }
+    if changed {
+        // Only these fields; whatever else changed in the file meanwhile (settings, user) stays.
+        if let Ok(Some(mut e)) = store.load() {
+            if e.device_id == enrollment.device_id && !e.revoked {
+                (e.device_name, e.org_name, e.tags) = (enrollment.device_name.clone(), enrollment.org_name.clone(), enrollment.tags.clone());
+                if let Err(err) = store.save(&e) {
+                    crate::host::log(&format!("cloud: {err}"));
+                }
+            }
+        }
+    }
+    Ok(d)
+}
+
 /// Keep the newest settings in the enrollment file (startup LAN decision); errors are logged.
 pub fn remember_settings(store: &Store, settings: &Settings) {
     if let Ok(Some(mut e)) = store.load() {
@@ -215,6 +246,33 @@ mod tests {
         http.routes.lock().unwrap().clear();
         assert!(matches!(ensure(&m, &store, &client, &f), Err(EnrollError::Retry(_))));
         assert_eq!(store.load(), Ok(None), "nothing stored on failure");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn device_refresh() {
+        let (http, client, store, m, f, dir) = setup(Some("t"));
+        http.on("POST /v1/enroll", 201, OK);
+        let mut e = ensure(&m, &store, &client, &f).unwrap();
+        let dc = client.clone().with_device(&e.device_token);
+        http.on("GET /v1/device", 200, r#"{"device_id":"dev_1","kind":"host","name":"Front desk","tags":["lobby","staff"],"org":{"id":"org_1","slug":"acme","name":"Acme Corp"},"settings":{}}"#);
+        let d = refresh_device(&store, &dc, &mut e).unwrap();
+        assert_eq!(d.name, "Front desk");
+        assert_eq!((e.device_name.as_str(), e.org_name.as_str(), e.tags.clone()), ("Front desk", "Acme Corp", vec!["lobby".to_string(), "staff".to_string()]));
+        let saved = store.load().unwrap().unwrap();
+        assert_eq!((saved.device_name.as_str(), saved.org_name.as_str(), saved.tags.len()), ("Front desk", "Acme Corp", 2));
+        assert_eq!(saved.settings.map(|s| s.lan_mode), Some(false), "settings untouched (the hub's are authoritative)");
+        let req = http.requests.lock().unwrap().last().cloned().unwrap();
+        assert!(req.headers.contains(&("Authorization".into(), format!("Bearer {}", e.device_token))));
+        // An empty name or org from the cloud doesn't wipe what is known.
+        http.routes.lock().unwrap().clear();
+        http.on("GET /v1/device", 200, r#"{"device_id":"dev_1","tags":[]}"#);
+        refresh_device(&store, &dc, &mut e).unwrap();
+        assert_eq!((e.device_name.as_str(), e.org_name.as_str(), e.tags.len()), ("Front desk", "Acme Corp", 0));
+        // 401: returned for the caller to treat as revoked.
+        http.routes.lock().unwrap().clear();
+        http.on("GET /v1/device", 401, "");
+        assert!(refresh_device(&store, &dc, &mut e).unwrap_err().is_unauthorized());
         let _ = std::fs::remove_dir_all(dir);
     }
 

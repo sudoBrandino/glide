@@ -36,6 +36,12 @@ pub struct Enrollment {
     pub user: Option<User>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings: Option<Settings>,
+    /// The device's name and tags as the cloud knows them (`GET /v1/device` on each hub
+    /// connection; an admin may rename or retag it).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub device_name: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// The device was revoked (§6.7): the record keeps only `cloud_url`, `settings` (still
     /// applied, across restarts, until the managed CloudURL is removed or changes) and the org
     /// name; the credentials are gone.

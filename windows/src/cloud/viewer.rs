@@ -452,6 +452,27 @@ impl ViewerAgent {
         }
     }
 
+    /// `GET /v1/device` (each hub connection, §6.7): refresh the device name, tags and org name.
+    /// A `401` means the device was revoked.
+    pub fn refresh_device(&self) {
+        let (Some(c), Some(mut e)) = (self.client(), self.state.lock().unwrap().enrollment.clone()) else { return };
+        match enroll::refresh_device(&self.store, &c, &mut e) {
+            Ok(_) => {
+                if let Some(cur) = self.state.lock().unwrap().enrollment.as_mut() {
+                    (cur.device_name, cur.org_name, cur.tags) = (e.device_name, e.org_name, e.tags);
+                }
+                self.changed();
+            }
+            Err(err) if err.is_unauthorized() => self.revoked("GET /v1/device was refused"),
+            Err(err) => log(&format!("cloud: GET /v1/device: {err}")),
+        }
+    }
+
+    /// This device's name as the cloud knows it (empty until the first refresh).
+    pub fn device_name(&self) -> String {
+        self.state.lock().unwrap().enrollment.as_ref().map(|e| e.device_name.clone()).unwrap_or_default()
+    }
+
     fn apply_settings(&self, s: Settings) {
         self.audit.set_file_names(s.audit_file_names);
         enroll::remember_settings(&self.store, &s);
@@ -545,6 +566,9 @@ impl HubHandler for ViewerHub {
     }
     fn connected(&self) {
         log("cloud: hub connected");
+        // Refresh the device name, tags and org name (§6.7), off the hub thread.
+        let me = self.0.clone();
+        thread::spawn(move || me.refresh_device());
         if self.0.heartbeat.on_connect() {
             if let Some(c) = self.0.client() {
                 let os = self.0.os_version.lock().unwrap().clone();
@@ -724,6 +748,32 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(audit.body.as_ref().unwrap()).unwrap();
         assert_eq!(v["events"][0]["type"], "session.local_end");
         assert_eq!(v["events"][0]["detail"]["by"], "viewer_user");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hub_connection_refreshes_the_device() {
+        let http = Arc::new(FakeHttp::default());
+        let (a, dir) = agent(http.clone(), false);
+        http.on("GET /v1/device", 200, r#"{"device_id":"dev_v","kind":"viewer","name":"Ada's laptop","tags":["it"],"org":{"id":"org_1","slug":"acme","name":"Acme Europe"}}"#);
+        http.on("POST /v1/device/heartbeat", 204, "");
+        let changes = Arc::new(Mutex::new(0));
+        let c2 = changes.clone();
+        a.set_on_change(Box::new(move || *c2.lock().unwrap() += 1));
+        ViewerHub(a.clone()).connected();
+        let t = Instant::now();
+        while (a.org_name() != "Acme Europe" || *changes.lock().unwrap() == 0) && t.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!((a.org_name().as_str(), a.device_name().as_str()), ("Acme Europe", "Ada's laptop"));
+        assert_eq!(a.status_line(), "Acme Europe — not signed in");
+        assert!(*changes.lock().unwrap() >= 1);
+        assert_eq!(a.store.load().unwrap().unwrap().tags, vec!["it"]);
+        // 401: revoked.
+        http.routes.lock().unwrap().clear();
+        http.on("GET /v1/device", 401, "");
+        a.refresh_device();
+        assert!(a.is_revoked() && !a.enrolled());
         let _ = std::fs::remove_dir_all(dir);
     }
 

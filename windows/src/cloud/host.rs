@@ -144,7 +144,7 @@ pub struct HostHooks {
 /// Managed mode as glide-host sees it: the agent once enrolled, and a status line.
 pub struct HostCloud {
     pub agent: OnceLock<Arc<HostAgent>>,
-    status: Mutex<String>,
+    status: Arc<Mutex<String>>,
     pub grants: Arc<GrantStore>,
     stop: Arc<AtomicBool>,
 }
@@ -176,7 +176,7 @@ impl HostCloud {
 
 /// Starts managed mode in the background: enroll (retrying), then the hub, heartbeat and audit.
 pub fn start(managed: ManagedConfig, store: Store, http: Arc<dyn Http>, facts: DeviceFacts, grants: Arc<GrantStore>, ui: Arc<dyn HostUi>, hooks: HostHooks) -> Arc<HostCloud> {
-    let cloud = Arc::new(HostCloud { agent: OnceLock::new(), status: Mutex::new("Glide Cloud: enrolling…".into()), grants: grants.clone(), stop: Arc::new(AtomicBool::new(false)) });
+    let cloud = Arc::new(HostCloud { agent: OnceLock::new(), status: Arc::new(Mutex::new("Glide Cloud: enrolling…".into())), grants: grants.clone(), stop: Arc::new(AtomicBool::new(false)) });
     // The last known settings apply until the hub sends fresh ones.
     if let Ok(Some(e)) = store.load() {
         if e.cloud_url == managed.cloud_url {
@@ -230,6 +230,8 @@ pub fn start(managed: ManagedConfig, store: Store, http: Arc<dyn Http>, facts: D
                 stop: c.stop.clone(),
                 os_version: facts.os_version.clone(),
                 beat: Heartbeat::default(),
+                status: c.status.clone(),
+                org_name: Mutex::new(enrollment.org_name.clone()),
             });
             let _ = c.agent.set(agent.clone());
             agent.spawn_background();
@@ -237,7 +239,7 @@ pub fn start(managed: ManagedConfig, store: Store, http: Arc<dyn Http>, facts: D
                 HubExit::Stopped => {}
                 HubExit::Revoked(reason) => {
                     agent.revoked(&reason);
-                    c.set_status(&format!("Removed from {org}: this PC is no longer managed ({reason})"));
+                    c.set_status(&format!("Removed from {}: this PC is no longer managed ({reason})", agent.org_label()));
                 }
             }
         })
@@ -262,6 +264,10 @@ pub struct HostAgent {
     stop: Arc<AtomicBool>,
     os_version: String,
     beat: Heartbeat,
+    /// `HostCloud`'s status line ("Managed by Acme (Glide Cloud)").
+    status: Arc<Mutex<String>>,
+    /// The org's name (refreshed with `GET /v1/device` on each hub connection).
+    org_name: Mutex<String>,
 }
 
 /// The hub's view of the agent.
@@ -282,6 +288,9 @@ impl HubHandler for AgentHub {
     }
     fn connected(&self) {
         log("cloud: hub connected");
+        // Refresh the device name, tags and org name (§6.7), off the hub thread.
+        let me = self.0.clone();
+        thread::spawn(move || me.refresh_device());
         if self.0.beat.on_connect() {
             let _ = self.0.heartbeat();
         }
@@ -308,6 +317,42 @@ impl HostAgent {
                 }
             }
         });
+    }
+
+    /// The org's name, or "your organization".
+    pub fn org_label(&self) -> String {
+        let n = self.org_name.lock().unwrap().clone();
+        if n.is_empty() {
+            "your organization".into()
+        } else {
+            n
+        }
+    }
+
+    /// `GET /v1/device`: refresh the device name, tags and org name (and the status line). A
+    /// `401` means the device was revoked: the hub is closed, its reconnect sees the same `401`
+    /// and ends with `Revoked`.
+    pub fn refresh_device(&self) {
+        let Ok(Some(mut e)) = self.store.load() else { return };
+        if e.revoked {
+            return;
+        }
+        match enroll::refresh_device(&self.store, &self.client, &mut e) {
+            Ok(d) => {
+                *self.org_name.lock().unwrap() = e.org_name.clone();
+                let mut st = self.status.lock().unwrap();
+                if st.starts_with("Managed by ") {
+                    *st = format!("Managed by {} (Glide Cloud)", self.org_label());
+                }
+                drop(st);
+                log(&format!("cloud: device “{}” (tags: {})", d.name, d.tags.join(", ")));
+            }
+            Err(err) if err.is_unauthorized() => {
+                log("cloud: GET /v1/device was refused; this device was revoked");
+                self.link.close();
+            }
+            Err(err) => log(&format!("cloud: GET /v1/device: {err}")),
+        }
     }
 
     fn heartbeat(&self) -> Result<(), super::client::CloudError> {
@@ -620,6 +665,8 @@ pub(crate) mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             os_version: "10".into(),
             beat: Heartbeat::default(),
+            status: Arc::new(Mutex::new("Managed by Acme (Glide Cloud)".into())),
+            org_name: Mutex::new("Acme".into()),
         });
         let (hub_client, hub_server) = pair();
         agent.link.set_for_test(hub_client);
@@ -790,6 +837,37 @@ pub(crate) mod tests {
         f.agent.handle_offer(o);
         let exp = f.grant_expiry.lock().unwrap().unwrap();
         assert!(exp <= t0 + Duration::from_secs(31), "capped at expires_at");
+    }
+
+    #[test]
+    fn hub_connection_refreshes_the_device() {
+        let f = fixture(None, false);
+        let enrolled = crate::cloud::store::Enrollment {
+            cloud_url: "https://c.example.com".into(),
+            device_id: "dev_h".into(),
+            device_token: "gd_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            org_name: "Acme".into(),
+            ..Default::default()
+        };
+        f.agent.store.save(&enrolled).unwrap();
+        f.http.on("GET /v1/device", 200, r#"{"device_id":"dev_h","kind":"host","name":"Reception PC","tags":["lobby"],"org":{"id":"o","slug":"acme","name":"Acme Europe"}}"#);
+        f.http.on("POST /v1/device/heartbeat", 204, "");
+        AgentHub(f.agent.clone()).connected();
+        let t = Instant::now();
+        while !f.agent.status.lock().unwrap().contains("Europe") && t.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(f.http.count("GET /v1/device"), 1);
+        assert_eq!(*f.agent.status.lock().unwrap(), "Managed by Acme Europe (Glide Cloud)");
+        let e = f.agent.store.load().unwrap().unwrap();
+        assert_eq!((e.device_name.as_str(), e.tags.clone(), e.org_name.as_str()), ("Reception PC", vec!["lobby".to_string()], "Acme Europe"));
+        // A 401 closes the hub (whose reconnect then ends with Revoked).
+        f.http.routes.lock().unwrap().clear();
+        f.http.on("GET /v1/device", 401, "");
+        assert!(f.agent.link.is_connected());
+        f.agent.refresh_device();
+        assert!(!f.agent.link.is_connected());
+        let _ = std::fs::remove_dir_all(&f.dir);
     }
 
     #[test]
