@@ -14,7 +14,7 @@
 set -u
 
 LABEL="dev.brandino.glide.host"
-LEGACY_LABELS="io.github.sudobrandino.glide.host"   # bundle ids of releases up to 0.3.x
+LEGACY_LABELS="io.github.sudobrandino.glide.host"   # bundle ids of releases up to 0.4.x
 APP="/Applications/Glide Host.app"
 BIN="$APP/Contents/MacOS/glide-host"
 AGENT="/Library/LaunchAgents/$LABEL.plist"

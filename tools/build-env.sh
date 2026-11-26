@@ -19,7 +19,7 @@ unset _glide_env_file _glide_keep
 
 # Bundle identifier of Glide Host.app. It is also the LaunchAgent label and the code-signing
 # identifier, so macOS privacy grants (Screen Recording, Accessibility) and MDM profiles (PPPC,
-# managed login items: packaging/mdm/) are tied to it. Releases up to 0.3.x used
+# managed login items: packaging/mdm/) are tied to it. Releases up to 0.4.x used
 # io.github.sudobrandino.glide.host; install.sh and the .pkg migrate that label.
 GLIDE_BUNDLE_ID="${GLIDE_BUNDLE_ID:-dev.brandino.glide.host}"
 # Bundle identifier of Glide Viewer.app (tools/make-viewer-app.sh).

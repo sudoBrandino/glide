@@ -168,7 +168,7 @@ curl -fsSL https://raw.githubusercontent.com/sudoBrandino/glide/main/install.sh 
 From a clone of the repository, `./install.sh --app …` does the same.
 
 **Option B: by hand.** This creates the same LaunchAgent as `install.sh`. The label must be the
-app's bundle identifier, `dev.brandino.glide.host` (releases up to 0.3.x: `io.github.sudobrandino.glide.host`). `KeepAlive` restarts the host
+app's bundle identifier, `dev.brandino.glide.host` (releases up to 0.4.x: `io.github.sudobrandino.glide.host`). `KeepAlive` restarts the host
 whenever it exits, as long as the app is still there:
 
 ```sh

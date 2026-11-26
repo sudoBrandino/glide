@@ -1,21 +1,26 @@
 name: Release
 
 # Builds the release artifacts and attaches them to a DRAFT GitHub Release; a maintainer reviews
-# and publishes it by hand. Same steps as tools/release.sh (see docs/INSTALL.md, CONTRIBUTING.md).
+# and publishes it by hand. Same steps as tools/release.sh (see docs/RELEASING.md).
 #
-# - Push a tag vX.Y.Z (must equal the VERSION file, on a commit in main): build, attest, draft.
+# - Push a tag vX.Y.Z (must equal the VERSION file, on a commit in main): build, sign, notarize,
+#   attest, draft.
 # - Run it by hand (workflow_dispatch) for a dry run: build only, artifacts on the run page.
 #   Pull requests that touch the release tooling get the same dry run.
 #
-# Optional repository secrets for a Developer ID signed and notarized Mac app. Without them the
-# app is signed ad hoc, as with tools/make-host-app.sh. They are only loaded for tag pushes: dry
-# runs and pull requests (whose tools/*.sh may be edited) always build ad hoc, so no branch's
-# scripts ever run with the signing keychain unlocked.
-#   MACOS_SIGN_P12          base64 of a .p12 holding the "Developer ID Application" cert + key
-#   MACOS_SIGN_P12_PASSWORD  its password
-#   MACOS_SIGN_ID            the identity, e.g. "Developer ID Application: Name (TEAMID)"
-#   MACOS_NOTARY_APPLE_ID, MACOS_NOTARY_TEAM_ID, MACOS_NOTARY_PASSWORD (app-specific password):
-#                            also notarize and staple (needs the three above)
+# Signing is optional and per platform: every signing step is skipped when its secrets are absent,
+# and the build still produces ad hoc signed (Mac) or unsigned (Windows) artifacts. Secrets are
+# only mapped for tag pushes: dry runs and pull requests (whose tools/*.sh may be edited) always
+# build unsigned, so no branch's scripts ever run with a signing key. docs/RELEASING.md lists every
+# secret, how to obtain it, and the migration from the old MACOS_SIGN_* / MACOS_NOTARY_* names.
+#
+#   macOS   MACOS_CERT_P12, MACOS_CERT_PASSWORD            Developer ID Application (.p12, base64)
+#           MACOS_INSTALLER_P12, MACOS_INSTALLER_PASSWORD  Developer ID Installer (.p12, base64)
+#           APPLE_API_KEY_P8, APPLE_API_KEY_ID, APPLE_API_ISSUER   App Store Connect API key (notary)
+#           MACOS_SELF_SIGN_P12, MACOS_SELF_SIGN_P12_PASSWORD      self-signed fallback, used only
+#                                                                 without a Developer ID
+#   Windows AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_SIGNING_ENDPOINT,
+#           AZURE_SIGNING_ACCOUNT, AZURE_CERT_PROFILE      Azure Artifact Signing
 #
 # Third-party actions are pinned to commit SHAs, as in ci.yml. No caches: release builds start
 # clean so nothing a pull-request build wrote can reach a release.
@@ -28,8 +33,13 @@ on:
       - VERSION
       - tools/release.sh
       - tools/version.sh
+      - tools/build-env.sh
+      - tools/mac-sign.sh
       - tools/make-host-app.sh
+      - tools/make-viewer-app.sh
+      - tools/notarize.sh
       - install.sh
+      - install.ps1
       - packaging/**
       - .github/workflows/release.yml
 
@@ -84,13 +94,25 @@ jobs:
           cmp "$RUNNER_TEMP/v.json" docs/test-vectors.json
           python3 tools/gen_vectors.py --check docs/test-vectors-rust.json
 
-  host:
-    name: Mac host (Glide Host.app)
+  mac:
+    name: Mac (Glide Host.app, Glide Viewer.app, DMG, pkgs)
     needs: check
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
+    outputs:
+      notarized: ${{ steps.notarize.outputs.notarized }}
     env:
       GLIDE_RELEASE_OUT: ${{ github.workspace }}/out
+      # Tag pushes only (see the header); empty otherwise, which skips the signing steps.
+      MACOS_CERT_P12: ${{ github.event_name == 'push' && secrets.MACOS_CERT_P12 || '' }}
+      MACOS_CERT_PASSWORD: ${{ github.event_name == 'push' && secrets.MACOS_CERT_PASSWORD || '' }}
+      MACOS_INSTALLER_P12: ${{ github.event_name == 'push' && secrets.MACOS_INSTALLER_P12 || '' }}
+      MACOS_INSTALLER_PASSWORD: ${{ github.event_name == 'push' && secrets.MACOS_INSTALLER_PASSWORD || '' }}
+      MACOS_SELF_SIGN_P12: ${{ github.event_name == 'push' && secrets.MACOS_SELF_SIGN_P12 || '' }}
+      MACOS_SELF_SIGN_P12_PASSWORD: ${{ github.event_name == 'push' && secrets.MACOS_SELF_SIGN_P12_PASSWORD || '' }}
+      APPLE_API_KEY_P8: ${{ github.event_name == 'push' && secrets.APPLE_API_KEY_P8 || '' }}
+      APPLE_API_KEY_ID: ${{ github.event_name == 'push' && secrets.APPLE_API_KEY_ID || '' }}
+      APPLE_API_ISSUER: ${{ github.event_name == 'push' && secrets.APPLE_API_ISSUER || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -100,101 +122,138 @@ jobs:
           sw_vers
           xcode-select -p
           swift --version
-      - name: Import Developer ID certificate (optional, tag pushes only)
-        if: github.event_name == 'push'
-        env:
-          P12: ${{ secrets.MACOS_SIGN_P12 }}
-          P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
-          SIGN_ID: ${{ secrets.MACOS_SIGN_ID }}
+
+      # A temporary keychain for whatever certificates there are. tools/mac-sign.sh and
+      # tools/release.sh read GLIDE_SIGN_KEYCHAIN and unlock it with the password file.
+      - name: Create the signing keychain
+        if: env.MACOS_CERT_P12 != '' || env.MACOS_INSTALLER_P12 != '' || env.MACOS_SELF_SIGN_P12 != ''
         run: |
-          if [ -z "$P12" ] || [ -z "$SIGN_ID" ]; then
-            echo "No Developer ID secrets: the app is signed ad hoc."
-            exit 0
-          fi
           KC="$RUNNER_TEMP/glide-sign.keychain-db"
-          KC_PASSWORD="$(openssl rand -hex 24)"
-          security create-keychain -p "$KC_PASSWORD" "$KC"
-          security set-keychain-settings -lut 3600 "$KC"
-          security unlock-keychain -p "$KC_PASSWORD" "$KC"
-          printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/sign.p12"
-          security import "$RUNNER_TEMP/sign.p12" -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign
-          rm -f "$RUNNER_TEMP/sign.p12"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PASSWORD" "$KC" >/dev/null
+          PW="$RUNNER_TEMP/glide-sign.pw"
+          (umask 077; openssl rand -hex 24 > "$PW")
+          security create-keychain -p "$(cat "$PW")" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$(cat "$PW")" "$KC"
+          # Developer ID intermediates, so codesign and productbuild can build the chain even if
+          # the runner image lacks them (G2 for certificates issued since 2021).
+          for ca in DeveloperIDG2CA DeveloperIDCA; do
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$ca.cer" "https://www.apple.com/certificateauthority/$ca.cer"
+            security import "$RUNNER_TEMP/$ca.cer" -k "$KC" >/dev/null 2>&1 || true
+          done
+          # shellcheck disable=SC2046  # the list is space-separated paths, as security expects
           security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
-          security find-identity -v -p codesigning "$KC"
           {
-            echo "GLIDE_SIGN_ID=$SIGN_ID"
+            echo "GLIDE_SIGN_KEYCHAIN=$KC"
+            echo "GLIDE_SIGN_KEYCHAIN_PASSWORD_FILE=$PW"
+          } >> "$GITHUB_ENV"
+      - name: Import the Developer ID Application certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/app.p12"
+          security import "$RUNNER_TEMP/app.p12" -k "$GLIDE_SIGN_KEYCHAIN" -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/app.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$(cat "$GLIDE_SIGN_KEYCHAIN_PASSWORD_FILE")" "$GLIDE_SIGN_KEYCHAIN" >/dev/null
+          ID="$(security find-identity -p codesigning "$GLIDE_SIGN_KEYCHAIN" \
+            | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -1)"
+          if [ -z "$ID" ]; then
+            echo "::error::MACOS_CERT_P12 holds no Developer ID Application identity"
+            security find-identity -p codesigning "$GLIDE_SIGN_KEYCHAIN"; exit 1
+          fi
+          echo "Signing apps as: $ID"
+          {
+            echo "GLIDE_SIGN_ID=$ID"
             echo "GLIDE_HARDENED_RUNTIME=1"
           } >> "$GITHUB_ENV"
-      - name: Import the self-signed release certificate (tag pushes, when there is no Developer ID)
-        if: github.event_name == 'push'
-        env:
-          DEVID_P12: ${{ secrets.MACOS_SIGN_P12 }}
-          P12: ${{ secrets.MACOS_SELF_SIGN_P12 }}
-          P12_PASSWORD: ${{ secrets.MACOS_SELF_SIGN_P12_PASSWORD }}
+      - name: Import the Developer ID Installer certificate
+        if: env.MACOS_INSTALLER_P12 != ''
+        run: |
+          printf '%s' "$MACOS_INSTALLER_P12" | base64 --decode > "$RUNNER_TEMP/installer.p12"
+          security import "$RUNNER_TEMP/installer.p12" -k "$GLIDE_SIGN_KEYCHAIN" \
+            -P "$MACOS_INSTALLER_PASSWORD" -T /usr/bin/productbuild -T /usr/bin/pkgbuild
+          rm -f "$RUNNER_TEMP/installer.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$(cat "$GLIDE_SIGN_KEYCHAIN_PASSWORD_FILE")" "$GLIDE_SIGN_KEYCHAIN" >/dev/null
+          ID="$(security find-identity -p basic "$GLIDE_SIGN_KEYCHAIN" \
+            | sed -n 's/.*"\(Developer ID Installer: .*\)"$/\1/p' | head -1)"
+          if [ -z "$ID" ]; then
+            echo "::error::MACOS_INSTALLER_P12 holds no Developer ID Installer identity"
+            security find-identity -p basic "$GLIDE_SIGN_KEYCHAIN"; exit 1
+          fi
+          echo "Signing pkgs as: $ID"
+          echo "GLIDE_INSTALLER_SIGN_ID=$ID" >> "$GITHUB_ENV"
+      - name: Import the self-signed release certificate (only without a Developer ID)
+        if: env.MACOS_CERT_P12 == '' && env.MACOS_SELF_SIGN_P12 != ''
         run: |
           # "Glide Release Signing" gives every release the same designated requirement, so macOS
           # keeps Screen Recording and Accessibility across updates (ad hoc changes every build).
           # Gatekeeper still asks on first launch: only a notarized Developer ID avoids that.
-          if [ -n "$DEVID_P12" ]; then echo "Developer ID present: using it."; exit 0; fi
-          if [ -z "$P12" ]; then echo "No self-signed certificate secret: the app is signed ad hoc."; exit 0; fi
-          KC="$RUNNER_TEMP/glide-self-sign.keychain-db"
-          KC_PASSWORD="$(openssl rand -hex 24)"
-          security create-keychain -p "$KC_PASSWORD" "$KC"
-          security set-keychain-settings -lut 3600 "$KC"
-          security unlock-keychain -p "$KC_PASSWORD" "$KC"
-          printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/self-sign.p12"
-          security import "$RUNNER_TEMP/self-sign.p12" -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          printf '%s' "$MACOS_SELF_SIGN_P12" | base64 --decode > "$RUNNER_TEMP/self-sign.p12"
+          security import "$RUNNER_TEMP/self-sign.p12" -k "$GLIDE_SIGN_KEYCHAIN" \
+            -P "$MACOS_SELF_SIGN_P12_PASSWORD" -T /usr/bin/codesign
           rm -f "$RUNNER_TEMP/self-sign.p12"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PASSWORD" "$KC" >/dev/null
-          # shellcheck disable=SC2046  # the list is space-separated paths, as codesign expects
-          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
-          security find-identity -p codesigning "$KC"
-          {
-            echo "GLIDE_SIGN_ID=Glide Release Signing"
-            echo "GLIDE_SIGN_KEYCHAIN=$KC"
-          } >> "$GITHUB_ENV"
-      - name: Build, test and zip
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$(cat "$GLIDE_SIGN_KEYCHAIN_PASSWORD_FILE")" "$GLIDE_SIGN_KEYCHAIN" >/dev/null
+          security find-identity -p codesigning "$GLIDE_SIGN_KEYCHAIN"
+          echo "GLIDE_SIGN_ID=Glide Release Signing" >> "$GITHUB_ENV"
+
+      - name: Build, test and zip Glide Host.app
         run: tools/release.sh host
-      - name: Notarize and staple (optional, tag pushes only)
-        if: github.event_name == 'push'
-        env:
-          APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
-          TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
-          NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+      - name: Build and zip Glide Viewer.app
+        run: tools/release.sh mac-viewer
+      # Apple requires a Developer ID, the hardened runtime and a secure timestamp
+      # (GLIDE_HARDENED_RUNTIME=1, set with the Developer ID above).
+      - name: Notarize and staple the apps
+        id: notarize
+        if: env.GLIDE_HARDENED_RUNTIME == '1' && env.APPLE_API_KEY_P8 != ''
         run: |
-          if [ "${GLIDE_HARDENED_RUNTIME:-0}" != 1 ] || [ -z "$APPLE_ID" ] || [ -z "$TEAM_ID" ] || [ -z "$NOTARY_PASSWORD" ]; then
-            echo "Not notarizing (needs the Developer ID and notary secrets)."
-            exit 0
-          fi
-          ZIP="$(ls "$GLIDE_RELEASE_OUT"/Glide-Host-*-macos-*.zip)"
-          xcrun notarytool submit "$ZIP" --apple-id "$APPLE_ID" --team-id "$TEAM_ID" \
-            --password "$NOTARY_PASSWORD" --wait --timeout 30m
-          WORK="$RUNNER_TEMP/staple"
-          rm -rf "$WORK" && mkdir -p "$WORK"
-          ditto -x -k "$ZIP" "$WORK"
-          xcrun stapler staple "$WORK/Glide Host.app"
-          rm -f "$ZIP"
-          ditto -c -k --sequesterRsrc --keepParent "$WORK/Glide Host.app" "$ZIP"
-          spctl -a -vv -t exec "$WORK/Glide Host.app"
-      - name: DMG (from the final, possibly stapled, app)
+          tools/notarize.sh "$GLIDE_RELEASE_OUT"/Glide-Host-*-macos-*.zip \
+                            "$GLIDE_RELEASE_OUT"/Glide-Viewer-*-macos-*.zip
+          echo "notarized=1" >> "$GITHUB_OUTPUT"
+      - name: DMG (from the final, possibly stapled, host app)
         run: tools/release.sh dmg
-      - name: Remove signing keychain
+      - name: Notarize and staple the DMG
+        if: env.GLIDE_HARDENED_RUNTIME == '1' && env.APPLE_API_KEY_P8 != ''
+        run: tools/notarize.sh "$GLIDE_RELEASE_OUT"/Glide-Host-*-macos-*.dmg
+      - name: Installer packages (from the final apps; signed with the Installer identity if any)
+        run: tools/release.sh pkg
+      - name: Notarize and staple the pkgs
+        if: env.GLIDE_INSTALLER_SIGN_ID != '' && env.GLIDE_HARDENED_RUNTIME == '1' && env.APPLE_API_KEY_P8 != ''
+        run: tools/notarize.sh "$GLIDE_RELEASE_OUT"/Glide-*-macos-*.pkg
+      - name: Signatures
+        run: |
+          for z in "$GLIDE_RELEASE_OUT"/Glide-*-macos-*.zip; do
+            d="$(mktemp -d)"; ditto -x -k "$z" "$d"
+            for app in "$d"/*.app; do
+              codesign --verify --strict --deep --verbose=1 "$app"
+              codesign -dv "$app" 2>&1 | grep -E '^(Authority|TeamIdentifier|Timestamp|Runtime|Identifier)' || true
+              spctl --assess --type execute -vv "$app" || echo "(not accepted by Gatekeeper: not notarized)"
+            done
+            rm -rf "$d"
+          done
+          for p in "$GLIDE_RELEASE_OUT"/Glide-*-macos-*.pkg; do
+            pkgutil --check-signature "$p" | sed -n '1,4p' || true
+          done
+      - name: Remove the signing keychain
         if: always()
         run: |
           security delete-keychain "$RUNNER_TEMP/glide-sign.keychain-db" 2>/dev/null || true
-          security delete-keychain "$RUNNER_TEMP/glide-self-sign.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/glide-sign.pw"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-host
+          name: release-mac
           path: |
-            out/Glide-Host-*.zip
-            out/Glide-Host-*.dmg
+            out/Glide-*-macos-*.zip
+            out/Glide-*-macos-*.dmg
+            out/Glide-*-macos-*.pkg
           if-no-files-found: error
           retention-days: 14
 
-  viewer:
-    name: Windows viewer (glide-client.exe)
+  # Cross-build on Linux (the same MinGW build as tools/release.sh viewer); the windows job signs
+  # the exes, zips them and builds the MSI.
+  windows-build:
+    name: Windows exes (cargo test + cross-build)
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -205,23 +264,93 @@ jobs:
         with:
           persist-credentials: false
       - name: Install MinGW-w64
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64 zip
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
           targets: x86_64-pc-windows-gnu
-      - name: Test, cross-build and zip
-        run: tools/release.sh viewer
+      - name: Test and cross-build
+        run: tools/release.sh viewer-build
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-viewer
-          path: out/Glide-Viewer-*.zip
+          name: windows-exes
+          path: out/windows/*.exe
+          if-no-files-found: error
+          retention-days: 3
+
+  windows:
+    name: Windows (sign, zip, MSI)
+    needs: windows-build
+    runs-on: windows-latest
+    timeout-minutes: 30
+    outputs:
+      signed: ${{ steps.signed.outputs.signed }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      GLIDE_RELEASE_OUT: ${{ github.workspace }}/out
+      # Tag pushes only (see the header); empty otherwise, which skips the signing steps.
+      AZURE_TENANT_ID: ${{ github.event_name == 'push' && secrets.AZURE_TENANT_ID || '' }}
+      AZURE_CLIENT_ID: ${{ github.event_name == 'push' && secrets.AZURE_CLIENT_ID || '' }}
+      AZURE_CLIENT_SECRET: ${{ github.event_name == 'push' && secrets.AZURE_CLIENT_SECRET || '' }}
+      AZURE_SIGNING_ENDPOINT: ${{ github.event_name == 'push' && secrets.AZURE_SIGNING_ENDPOINT || '' }}
+      AZURE_SIGNING_ACCOUNT: ${{ github.event_name == 'push' && secrets.AZURE_SIGNING_ACCOUNT || '' }}
+      AZURE_CERT_PROFILE: ${{ github.event_name == 'push' && secrets.AZURE_CERT_PROFILE || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-exes
+          path: out/windows
+      - name: Build commit (as the exes record it)
+        run: echo "GLIDE_BUILD_COMMIT=${GITHUB_SHA:0:12}" >> "$GITHUB_ENV"
+      - name: Sign the exes (Azure Artifact Signing)
+        if: env.AZURE_CLIENT_ID != '' && env.AZURE_SIGNING_ENDPOINT != ''
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ env.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ env.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ env.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ env.AZURE_CERT_PROFILE }}
+          files: |
+            ${{ github.workspace }}\out\windows\glide-client.exe
+            ${{ github.workspace }}\out\windows\glide-host.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: Glide
+          description-url: https://github.com/${{ github.repository }}
+          cache-dependencies: false   # no caches in release builds (header)
+      - name: Zip
+        run: tools/release.sh viewer-zip
+      - name: Signing status
+        id: signed
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem out\windows\*.exe
+          $all = $true
+          foreach ($f in $files) {
+            $s = Get-AuthenticodeSignature $f.FullName
+            "{0}: {1} {2}" -f $f.Name, $s.Status, $s.SignerCertificate.Subject
+            if ($s.Status -ne 'Valid') { $all = $false }
+          }
+          if ($env:AZURE_CLIENT_ID -and $env:AZURE_SIGNING_ENDPOINT -and -not $all) { Write-Error "signing was configured but an exe is not validly signed"; exit 1 }
+          "signed=$(if ($all) { '1' } else { '0' })" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-windows
+          path: out/Glide-*-windows-x64.zip
           if-no-files-found: error
           retention-days: 14
 
   publish:
     name: Checksums, notes and draft release
-    needs: [check, host, viewer]
+    needs: [check, mac, windows]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -231,6 +360,8 @@ jobs:
     env:
       GLIDE_RELEASE_OUT: ${{ github.workspace }}/out
       VERSION: ${{ needs.check.outputs.version }}
+      GLIDE_MAC_NOTARIZED: ${{ needs.mac.outputs.notarized || '0' }}
+      GLIDE_WINDOWS_SIGNED: ${{ needs.windows.outputs.signed || '0' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -260,13 +391,16 @@ jobs:
           subject-path: |
             out/Glide-*.zip
             out/Glide-*.dmg
+            out/Glide-*.pkg
+            out/Glide-*.msi
       - name: Create or update the draft release
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          files=(out/Glide-*.zip out/Glide-*.dmg out/SHA256SUMS out/glide-host.rb)
+          shopt -s nullglob
+          files=(out/Glide-*.zip out/Glide-*.dmg out/Glide-*.pkg out/Glide-*.msi out/SHA256SUMS out/glide-host.rb)
           if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
             if [ "$state" != "true" ]; then
               echo "::error::release $TAG is already published; not touching it"; exit 1
