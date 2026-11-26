@@ -133,6 +133,7 @@ func cloudTests() throws {
     auditTests()
     bridgeTests()
     try cloudDeviceTests()
+    try cloudReviewTests()
 }
 
 // MARK: Managed config (§11.1)
@@ -332,7 +333,9 @@ func cloudPolicyTests() {
     }
     check(OfferDecision.decide(offer(), cloudURL: cloud, busy: false, paused: false, updateRequired: false) == .accept, "offer: approval none, idle -> accept at once")
     check(OfferDecision.decide(offer(), cloudURL: cloud, busy: true, paused: false, updateRequired: false) == .decline("busy"), "offer: approval none, busy -> busy")
-    check(OfferDecision.decide(offer(approval: .required), cloudURL: cloud, busy: true, paused: false, updateRequired: false) == .prompt, "offer: approval required -> prompt (even when busy)")
+    check(OfferDecision.decide(offer(approval: .required), cloudURL: cloud, busy: false, paused: false, updateRequired: false) == .prompt, "offer: approval required, idle -> prompt")
+    check(OfferDecision.decide(offer(approval: .required), cloudURL: cloud, busy: true, paused: false, updateRequired: false) == .decline("busy"),
+          "offer: approval required but a session runs -> busy without prompting (§6.7)")
     check(OfferDecision.decide(offer(), cloudURL: cloud, busy: false, paused: true, updateRequired: false) == .decline("declined"), "offer: paused host declines")
     check(OfferDecision.decide(offer(), cloudURL: cloud, busy: false, paused: false, updateRequired: true) == .decline("policy"), "offer: update required -> policy")
     check(OfferDecision.decide(offer(relay: "wss://evil.example.net/v1/relay/ses_1"), cloudURL: cloud, busy: false, paused: false, updateRequired: false) == .decline("policy"),
@@ -392,7 +395,8 @@ func permissionTests() {
           "permissions: viewer sends no input when view only")
     check(!ManagedPermissions.viewerMaySend(.clipboard(clip), toViewer) && ManagedPermissions.viewerMaySend(.clipboard(clip), toHost)
           && !ManagedPermissions.viewerMaySend(.file(offer), toViewer) && !ManagedPermissions.viewerMaySend(.audioEnable(true), toHost)
-          && ManagedPermissions.viewerMaySend(.audioEnable(false), toHost), "permissions: viewer send directions")
+          && !ManagedPermissions.viewerMaySend(.audioEnable(false), toHost) && ManagedPermissions.viewerMaySend(.audioEnable(false), .full),
+          "permissions: viewer send directions (no AudioEnable at all without audio, §6.7)")
     check(!ManagedPermissions.viewerAccepts(.clipboard(clip), toHost) && ManagedPermissions.viewerAccepts(.clipboard(clip), toViewer)
           && !ManagedPermissions.viewerAccepts(.audioFrame(seq: 1, captureTimeUs: 0, pcm: Data()), toHost)
           && !ManagedPermissions.viewerAccepts(.file(offer), toHost) && ManagedPermissions.viewerAccepts(.pong(clientTimeUs: 1, hostTimeUs: 2), .none),
@@ -548,7 +552,7 @@ func cloudClientTests() throws {
     // Device authorization polling (RFC 8628).
     check(DeviceAuthPoll.next(after: .http(status: 400, code: "authorization_pending", message: ""), interval: 5) == .keepPolling(interval: 5)
           && DeviceAuthPoll.next(after: .http(status: 400, code: "slow_down", message: ""), interval: 5) == .keepPolling(interval: 10)
-          && DeviceAuthPoll.next(after: .transport("offline"), interval: 5) == .keepPolling(interval: 5),
+          && DeviceAuthPoll.next(after: .transport("offline"), interval: 5) == .retry(after: 10),
           "device auth: pending keeps the interval, slow_down adds 5 s")
     if case .failed = DeviceAuthPoll.next(after: .http(status: 400, code: "expired_token", message: ""), interval: 5),
        case .failed = DeviceAuthPoll.next(after: .http(status: 400, code: "access_denied", message: ""), interval: 5) {
@@ -799,8 +803,8 @@ func cloudDeviceTests() throws {
     check(waitUntil { lock.withLock { offers.count == 1 } }, "device: offers reach the app")
     lock.withLock { socks[0] }.pushText(#"{"type":"revoked","reason":"device revoked"}"#)
     check(waitUntil { lock.withLock { revokedReason == "device revoked" } }, "device: revoked -> app told")
-    check(!FileManager.default.fileExists(atPath: store.url.path) && dev.queue.sync { dev.status.policy.lanAllowed && dev.client == nil },
-          "device: revoked wipes the enrollment and the org policy")
+    check((try? store.load()) == nil && store.loadRevoked()?.settings?.lanMode == false && dev.queue.sync { !dev.status.policy.lanAllowed && dev.client == nil },
+          "device: revoked deletes the credentials but keeps {cloud_url, revoked, settings} and their policy (§6.7)")
 
     // Enrolling a revoked key is refused for good.
     let t409 = FakeTransport { _ in (409, #"{"error":{"code":"device_revoked","message":"This device was revoked."}}"#) }
