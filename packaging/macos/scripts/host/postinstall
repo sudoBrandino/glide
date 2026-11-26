@@ -1,0 +1,114 @@
+#!/bin/bash
+# postinstall of the Glide Host .pkg (tools/release.sh pkg). Runs as root after the payload is in
+# place: /Applications/Glide Host.app and /Library/LaunchAgents/dev.brandino.glide.host.plist.
+# MDM installs often run with nobody logged in, or with the user at the login window: then launchd
+# loads the agent at the next login and there is nothing to start now.
+#
+# For every local user it removes what would compete with the system-wide agent: per-user
+# LaunchAgents written by install.sh (~/Library/LaunchAgents/*.glide.host.plist, including those
+# of earlier bundle ids) and, for users logged in now, the app's own login item and running jobs.
+# Then it (re)starts the host in each logged-in user's GUI session. Settings and pairings in
+# ~/Library/Application Support/Glide are kept. Output goes to /var/log/install.log.
+#
+# Arguments from Installer: $1 package path, $2 destination, $3 target volume.
+set -u
+
+LABEL="dev.brandino.glide.host"
+LEGACY_LABELS="io.github.sudobrandino.glide.host"   # bundle ids of releases up to 0.3.x
+APP="/Applications/Glide Host.app"
+BIN="$APP/Contents/MacOS/glide-host"
+AGENT="/Library/LaunchAgents/$LABEL.plist"
+
+log() { echo "glide-host postinstall: $*"; }
+
+# Runs a command, killing it after $1 seconds (Installer must never hang on us).
+with_timeout() {
+  local secs="$1" pid="" watcher="" rc=0
+  shift
+  "$@" &
+  pid=$!
+  ( sleep "$secs"; kill "$pid" 2>/dev/null ) &
+  watcher=$!
+  wait "$pid" 2>/dev/null || rc=$?
+  kill "$watcher" 2>/dev/null
+  wait "$watcher" 2>/dev/null
+  return "$rc"
+}
+
+# Users with a GUI session now (fast user switching: possibly several). Each has a loginwindow
+# process running as that user; the login window itself runs as root.
+gui_uids() {
+  ps -axo uid=,comm= | awk '$2 ~ /(^|\/)loginwindow$/ && $1 != 0 { print $1 }' | sort -u
+}
+
+home_of() { dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | awk 'NR == 1 { print $2 }'; }
+
+loaded() { launchctl print "gui/$1/$2" >/dev/null 2>&1; }
+
+bootout_wait() { # bootout_wait UID LABEL: bootout is asynchronous
+  loaded "$1" "$2" || return 0
+  launchctl bootout "gui/$1/$2" 2>/dev/null || true
+  for _ in $(seq 1 40); do loaded "$1" "$2" || return 0; sleep 0.25; done
+  log "launchd has not unloaded $2 for uid $1 yet"
+}
+
+main() {
+  if [[ "${3:-/}" != "/" ]]; then
+    log "installed on $3, not the startup volume: nothing to start"
+    exit 0
+  fi
+  [[ -f "$AGENT" ]] || { log "missing $AGENT"; exit 1; }
+  chown root:wheel "$AGENT"
+  chmod 0644 "$AGENT"
+
+  # 1. Per-user agents of every local user (not only those logged in), so nobody gets a second
+  #    job with the same label at their next login. Loaded ones are stopped in step 2.
+  local user="" uid="" home="" f=""
+  while read -r user uid; do
+    [[ "$uid" -ge 500 ]] 2>/dev/null || continue
+    home="$(home_of "$user")"
+    [[ -n "$home" && -d "$home/Library/LaunchAgents" ]] || continue
+    for f in "$home/Library/LaunchAgents/"*.glide.host.plist; do
+      [[ -e "$f" ]] || continue
+      launchctl bootout "gui/$uid/$(basename "$f" .plist)" 2>/dev/null || true
+      rm -f "$f"
+      log "removed $f (the system-wide LaunchAgent replaces it)"
+    done
+  done < <(dscl . -list /Users UniqueID 2>/dev/null)
+
+  # Grants recorded for an earlier bundle id no longer apply (System Settings would list Glide Host
+  # twice). Screen Recording and Accessibility live in the system TCC database.
+  local l=""
+  for l in $LEGACY_LABELS; do
+    tccutil reset ScreenCapture "$l" >/dev/null 2>&1 || true
+    tccutil reset Accessibility "$l" >/dev/null 2>&1 || true
+  done
+
+  # 2. Each logged-in user: stop older jobs and the app's login item, then start the host under
+  #    the system-wide agent.
+  local uids="" status=""
+  uids="$(gui_uids)"
+  if [[ -z "$uids" ]]; then
+    log "nobody is logged in: Glide Host starts at the next login"
+    exit 0
+  fi
+  for uid in $uids; do
+    user="$(id -un "$uid" 2>/dev/null)" || continue
+    for l in $LEGACY_LABELS; do bootout_wait "$uid" "$l"; done
+    # The setup window's Start at Login (SMAppService) registers a job with this same label.
+    status="$(with_timeout 15 launchctl asuser "$uid" sudo -u "$user" "$BIN" --login-item status 2>/dev/null)"
+    if grep -qE 'login-item=(on|needsApproval)' <<<"$status"; then
+      with_timeout 15 launchctl asuser "$uid" sudo -u "$user" "$BIN" --login-item off >/dev/null 2>&1 \
+        && log "turned off the app's own login item for $user"
+    fi
+    bootout_wait "$uid" "$LABEL"
+    if launchctl bootstrap "gui/$uid" "$AGENT" 2>/dev/null || loaded "$uid" "$LABEL"; then
+      log "started Glide Host for $user"
+    else
+      log "could not start Glide Host for $user now; it starts at their next login"
+    fi
+  done
+  exit 0
+}
+
+main "$@"

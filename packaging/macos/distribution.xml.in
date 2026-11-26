@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Distribution definition for the Glide .pkg installers (tools/release.sh pkg fills in the @…@
+  values). One component package, installed to the startup volume for all users, no choices: the
+  same result from a double-click, `installer -pkg … -target /` and an MDM.
+-->
+<installer-gui-script minSpecVersion="2">
+  <title>@TITLE@</title>
+  <options customize="never" require-scripts="false" hostArchitectures="@ARCHS@"/>
+  <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+  <volume-check>
+    <allowed-os-versions>
+      <os-version min="14.0"/>
+    </allowed-os-versions>
+  </volume-check>
+  <choices-outline>
+    <line choice="default">
+      <line choice="@PKG_ID@"/>
+    </line>
+  </choices-outline>
+  <choice id="default"/>
+  <choice id="@PKG_ID@" visible="false">
+    <pkg-ref id="@PKG_ID@"/>
+  </choice>
+  <pkg-ref id="@PKG_ID@" version="@VERSION@" onConclusion="none">#component.pkg</pkg-ref>
+</installer-gui-script>

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The LaunchAgent the Glide Host .pkg installs to /Library/LaunchAgents (tools/release.sh pkg):
+  launchd starts Glide Host in every user's GUI session at login, and restarts it when it exits
+  (KeepAlive, while the binary exists, so deleting the app leaves nothing retrying). The label is
+  the bundle id, like install.sh's per-user agent and the app's own login item; the postinstall
+  script removes those so only this job runs. AssociatedBundleIdentifiers makes System Settings →
+  Login Items show it as Glide Host, and lets a managed login-items profile
+  (packaging/mdm/glide-login-items.mobileconfig) match it. The host writes its log to
+  ~/Library/Logs/glide-host.log by itself when stderr isn't a file.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.brandino.glide.host</string>
+  <key>ProgramArguments</key>
+  <array><string>/Applications/Glide Host.app/Contents/MacOS/glide-host</string></array>
+  <key>AssociatedBundleIdentifiers</key>
+  <array><string>dev.brandino.glide.host</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>PathState</key>
+    <dict><key>/Applications/Glide Host.app/Contents/MacOS/glide-host</key><true/></dict>
+  </dict>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+</dict>
+</plist>

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for Glide Viewer.app (tools/make-viewer-app.sh). Deliberately
+  empty, like glide-host.entitlements:
+  - Video decoding (VideoToolbox), display (AVSampleBufferDisplayLayer) and audio playback: no
+    entitlement. The viewer plays the PC's audio; it never records, so no audio-input.
+  - Capturing system shortcuts while a session has focus (a CGEventTap at the session level):
+    gated by Accessibility (TCC), not an entitlement. Without it the viewer falls back to a local
+    event monitor.
+  - Outgoing TCP to the PC and HTTPS to Glide Cloud: not sandboxed, so no network entitlement;
+    macOS 15+ asks for Local Network access using NSLocalNetworkUsageDescription.
+  - No JIT, unsigned memory, DYLD_* variables, library-validation exception or Apple Events.
+-->
+<plist version="1.0">
+<dict/>
+</plist>
