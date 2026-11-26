@@ -70,6 +70,18 @@ pub enum Approval {
     Decline,
 }
 
+/// The approval prompt's text and detail lines (§6.4, §6.7): names the user and email and the
+/// viewer device (cleaned of control and bidirectional-override characters), and says "see and
+/// control this PC" or "see this PC (view only)" according to `permissions.control`.
+pub fn approval_text(o: &SessionOffer) -> (String, String) {
+    let viewer = crate::host::trust::display_name(&super::api::clean_display(&o.viewer.name));
+    let what = if o.permissions.control { "see and control this PC" } else { "see this PC (view only)" };
+    (
+        format!("{} from your organization asks to {what} (from “{viewer}”).\nAccept only if you expect this.", o.user.label()),
+        format!("This session: {}.\nYou can end it at any time from the Glide Host icon (End session).", o.permissions.describe()),
+    )
+}
+
 /// The host's UI for managed sessions.
 pub trait HostUi: Send + Sync {
     /// The approval prompt naming the user and email (Decline default, Accept enabled after 1 s).
@@ -643,6 +655,22 @@ pub(crate) mod tests {
         assert!(!hb.on_connect(), "reconnects don't heartbeat");
         assert!(!hb.due());
         assert!(hb.due_at(Instant::now() + HEARTBEAT_EVERY));
+    }
+
+    #[test]
+    fn approval_prompt_text() {
+        let mut o = offer("ses_t", "required");
+        let (text, detail) = approval_text(&o);
+        assert!(text.starts_with("Ada (ada@example.com) from your organization asks to see and control this PC (from “Viewer PC”)."), "{text}");
+        assert!(detail.starts_with("This session: can use the keyboard and mouse;"), "{detail}");
+        o.permissions.control = false;
+        o.user = User { name: "\u{202e}moc.live\u{202c}".into(), email: "x@example.com\u{7}".into(), ..Default::default() };
+        o.viewer.name = "Evil\u{2066}PC\u{2069}\n".into();
+        let (text, detail) = approval_text(&o);
+        assert!(text.starts_with("moc.live (x@example.com) from your organization asks to see this PC (view only) (from “EvilPC”)."), "{text}");
+        assert!(!text.contains("control"));
+        assert!(detail.starts_with("This session: view only;"), "{detail}");
+        assert!(!text.chars().any(|c| crate::cloud::api::unsafe_display_char(c) && c != '\n'));
     }
 
     #[test]

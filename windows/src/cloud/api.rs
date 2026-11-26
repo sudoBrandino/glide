@@ -2,8 +2,37 @@
 //! API, hub frames, relay control frames, org settings, session permissions and the error
 //! envelope. JSON, with unknown fields ignored (§6). Where a field is missing the most restrictive
 //! value is assumed for permissions; settings fall back to the documented defaults (§7).
+//!
+//! Display strings from the cloud (names, emails, device and org names, error messages) are
+//! cleaned of control and bidirectional-override characters as they are decoded (§6.7), so no UI
+//! or tray text can be spoofed with them.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+// ------------------------------------------------------------------ display strings (§6.7)
+
+/// A character that must never reach a label: C0 and C1 controls (and DEL), the bidirectional
+/// embedding / override / isolate controls (U+202A–202E, U+2066–2069) and marks (U+200E, U+200F,
+/// U+061C).
+pub fn unsafe_display_char(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// `s` without control and bidirectional-override characters, trimmed.
+pub fn clean_display(s: &str) -> String {
+    let c: String = s.chars().filter(|&c| !unsafe_display_char(c)).collect();
+    c.trim().to_string()
+}
+
+/// serde: a display string, cleaned; `null` reads as empty.
+fn de_display<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.map(|s| clean_display(&s)).unwrap_or_default())
+}
+
+/// serde: a list of display strings (tags), cleaned; `null` reads as empty.
+fn de_display_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(Option::<Vec<String>>::deserialize(d)?.unwrap_or_default().iter().map(|s| clean_display(s)).filter(|s| !s.is_empty()).collect())
+}
 
 // ------------------------------------------------------------------ errors
 
@@ -17,6 +46,7 @@ pub struct ErrorEnvelope {
 #[serde(default)]
 pub struct ErrorBody {
     pub code: String,
+    #[serde(deserialize_with = "de_display")]
     pub message: String,
 }
 
@@ -109,7 +139,9 @@ pub struct Permissions {
 #[serde(default)]
 pub struct Org {
     pub id: String,
+    #[serde(deserialize_with = "de_display")]
     pub slug: String,
+    #[serde(deserialize_with = "de_display")]
     pub name: String,
 }
 
@@ -117,20 +149,23 @@ pub struct Org {
 #[serde(default)]
 pub struct User {
     pub id: String,
+    #[serde(deserialize_with = "de_display")]
     pub email: String,
+    #[serde(deserialize_with = "de_display")]
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub groups: Option<Vec<String>>,
 }
 
 impl User {
-    /// "Ada Lovelace (ada@example.com)", or just the email.
+    /// "Ada Lovelace (ada@example.com)", or just the email; "an organization user" without
+    /// either. Control and bidirectional-override characters are removed (§6.7).
     pub fn label(&self) -> String {
-        let (n, e) = (self.name.trim(), self.email.trim());
+        let (n, e) = (clean_display(&self.name), clean_display(&self.email));
         match (n.is_empty(), e.is_empty()) {
             (false, false) if n != e => format!("{n} ({e})"),
-            (false, _) => n.to_string(),
-            (true, false) => e.to_string(),
+            (false, _) => n,
+            (true, false) => e,
             (true, true) => "an organization user".into(),
         }
     }
@@ -171,7 +206,9 @@ pub struct EnrollResponse {
 pub struct DeviceInfo {
     pub device_id: String,
     pub kind: String,
+    #[serde(deserialize_with = "de_display")]
     pub name: String,
+    #[serde(deserialize_with = "de_display_list")]
     pub tags: Vec<String>,
     pub org: Org,
     pub settings: Settings,
@@ -251,8 +288,10 @@ pub struct MeResponse {
 #[serde(default)]
 pub struct HostEntry {
     pub id: String,
+    #[serde(deserialize_with = "de_display")]
     pub name: String,
     pub platform: String,
+    #[serde(deserialize_with = "de_display_list")]
     pub tags: Vec<String>,
     pub online: bool,
     pub last_seen: Option<String>,
@@ -279,6 +318,7 @@ pub struct SessionRequest {
 #[serde(default)]
 pub struct SessionHost {
     pub id: String,
+    #[serde(deserialize_with = "de_display")]
     pub name: String,
     pub public_key: String,
 }
@@ -303,6 +343,7 @@ pub struct SessionResponse {
 #[serde(default)]
 pub struct OfferViewer {
     pub device_id: String,
+    #[serde(deserialize_with = "de_display")]
     pub name: String,
     pub public_key: String,
 }
@@ -352,7 +393,7 @@ pub enum ServerFrame {
         settings: Settings,
     },
     Revoked {
-        #[serde(default)]
+        #[serde(default, deserialize_with = "de_display")]
         reason: String,
     },
     Ping {
@@ -587,5 +628,39 @@ mod tests {
         assert_eq!(serde_json::from_str::<RelayControl>(r#"{"type":"peer_left"}"#).unwrap(), RelayControl::PeerLeft);
         assert_eq!(serde_json::from_str::<RelayControl>(r#"{"type":"later"}"#).unwrap(), RelayControl::Unknown);
         assert_eq!(close::describe(4005), "the session reached its time limit");
+    }
+
+    #[test]
+    fn display_strings_are_cleaned() {
+        // RLO / isolates / marks / C0 / C1 / DEL never reach a label.
+        assert_eq!(clean_display("  Ada\u{202E}gnp.exe\u{202C} "), "Adagnp.exe");
+        assert_eq!(clean_display("a\u{2066}b\u{2067}c\u{2068}d\u{2069}e\u{200E}f\u{200F}g\u{061C}h"), "abcdefgh");
+        assert_eq!(clean_display("x\u{0}\u{7}\n\r\t\u{1b}[31my\u{7f}\u{85}\u{9b}z"), "x[31myz");
+        assert_eq!(clean_display("Zoë 日本 😀"), "Zoë 日本 😀", "ordinary text is kept");
+        for c in ['\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{0}', '\u{1f}', '\u{80}', '\u{9f}'] {
+            assert!(unsafe_display_char(c), "{:04x}", c as u32);
+        }
+        assert!(!unsafe_display_char('\u{200D}'), "ZWJ (emoji sequences) is fine");
+
+        let u: User = serde_json::from_str("{\"id\":\"usr_1\",\"email\":\"ada@example.com\\u202e\",\"name\":\"\\u202eecalevoL adA\\u0007\"}").unwrap();
+        assert_eq!((u.name.as_str(), u.email.as_str()), ("ecalevoL adA", "ada@example.com"));
+        assert_eq!(u.label(), "ecalevoL adA (ada@example.com)");
+        // label() cleans even a User built by hand.
+        let u = User { name: "\u{2067}Bo\u{2069}".into(), email: "\u{202d}".into(), ..Default::default() };
+        assert_eq!(u.label(), "Bo");
+        assert_eq!(User { name: "\u{202e}".into(), ..Default::default() }.label(), "an organization user");
+        let u: User = serde_json::from_str(r#"{"id":"u","email":null,"name":null}"#).unwrap();
+        assert_eq!(u.label(), "an organization user", "null display fields are empty");
+
+        let d: DeviceInfo = serde_json::from_str("{\"name\":\"PC\\u202e1\",\"tags\":[\"lab\\u0000\",\"\\u2066\"],\"org\":{\"id\":\"o\",\"slug\":\"s\",\"name\":\"Acme\\u202e\"}}").unwrap();
+        assert_eq!((d.name.as_str(), d.tags.clone(), d.org.name.as_str()), ("PC1", vec!["lab".to_string()], "Acme"));
+        let h: HostsResponse = serde_json::from_str("{\"hosts\":[{\"id\":\"dev_h\",\"name\":\"Stu\\u202edio\"}]}").unwrap();
+        assert_eq!(h.hosts[0].name, "Studio");
+        let o: SessionOffer = serde_json::from_str("{\"session_id\":\"s\",\"viewer\":{\"name\":\"\\u202eCP\"},\"relay_url\":\"u\",\"ticket\":\"t\"}").unwrap();
+        assert_eq!(o.viewer.name, "CP");
+        let e: ErrorEnvelope = serde_json::from_str("{\"error\":{\"code\":\"x\",\"message\":\"bad\\u202e\\u001b[0m\"}}").unwrap();
+        assert_eq!(e.error.message, "bad[0m");
+        let f: ServerFrame = serde_json::from_str("{\"type\":\"revoked\",\"reason\":\"gone\\u202e\"}").unwrap();
+        assert_eq!(f, ServerFrame::Revoked { reason: "gone".into() });
     }
 }

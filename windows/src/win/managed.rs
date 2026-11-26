@@ -8,7 +8,7 @@
 //! memory for target `relay:<session_id>` and the session's permissions enforced by
 //! `net::Connection::restrict`.
 
-use crate::cloud::api::{HostEntry, Permissions};
+use crate::cloud::api::{clean_display, HostEntry, Permissions};
 use crate::cloud::audit::AuditQueue;
 use crate::cloud::devauth::SignInError;
 use crate::cloud::viewer::{ManagedSession, ViewerAgent};
@@ -224,8 +224,8 @@ pub fn sign_in(owner: HWND) {
         title: format!("Glide — Sign in to {}", agent.org_name()),
         t: super::prompt::PairText {
             text: "Finish signing in in your browser with your work account. If the page asks, check that it shows this code:".into(),
-            code: start.user_code.clone(),
-            detail: format!("Page: {}\nGlide never sees your password. This window closes by itself once you're signed in.", start.verification_uri),
+            code: clean_display(&start.user_code),
+            detail: format!("Page: {}\nGlide never sees your password. This window closes by itself once you're signed in.", clean_display(&start.verification_uri)),
         },
         confirm: "Open browser again".into(),
         cancel: "Cancel".into(),

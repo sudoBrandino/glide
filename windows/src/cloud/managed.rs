@@ -190,7 +190,7 @@ pub fn read(scopes: &[&dyn PolicySource]) -> Result<Option<ManagedConfig>, Strin
     Ok(Some(ManagedConfig {
         cloud_url,
         enrollment_token: non_empty(src.string("EnrollmentToken")),
-        device_name: non_empty(src.string("DeviceName")).map(|n| n.chars().filter(|c| !c.is_control()).take(64).collect()),
+        device_name: non_empty(src.string("DeviceName")).map(|n| super::api::clean_display(&n).chars().take(64).collect()).filter(|n: &String| !n.is_empty()),
         tags,
         disable_lan_mode,
     }))
