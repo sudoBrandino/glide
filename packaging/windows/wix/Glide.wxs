@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Glide for Windows, per-machine MSI (WiX Toolset v5). Built by packaging/windows/build-msi.ps1;
+  deployment: docs/DEPLOYMENT.md.
+
+  Installs glide-client.exe (the viewer) and glide-host.exe (the Windows host) to
+  %ProgramFiles%\Glide with Start menu shortcuts. Features:
+    Core       the two programs and shortcuts (always)
+    Policy     HKLM\SOFTWARE\Policies\Glide values from the properties below (always; only the
+               values whose property is set are written)
+    Firewall   inbound TCP rules for glide-client.exe (7420) and glide-host.exe (7421), scoped to
+               those programs, Domain and Private profiles; left out when DISABLELANMODE=1
+    Autostart  start the viewer at every user's sign-in (HKLM Run); only with AUTOSTART=1 or
+               ADDLOCAL=Autostart
+
+  Public properties (msiexec /i Glide-X.Y.Z-windows-x64.msi CLOUDURL=… ENROLLMENTTOKEN=… /qn):
+    CLOUDURL         → CloudURL (REG_SZ)         Glide Cloud URL, e.g. https://glide.example.com
+    ENROLLMENTTOKEN  → EnrollmentToken (REG_SZ)  from the admin console (kept out of MSI logs)
+    DEVICENAME       → DeviceName (REG_SZ)       optional; default the computer name
+    DISABLELANMODE=1 → DisableLANMode (REG_DWORD 1), and no firewall rules
+    AUTOSTART=1      → the Autostart feature
+  docs/ENTERPRISE.md §11.2 defines the values; packaging/windows/admx/ sets the same ones through
+  Group Policy (Tags too). A value given at install is kept across upgrades (read back from the
+  registry when the property isn't passed again) and removed on uninstall.
+
+  The UpgradeCode never changes: every Glide MSI upgrades any earlier one (MajorUpgrade).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
+  <Package Name="Glide"
+           Manufacturer="Glide"
+           Version="$(var.Version)"
+           UpgradeCode="B662162C-78E9-4C23-A6BC-57D227A3B362"
+           Scope="perMachine"
+           Compressed="yes"
+           Language="1033">
+    <SummaryInformation Description="Glide remote desktop: viewer and Windows host" />
+
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of Glide is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Windows 10 or later (VersionNT64 is 603 for 8.1; 10 and 11 report 603 too, so check the
+         build number instead). -->
+    <Launch Condition="Installed OR (VersionNT64 AND WINDOWSBUILDNUMBER &gt;= 10240)"
+            Message="Glide needs 64-bit Windows 10 or later." />
+    <Property Id="WINDOWSBUILDNUMBER" Secure="yes">
+      <RegistrySearch Id="FindBuildNumber" Root="HKLM" Bitness="always64"
+                      Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" Name="CurrentBuildNumber" Type="raw" />
+    </Property>
+
+    <Icon Id="GlideIcon" SourceFile="$(var.ExeDir)\glide-client.exe" />
+    <Property Id="ARPPRODUCTICON" Value="GlideIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/sudoBrandino/glide" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/sudoBrandino/glide/blob/main/docs/DEPLOYMENT.md" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <!-- Managed configuration. Secure: passed from the client to the elevated install. Each is
+         remembered across upgrades: SAVED_* reads the current value, and it is used when the
+         property isn't on the command line (an upgrade otherwise removes it with the old
+         product). -->
+    <Property Id="CLOUDURL" Secure="yes" />
+    <Property Id="ENROLLMENTTOKEN" Secure="yes" Hidden="yes" />
+    <Property Id="DEVICENAME" Secure="yes" />
+    <Property Id="DISABLELANMODE" Secure="yes" />
+    <Property Id="AUTOSTART" Secure="yes" />
+
+    <Property Id="SAVED_CLOUDURL" Secure="yes">
+      <RegistrySearch Id="FindCloudURL" Root="HKLM" Bitness="always64" Key="SOFTWARE\Policies\Glide" Name="CloudURL" Type="raw" />
+    </Property>
+    <Property Id="SAVED_ENROLLMENTTOKEN" Secure="yes" Hidden="yes">
+      <RegistrySearch Id="FindEnrollmentToken" Root="HKLM" Bitness="always64" Key="SOFTWARE\Policies\Glide" Name="EnrollmentToken" Type="raw" />
+    </Property>
+    <Property Id="SAVED_DEVICENAME" Secure="yes">
+      <RegistrySearch Id="FindDeviceName" Root="HKLM" Bitness="always64" Key="SOFTWARE\Policies\Glide" Name="DeviceName" Type="raw" />
+    </Property>
+    <!-- A REG_DWORD reads back as "#1". -->
+    <Property Id="SAVED_DISABLELANMODE" Secure="yes">
+      <RegistrySearch Id="FindDisableLANMode" Root="HKLM" Bitness="always64" Key="SOFTWARE\Policies\Glide" Name="DisableLANMode" Type="raw" />
+    </Property>
+    <Property Id="SAVED_AUTOSTART" Secure="yes">
+      <RegistrySearch Id="FindAutostart" Root="HKLM" Bitness="always64" Key="SOFTWARE\Glide\Installer" Name="Autostart" Type="raw" />
+    </Property>
+
+    <SetProperty Id="CLOUDURL" Value="[SAVED_CLOUDURL]" After="AppSearch" Sequence="both"
+                 Condition="NOT CLOUDURL AND SAVED_CLOUDURL" />
+    <SetProperty Id="ENROLLMENTTOKEN" Value="[SAVED_ENROLLMENTTOKEN]" After="AppSearch" Sequence="both"
+                 Condition="NOT ENROLLMENTTOKEN AND SAVED_ENROLLMENTTOKEN" />
+    <SetProperty Id="DEVICENAME" Value="[SAVED_DEVICENAME]" After="AppSearch" Sequence="both"
+                 Condition="NOT DEVICENAME AND SAVED_DEVICENAME" />
+    <SetProperty Id="DISABLELANMODE" Value="1" After="AppSearch" Sequence="both"
+                 Condition="NOT DISABLELANMODE AND SAVED_DISABLELANMODE = &quot;#1&quot;" />
+    <SetProperty Id="AUTOSTART" Value="1" After="AppSearch" Sequence="both"
+                 Condition="NOT AUTOSTART AND SAVED_AUTOSTART = &quot;#1&quot;" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Glide" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Core" Title="Glide" Level="1" AllowAbsent="no" Display="expand">
+      <ComponentRef Id="Viewer" />
+      <ComponentRef Id="Host" />
+      <ComponentRef Id="InstallMarker" />
+    </Feature>
+
+    <Feature Id="Policy" Title="Managed configuration" Level="1" AllowAbsent="no" Display="hidden">
+      <ComponentGroupRef Id="PolicyValues" />
+    </Feature>
+
+    <Feature Id="Firewall" Title="Windows Firewall rules for LAN connections" Level="1">
+      <Level Value="0" Condition="DISABLELANMODE = 1" />
+      <ComponentRef Id="FirewallViewer" />
+      <ComponentRef Id="FirewallHost" />
+    </Feature>
+
+    <Feature Id="Autostart" Title="Start the viewer at sign-in" Level="1000">
+      <Level Value="1" Condition="AUTOSTART = 1" />
+      <ComponentRef Id="AutostartViewer" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="Viewer" Bitness="always64">
+        <File Id="GlideClientExe" Source="$(var.ExeDir)\glide-client.exe" KeyPath="yes">
+          <Shortcut Id="ViewerShortcut" Directory="ProgramMenuFolder" Name="Glide Viewer"
+                    Description="Control a Mac from this PC" WorkingDirectory="INSTALLFOLDER" />
+        </File>
+      </Component>
+      <Component Id="Host" Bitness="always64">
+        <File Id="GlideHostExe" Source="$(var.ExeDir)\glide-host.exe" KeyPath="yes">
+          <Shortcut Id="HostShortcut" Directory="ProgramMenuFolder" Name="Glide Host"
+                    Description="Let a Mac control this PC" WorkingDirectory="INSTALLFOLDER" />
+        </File>
+      </Component>
+      <!-- install.ps1 checks this key to step aside for an MSI install. -->
+      <Component Id="InstallMarker" Bitness="always64">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Glide\Installer" Name="InstallDir" Type="string"
+                       Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Glide\Installer" Name="Version" Type="string"
+                       Value="$(var.Version)" />
+      </Component>
+
+      <!-- Inbound rules for LAN mode, scoped to each program: the viewer listens on 7420 (the Mac
+           connects to it), the Windows host on 7421. Domain and Private networks only. -->
+      <Component Id="FirewallViewer" Bitness="always64">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Glide\Installer" Name="FirewallViewer" Type="integer"
+                       Value="1" KeyPath="yes" />
+        <fw:FirewallException Id="FwViewerDomain" Name="Glide Viewer" Description="Glide viewer, LAN connections from a Mac (TCP 7420)"
+                              Program="[#GlideClientExe]" Port="7420" Protocol="tcp" Scope="any" Profile="domain" />
+        <fw:FirewallException Id="FwViewerPrivate" Name="Glide Viewer" Description="Glide viewer, LAN connections from a Mac (TCP 7420)"
+                              Program="[#GlideClientExe]" Port="7420" Protocol="tcp" Scope="any" Profile="private" />
+      </Component>
+      <Component Id="FirewallHost" Bitness="always64">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Glide\Installer" Name="FirewallHost" Type="integer"
+                       Value="1" KeyPath="yes" />
+        <fw:FirewallException Id="FwHostDomain" Name="Glide Host" Description="Glide Windows host, LAN connections from a Mac viewer (TCP 7421)"
+                              Program="[#GlideHostExe]" Port="7421" Protocol="tcp" Scope="any" Profile="domain" />
+        <fw:FirewallException Id="FwHostPrivate" Name="Glide Host" Description="Glide Windows host, LAN connections from a Mac viewer (TCP 7421)"
+                              Program="[#GlideHostExe]" Port="7421" Protocol="tcp" Scope="any" Profile="private" />
+      </Component>
+
+      <!-- Every user's sign-in starts the viewer paused (the startup flag: it opens without connecting,
+           windows/src/signin.rs). Same value name as the viewer's own per-user entry. -->
+      <Component Id="AutostartViewer" Bitness="always64">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run" Name="Glide Viewer"
+                       Type="string" Value="&quot;[#GlideClientExe]&quot; --startup" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Glide\Installer" Name="Autostart" Type="integer" Value="1" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+
+  <!-- HKLM\SOFTWARE\Policies\Glide (ENTERPRISE.md §11.2): one component per value, installed only
+       when its property is set. -->
+  <Fragment>
+    <ComponentGroup Id="PolicyValues" Directory="INSTALLFOLDER">
+      <Component Id="PolicyCloudURL" Bitness="always64" Condition="CLOUDURL">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Policies\Glide" Name="CloudURL" Type="string"
+                       Value="[CLOUDURL]" KeyPath="yes" />
+      </Component>
+      <Component Id="PolicyEnrollmentToken" Bitness="always64" Condition="ENROLLMENTTOKEN">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Policies\Glide" Name="EnrollmentToken" Type="string"
+                       Value="[ENROLLMENTTOKEN]" KeyPath="yes" />
+      </Component>
+      <Component Id="PolicyDeviceName" Bitness="always64" Condition="DEVICENAME">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Policies\Glide" Name="DeviceName" Type="string"
+                       Value="[DEVICENAME]" KeyPath="yes" />
+      </Component>
+      <Component Id="PolicyDisableLANMode" Bitness="always64" Condition="DISABLELANMODE = 1">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Policies\Glide" Name="DisableLANMode" Type="integer"
+                       Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

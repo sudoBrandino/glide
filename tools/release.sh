@@ -19,6 +19,8 @@
 #                                    (packaging/homebrew/README.md)
 #   tools/release.sh check           version consistency + CHANGELOG entry, nothing is built
 #
+# The Windows MSI is built on Windows, after viewer-build: pwsh packaging/windows/build-msi.ps1.
+#
 # Options (environment):
 #   GLIDE_RELEASE_OUT=DIR     output folder (default: dist/release/<version>)
 #   GLIDE_SKIP_TESTS=1        skip glide-selftest and cargo test before packaging

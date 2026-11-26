@@ -328,23 +328,48 @@ jobs:
           cache-dependencies: false   # no caches in release builds (header)
       - name: Zip
         run: tools/release.sh viewer-zip
+      # The MSI embeds the exes signed above (packaging/windows/build-msi.ps1, WiX Toolset v5
+      # pinned there).
+      - name: Build the MSI
+        shell: pwsh
+        run: packaging/windows/build-msi.ps1
+      - name: Sign the MSI (Azure Artifact Signing)
+        if: env.AZURE_CLIENT_ID != '' && env.AZURE_SIGNING_ENDPOINT != ''
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ env.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ env.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ env.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ env.AZURE_CERT_PROFILE }}
+          files-folder: ${{ github.workspace }}\out
+          files-folder-filter: msi
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: Glide
+          description-url: https://github.com/${{ github.repository }}
+          cache-dependencies: false
       - name: Signing status
         id: signed
         shell: pwsh
         run: |
-          $files = Get-ChildItem out\windows\*.exe
+          $files = @(Get-ChildItem out\windows\*.exe) + @(Get-ChildItem out\Glide-*-windows-x64.msi)
           $all = $true
           foreach ($f in $files) {
             $s = Get-AuthenticodeSignature $f.FullName
             "{0}: {1} {2}" -f $f.Name, $s.Status, $s.SignerCertificate.Subject
             if ($s.Status -ne 'Valid') { $all = $false }
           }
-          if ($env:AZURE_CLIENT_ID -and $env:AZURE_SIGNING_ENDPOINT -and -not $all) { Write-Error "signing was configured but an exe is not validly signed"; exit 1 }
+          if ($env:AZURE_CLIENT_ID -and $env:AZURE_SIGNING_ENDPOINT -and -not $all) { Write-Error "signing was configured but a file is not validly signed"; exit 1 }
           "signed=$(if ($all) { '1' } else { '0' })" >> $env:GITHUB_OUTPUT
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-windows
-          path: out/Glide-*-windows-x64.zip
+          path: |
+            out/Glide-*-windows-x64.zip
+            out/Glide-*-windows-x64.msi
           if-no-files-found: error
           retention-days: 14
 

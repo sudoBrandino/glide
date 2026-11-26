@@ -26,6 +26,20 @@ tooling always build unsigned, so a branch's scripts never run with a signing ke
 `tools/release.sh` runs the same steps locally (`tools/release.sh --help`), and
 `tools/notarize.sh` notarizes and staples with the same API key.
 
+## The Windows MSI
+
+`packaging/windows/build-msi.ps1` builds `Glide-X.Y.Z-windows-x64.msi` from
+`packaging/windows/wix/Glide.wxs` with the WiX Toolset v5 .NET tool (version pinned in the
+script, with the matching firewall extension). It needs Windows and the .NET SDK, so the release
+workflow runs it in the `windows` job, after the exes are signed (the MSI embeds them) and before
+the MSI itself is signed. Locally, on a Windows PC: `tools/release.sh viewer-build` in Git Bash or
+WSL, then `pwsh packaging/windows/build-msi.ps1`.
+
+The `UpgradeCode` in `Glide.wxs` must never change: it is how every Glide MSI finds and replaces
+an earlier one (`MajorUpgrade`), and how admins' detection rules recognize it. MSI versions are
+numeric, so a pre-release suffix (`0.5.0-rc.1`) is dropped from the MSI's ProductVersion; the file
+name keeps it.
+
 ## Secrets
 
 Add them under the repository's **Settings → Secrets and variables → Actions → Repository
