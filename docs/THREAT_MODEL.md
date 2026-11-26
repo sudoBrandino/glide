@@ -51,7 +51,8 @@ security step.** Decline any pairing prompt you didn't start.
   secrets) allows impersonation. Unpair (Mac: *Paired Viewers ▸ Remove…*; viewer: *Forget host*)
   and re-pair to rotate.
 - **The person at the viewer.** A paired viewer is trusted to control the Mac. There is no
-  per-session approval and no restricted (view-only) mode yet.
+  per-session approval and no restricted (view-only) mode in LAN mode; managed mode has both
+  ([below](#managed-mode-glide-cloud)).
 - **Denial of service** from the local network: anyone who can reach the port can keep it busy
   or reset connections. A paired peer can also overload the other side (for example a host
   flooding video reconfigurations); the caps above prevent crashes and unbounded memory from
@@ -105,6 +106,49 @@ The host redials every 2 s (backing off to 60 s while it is refused), doesn't di
 that dialed in is connected, and doesn't dial at all while it has no paired viewer and its pairing
 window is closed. Its own dialed sessions never count against the inbound rate limiter. It sends nothing about
 itself beyond what any host sends to a connecting viewer.
+
+## Managed mode (Glide Cloud)
+
+In managed mode ([ENTERPRISE.md](ENTERPRISE.md) §3) the organization's Glide Cloud tenant, not a
+pairing code, decides which viewer key may reach which host, one session at a time. Each device
+keeps its own X25519 key and registers only the public half at enrollment. For each session the
+cloud sends the viewer the host's public key and the host the viewer's (a *session grant*), and
+Noise XX runs end to end through a relay: the viewer refuses a host whose key isn't the granted
+one, and the host refuses a viewer whose key isn't. Everything in *What pairing protects* about
+records and keys still holds; what changes is who decides, and that every session passes through
+a relay. Client↔cloud traffic is HTTPS/WSS (TLS 1.2+) validated against the OS trust store, but
+Noise, not TLS, is what protects session contents.
+
+| Actor | Can | Glide's answer |
+|---|---|---|
+| Org admin (console `owner` / `admin`) | Write policies, enroll and revoke devices, change org settings, so grant any org user (themselves included) a session to any org host | By design: the admin decides access. Every grant is audited before it is delivered; a policy with `approval: "required"` makes the person at the host accept each session (Decline is the default, 50 s timeout); the host shows a persistent "NAME (email) is connected" indicator and can end the session. A local `DisableLANMode` can only make a device stricter |
+| Glide Cloud operator (runs the service, holds `OPERATOR_TOKEN` and the database) | Everything an org admin can, in any org; read and change the database, including the audit log; issue a new setup link | Same as for an admin: approval prompts and the connected indicator are enforced by the apps, not the cloud. It holds no device private keys, so it can't impersonate an enrolled device to another device or read sessions. The audit log is only as trustworthy as the operator: an organization that needs more should keep `approval: "required"` and export the log regularly |
+| The relay (a Durable Object per session, or anyone who can observe or alter its traffic) | See, delay, drop, reorder or alter the bytes of a session | Records are authenticated end to end (ChaCha20-Poly1305, Noise XX keys): changes and reordering are detected and end the session. A relay acting as a peer fails the handshake: it holds neither granted key. See *What leaks to the relay* |
+| Holder of a stolen device token (`gd_…`, stored next to the device key with the same protection: 0600 file, Keychain or DPAPI) | Act as that device toward the cloud: connect its hub, receive its session offers (user names and emails, permissions), report audit events, read org settings | Can't complete a session without the device's private key: peers check the granted key. A viewer token alone can't request sessions: that needs a user token (`gu_…`) bound to that device, obtained only by an SSO sign-in. Revoking the device in the console closes its hub and relay sessions at once; tokens are stored hashed in the cloud |
+| Another organization | Use the same Glide Cloud | Every row carries `org_id` and every query is scoped by it; grants and relay tickets name the session's devices |
+
+### What leaks to the relay
+
+The relay sees what a passive observer on the LAN sees in LAN mode (*What leaks* above), plus the
+session's timing:
+
+- the plaintext preambles: that it is Glide, and which protocol versions both sides speak;
+- record sizes and timing in both directions: when the screen changes and roughly how much, and
+  **when keys are pressed** (each key event is its own small record), not which keys;
+- both ends' IP addresses, as Cloudflare sees them.
+
+It doesn't see the static keys (Noise XX encrypts both) or anything inside the records: screen,
+input, clipboard, files, audio.
+
+### What the cloud sees
+
+Session **metadata**, not contents: which user (email, name, IdP groups) asked for which host from
+which viewer, when, with which permissions, whether the host approved, how long the session lasted,
+how many bytes went each way and who closed it; devices' names, platforms, OS and app versions,
+tags, public keys, last-seen times, IP addresses and countries. Clients also report file transfers
+(counts, sizes and, unless the org turns `audit_file_names` off, names) and clipboard use
+(direction, kind, size; never contents). All of it is in the organization's audit log
+([ENTERPRISE.md §9](ENTERPRISE.md#9-audit-log)).
 
 ## Untrusted input, by side
 
