@@ -7,7 +7,7 @@
 
 use crate::handshake::fingerprint;
 use crate::noise::public_key;
-use rand_core::OsRng;
+use crate::crypto::os_rng;
 use std::path::{Path, PathBuf};
 use x25519_dalek::StaticSecret;
 
@@ -27,7 +27,7 @@ impl std::fmt::Debug for Identity {
 
 impl Identity {
     pub fn generate() -> Identity {
-        Identity { secret: StaticSecret::random_from_rng(OsRng).to_bytes() }
+        Identity { secret: StaticSecret::random_from_rng(&mut os_rng()).to_bytes() }
     }
     pub fn from_bytes(b: [u8; 32]) -> Identity {
         Identity { secret: b }
