@@ -202,7 +202,7 @@ All with `Authorization: Bearer gd_…` unless noted; "user" = also needs `X-Gli
 
 | Method & path | Request → response |
 |---|---|
-| `POST /v1/enroll` | no bearer. `{enrollment_token, kind, public_key (64 hex), name, platform ("macos"\|"windows"), os_version, app_version, tags?}` → `201 {device_id, device_token, org:{id,slug,name}, settings}` |
+| `POST /v1/enroll` | no bearer. `{enrollment_token, kind, public_key (64 hex), name, platform ("macos"\|"windows"), os_version, app_version, tags?}` → `201 {device_id, device_token, org:{id,slug,name}, settings}`. Errors: `400 invalid_request`, `401 invalid_enrollment_token` (unknown, expired, revoked or used up), `409 device_revoked`, `429 rate_limited` |
 | `GET /v1/device` | → `{device_id, kind, name, tags, org, settings}` |
 | `POST /v1/device/heartbeat` | `{app_version, os_version, name?}` → `204` |
 | `POST /v1/audit` | `{events:[{type, ts, session_id?, detail}]}` (≤ 100) → `202`; only the client types of §9 |
@@ -213,7 +213,7 @@ All with `Authorization: Bearer gd_…` unless noted; "user" = also needs `X-Gli
 | `GET /v1/me` | user → `{user:{id,email,name,groups}, org}` |
 | `GET /v1/hosts` | user → `{hosts:[{id, name, platform, tags, online, last_seen, permissions, approval}]}`: the hosts this user may reach and what a session would allow |
 | `POST /v1/sessions` | user. `{host_id, view_only?}` → `201 {session_id, relay_url, ticket, host:{id,name,public_key}, permissions, approval_required, expires_at}`. Errors: `403 not_allowed`, `409 host_offline`, `403 denied_by_host`, `409 host_busy`, `504 host_no_answer` |
-| `POST /v1/sessions/{id}/end` | user (the session's viewer) or the session's host device → `204` |
+| `POST /v1/sessions/{id}/end` | user (the session's viewer) or the session's host device → `204`; idempotent (an ended or unknown-to-this-device session also answers `204` / `404`) |
 
 `relay_url` is `wss://<cloud>/v1/relay/<session_id>`; the client appends `?ticket=<ticket>`.
 
@@ -295,6 +295,52 @@ The apps' session code runs on TCP streams. A managed session plugs the relay in
    the inbound rate limiter, PROTOCOL.md §2.5).
 
 Noise authenticates the peer whatever happens on the loopback hop.
+
+### 6.7 Client behaviour (normative for both apps)
+
+So that the Mac and Windows apps behave the same and fail safe:
+
+- **Managed configuration source.** `CloudURL` and `EnrollmentToken` are honoured only when an
+  administrator set them: on macOS only when `CFPreferencesAppValueIsForced` is true (a
+  configuration profile), on Windows only from the `Policies` keys. A value a user or process
+  wrote to ordinary preferences is ignored. `DisableLANMode` is read from anywhere, since it can
+  only make things stricter.
+- **CloudURL** is an origin: `https://host[:port]` with no path, query or fragment (a lone `/` is
+  allowed). Anything else is a configuration error. Plain `http` is accepted only when the host
+  parses as a loopback IP address (`127.0.0.0/8`, `::1`).
+- **Decoding.** Unknown fields are ignored. Missing optional or display fields take defaults (an
+  offer without `user` is shown as "an organization user"). Missing permission fields mean the
+  most restrictive value; missing `approval` means `"required"`; missing settings mean the §7
+  defaults. A frame or response missing a security field (`session_id`, a public key, `ticket`,
+  `relay_url`) is rejected, and an offer is then declined with reason `policy`.
+- **Offers.** A host declines an offer whose `expires_at` has passed (`timeout`), declines with
+  `busy` without prompting while any session (LAN or managed) runs, and declines with `policy` if
+  `relay_url` isn't `wss://<CloudURL host:port>/v1/relay/<session_id>`. The grant's lifetime
+  starts at acceptance and ends at the earlier of `expires_at` and acceptance + 120 s.
+- **Prompts and labels.** Names, emails and device names from the cloud have control and
+  bidirectional-override characters removed before display. The approval prompt says "see and
+  control" or "see (view only)" according to `permissions.control`.
+- **Browser.** The viewer opens only `https` URLs on the CloudURL's host.
+- **View only.** With `control: false` the host still uses the viewer's size for scaling, but
+  never changes its display mode or resolution because of the viewer; the viewer also doesn't send
+  `SetDisplayPreference`. With `audio: false` the viewer doesn't send `AudioEnable`.
+- **Revocation.** After `revoked` (or a `401` on `GET /v1/device` or the hub), the app deletes its
+  credentials but keeps a record `{cloud_url, revoked: true, settings}` and keeps applying those
+  last settings, across restarts, until the managed `CloudURL` is removed or changes.
+- **LAN settings at runtime.** When `lan_mode` becomes false, both apps stop listening and dialing
+  on the LAN, end any LAN session at once, and refuse LAN connections at admission. When
+  `allow_local_pairing` is false (or `lan_mode` is false), neither app starts or accepts a
+  pairing.
+- **Retries.** Enrollment stops for good on `401 invalid_enrollment_token` or `409 device_revoked`;
+  other failures retry with backoff from 5 s doubling to 10 min (±20 % jitter). Device-code polling
+  retries network errors, `429` and `5xx` (at least `interval` apart, backing off) until
+  `expires_in`, and stops on any other error. Audit batches rejected with a `4xx` other than `401`
+  or `429` are dropped (logged locally), not retried.
+- **Ending.** The viewer calls `POST /v1/sessions/{id}/end` whenever its side closes a session
+  (the call is idempotent). Both apps report relay and handshake failures as `client.error`.
+- **Refresh.** On each hub connection the app calls `GET /v1/device` to refresh its name, tags and
+  org name.
+- **View-only connect.** Both viewers offer "Connect" and "Connect (view only)".
 
 ## 7. Org settings (effective per device)
 
