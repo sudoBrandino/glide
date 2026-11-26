@@ -89,6 +89,32 @@ pub fn truncate_display(s: &str, max: usize) -> String {
 /// Longest user name or email shown in a label.
 pub const LABEL_PART_MAX: usize = 64;
 
+/// An email cut to at most `max` characters without ever hiding its real domain: the whole
+/// domain is kept and only the local part is shortened (`loc…@example.com`). A domain that alone
+/// is too long keeps its end, the registrable part (`…@…company.example`). Without an `@` the
+/// end is kept the same way (`…tail`).
+pub fn truncate_email(e: &str, max: usize) -> String {
+    let n = e.chars().count();
+    if n <= max {
+        return e.to_string();
+    }
+    let tail = |s: &str, keep: usize| -> String {
+        let len = s.chars().count();
+        s.chars().skip(len.saturating_sub(keep)).collect()
+    };
+    let Some((local, domain)) = e.rsplit_once('@') else {
+        return format!("…{}", tail(e, max.saturating_sub(1)));
+    };
+    let domain_len = domain.chars().count();
+    if domain_len + 2 <= max {
+        // local part + "…" + "@" + domain
+        let keep = max - 2 - domain_len;
+        format!("{}…@{domain}", local.chars().take(keep).collect::<String>())
+    } else {
+        format!("…@…{}", tail(domain, max.saturating_sub(3)))
+    }
+}
+
 /// serde: a display string, cleaned; `null` reads as empty.
 fn de_display<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     Ok(Option::<String>::deserialize(d)?.map(|s| clean_display(&s)).unwrap_or_default())
@@ -225,9 +251,10 @@ pub struct User {
 impl User {
     /// "Ada Lovelace (ada@example.com)", or just the email; "an organization user" without
     /// either. Cleaned with `clean_display` (§6.7); name and email are each cut to
-    /// `LABEL_PART_MAX` characters.
+    /// `LABEL_PART_MAX` characters (the name at its end, the email in its local part, so the
+    /// domain shown is always the real one: `truncate_email`).
     pub fn label(&self) -> String {
-        let (n, e) = (truncate_display(&clean_display(&self.name), LABEL_PART_MAX), truncate_display(&clean_display(&self.email), LABEL_PART_MAX));
+        let (n, e) = (truncate_display(&clean_display(&self.name), LABEL_PART_MAX), truncate_email(&clean_display(&self.email), LABEL_PART_MAX));
         match (n.is_empty(), e.is_empty()) {
             (false, false) if n != e => format!("{n} ({e})"),
             (false, _) => n,
@@ -740,7 +767,25 @@ mod tests {
         // Name and email are each capped at 64 characters.
         let long = User { name: "N".repeat(100), email: format!("{}@example.com", "e".repeat(80)), ..Default::default() };
         let l = long.label();
-        assert_eq!(l, format!("{}… ({}…)", "N".repeat(63), "e".repeat(63)));
+        assert_eq!(l, format!("{}… ({}…@example.com)", "N".repeat(63), "e".repeat(51)));
+        // A long email never hides its real domain.
+        let spoof = format!("it{}@yourcompany.com.evil.example", "x".repeat(60));
+        let shown = User { email: spoof.clone(), ..Default::default() }.label();
+        assert!(shown.ends_with("@yourcompany.com.evil.example"), "{shown}");
+        assert_eq!(shown.chars().count(), LABEL_PART_MAX);
+        assert_eq!(shown, format!("it{}…@yourcompany.com.evil.example", "x".repeat(32)));
+        // The domain alone too long: its end (the registrable part) is kept.
+        let long_domain = format!("it@{}.yourcompany.com.evil.example", "sub.".repeat(20));
+        let shown = User { email: long_domain, ..Default::default() }.label();
+        assert!(shown.starts_with("…@…") && shown.ends_with(".evil.example"), "{shown}");
+        assert_eq!(shown.chars().count(), LABEL_PART_MAX);
+        assert_eq!(truncate_email("it@yourcompany.com.evil.example", 20), "…@….com.evil.example");
+        assert_eq!(truncate_email("ada@example.com", 64), "ada@example.com");
+        assert_eq!(truncate_email("lovelace@example.com", 16), "lov…@example.com");
+        assert_eq!(truncate_email("ab@example.com", 13), "…@example.com", "no room for the local part");
+        assert_eq!(truncate_email("a@b@company.example", 16), "…@…mpany.example", "the last @ starts the domain");
+        assert_eq!(truncate_email("no-at-sign-but-very-long", 10), "…very-long");
+        assert_eq!(truncate_email("Zoë.日本@例え.テスト", 9), "Z…@例え.テスト", "char boundaries");
         let u: User = serde_json::from_str("{\"name\":\"Ada\\u200b\\u2028  Lovelace\",\"email\":\"ada\\ufeff@example.com\"}").unwrap();
         assert_eq!(u.label(), "Ada Lovelace (ada@example.com)");
         let d: DeviceInfo = serde_json::from_str("{\"name\":\"Front\\u00a0\\u00a0desk\\ufe0f\",\"tags\":[\"\\udb40\\udc01\"]}").unwrap();
