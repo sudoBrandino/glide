@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Managed login items for Glide Host (macOS 13+). The Glide Host .pkg installs a LaunchAgent,
+  /Library/LaunchAgents/dev.brandino.glide.host.plist; without this profile macOS notifies the
+  user about a new background item and lets them switch it off in System Settings → General →
+  Login Items. With it, the item is shown as managed and stays on.
+  Rules: the LaunchAgent's label, and the bundle id (the agent's AssociatedBundleIdentifiers, and
+  the app's own Start at Login item). tools/fill-mdm-profiles.sh gives the payloads fresh
+  PayloadUUIDs and puts in your organization's name.
+-->
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadDisplayName</key>
+      <string>Managed Login Items</string>
+      <key>PayloadIdentifier</key>
+      <string>dev.brandino.glide.loginitems.servicemanagement</string>
+      <key>PayloadType</key>
+      <string>com.apple.servicemanagement</string>
+      <key>PayloadUUID</key>
+      <string>B08FF184-644A-41D1-B00F-81201CC0478A</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+      <key>Rules</key>
+      <array>
+        <dict>
+          <key>Comment</key>
+          <string>Glide Host LaunchAgent</string>
+          <key>RuleType</key>
+          <string>Label</string>
+          <key>RuleValue</key>
+          <string>dev.brandino.glide.host</string>
+        </dict>
+        <dict>
+          <key>Comment</key>
+          <string>Glide Host app</string>
+          <key>RuleType</key>
+          <string>BundleIdentifier</string>
+          <key>RuleValue</key>
+          <string>dev.brandino.glide.host</string>
+        </dict>
+      </array>
+    </dict>
+  </array>
+  <key>PayloadDescription</key>
+  <string>Keeps Glide Host starting at login.</string>
+  <key>PayloadDisplayName</key>
+  <string>Glide Host: login item</string>
+  <key>PayloadIdentifier</key>
+  <string>dev.brandino.glide.loginitems</string>
+  <key>PayloadOrganization</key>
+  <string>ORGANIZATION</string>
+  <key>PayloadRemovalDisallowed</key>
+  <true/>
+  <key>PayloadScope</key>
+  <string>System</string>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadUUID</key>
+  <string>7D8679DA-4817-4444-9254-404BF15A1047</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+</dict>
+</plist>

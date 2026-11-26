@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Managed preferences for Glide (domain dev.brandino.glide, docs/ENTERPRISE.md §11.1): both
+  Glide Host and Glide Viewer read them (CFPreferences sees /Library/Managed Preferences).
+  TEMPLATE: set CloudURL and EnrollmentToken (tools/fill-mdm-profiles.sh does it with its cloud URL
+  and token options, and gives the payloads fresh PayloadUUIDs). Empty values count as unset:
+    CloudURL         your Glide Cloud, https only
+    EnrollmentToken  from the admin console (Enrollment tokens); used once per device
+    DeviceName       optional; empty: the computer name. In Jamf you can use $COMPUTERNAME,
+                     in Kandji $DEVICE_NAME
+    Tags             optional tags added at enrollment (empty array: none)
+    DisableLANMode   true: no direct LAN connections, only Glide Cloud sessions (can only be
+                     stricter than the org setting)
+  The same keys without the payload wrapper are in dev.brandino.glide.plist, for MDMs that take a
+  plain preference file (Jamf "Application & Custom Settings", Intune "Preference file").
+-->
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadDisplayName</key>
+      <string>Glide managed settings</string>
+      <key>PayloadIdentifier</key>
+      <string>dev.brandino.glide.settings.prefs</string>
+      <key>PayloadType</key>
+      <string>dev.brandino.glide</string>
+      <key>PayloadUUID</key>
+      <string>0B3EC57C-E211-40FE-A4ED-768940AC77A8</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+      <key>CloudURL</key>
+      <string>https://glide.example.com</string>
+      <key>EnrollmentToken</key>
+      <string>ENROLLMENT_TOKEN</string>
+      <key>DeviceName</key>
+      <string></string>
+      <key>Tags</key>
+      <array/>
+      <key>DisableLANMode</key>
+      <false/>
+    </dict>
+  </array>
+  <key>PayloadDescription</key>
+  <string>Connects Glide to your organization's Glide Cloud.</string>
+  <key>PayloadDisplayName</key>
+  <string>Glide: managed settings</string>
+  <key>PayloadIdentifier</key>
+  <string>dev.brandino.glide.settings</string>
+  <key>PayloadOrganization</key>
+  <string>ORGANIZATION</string>
+  <key>PayloadRemovalDisallowed</key>
+  <true/>
+  <key>PayloadScope</key>
+  <string>System</string>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadUUID</key>
+  <string>FE6486C7-4295-49F8-8130-141382BC4DDA</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+</dict>
+</plist>
