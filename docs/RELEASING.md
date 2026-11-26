@@ -21,7 +21,11 @@ Every signing step is skipped when its secrets are missing, so the same workflow
 release without any of them: the Mac apps are then signed ad hoc (or with the self-signed
 fallback certificate, below), the pkgs and the Windows files are unsigned, and the release notes
 say so. Secrets are only handed to tag pushes; manual runs and pull requests that touch the release
-tooling always build unsigned, so a branch's scripts never run with a signing key.
+tooling always build unsigned, so a branch's scripts never run with a signing key. Within a job a
+secret is visible only to the step that uses it (the certificate imports, the notarization steps,
+the signing action's inputs); the other steps see a true/false flag. The build steps can still use
+the imported certificates through the temporary keychain, since they sign the apps, but never see a
+`.p12` password, the API key or the Azure client secret.
 
 `tools/release.sh` runs the same steps locally (`tools/release.sh --help`), and
 `tools/notarize.sh` notarizes and staples with the same API key.
@@ -30,7 +34,12 @@ tooling always build unsigned, so a branch's scripts never run with a signing ke
 
 `packaging/windows/build-msi.ps1` builds `Glide-X.Y.Z-windows-x64.msi` from
 `packaging/windows/wix/Glide.wxs` with the WiX Toolset v5 .NET tool (version pinned in the
-script, with the matching firewall extension). It needs Windows and the .NET SDK, so the release
+script, with the matching firewall extension). Both packages are pinned by content as well: the
+script downloads them from nuget.org, checks their SHA-512 against
+`packaging/windows/wix/packages.sha512` (the hashes nuget.org's catalog lists), installs the tool
+from that local folder only, and loads the extension DLL from its verified package. To update WiX,
+change the version in the script and record the new hashes after checking them against the
+catalog (`packageHash`, base64 SHA-512). It needs Windows and the .NET SDK, so the release
 workflow runs it in the `windows` job, after the exes are signed (the MSI embeds them) and before
 the MSI itself is signed. Locally, on a Windows PC: `tools/release.sh viewer-build` in Git Bash or
 WSL, then `pwsh packaging/windows/build-msi.ps1`.
