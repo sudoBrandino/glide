@@ -233,7 +233,7 @@ tools/make-host-app.sh && tools/install-host.sh
   grants may need to be renewed after each rebuild. To keep them, sign with a stable identity:
   set `GLIDE_SIGN_ID="<identity>"` (list yours with `security find-identity -v -p codesigning`).
 - `GLIDE_BUNDLE_ID` sets the app's bundle identifier, which is also the LaunchAgent label
-  (default `dev.brandino.glide.host`; releases up to 0.3.x used `io.github.sudobrandino.glide.host`). Put your values in `.dev/build.env`, which is
+  (default `dev.brandino.glide.host`; releases up to 0.4.x used `io.github.sudobrandino.glide.host`). Put your values in `.dev/build.env`, which is
   gitignored; see [`tools/build-env.sh`](tools/build-env.sh).
 - `install-host.sh` runs the installer (`install.sh`) unattended on the app you built.
   `--no-start` installs without starting the app; `--uninstall` removes the app and the agent but
