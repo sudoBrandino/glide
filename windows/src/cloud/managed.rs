@@ -120,7 +120,12 @@ impl Url {
     }
 
     pub fn is_loopback(&self) -> bool {
-        self.host == "localhost" || self.host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        self.host == "localhost" || self.is_loopback_ip()
+    }
+
+    /// The host is a loopback IP address (`127.0.0.0/8`, `::1`), not a name.
+    pub fn is_loopback_ip(&self) -> bool {
+        self.host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
     }
 
     /// `scheme://host[:port]` (default port omitted).
@@ -135,17 +140,36 @@ impl Url {
     }
 }
 
-/// Validates and normalizes `CloudURL`: HTTPS (plain HTTP only to a loopback address, for a
-/// local development service), no user info, and the path dropped.
+/// Validates and normalizes `CloudURL` (docs/ENTERPRISE.md §6.7): an origin, `https://host[:port]`
+/// with no user info, path, query or fragment (a lone `/` is allowed). Plain `http` only when the
+/// host is a loopback IP address (`127.0.0.0/8`, `::1`), for a local development service.
 pub fn normalize_cloud_url(s: &str) -> Result<String, String> {
+    let s = s.trim();
     let u = Url::parse(s)?;
+    let rest = s.split_once("://").map(|(_, r)| r).unwrap_or("");
+    let tail = rest.find(['/', '?', '#']).map(|i| &rest[i..]).unwrap_or("");
+    if !tail.is_empty() && tail != "/" {
+        return Err(format!("CloudURL must be an origin like https://glide.example.com, without a path, query or fragment (got {s:?})"));
+    }
     match u.scheme.as_str() {
         "https" => {}
-        "http" if u.is_loopback() => {}
-        "http" => return Err("CloudURL must use https://".into()),
+        "http" if u.is_loopback_ip() => {}
+        "http" => return Err("CloudURL must use https:// (plain http only to a loopback IP address)".into()),
         _ => return Err("CloudURL must be an https:// URL".into()),
     }
     Ok(u.origin())
+}
+
+/// May the viewer open `url` in the browser (§6.7)? Only `https` URLs on the CloudURL's host and
+/// port, without whitespace or control characters.
+pub fn browser_url_allowed(cloud_url: &str, url: &str) -> bool {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    match (Url::parse(cloud_url), Url::parse(url)) {
+        (Ok(c), Ok(u)) => u.scheme == "https" && u.host == c.host && u.port == c.port,
+        _ => false,
+    }
 }
 
 fn non_empty(s: Option<String>) -> Option<String> {
@@ -289,7 +313,7 @@ mod tests {
     #[test]
     fn machine_policy() {
         let m = MapSource::default()
-            .with("CloudURL", " https://Glide.Example.com/console/ ")
+            .with("CloudURL", " https://Glide.Example.com/ ")
             .with("EnrollmentToken", "enr_secret")
             .with("DeviceName", "Front desk")
             .with_multi("Tags", &["staff-macs", " ", "lobby"]);
@@ -325,17 +349,54 @@ mod tests {
 
     #[test]
     fn cloud_url_rules() {
-        assert_eq!(normalize_cloud_url("https://glide.example.com:8443/x?y"), Ok("https://glide.example.com:8443".into()));
+        assert_eq!(normalize_cloud_url("https://glide.example.com:8443"), Ok("https://glide.example.com:8443".into()));
         assert_eq!(normalize_cloud_url("https://glide.example.com:443"), Ok("https://glide.example.com".into()));
+        assert_eq!(normalize_cloud_url("HTTPS://Glide.Example.com/"), Ok("https://glide.example.com".into()), "a lone / is fine");
         assert_eq!(normalize_cloud_url("http://127.0.0.1:8787"), Ok("http://127.0.0.1:8787".into()));
-        assert_eq!(normalize_cloud_url("http://localhost:8787/"), Ok("http://localhost:8787".into()));
+        assert_eq!(normalize_cloud_url("http://127.1.2.3:8787/"), Ok("http://127.1.2.3:8787".into()));
+        assert_eq!(normalize_cloud_url("http://[::1]:8787"), Ok("http://[::1]:8787".into()));
         assert_eq!(normalize_cloud_url("https://[::1]:9000"), Ok("https://[::1]:9000".into()));
+        // An origin only: no path, query or fragment.
+        for bad in [
+            "https://glide.example.com/console",
+            "https://glide.example.com/console/",
+            "https://glide.example.com:8443/x?y",
+            "https://glide.example.com?x=1",
+            "https://glide.example.com/?x",
+            "https://glide.example.com#top",
+            "https://glide.example.com/#",
+            "https://glide.example.com//",
+        ] {
+            assert!(normalize_cloud_url(bad).is_err(), "{bad}");
+        }
+        assert!(read(&[&MapSource::default().with("CloudURL", "https://glide.example.com/tenant")]).is_err());
+        // Plain http only to a loopback IP address (not a name).
+        assert!(normalize_cloud_url("http://localhost:8787").is_err());
+        assert!(normalize_cloud_url("http://10.0.0.1").is_err());
         assert!(normalize_cloud_url("http://glide.example.com").is_err());
         assert!(normalize_cloud_url("ftp://glide.example.com").is_err());
         assert!(normalize_cloud_url("https://user:pw@glide.example.com").is_err());
         assert!(normalize_cloud_url("glide.example.com").is_err());
         assert!(normalize_cloud_url("https://").is_err());
         assert!(read(&[&MapSource::default().with("CloudURL", "http://evil.example.com")]).is_err());
+    }
+
+    #[test]
+    fn browser_urls() {
+        let c = "https://glide.example.com";
+        assert!(browser_url_allowed(c, "https://glide.example.com/auth/device?user_code=ABCD-EFGH"));
+        assert!(browser_url_allowed(c, "https://Glide.Example.com:443/auth/device"));
+        assert!(!browser_url_allowed(c, "http://glide.example.com/auth/device"), "https only");
+        assert!(!browser_url_allowed(c, "https://glide.example.com:8443/auth/device"), "same port");
+        assert!(!browser_url_allowed(c, "https://evil.example.com/auth/device"));
+        assert!(!browser_url_allowed(c, "https://glide.example.com.evil.example/auth"));
+        assert!(!browser_url_allowed(c, "https://user@glide.example.com/"));
+        assert!(!browser_url_allowed(c, "file:///C:/Windows/System32/calc.exe"));
+        assert!(!browser_url_allowed(c, "https://glide.example.com/a b"));
+        assert!(!browser_url_allowed(c, "https://glide.example.com/\u{0}"));
+        assert!(browser_url_allowed("https://glide.example.com:8443", "https://glide.example.com:8443/auth/device"));
+        // A loopback development cloud on plain http: its pages aren't opened (shown only).
+        assert!(!browser_url_allowed("http://127.0.0.1:8787", "http://127.0.0.1:8787/auth/device"));
     }
 
     #[test]

@@ -182,11 +182,11 @@ fn message(owner: HWND, text: &str, icon: MESSAGEBOX_STYLE) {
     }
 }
 
-/// Opens an http(s) URL from the cloud in the default browser (nothing else is ever launched).
-fn open_url(url: &str) {
-    let ok = crate::cloud::managed::Url::parse(url).is_ok_and(|u| u.scheme == "https" || (u.scheme == "http" && u.is_loopback()));
-    if !ok {
-        eprintln!("managed: not opening {url:?} (not an https URL)");
+/// Opens a URL from the cloud in the default browser: only an `https` URL on the CloudURL's host
+/// and port (docs/ENTERPRISE.md §6.7); nothing else is ever launched.
+fn open_url(cloud_url: &str, url: &str) {
+    if !crate::cloud::managed::browser_url_allowed(cloud_url, url) {
+        eprintln!("managed: not opening {url:?} (not an https URL on {cloud_url})");
         return;
     }
     unsafe {
@@ -206,7 +206,8 @@ pub fn sign_in(owner: HWND) {
         Ok(s) => s,
         Err(e) => return message(owner, &format!("Can't start signing in: {e}"), MB_ICONWARNING),
     };
-    open_url(&start.verification_uri_complete);
+    let cloud_url = agent.cloud_url().to_string();
+    open_url(&cloud_url, &start.verification_uri_complete);
     let close = Arc::new(AtomicBool::new(false));
     let stop_poll = Arc::new(AtomicBool::new(false));
     let result: Arc<Mutex<Option<Result<crate::cloud::api::User, SignInError>>>> = Arc::new(Mutex::new(None));
@@ -229,7 +230,7 @@ pub fn sign_in(owner: HWND) {
         confirm: "Open browser again".into(),
         cancel: "Cancel".into(),
         code_pt: 24,
-        on_confirm: Some(Box::new(move || open_url(&url))),
+        on_confirm: Some(Box::new(move || open_url(&cloud_url, &url))),
         live_code: None,
     };
     if let Err(e) = super::prompt::ask(Some(owner), spec, close.clone()) {

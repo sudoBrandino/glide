@@ -183,6 +183,11 @@ impl ViewerAgent {
         Some(CloudClient::new(&e.cloud_url, self.http.clone()).with_device(&e.device_token).with_user(e.live_user_token(now_s())))
     }
 
+    /// The managed (normalized) CloudURL.
+    pub fn cloud_url(&self) -> &str {
+        &self.managed.cloud_url
+    }
+
     pub fn enrolled(&self) -> bool {
         self.state.lock().unwrap().enrollment.is_some()
     }
