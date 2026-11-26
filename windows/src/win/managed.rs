@@ -141,9 +141,10 @@ pub fn audit(f: impl FnOnce(&AuditQueue, &str)) {
     }
 }
 
-/// Connect to an organization host (Connections window): the request and relay run in the
-/// background; the session thread shows the progress and then runs the session.
-pub fn start(host: HostEntry) {
+/// Connect to an organization host (Connections window: Connect, or Connect (view only)): the
+/// request and relay run in the background; the session thread shows the progress and then runs
+/// the session.
+pub fn start(host: HostEntry, view_only: bool) {
     let Some(agent) = AGENT.get().cloned() else { return };
     {
         let mut st = STATE.lock().unwrap();
@@ -156,7 +157,7 @@ pub fn start(host: HostEntry) {
     // Stop whatever the session thread is doing (a LAN connection, dialing, listening).
     super::app::begin_managed();
     std::thread::spawn(move || {
-        let r = agent.connect(&host.id, &host.name, &|line| {
+        let r = agent.connect(&host.id, &host.name, view_only, &|line| {
             eprintln!("managed: {line}");
             STATE.lock().unwrap().connecting = Some(line);
         });

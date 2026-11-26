@@ -41,6 +41,8 @@ const IDC_CN_UNPAIR: i32 = 1306;
 const IDC_CN_STATUS: i32 = 1307;
 /// Managed mode: Sign in… / Sign out of the organization.
 const IDC_CN_ORG: i32 = 1308;
+/// Managed mode: Connect (view only) to an organization host.
+const IDC_CN_VIEWONLY: i32 = 1309;
 /// The organization's host list arrived (background refresh).
 const WM_CN_ORG: u32 = WM_APP + 2;
 
@@ -126,10 +128,10 @@ pub fn manage(hwnd: HWND) {
         eprintln!("connections window unavailable: {}", windows::core::Error::from_thread());
         return;
     }
-    if let Some(host) = ctx.connect_org.borrow_mut().take() {
+    if let Some((host, view_only)) = ctx.connect_org.borrow_mut().take() {
         // A managed session (Glide Cloud): runs in this viewer, no restart. A pending restart
         // (edited saved connections) waits until the session thread is back to LAN mode.
-        super::managed::start(host);
+        super::managed::start(host, view_only);
         return;
     }
     let connect = ctx.connect.borrow_mut().take();
@@ -167,8 +169,8 @@ struct Ctx {
     restart: Cell<bool>,
     /// Connect was chosen: switch to this id after the window closes.
     connect: RefCell<Option<String>>,
-    /// Connect to an organization host (managed mode) after the window closes.
-    connect_org: RefCell<Option<crate::cloud::api::HostEntry>>,
+    /// Connect to an organization host (managed mode) after the window closes; true = view only.
+    connect_org: RefCell<Option<(crate::cloud::api::HostEntry, bool)>>,
     icons: RefCell<Vec<HICON>>,
 }
 
@@ -194,12 +196,17 @@ fn refresh_org_hosts(h: HWND) {
     });
 }
 
-/// The Organization button: Sign in… / Sign out (hidden when not managed).
+/// The Organization button: Sign in… / Sign out, and Connect (view only) (hidden when not
+/// managed).
 unsafe fn sync_org_button(h: HWND) {
     match super::managed::agent() {
-        None => show(h, IDC_CN_ORG, false),
+        None => {
+            show(h, IDC_CN_ORG, false);
+            show(h, IDC_CN_VIEWONLY, false);
+        }
         Some(a) => {
             show(h, IDC_CN_ORG, true);
+            show(h, IDC_CN_VIEWONLY, true);
             set_text(h, IDC_CN_ORG, if a.signed_in().is_some() { "Sign &out" } else { "Sign &in…" });
         }
     }
@@ -433,6 +440,7 @@ unsafe fn update_selection(h: HWND, ctx: &Ctx) {
     let org_sel = sel.as_ref().is_some_and(is_org);
     let any = sel.is_some() && !org_sel;
     enable(h, IDOK.0, sel.as_ref().is_some_and(|r| if is_org(r) { r.supported } else { can_connect(r) }));
+    enable(h, IDC_CN_VIEWONLY, sel.as_ref().is_some_and(|r| is_org(r) && r.supported));
     enable(h, IDC_CN_EDIT, any);
     enable(h, IDC_CN_DUPLICATE, any);
     enable(h, IDC_CN_REMOVE, any);
@@ -475,18 +483,19 @@ unsafe fn update_selection(h: HWND, ctx: &Ctx) {
     }
 }
 
-unsafe fn do_connect(h: HWND, ctx: &Ctx) {
+/// Connect (`view_only`: Connect (view only), organization hosts only).
+unsafe fn do_connect(h: HWND, ctx: &Ctx, view_only: bool) {
     let Some(r) = selected(h, ctx) else { return };
     if is_org(&r) {
         let id = &r.id[crate::cloud::viewer::ROW_PREFIX.len()..];
         let host = super::managed::agent().and_then(|a| a.hosts().into_iter().find(|x| x.id == id));
         if let Some(host) = host.filter(|x| x.online) {
-            *ctx.connect_org.borrow_mut() = Some(host);
+            *ctx.connect_org.borrow_mut() = Some((host, view_only));
             let _ = EndDialog(h, IDOK.0 as isize);
         }
         return;
     }
-    if !can_connect(&r) {
+    if view_only || !can_connect(&r) {
         return;
     }
     *ctx.connect.borrow_mut() = Some(r.id);
@@ -683,7 +692,8 @@ unsafe extern "system" fn conns_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     refresh(h, ctx, keep);
                 }
                 IDC_CN_SEARCH => return 0,
-                x if x == IDOK.0 => do_connect(h, ctx),
+                x if x == IDOK.0 => do_connect(h, ctx, false),
+                IDC_CN_VIEWONLY => do_connect(h, ctx, true),
                 IDC_CN_ADD => do_add(h, ctx),
                 IDC_CN_EDIT => do_edit(h, ctx),
                 IDC_CN_DUPLICATE => do_duplicate(h, ctx),

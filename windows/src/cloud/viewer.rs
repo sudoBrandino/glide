@@ -371,7 +371,10 @@ impl ViewerAgent {
 
     /// Requests a session with `host_id` and opens the relay (blocks: up to 60 s for the host's
     /// approval, then up to 70 s for it to join). `status` gets progress lines.
-    pub fn connect(&self, host_id: &str, host_label: &str, status: &dyn Fn(String)) -> Result<ManagedSession, String> {
+    /// `view_only` ("Connect (view only)") asks for `view_only: true`: the cloud lowers control to
+    /// false and clipboard and files to off (§8). Once the cloud has created the session, every
+    /// failure here ends it (`POST /v1/sessions/{id}/end`).
+    pub fn connect(&self, host_id: &str, host_label: &str, view_only: bool, status: &dyn Fn(String)) -> Result<ManagedSession, String> {
         if let Some(min) = self.settings().and_then(|s| s.min_app_version).filter(|m| !version_ok(app_version(), Some(m))) {
             return Err(super::settings::update_required(&min));
         }
@@ -381,7 +384,7 @@ impl ViewerAgent {
         }
         let approval = self.hosts().iter().find(|h| h.id == host_id).is_some_and(|h| h.approval == "required");
         status(if approval { format!("Waiting for {host_label} to approve…") } else { format!("Connecting to {host_label}…") });
-        let r = c.create_session(&SessionRequest { host_id: host_id.into(), view_only: None }).map_err(|e| {
+        let r = c.create_session(&SessionRequest { host_id: host_id.into(), view_only: view_only.then_some(true) }).map_err(|e| {
             self.on_user_error(&e);
             e.user_message()
         })?;
@@ -399,12 +402,32 @@ impl ViewerAgent {
         };
         let host_name = if r.host.name.trim().is_empty() { host_label.to_string() } else { r.host.name.clone() };
         status(format!("Connecting to {host_name} through Glide Cloud…"));
-        let ws = c.relay(&r.relay_url, &r.session_id, &r.ticket).map_err(|e| {
-            self.audit.client_error(Some(&r.session_id), "relay_connect", &e.to_string());
-            format!("Can't open the relay: {e}")
-        })?;
-        let (stream, bridge) = bridge::open(ws, &|| status(format!("Waiting for {host_name} to join…"))).map_err(|e| format!("{e}"))?;
-        Ok(ManagedSession { stream, session_id: r.session_id, host_key, host_name, permissions: r.permissions, bridge })
+        let ws = match c.relay(&r.relay_url, &r.session_id, &r.ticket) {
+            Ok(ws) => ws,
+            Err(e) => {
+                self.audit.client_error(Some(&r.session_id), "relay_connect", &e.to_string());
+                self.end_session(&c, &r.session_id);
+                let _ = self.audit.flush(&c);
+                return Err(format!("Can't open the relay: {e}"));
+            }
+        };
+        let (stream, bridge) = match bridge::open(ws, &|| status(format!("Waiting for {host_name} to join…"))) {
+            Ok(x) => x,
+            Err(e) => {
+                self.audit.client_error(Some(&r.session_id), "relay", &e.to_string());
+                self.end_session(&c, &r.session_id);
+                let _ = self.audit.flush(&c);
+                return Err(format!("{e}"));
+            }
+        };
+        let mut permissions = r.permissions;
+        if view_only {
+            // Never more than asked for, whatever the answer says (§8: view_only lowers these).
+            permissions.control = false;
+            permissions.clipboard = super::api::Direction::Off;
+            permissions.files = super::api::Direction::Off;
+        }
+        Ok(ManagedSession { stream, session_id: r.session_id, host_key, host_name, permissions, bridge })
     }
 
     /// `POST /v1/sessions/{id}/end` (idempotent; `404`, a session already gone, is fine).
@@ -416,17 +439,15 @@ impl ViewerAgent {
         }
     }
 
-    /// The session ended. `by_user`: this viewer's user ended it (audited, and the cloud told).
+    /// This side closed the session, however it ended (the user, a failure, the host or the relay
+    /// going away): the cloud is told with `POST /v1/sessions/{id}/end` every time (§6.7; it is
+    /// idempotent, a `404` is fine). `by_user`: this viewer's user ended it (audited as such).
     pub fn ended(&self, session_id: &str, by_user: bool) {
         if by_user {
             self.audit.local_end(session_id, false);
-            if let Some(c) = self.client() {
-                if let Err(e) = c.end_session(session_id, true) {
-                    log(&format!("cloud: end session: {e}"));
-                }
-            }
         }
         if let Some(c) = self.client() {
+            self.end_session(&c, session_id);
             let _ = self.audit.flush(&c);
         }
     }
@@ -593,7 +614,7 @@ mod tests {
         assert!(!a.lan_allowed() && !a.local_pairing_allowed());
         a.apply_settings(Settings { min_app_version: Some("999".into()), ..Settings::default() });
         assert!(a.status_line().starts_with("Update required"));
-        assert!(a.connect("dev_h", "Studio", &|_| {}).err().unwrap().starts_with("Update required"));
+        assert!(a.connect("dev_h", "Studio", false, &|_| {}).err().unwrap().starts_with("Update required"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -680,7 +701,7 @@ mod tests {
         relay_server.send(WsMsg::Text(r#"{"type":"waiting"}"#.into())).unwrap();
         relay_server.send(WsMsg::Text(r#"{"type":"peer_joined"}"#.into())).unwrap();
         let lines = Mutex::new(Vec::new());
-        let mut s = a.connect("dev_h", "Studio", &|l| lines.lock().unwrap().push(l)).unwrap();
+        let mut s = a.connect("dev_h", "Studio", false, &|l| lines.lock().unwrap().push(l)).unwrap();
         assert_eq!((s.session_id.as_str(), s.host_key, s.target()), ("ses_9", [0xcd; 32], "relay:ses_9".to_string()));
         assert_eq!(s.permissions.clipboard, crate::cloud::Direction::ToViewer);
         let l = lines.lock().unwrap().clone();
@@ -707,32 +728,74 @@ mod tests {
     }
 
     #[test]
+    fn view_only_connect_and_every_end_is_reported() {
+        let http = Arc::new(FakeHttp::default());
+        let (a, dir) = agent(http.clone(), true);
+        // The cloud answers with more than view only: the viewer still keeps to what it asked.
+        http.on(
+            "POST /v1/sessions",
+            201,
+            &format!(
+                r#"{{"session_id":"ses_v","relay_url":"wss://c.example.com/v1/relay/ses_v","ticket":"tk","host":{{"id":"dev_h","name":"Studio","public_key":"{}"}},"permissions":{{"control":true,"clipboard":"both","files":"both","audio":true}}}}"#,
+                "cd".repeat(32)
+            ),
+        );
+        let (relay_client, relay_server) = pair();
+        http.sockets.lock().unwrap().push_back(Ok(relay_client));
+        relay_server.send(WsMsg::Text(r#"{"type":"peer_joined"}"#.into())).unwrap();
+        let s = a.connect("dev_h", "Studio", true, &|_| {}).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(http.requests.lock().unwrap()[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(body, serde_json::json!({"host_id":"dev_h","view_only":true}));
+        assert_eq!(s.permissions, Permissions { control: false, clipboard: crate::cloud::Direction::Off, files: crate::cloud::Direction::Off, audio: true });
+        s.bridge.close();
+        // Ended by the host (or a failure): the cloud is still told; 404 is fine; not audited
+        // as a local end.
+        http.on("POST /v1/sessions/ses_v/end", 404, r#"{"error":{"code":"not_found","message":"x"}}"#);
+        http.on("POST /v1/audit", 202, "");
+        a.ended("ses_v", false);
+        assert_eq!(http.count("POST /v1/sessions/ses_v/end"), 1);
+        assert_eq!(http.count("POST /v1/audit"), 0, "nothing to audit");
+        // The relay can't be reached: audited as client.error and the session ended.
+        http.routes.lock().unwrap().clear();
+        http.on("POST /v1/sessions", 201, &format!(r#"{{"session_id":"ses_r","relay_url":"wss://c.example.com/v1/relay/ses_r","ticket":"t","host":{{"id":"h","name":"S","public_key":"{}"}}}}"#, "00".repeat(32)));
+        http.on("POST /v1/sessions/ses_r/end", 204, "");
+        http.on("POST /v1/audit", 202, "");
+        assert!(a.connect("dev_h", "Studio", false, &|_| {}).err().unwrap().starts_with("Can't open the relay"));
+        assert_eq!(http.count("POST /v1/sessions/ses_r/end"), 1);
+        let audit = http.requests.lock().unwrap().iter().rev().find(|r| r.url.ends_with("/v1/audit")).cloned().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(audit.body.as_ref().unwrap()).unwrap();
+        assert_eq!((v["events"][0]["type"].as_str(), v["events"][0]["session_id"].as_str()), (Some("client.error"), Some("ses_r")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn approval_status_and_errors() {
         let http = Arc::new(FakeHttp::default());
         let (a, dir) = agent(http.clone(), true);
         a.state.lock().unwrap().hosts = vec![HostEntry { id: "dev_h".into(), name: "Studio".into(), approval: "required".into(), ..Default::default() }];
         http.on("POST /v1/sessions", 403, r#"{"error":{"code":"denied_by_host","message":"x"}}"#);
         let lines = Mutex::new(Vec::new());
-        let e = a.connect("dev_h", "Studio", &|l| lines.lock().unwrap().push(l)).err().unwrap();
+        let e = a.connect("dev_h", "Studio", false, &|l| lines.lock().unwrap().push(l)).err().unwrap();
         assert_eq!(lines.lock().unwrap()[0], "Waiting for Studio to approve…");
         assert_eq!(e, "The person at that computer declined the request");
         // A relay URL that isn't this cloud's is refused before connecting.
         http.routes.lock().unwrap().clear();
         http.on("POST /v1/sessions", 201, &format!(r#"{{"session_id":"ses_1","relay_url":"wss://evil.example.com/v1/relay/ses_1","ticket":"t","host":{{"id":"h","name":"S","public_key":"{}"}}}}"#, "00".repeat(32)));
-        assert!(a.connect("dev_h", "Studio", &|_| {}).is_err());
+        assert!(a.connect("dev_h", "Studio", false, &|_| {}).is_err());
         assert!(http.ws_urls.lock().unwrap().is_empty());
+        assert_eq!(http.count("POST /v1/sessions/ses_1/end"), 1, "a failure after the cloud created the session ends it");
         // A session answer missing a security field is rejected, and the session ended at once.
         http.routes.lock().unwrap().clear();
         http.on("POST /v1/sessions", 201, r#"{"session_id":"ses_2","relay_url":"wss://c.example.com/v1/relay/ses_2","host":{"id":"h","name":"S","public_key":"00"}}"#);
         http.on("POST /v1/sessions/ses_2/end", 404, r#"{"error":{"code":"not_found","message":"x"}}"#);
-        let e = a.connect("dev_h", "Studio", &|_| {}).err().unwrap();
+        let e = a.connect("dev_h", "Studio", false, &|_| {}).err().unwrap();
         assert!(e.contains("no ticket"), "{e}");
         assert_eq!(http.count("POST /v1/sessions/ses_2/end"), 1);
         assert!(http.ws_urls.lock().unwrap().is_empty());
         // Without even a session id there is nothing to end.
         http.routes.lock().unwrap().clear();
         http.on("POST /v1/sessions", 201, r#"{"relay_url":"x"}"#);
-        assert!(a.connect("dev_h", "Studio", &|_| {}).err().unwrap().contains("no session_id"));
+        assert!(a.connect("dev_h", "Studio", false, &|_| {}).err().unwrap().contains("no session_id"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
