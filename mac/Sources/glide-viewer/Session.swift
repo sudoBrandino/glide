@@ -169,7 +169,32 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         keys.start()
         NotificationCenter.default.addObserver(self, selector: #selector(screenParametersChanged(_:)),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(managedPolicyChanged(_:)),
+                                               name: ManagedViewer.changed, object: nil)
         connect()
+    }
+
+    /// LAN settings at runtime (ENTERPRISE.md §6.7): when `lan_mode` becomes false a LAN session
+    /// ends at once (connecting, pairing, streaming or waiting to retry); a pairing in progress
+    /// ends when `allow_local_pairing` becomes false. Managed sessions are not affected.
+    @objc private func managedPolicyChanged(_ n: Notification) {
+        guard phase != .stopped else { return }
+        let mv = ManagedViewer.shared
+        guard ViewerLANGate.mustEnd(managedSession: cloud != nil, pairing: phase == .pairing, policy: mv.policy) else { return }
+        if let why = mv.lanBlockedReason {
+            print("LAN mode turned off (\(why)): ending the session with \(label)")
+            stop(message: "LAN connections were \(why), so the session with \(label) ended.")
+        } else {
+            print("pairing turned off by \(mv.orgName): ending the pairing with \(label)")
+            stop(message: pairingOffText)
+        }
+    }
+
+    /// A LAN pairing may start (§6.7: never while `allow_local_pairing` or `lan_mode` is false).
+    private var mayPair: Bool { ViewerLANGate.mayPair(managedSession: cloud != nil, policy: ManagedViewer.shared.policy) }
+
+    private var pairingOffText: String {
+        "Pairing is turned off by \(ManagedViewer.shared.orgName). Ask your administrator, or connect through your organization's list."
     }
 
     // MARK: Status
@@ -308,8 +333,13 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         let pinned = currentPin()
         // A managed session never pairs: the cloud named the host key (pinned in memory).
         if cloud != nil, pinned == nil { stop(message: "Glide Cloud didn't name the computer's key."); return }
+        let wantsPairing = cloud == nil && (forcePair || repair)
+        if wantsPairing, !mayPair {
+            stop(message: pairingOffText)
+            return
+        }
         ch.performHandshake(identity: identity, name: Host.current().localizedName ?? "Mac", pinned: pinned,
-                            requestPairing: cloud == nil && (forcePair || repair), requireOpenPairingWindow: true) { [weak self] res in
+                            requestPairing: cloud == nil && (forcePair || repair) && mayPair, requireOpenPairingWindow: true) { [weak self] res in
             DispatchQueue.main.async { self?.handshakeDone(gen, res) }
         }
     }
@@ -323,6 +353,7 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         guard gen == generation, phase == .handshaking, let ch = channel else { return }
         switch res {
         case .failure(let e):
+            cloud?.reportError("handshake_failed", "\(e)")
             switch e {
             case SecureChannel.ViewerFailure.hostKeyChanged(_, let presented) where cloud != nil:
                 stop(message: "The computer presented a key (\(GlideHandshake.fingerprint(presented))) that isn't the one Glide Cloud named. Not connecting.")
@@ -340,6 +371,11 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
                 failed(gen, "Handshake with \(label) failed: \(e)", retryAfter: nil)
             }
         case .success(let vc):
+            if vc.pairing, !mayPair {
+                // The host started a pairing this Mac may not take part in.
+                stop(message: cloud != nil ? "\(label) asked to pair over Glide Cloud. Not connecting." : pairingOffText)
+                return
+            }
             if vc.pairing {
                 phase = .pairing
                 pendingPair = vc
@@ -405,6 +441,7 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         switch m {
         case let .pairReveal(nH):
             guard phase == .pairing, let vc = pendingPair, pairingAlert == nil, !pairConfirmed else { return }
+            guard mayPair else { stop(message: pairingOffText); return }
             guard GlideHandshake.commitment(nH) == vc.hostInfo.commitment else {
                 stop(message: "Pairing failed: the host's pairing nonce doesn't match its commitment.")
                 return
@@ -432,10 +469,13 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
             }
             let text = ViewerStatusText.authResult(code, host: label)
             if cloud != nil {
+                cloud?.reportError("handshake_failed", "the host refused the session (\(code))")
                 stop(message: "\(label) refused the managed session (\(code)).")
                 return
             }
             switch code {
+            case .unknownViewer where !mayPair:
+                stop(message: "\(text)\n\n\(pairingOffText)")
             case .unknownViewer:
                 repair = true
                 failed(gen, text, retryAfter: 2)

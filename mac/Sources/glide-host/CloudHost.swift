@@ -114,6 +114,10 @@ final class ManagedHost: @unchecked Sendable {
     private func hubEvent(_ ev: HubEvent) {
         switch ev {
         case let .offer(o): handleOffer(o)
+        case let .invalidOffer(sid, why):
+            // A security field is missing (§6.7): refuse without prompting.
+            log("cloud: session offer \(sid) is missing a required field (\(why)); declining (policy)")
+            device?.send(.sessionAnswer(sessionId: sid, accept: false, reason: "policy"))
         case let .cancel(id, reason):
             log("cloud: session \(id) cancelled (\(reason.isEmpty ? "no reason" : reason))")
             grants.revoke(id)
@@ -123,11 +127,17 @@ final class ManagedHost: @unchecked Sendable {
         }
     }
 
+    /// Any session (LAN or managed) runs, or another offer is being prompted (§6.7: `busy`
+    /// without prompting).
+    private var isBusy: Bool {
+        guard let server else { return true }
+        return server.current != nil || prompt != nil || relays.values.contains { !$0.finished }
+    }
+
     private func handleOffer(_ o: SessionOffer) {
         guard let d = device, let url = d.status.cloudURL, let server else { return }
-        let busy = server.current != nil || prompt != nil || relays.values.contains { !$0.finished }
-        let decision = OfferDecision.decide(o, cloudURL: url, busy: busy, paused: server.isPaused, updateRequired: policy.updateRequired)
-        log("cloud: session offer \(o.sessionId) from \(o.user.label) on “\(PairedViewer.displayName(o.viewer.name))” (\(o.permissions.summary), approval \(o.approval.rawValue)) -> \(decision)")
+        let decision = OfferDecision.decide(o, cloudURL: url, busy: isBusy, paused: server.isPaused, updateRequired: policy.updateRequired)
+        log("cloud: session offer \(o.sessionId) from \(o.user.label) on “\(CloudText.name(o.viewer.name, fallback: "unnamed viewer"))” (\(o.permissions.summary), approval \(o.approval.rawValue)) -> \(decision)")
         switch decision {
         case .accept: accept(o)
         case let .decline(reason): answer(o, accept: false, reason: reason)
@@ -141,7 +151,12 @@ final class ManagedHost: @unchecked Sendable {
                 self.prompt = nil
                 HostStatus.shared.update { $0.pendingApproval = nil }
                 log("cloud: session \(o.sessionId) \(accepted ? "accepted" : "declined") by the person at this Mac\(reason == "timeout" ? " (no answer in 50 s)" : "")")
-                if accepted, CloudTime.parse(o.expiresAt).map({ $0 > Date() }) ?? true { self.accept(o) } else { self.answer(o, accept: false, reason: accepted ? "timeout" : reason) }
+                // The grant's lifetime starts now, at acceptance (accept() → SessionGrant).
+                switch OfferDecision.afterPrompt(accepted: accepted, reason: reason, expiresAt: o.expiresAt, busy: self.isBusy) {
+                case .accept: self.accept(o)
+                case let .decline(why): self.answer(o, accept: false, reason: why)
+                case .prompt: self.answer(o, accept: false, reason: "declined")
+                }
             }
         }
     }
@@ -165,7 +180,10 @@ final class ManagedHost: @unchecked Sendable {
         relays[o.sessionId] = r
         let sid = o.sessionId
         bridge.onStatus = { st in if st == .waiting { log("cloud: session \(sid): waiting for the viewer on the relay") } }
-        bridge.onClosed = { [weak self] why in DispatchQueue.main.async { self?.relayClosed(sid, why) } }
+        bridge.onClosed = { [weak self, weak bridge] why in
+            let failed = bridge?.failed ?? false  // on the bridge queue, set before onClosed
+            DispatchQueue.main.async { self?.relayClosed(sid, why, failed: failed) }
+        }
         let queue = DispatchQueue(label: "glide.session.relay", qos: .userInteractive)
         let audit = self.audit
         bridge.start(sessionQueue: queue) { [weak self, weak server] conn in
@@ -178,6 +196,7 @@ final class ManagedHost: @unchecked Sendable {
         DispatchQueue.main.asyncAfter(deadline: .now() + 130) { [weak self] in
             guard let self, let r = self.relays[sid], !r.connected, !r.finished else { return }
             log("cloud: session \(sid): the viewer never completed the handshake; closing")
+            self.audit?.error(code: "handshake_timeout", message: "the viewer did not complete the handshake in time", sessionId: sid)
             r.bridge.close("no handshake")
             self.finish(sid, detail: "the viewer did not connect")
         }
@@ -199,9 +218,10 @@ final class ManagedHost: @unchecked Sendable {
         }
     }
 
-    private func relayClosed(_ sid: String, _ why: String) {
+    private func relayClosed(_ sid: String, _ why: String, failed: Bool) {
         guard let r = relays[sid] else { return }
         log("cloud: session \(sid): relay closed (\(why))")
+        if failed { audit?.error(code: "relay_failed", message: why, sessionId: sid) }
         r.session?.end()
         finish(sid, detail: why)
     }
@@ -265,12 +285,8 @@ final class ApprovalPrompt: NSObject {
     static func makeAlert(offer o: SessionOffer, orgName: String?, countdown: NSTextField) -> NSAlert {
         let a = NSAlert()
         a.alertStyle = .warning
-        let who = o.user.label
-        a.messageText = "Allow \(who) to connect to this Mac?"
-        var lines = ["\(who) asked to \(o.permissions.control ? "control" : "view") this Mac from “\(PairedViewer.displayName(o.viewer.name))” through \(orgName ?? "your organization")'s Glide Cloud.",
-                     "Allowed: \(o.permissions.summary)."]
-        lines.append("You can end the session at any time from the Glide menu. If you didn't expect this, click Decline.")
-        a.informativeText = lines.joined(separator: "\n\n")
+        a.messageText = ApprovalText.title(o)
+        a.informativeText = ApprovalText.body(o, orgName: orgName)
         countdown.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         countdown.textColor = .secondaryLabelColor
         countdown.frame = NSRect(x: 0, y: 0, width: 280, height: 18)

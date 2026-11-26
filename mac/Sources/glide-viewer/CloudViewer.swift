@@ -83,6 +83,7 @@ final class ManagedViewer: @unchecked Sendable {
                     self.signedIn(t, client: c)
                     done(nil)
                 case let .failure(e):
+                    if e.isUnauthorized { d.tokenRejected() }  // the device token is gone: revoked
                     done(isCancelled() ? nil : e.description)
                 }
             }
@@ -192,7 +193,7 @@ final class CloudConnector {
         self.viewOnly = viewOnly
     }
 
-    var hostName: String { pin?.hostName ?? PairedViewer.displayName(host.name) }
+    var hostName: String { pin?.hostName ?? CloudText.name(host.name, fallback: "the computer") }
 
     /// Main thread. `status` texts for the window; `completion` once with the connection (already
     /// connected, started on `queue`) or the reason it failed.
@@ -200,7 +201,7 @@ final class CloudConnector {
         close(byUser: false)
         attempt += 1
         let mine = attempt
-        let name = PairedViewer.displayName(host.name)
+        let name = CloudText.name(host.name, fallback: "the computer")
         status(host.approval == .required ? "Waiting for \(name) to approve…" : "Connecting to \(name) through Glide Cloud…")
         Task {
             let r = await ManagedViewer.shared.createSession(host, viewOnly: viewOnly)
@@ -239,8 +240,11 @@ final class CloudConnector {
                 }
             }
         }
-        b.onClosed = { why in
+        let sid = s.sessionId
+        b.onClosed = { [weak b] why in
+            let failed = b?.failed ?? false  // on the bridge queue, set before onClosed
             DispatchQueue.main.async {
+                if failed { CloudConnector.reportError("relay_failed", why, sessionId: sid) }
                 if !delivered { delivered = true; completion(.failure(CloudFailure("The relay closed: \(why)."))) }
             }
         }
@@ -253,8 +257,20 @@ final class CloudConnector {
         }
     }
 
-    /// Ends the managed session (window closed, Disconnect, reconnect). `byUser`: the person at
-    /// this Mac ended it (audit `session.local_end`, `POST /v1/sessions/{id}/end`).
+    /// `client.error` (§6.7, §9) for this session's relay or handshake failure.
+    func reportError(_ code: String, _ message: String) {
+        guard let sid = sessionId else { return }
+        Self.reportError(code, message, sessionId: sid)
+    }
+
+    static func reportError(_ code: String, _ message: String, sessionId: String) {
+        print("cloud: session \(sessionId): \(code): \(message)")
+        ManagedViewer.shared.audit?.error(code: code, message: message, sessionId: sessionId)
+    }
+
+    /// Ends the managed session (window closed, Disconnect, reconnect, failure): whenever this
+    /// side closes a session it calls `POST /v1/sessions/{id}/end` (idempotent; a 404 is fine).
+    /// `byUser`: the person at this Mac ended it (audit `session.local_end`).
     func close(byUser: Bool) {
         attempt += 1
         bridge?.close(byUser ? "ended by the viewer" : "closed")
@@ -264,7 +280,11 @@ final class CloudConnector {
                 ManagedViewer.shared.audit?.localEnd(sessionId: sid, byHostUser: false)
                 ManagedViewer.shared.audit?.flush()
             }
-            if let c = ManagedViewer.shared.client { Task { try? await c.endSession(sid, as: .user) } }
+            if let c = ManagedViewer.shared.client {
+                Task {
+                    do { try await c.endSession(sid, as: .user) } catch { print("cloud: ending session \(sid): \(error)") }
+                }
+            }
         }
         sessionId = nil
         pin = nil

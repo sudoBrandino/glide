@@ -221,6 +221,7 @@ final class Session: @unchecked Sendable {
             case .failure(let e):
                 // EOF right after msg2 = the viewer didn't like our key (pinned to another host key).
                 self.peerLog("session \(self.id): handshake with \(self.peer) failed: \(e)")
+                self.reportManagedError("handshake_failed", "\(e)")
                 self.chargeFailure()
                 self.end()
             case .success(let acc):
@@ -260,6 +261,7 @@ final class Session: @unchecked Sendable {
             })
         case let .reject(code) where relaySessionId != nil:
             securityLog("session \(id): managed session \(relaySessionId ?? ""): viewer “\(name)” (\(fp)) is not the one the cloud granted (\(code)); closing")
+            reportManagedError("handshake_failed", "the viewer's key is not the one the cloud granted (\(code))")
             HostStatus.shared.note("Refused a managed connection whose key didn't match the session", warning: true)
             reject(code)
         case .reject(.pairingClosed):
@@ -274,6 +276,12 @@ final class Session: @unchecked Sendable {
             HostStatus.shared.note("Rejected unknown viewer “\(name)” (\(address))", warning: true)
             reject(code)
         }
+    }
+
+    /// `client.error` for a managed session's handshake failures (ENTERPRISE.md §6.7, §9).
+    private func reportManagedError(_ code: String, _ message: String) {
+        guard let sid = relaySessionId else { return }
+        audit?.error(code: code, message: message, sessionId: sid)
     }
 
     private func evaluateVote() {
@@ -451,6 +459,13 @@ final class Session: @unchecked Sendable {
             }
             // Size the virtual display for this viewer (pixels and refresh rate; max_fps is the viewer
             // monitor's refresh), or switch the Mac's display mode if the policy says so, then capture once.
+            // View only (ENTERPRISE.md §6.7): the viewer's size drives scaling only; this Mac's
+            // display mode and resolution (and the virtual display) are left alone.
+            guard ManagedPermissions.hostAdaptsDisplay(perms) else {
+                log("session \(id): view-only managed session: the display mode is left as it is")
+                startStreaming(caps: caps, mode: mode, maxFps: maxFps, viewW: viewW)
+                return
+            }
             DisplayModeController.shared.sessionBegan(id: id, viewW: viewW, viewH: viewH, viewerHz: Int(maxFps)) { [weak self] in
                 self?.channel.queue.async {
                     guard let self, !self.ended else { return }
@@ -487,8 +502,7 @@ final class Session: @unchecked Sendable {
             }
             let vw = view.w, vh = view.h
             HostStatus.shared.viewSize(id: id, w: vw, h: vh)
-            // Debounced; may switch the display mode, in which case the display-change observer re-captures.
-            DisplayModeController.shared.viewSizeChanged(id: id, viewW: vw, viewH: vh) { [weak self] switched in
+            let rescale: (Bool) -> Void = { [weak self] switched in
                 guard let self, !self.ended, let p = self.pipeline else { return }
                 let target = min(self.settings.maxWidth, vw)
                 if switched { p.setMaxWidth(target); return }
@@ -499,6 +513,10 @@ final class Session: @unchecked Sendable {
                     catch { log("session \(self.id): restart failed: \(error)") }
                 }
             }
+            // View only (§6.7): scaling only, never a display mode change.
+            guard ManagedPermissions.hostAdaptsDisplay(permissions) else { rescale(false); return }
+            // Debounced; may switch the display mode, in which case the display-change observer re-captures.
+            DisplayModeController.shared.viewSizeChanged(id: id, viewW: vw, viewH: vh, then: rescale)
         case let .setMode(mode, br, fps):
             guard let p = pipeline else { return }
             log("session \(id): setMode \(mode) bitrate=\(br)kbps fps=\(fps)")

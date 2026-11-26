@@ -148,7 +148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         session?.close()
         let cfg = (try? ViewerStore.load()) ?? ViewerConfig()
         let target = ViewerTarget(host: "relay:" + host.id, port: 0)
-        let s = ViewerSession(target: target, connectionID: nil, label: PairedViewer.displayName(host.name), identity: identity,
+        let s = ViewerSession(target: target, connectionID: nil, label: CloudText.name(host.name, fallback: "the computer"), identity: identity,
                               remap: cfg.remapModifiers && !options.noRemap, forcePair: false,
                               fullscreen: options.fullscreen || cfg.startFullScreen, cloud: CloudConnector(host: host, viewOnly: viewOnly))
         s.onEnd = { [weak self, weak s] in
@@ -156,6 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             self.session = nil
             self.showList()
         }
+        s.sessionMenu = { [weak self] in self?.makeSessionMenu() }
         session = s
         s.start()
     }
