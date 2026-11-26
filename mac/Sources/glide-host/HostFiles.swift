@@ -31,12 +31,22 @@ final class SessionFiles: @unchecked Sendable {
     let config: HostFileConfig
     /// Chunks only go out while the connection's backlog is below this (video first).
     static let bulkBacklogLimit = 256 * 1024
+    /// FileCaps flags (managed sessions narrow them to the session's permissions).
+    let capsFlags: UInt32
+    /// Mac -> viewer allowed (managed sessions: files `to_viewer` or `both`).
+    let allowSend: Bool
+    /// Finished transfers (managed sessions: the audit event).
+    var onAudit: ((_ sent: Bool, _ count: Int, _ bytes: UInt64, _ names: [String]) -> Void)?
+    private var lastSentNames: [String] = []
 
     /// `send(message, onSent)`: `onSent` (chunks only) runs once the bytes left the send queue.
-    init(sessionId: Int, viewerName: String, config: HostFileConfig, send: @escaping (FileMessage, (() -> Void)?) -> Void, backlog: @escaping () -> Int) {
+    init(sessionId: Int, viewerName: String, config: HostFileConfig, capsFlags: UInt32? = nil, allowSend: Bool = true,
+         send: @escaping (FileMessage, (() -> Void)?) -> Void, backlog: @escaping () -> Int) {
         self.sessionId = sessionId
         self.viewerName = viewerName
         self.config = config
+        self.capsFlags = capsFlags ?? ((config.receive ? FileMessage.capsReceive : 0) | FileMessage.capsSend)
+        self.allowSend = allowSend
         engine = FileTransferEngine(config: .init(downloadDir: config.downloadDir, limits: config.limits, receive: config.receive, hostRole: true))
         engine.send = { [weak e = engine] m, bulk in send(m, bulk ? { e?.kick() } : nil) }
         engine.canSendBulk = { backlog() < SessionFiles.bulkBacklogLimit }
@@ -49,7 +59,7 @@ final class SessionFiles: @unchecked Sendable {
 
     /// FileCaps for the viewer (sent right after ServerHello).
     var caps: FileMessage {
-        .caps(flags: (config.receive ? FileMessage.capsReceive : 0) | FileMessage.capsSend,
+        .caps(flags: capsFlags,
               maxTotalBytes: config.limits.maxTotalBytes, maxFiles: UInt32(clamping: config.limits.maxFiles))
     }
 
@@ -64,7 +74,9 @@ final class SessionFiles: @unchecked Sendable {
     }
 
     func send(_ urls: [URL]) {
+        guard allowSend else { return log("not sending: this session doesn't allow files to the viewer") }
         log("sending \(urls.map(\.lastPathComponent))")
+        lastSentNames = urls.map(\.lastPathComponent)
         engine.sendItems(urls)
     }
 
@@ -72,6 +84,10 @@ final class SessionFiles: @unchecked Sendable {
 
     /// The viewer asked for the files copied in Finder.
     func pull() {
+        guard allowSend else {
+            engine.send(.pullResult(status: FileStatus.declined, detail: "This session doesn't allow files to the viewer"), false)
+            return
+        }
         DispatchQueue.main.async { [self] in
             let pb = NSPasteboard.general
             let urls = (pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
@@ -82,6 +98,7 @@ final class SessionFiles: @unchecked Sendable {
             }
             log("pull: sending \(urls.count) copied item(s)")
             engine.send(.pullResult(status: FileStatus.ok, detail: ""), false)
+            lastSentNames = urls.map(\.lastPathComponent)
             engine.sendItems(urls)
         }
     }
@@ -94,9 +111,11 @@ final class SessionFiles: @unchecked Sendable {
             log("received \(FileOffers.fileText(files)) (\(FileOffers.byteText(bytes))) into \(dir.path): \(items.map(\.lastPathComponent))")
             HostStatus.shared.addTransfer(.init(incoming: true, files: files, bytes: bytes, items: items, ok: true, text: nil, date: Date()))
             HostNotifier.shared.received(files: files, bytes: bytes, items: items, from: viewerName)
+            onAudit?(false, files, bytes, items.map(\.lastPathComponent))
         case let .sent(files, bytes):
             log("viewer saved \(FileOffers.fileText(files)) (\(FileOffers.byteText(bytes)))")
             HostStatus.shared.addTransfer(.init(incoming: false, files: files, bytes: bytes, items: [], ok: true, text: nil, date: Date()))
+            onAudit?(true, files, bytes, lastSentNames)
         case let .failed(why):
             log(why)
             HostStatus.shared.addTransfer(.init(incoming: false, files: 0, bytes: 0, items: [], ok: false, text: why, date: Date()))

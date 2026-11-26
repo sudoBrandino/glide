@@ -5,7 +5,7 @@ import Foundation
 /// two-party confirmation, and the per-address rate limiter.
 
 /// AuthResult codes (message 0x05).
-public enum AuthCode: UInt8, CustomStringConvertible {
+public enum AuthCode: UInt8, CustomStringConvertible, Sendable {
     case ok = 0
     case unknownViewer = 1
     case pairingClosed = 2

@@ -104,9 +104,13 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
     private let toast = ToastView()
     /// Builds the session menu (⌃⌥⇧Space); set by the app.
     var sessionMenu: (() -> NSMenu?)?
+    /// Managed session (ENTERPRISE.md §5.3): the cloud connector, else nil for a LAN connection.
+    /// It never reconnects on its own: every attempt is a new session request (and approval).
+    let cloud: CloudConnector?
 
     init(target: ViewerTarget, connectionID: String?, label: String, identity: Curve25519.KeyAgreement.PrivateKey,
-         remap: Bool, forcePair: Bool, fullscreen: Bool) {
+         remap: Bool, forcePair: Bool, fullscreen: Bool, cloud: CloudConnector? = nil) {
+        self.cloud = cloud
         self.target = target
         self.connectionID = connectionID
         self.label = label
@@ -178,6 +182,10 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
 
     private func updateTitle() {
         var t = hostName.isEmpty ? label : hostName
+        if let c = cloud {
+            t += " — via Glide Cloud"
+            if c.permissions?.control == false { t += " (view only)" }
+        }
         if !rttText.isEmpty { t += " — \(rttText)" }
         if keyboardReleased { t += " — keyboard released" }
         window.title = t
@@ -198,26 +206,18 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         phase = .connecting
         pendingPair = nil
         pairConfirmed = false
+        if let cloud {
+            connectCloud(cloud, gen: gen)
+            return
+        }
+        if let why = ManagedViewer.shared.lanBlockedReason {
+            stop(message: "LAN connections are \(why). Connect through your organization's list instead.")
+            return
+        }
         setStatus("Connecting to \(label)…")
         guard let port = NWEndpoint.Port(rawValue: target.port) else { stop(message: "Bad port \(target.port)"); return }
         let conn = NWConnection(host: NWEndpoint.Host(target.host), port: port, using: SecureChannel.tcpParameters())
-        let ch = SecureChannel(connection: conn, queue: net)
-        ch.maxRecordBytes = SecureChannel.preAuthMaxRecord
-        channel = ch
-        let gate = StreamGate()
-        self.gate = gate
-        let decoder = VideoDecoder()
-        decoder.onFrame = { [weak self] pb in
-            DispatchQueue.main.async { if let self, self.generation == gen { self.video.show(pb) } }
-        }
-        decoder.onError = { [weak self] why in
-            DispatchQueue.main.async { self?.decodeError(gen, why) }
-        }
-        ch.onMessage = { [weak self, weak ch] d in
-            guard let ch else { return }
-            self?.received(d, gen: gen, channel: ch, decoder: decoder, gate: gate)
-        }
-        ch.onClose = { [weak self] err in DispatchQueue.main.async { self?.closed(gen, err) } }
+        attach(conn, gen: gen)
         let label = self.label
         conn.stateUpdateHandler = { [weak self] st in
             switch st {
@@ -233,6 +233,56 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         }
         arm(gen, seconds: 10, what: "connecting")
         conn.start(queue: net)
+    }
+
+    /// A managed session: ask Glide Cloud (waiting for the host's approval), then the relay; the
+    /// loopback connection it hands over is used like a dialed one (§6.6).
+    private func connectCloud(_ c: CloudConnector, gen: Int) {
+        // POST /v1/sessions may wait 60 s for an approval, the relay 60 s for the host.
+        arm(gen, seconds: 150, what: "waiting for the session")
+        c.open(queue: net, status: { [weak self] text in
+            guard let self, self.generation == gen, self.phase == .connecting else { return }
+            self.setStatus(text)
+        }, completion: { [weak self] r in
+            guard let self, self.generation == gen, self.phase == .connecting else {
+                if case let .success(conn) = r { conn.cancel() }
+                return
+            }
+            switch r {
+            case let .failure(f): self.stop(message: f.text)
+            case let .success(conn):
+                self.attach(conn, gen: gen)
+                conn.stateUpdateHandler = { [weak self] st in
+                    switch st {
+                    case .failed, .cancelled: DispatchQueue.main.async { self?.closed(gen, nil) }
+                    default: break
+                    }
+                }
+                self.connected(gen)
+            }
+        })
+    }
+
+    /// The channel, decoder and message handlers for connection attempt `gen`.
+    private func attach(_ conn: NWConnection, gen: Int) {
+        let ch = SecureChannel(connection: conn, queue: net)
+        ch.maxRecordBytes = SecureChannel.preAuthMaxRecord
+        channel = ch
+        let gate = StreamGate()
+        self.gate = gate
+        let decoder = VideoDecoder()
+        decoder.onFrame = { [weak self] pb in
+            DispatchQueue.main.async { if let self, self.generation == gen { self.video.show(pb) } }
+        }
+        decoder.onError = { [weak self] why in
+            DispatchQueue.main.async { self?.decodeError(gen, why) }
+        }
+        let perms = cloud?.permissions
+        ch.onMessage = { [weak self, weak ch] d in
+            guard let ch else { return }
+            self?.received(d, gen: gen, channel: ch, decoder: decoder, gate: gate, permissions: perms)
+        }
+        ch.onClose = { [weak self] err in DispatchQueue.main.async { self?.closed(gen, err) } }
     }
 
     /// Fails attempt `gen` if it hasn't got past the pre-auth phases within `seconds`.
@@ -256,14 +306,17 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         // Pre-auth deadline (PROTOCOL.md §2.4): 5 s for the handshake and PairReveal / ServerHello.
         arm(gen, seconds: 5, what: "waiting for the host")
         let pinned = currentPin()
+        // A managed session never pairs: the cloud named the host key (pinned in memory).
+        if cloud != nil, pinned == nil { stop(message: "Glide Cloud didn't name the computer's key."); return }
         ch.performHandshake(identity: identity, name: Host.current().localizedName ?? "Mac", pinned: pinned,
-                            requestPairing: forcePair || repair, requireOpenPairingWindow: true) { [weak self] res in
+                            requestPairing: cloud == nil && (forcePair || repair), requireOpenPairingWindow: true) { [weak self] res in
             DispatchQueue.main.async { self?.handshakeDone(gen, res) }
         }
     }
 
     private func currentPin() -> Data? {
-        (try? ViewerStore.load())?.pinnedKey(for: target)
+        if let cloud { return cloud.pin?.hostKey }  // relay:<session_id>, never viewer.json
+        return (try? ViewerStore.load())?.pinnedKey(for: target)
     }
 
     private func handshakeDone(_ gen: Int, _ res: Result<SecureChannel.ViewerConnected, Error>) {
@@ -271,6 +324,8 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         switch res {
         case .failure(let e):
             switch e {
+            case SecureChannel.ViewerFailure.hostKeyChanged(_, let presented) where cloud != nil:
+                stop(message: "The computer presented a key (\(GlideHandshake.fingerprint(presented))) that isn't the one Glide Cloud named. Not connecting.")
             case SecureChannel.ViewerFailure.hostKeyChanged(_, let presented):
                 stop(message: ViewerStatusText.hostKeyChanged(host: target.display, presented: presented))
                 showAlert("Host key changed", ViewerStatusText.hostKeyChanged(host: target.display, presented: presented))
@@ -303,7 +358,11 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         sentViewSize = px
         gate.openHello()
         let fps = s?.maximumFramesPerSecond ?? 60
-        ch.send(ViewerHello.message(viewW: px.w, viewH: px.h, maxFps: fps, name: Host.current().localizedName ?? "Mac").encoded)
+        var hello = ViewerHello.message(viewW: px.w, viewH: px.h, maxFps: fps, name: Host.current().localizedName ?? "Mac")
+        if let p = cloud?.permissions, case let .hello(v, caps, w, h, mode, f, n) = hello {
+            hello = .hello(version: v, caps: ManagedPermissions.viewerCaps(caps, p), viewW: w, viewH: h, mode: mode, maxFps: f, name: n)
+        }
+        ch.send(hello.encoded)
     }
 
     private func screenPixels(_ s: NSScreen?) -> (w: Int, h: Int) {
@@ -313,8 +372,10 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
 
     /// Channel callback, on `net`. Video stays on this queue (decoder order = stream order);
     /// everything else goes to the main thread.
-    private func received(_ d: Data, gen: Int, channel ch: SecureChannel, decoder: VideoDecoder, gate: StreamGate) {
+    private func received(_ d: Data, gen: Int, channel ch: SecureChannel, decoder: VideoDecoder, gate: StreamGate, permissions: CloudPermissions?) {
         guard let m = try? HostMessage.decode(d) else { return }  // unknown message types are ignored
+        // Managed sessions also enforce the permissions on what the host sends (§6.3).
+        if let p = permissions, !ManagedPermissions.viewerAccepts(m, p) { return }
         switch m {
         case let .videoFrame(_, _, _, _, sharp, _, data):
             // Fast mode only: no sharp layer, and every base frame is decoded and shown whole.
@@ -370,6 +431,10 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
                 return
             }
             let text = ViewerStatusText.authResult(code, host: label)
+            if cloud != nil {
+                stop(message: "\(label) refused the managed session (\(code)).")
+                return
+            }
             switch code {
             case .unknownViewer:
                 repair = true
@@ -384,10 +449,12 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
             deadlineWork?.cancel()
             backoff.reset()
             hostName = name
-            let t = target, id = connectionID, key = currentPin()
-            ViewerStore.update { c in
-                c.markConnected(id: id, target: t, at: Date())
-                if let key { c.renamePin(t, key: key, name: name) }
+            if cloud == nil {
+                let t = target, id = connectionID, key = currentPin()
+                ViewerStore.update { c in
+                    c.markConnected(id: id, target: t, at: Date())
+                    if let key { c.renamePin(t, key: key, name: name) }
+                }
             }
             print("connected to '\(name)': \(cfg.width)x\(cfg.height) \(cfg.codec)")
             setStatus(nil)
@@ -474,6 +541,11 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
     /// Ends attempt / session `gen` and, unless told otherwise, reconnects with backoff.
     private func failed(_ gen: Int, _ message: String, retryAfter: TimeInterval?) {
         guard gen == generation, phase != .stopped else { return }
+        if cloud != nil {
+            // No automatic retry: it would be a new session request for the host to approve.
+            stop(message: message)
+            return
+        }
         drop()
         let delay = retryAfter ?? backoff.next()
         phase = .idle
@@ -490,6 +562,10 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
     private func closed(_ gen: Int, _ err: Error?) {
         guard gen == generation, phase != .stopped else { return }
         let why = err.map { "\($0)" } ?? "closed"
+        if cloud != nil {
+            stop(message: phase == .streaming ? "The session with \(label) ended." : "\(label) closed the connection (\(why)).")
+            return
+        }
         switch phase {
         case .streaming: failed(gen, "Connection to \(label) lost (\(why))", retryAfter: 1)
         case .pairing: failed(gen, "Pairing failed: the host closed the connection", retryAfter: nil)
@@ -508,6 +584,7 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
         if phase == .streaming { channel?.send(ClientMessage.releaseAll.encoded) }
         channel?.close()
         channel = nil
+        cloud?.close(byUser: false)
         pendingPair = nil
         pairConfirmed = false
         config = nil
@@ -569,6 +646,7 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
     }
 
     func close() {
+        cloud?.close(byUser: phase == .streaming)
         drop()
         retryWork?.cancel()
         phase = .stopped
@@ -631,6 +709,7 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
 
     private func send(_ m: ClientMessage) {
         guard phase == .streaming else { return }
+        if let p = cloud?.permissions, !ManagedPermissions.viewerMaySend(m, p) { return }
         channel?.send(m.encoded)
     }
 
@@ -706,6 +785,7 @@ final class ViewerSession: NSObject, VideoViewInput, KeySink {
     }
 
     fileprivate func windowClosing() {
+        cloud?.close(byUser: phase == .streaming)
         drop()
         retryWork?.cancel()
         retryWork = nil

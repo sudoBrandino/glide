@@ -110,9 +110,10 @@ final class SettingsModel: ObservableObject {
 
     // MARK: General
 
-    var startsAtLogin: Bool { loginItem == .on || loginItem == .onViaScript || loginItem == .needsApproval }
+    var startsAtLogin: Bool { loginItem == .on || loginItem == .onViaScript || loginItem == .needsApproval || loginItem == .managed }
 
     func setStartAtLogin(_ on: Bool) {
+        guard loginItem != .managed else { return }
         do {
             if on {
                 try Instance.enableLoginItem()
@@ -373,12 +374,42 @@ struct SettingsView: View {
 
     // MARK: General
 
+    /// Glide Cloud (ENTERPRISE.md): who manages this Mac and what that changes.
+    @ViewBuilder private var organization: some View {
+        if let g = m.status.managed {
+            Section {
+                LabeledContent("Status", value: g.summary)
+                if let d = g.deviceName { LabeledContent("This Mac in the console", value: d) }
+                if let u = g.cloudURL { LabeledContent("Glide Cloud", value: u) }
+                if let e = g.enrolledAt { LabeledContent("Enrolled", value: SettingsModel.pairedDate(e)) }
+                if g.updateRequired {
+                    Text("This version (\(GlideVersion.version)) is older than your organization's minimum (\(g.minAppVersion ?? "?")). Update Glide Host to accept sessions through Glide Cloud.")
+                        .foregroundStyle(.red).font(.callout).fixedSize(horizontal: false, vertical: true)
+                }
+                if !g.lanAllowed { note("LAN connections are \(g.lanOffReason ?? "off"): viewers connect through Glide Cloud only.") }
+                else if !g.pairingAllowed { note("Pairing new viewers on the local network is turned off by \(g.orgName ?? "your organization").") }
+                ForEach(g.problems, id: \.self) { p in Text(p).font(.callout).foregroundStyle(.orange) }
+            } header: {
+                Text(g.orgName.map { "Managed by \($0)" } ?? "Organization")
+            } footer: {
+                note("People your organization allows connect through Glide Cloud with their work account. You see who is connected in the menu bar and can end the session there at any time.")
+            }
+        }
+    }
+
     private var general: some View {
         Form {
+            organization
             Section {
-                toggle("Start Glide Host at login", m.startsAtLogin) { m.setStartAtLogin($0) }
-                    .disabled(m.loginItem == .onViaScript || !Instance.isAppBundle)
+                if m.loginItem == .managed {
+                    LabeledContent("Start Glide Host at login", value: "Managed by your organization")
+                } else {
+                    toggle("Start Glide Host at login", m.startsAtLogin) { m.setStartAtLogin($0) }
+                        .disabled(m.loginItem == .onViaScript || !Instance.isAppBundle)
+                }
                 switch m.loginItem {
+                case .managed:
+                    note("Your organization's installer starts Glide Host at login for every user of this Mac.")
                 case .needsApproval:
                     HStack {
                         note("Waiting for your approval in System Settings → General → Login Items.")
@@ -410,6 +441,7 @@ struct SettingsView: View {
 
     private var connectionStatus: String {
         let s = m.status
+        if let v = s.viewer, let u = v.cloudUser { return "Connected through Glide Cloud: \(u.label)." }
         if let v = s.viewer { return "Connected: \(v.name) (\(v.address))." }
         var parts: [String] = []
         if s.paused { parts.append("Paused from the menu bar: not accepting or dialing connections.") }
@@ -425,6 +457,10 @@ struct SettingsView: View {
         Form {
             Section {
                 note(connectionStatus)
+                if let g = m.status.managed, !g.lanAllowed {
+                    Text("LAN connections are \(g.lanOffReason ?? "off"). These settings apply again if that changes.")
+                        .font(.callout).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                }
             }
             Section {
                 HStack {
@@ -549,12 +585,14 @@ struct SettingsView: View {
                     } else if open, let until = s.pairingUntil {
                         let left = max(0, Int(until.timeIntervalSinceNow.rounded(.up)))
                         note(String(format: "Pairing is open for %d:%02d. Connect from the PC; both screens show the same code.", left / 60, left % 60))
+                    } else if let g = s.managed, !g.pairingAllowed {
+                        note("Pairing is turned off by \(g.orgName ?? "your organization"). Viewers connect through Glide Cloud.")
                     } else {
                         note("A new viewer proves who it is once, with a code shown on both screens.")
                     }
                     Spacer()
                     if open { Button("Stop Pairing") { m.cancelPairing() } }
-                    else { Button("Pair New Viewer…") { m.pair() }.disabled(s.pairingWith != nil) }
+                    else { Button("Pair New Viewer…") { m.pair() }.disabled(s.pairingWith != nil || s.managed?.pairingAllowed == false) }
                 }
                 LabeledContent("This Mac's key") {
                     Text(s.hostFingerprint ?? "?").font(.system(.body, design: .monospaced)).textSelection(.enabled)

@@ -71,6 +71,21 @@ final class Session: @unchecked Sendable {
     var onAuthenticated: ((Session) -> Void)?
     /// Host is paused: answer new handshakes with status 2.
     var isPaused: () -> Bool = { false }
+    /// Managed session (ENTERPRISE.md §6.6): the Glide Cloud session this bridged connection was
+    /// opened for. Set before `start()`. Such a connection is accepted only for that session's
+    /// grant (never pairing, never a paired key); a LAN connection never uses a grant.
+    var relaySessionId: String?
+    /// LAN mode is on (org policy). A LAN connection is refused while it is off (backstop to the
+    /// server's admission check).
+    var lanAllowed: () -> Bool = { true }
+    /// The live grants (ManagedHost's store).
+    var grants = GrantStore()
+    /// Client audit events of a managed session (§9).
+    var audit: AuditReporter?
+    /// The grant this managed session was accepted with.
+    private(set) var grant: SessionGrant?
+    /// A managed session's permissions (§6.3); nil = LAN session, unrestricted.
+    var permissions: CloudPermissions? { grant?.permissions }
     static let authTimeout: TimeInterval = 5
 
     /// Auth phase (docs/PROTOCOL.md §2.4).
@@ -183,6 +198,9 @@ final class Session: @unchecked Sendable {
         let outbound = outbound
         channel.acceptHandshake(identity: settings.identity, admission: { [weak self] in
             if self?.isPaused() == true { return (GlideHandshake.statusPaused, 0) }
+            // A bridged managed session: pairing is never open over the relay.
+            if self?.relaySessionId != nil { return (GlideHandshake.statusOK, 0) }
+            if let self, !LANGate.admits(relaySessionId: nil, lanAllowed: self.lanAllowed()) { return (GlideHandshake.statusPaused, 0) }
             if !outbound, let left = pc.backoff.blocked(addr) {
                 PeerLog.line(addr, "session \(self?.id ?? 0): \(addr) is rate-limited (\(Int(left.rounded(.up))) s left); refusing")
                 return (GlideHandshake.statusRateLimited, 0)
@@ -220,31 +238,41 @@ final class Session: @unchecked Sendable {
         channel.maxRecordBytes = SecureChannel.preAuthMaxRecord
         channel.startReceiving()
         let pc = PairingController.shared
-        if acc.info.pairRequest {
-            switch pc.window.claim(id) {
-            case .closed:
-                securityLog("session \(id): viewer “\(name)” (\(fp)) at \(address) asked to pair, but pairing isn't open")
-                HostStatus.shared.note("“\(name)” (\(address)) asked to pair — use Pair New Viewer…", warning: true)
-                reject(.pairingClosed)
-            case .busy:
-                securityLog("session \(id): viewer “\(name)” asked to pair while another pairing is in progress")
-                reject(.busy)
-            case .granted:
-                phase = .pairing
-                let code = GlideHandshake.sasCode(handshakeHash: acc.handshakeHash, viewerNonce: acc.info.nonce, hostNonce: acc.hostNonce)
-                log("session \(id): pairing with “\(name)” (\(fp)) at \(address); code \(GlideHandshake.sasText(code))")
-                armDeadline(PairingWindow.confirmTimeout, what: "pairing confirmation")
-                send(.pairReveal(nonce: acc.hostNonce))
-                pc.ask(PendingPairing(sessionId: id, viewerName: name, viewerFingerprint: fp, address: address, code: code) { [weak self] ok in
-                    self?.channel.queue.async { self?.vote.local = ok; self?.evaluateVote() }
-                })
-            }
-        } else if TrustStore.shared.isPaired(acc.viewerKey) {
+        let decision = HostAuth.decide(viewerKey: acc.viewerKey, pairRequest: acc.info.pairRequest, relaySessionId: relaySessionId, grants: grants,
+                                       isPaired: { TrustStore.shared.isPaired($0) }, claimPairing: { pc.window.claim(id) })
+        switch decision {
+        case let .granted(g):
+            // Managed: the cloud named this key for this session. Nothing is pinned (§6.3).
+            grant = g
+            clientName = g.user.label
+            log("session \(id): managed session \(g.sessionId): \(g.user.label) on “\(g.viewerName)” (\(fp)); \(g.permissions.summary)")
             phase = .awaitHello
-        } else {
+        case .paired:
+            phase = .awaitHello
+        case .pair:
+            phase = .pairing
+            let code = GlideHandshake.sasCode(handshakeHash: acc.handshakeHash, viewerNonce: acc.info.nonce, hostNonce: acc.hostNonce)
+            log("session \(id): pairing with “\(name)” (\(fp)) at \(address); code \(GlideHandshake.sasText(code))")
+            armDeadline(PairingWindow.confirmTimeout, what: "pairing confirmation")
+            send(.pairReveal(nonce: acc.hostNonce))
+            pc.ask(PendingPairing(sessionId: id, viewerName: name, viewerFingerprint: fp, address: address, code: code) { [weak self] ok in
+                self?.channel.queue.async { self?.vote.local = ok; self?.evaluateVote() }
+            })
+        case let .reject(code) where relaySessionId != nil:
+            securityLog("session \(id): managed session \(relaySessionId ?? ""): viewer “\(name)” (\(fp)) is not the one the cloud granted (\(code)); closing")
+            HostStatus.shared.note("Refused a managed connection whose key didn't match the session", warning: true)
+            reject(code)
+        case .reject(.pairingClosed):
+            securityLog("session \(id): viewer “\(name)” (\(fp)) at \(address) asked to pair, but pairing isn't open")
+            HostStatus.shared.note("“\(name)” (\(address)) asked to pair — use Pair New Viewer…", warning: true)
+            reject(.pairingClosed)
+        case .reject(.busy):
+            securityLog("session \(id): viewer “\(name)” asked to pair while another pairing is in progress")
+            reject(.busy)
+        case let .reject(code):
             securityLog("session \(id): rejected unknown viewer “\(name)” (\(fp)) from \(address)")
             HostStatus.shared.note("Rejected unknown viewer “\(name)” (\(address))", warning: true)
-            reject(.unknownViewer)
+            reject(code)
         }
     }
 
@@ -338,7 +366,7 @@ final class Session: @unchecked Sendable {
 
     /// Menu "Send Files to Viewer…". False if this viewer can't take files.
     func sendFiles(_ urls: [URL]) -> Bool {
-        guard let f = files else { return false }
+        guard let f = files, f.allowSend else { return false }
         f.send(urls)
         return true
     }
@@ -384,23 +412,42 @@ final class Session: @unchecked Sendable {
             onAuthenticated?(self)
             if ended { return }  // rejected by the server (e.g. paused)
             HostStatus.shared.sessionAuthed(id: id, name: name, endpoint: channel.connection.endpoint, viewW: viewW, viewH: viewH)
+            if let g = grant { HostStatus.shared.managedSession(id: id, grant: g) }
             Power.wakeDisplay()
             displayAssertion = Power.preventDisplaySleep()
             log("session \(id): '\(name)' (\(GlideHandshake.fingerprint(viewerKey ?? Data()))) authenticated from \(peer) (proto v\(version), view \(vw)x\(vh)\(viewW != Int(vw) || viewH != Int(vh) ? " -> \(viewW)x\(viewH)" : ""), caps \(caps.rawValue), mode \(mode), fps \(maxFps))")
             displaysEnabled = caps.contains(.displays)
+            // Managed sessions: the grant's permissions narrow what is offered and accepted (§6.3).
+            let perms = permissions
+            let clipSend = perms.map(ManagedPermissions.hostSendsClipboard) ?? true
+            let clipRecv = perms.map(ManagedPermissions.hostAcceptsClipboard) ?? true
             if caps.contains(.clipboard) && !settings.clipboardEnabled {
                 log("session \(id): clipboard sync off on this host (Settings → Sharing)")
+            } else if caps.contains(.clipboard) && !clipSend && !clipRecv {
+                log("session \(id): clipboard sync not allowed for this managed session")
             } else if caps.contains(.clipboard) {
-                clipboard = ClipboardSync(sessionId: id, syncConcealed: settings.clipboardSyncConcealed) { [weak self] c in self?.send(.clipboard(c)) }
+                let c = ClipboardSync(sessionId: id, syncConcealed: settings.clipboardSyncConcealed, allowSend: clipSend, allowReceive: clipRecv) { [weak self] c in self?.send(.clipboard(c)) }
+                if let g = grant, let audit {
+                    c.onTransfer = { toHost, image, bytes in audit.clipboard(sessionId: g.sessionId, toHost: toHost, image: image, bytes: bytes) }
+                }
+                clipboard = c
             }
-            if caps.contains(.files) && settings.files.enabled {
+            let filesSend = perms.map(ManagedPermissions.hostSendsFiles) ?? true
+            let filesRecv = perms.map(ManagedPermissions.hostAcceptsFiles) ?? true
+            if caps.contains(.files) && settings.files.enabled && (filesSend || filesRecv) {
                 let ch = channel
-                let f = SessionFiles(sessionId: id, viewerName: name, config: settings.files,
+                var fc = settings.files
+                fc.receive = fc.receive && filesRecv
+                let f = SessionFiles(sessionId: id, viewerName: name, config: fc,
+                                     capsFlags: ManagedPermissions.hostFileCapsFlags(perms, receiveSetting: settings.files.receive), allowSend: filesSend,
                                      send: { m, onSent in ch.send(HostMessage.file(m).encoded, completion: onSent.map { f in { _ in f() } }) },
                                      backlog: { ch.bytesInFlight })
+                if let g = grant, let audit {
+                    f.onAudit = { sent, count, bytes, names in audit.files(sent: sent, sessionId: g.sessionId, count: count, bytes: bytes, names: names) }
+                }
                 files = f
                 HostStatus.shared.fileProgress = { f.engine.progress }
-                HostStatus.shared.files(id: id, true)
+                HostStatus.shared.files(id: id, filesSend)
             }
             // Size the virtual display for this viewer (pixels and refresh rate; max_fps is the viewer
             // monitor's refresh), or switch the Mac's display mode if the policy says so, then capture once.
@@ -414,6 +461,13 @@ final class Session: @unchecked Sendable {
         }
         if hostTestMode {  // never inject input or capture in test mode
             if case let .ping(t) = msg { send(.pong(clientTimeUs: t, hostTimeUs: hostTimeMicros())) }
+            return
+        }
+        // Managed sessions enforce their permissions on everything the viewer sends (§6.3).
+        if let p = permissions, !ManagedPermissions.hostAccepts(msg, p) {
+            if case let .file(.offer(fid, _, _)) = msg {
+                send(.file(.answer(id: fid, status: FileStatus.declined, detail: "this session doesn't allow files to this computer")))
+            }
             return
         }
         switch msg {
@@ -554,8 +608,9 @@ final class Session: @unchecked Sendable {
     /// GLIDE_NO_AUDIO=1 turns it off host-side.
     private func setUpAudio(_ p: VideoPipeline, maxInFlight: Int) {
         let envOff = ProcessInfo.processInfo.environment["GLIDE_NO_AUDIO"] == "1"
-        guard !envOff && settings.audioEnabled else {
-            log("session \(id): audio disabled on this host (\(envOff ? "GLIDE_NO_AUDIO=1" : "Settings → Sharing"))")
+        let orgOff = permissions.map { !ManagedPermissions.hostSendsAudio($0) } ?? false
+        guard !envOff && !orgOff && settings.audioEnabled else {
+            log("session \(id): audio disabled on this host (\(envOff ? "GLIDE_NO_AUDIO=1" : orgOff ? "not allowed for this managed session" : "Settings → Sharing"))")
             audioOff = true  // tell the viewer right after ServerHello
             HostStatus.shared.audio(id: id, "off")
             return

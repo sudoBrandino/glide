@@ -10,6 +10,12 @@ final class SettingsController: NSObject {
     private let fullScreen = NSButton(checkboxWithTitle: "Open sessions in full screen", target: nil, action: nil)
     private let fullScreenNote = NSTextField(wrappingLabelWithString: "")
     private let fingerprint: String
+    /// Glide Cloud (ENTERPRISE.md): organization, signed-in user, Sign In / Sign Out.
+    private let orgTitle = NSTextField(labelWithString: "Organization")
+    private let orgStatus = NSTextField(wrappingLabelWithString: "")
+    private let orgButton = NSButton(title: "Sign In…", target: nil, action: nil)
+    /// "Sign In…" was clicked (the app shows the sign-in window).
+    var onSignIn: (() -> Void)?
     /// Command-line flags that override the saved settings for this run.
     private let noRemapFlag: Bool
     private let fullscreenFlag: Bool
@@ -68,7 +74,14 @@ final class SettingsController: NSObject {
         showFile.bezelStyle = .inline
         showFile.controlSize = .small
 
-        let stack = NSStackView(views: [keyboardTitle, remap, remapNote, windowTitle, fullScreen, fullScreenNote, shortcutsTitle, grid, shortcutsNote, keyTitle, keyRow, keyNote, showFile])
+        orgTitle.font = keyTitle.font
+        orgButton.target = self
+        orgButton.action = #selector(orgClicked(_:))
+        let orgRow = NSStackView(views: [orgStatus, orgButton])
+        orgRow.spacing = 8
+        orgRow.alignment = .top
+        let stack = NSStackView(views: [orgTitle, orgRow, keyboardTitle, remap, remapNote, windowTitle, fullScreen, fullScreenNote, shortcutsTitle, grid, shortcutsNote, keyTitle, keyRow, keyNote, showFile])
+        stack.setCustomSpacing(16, after: orgRow)
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 6
@@ -89,7 +102,9 @@ final class SettingsController: NSObject {
             fullScreenNote.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -20),
             shortcutsNote.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -20),
             keyNote.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            orgRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
+        NotificationCenter.default.addObserver(forName: ManagedViewer.changed, object: nil, queue: .main) { [weak self] _ in self?.refreshOrg() }
         window.contentView = content
     }
 
@@ -105,7 +120,27 @@ final class SettingsController: NSObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    private func refreshOrg() {
+        let mv = ManagedViewer.shared
+        orgTitle.isHidden = !mv.isManaged
+        orgStatus.superview?.isHidden = !mv.isManaged
+        guard mv.isManaged else { return }
+        var lines = [mv.status?.summary ?? "Managed"]
+        if let u = mv.user { lines.append("Signed in as \(u.label)") } else if mv.isEnrolled { lines.append("Not signed in") }
+        if let d = mv.status?.deviceName { lines.append("This Mac: \(d)") }
+        if let why = mv.lanBlockedReason { lines.append("LAN connections are \(why).") }
+        if mv.policy.updateRequired { lines.append("Update required: \(mv.orgName) requires \(mv.policy.minAppVersion ?? "?") or later.") }
+        orgStatus.stringValue = lines.joined(separator: "\n")
+        orgButton.title = mv.isSignedIn ? "Sign Out" : "Sign In…"
+        orgButton.isEnabled = mv.isEnrolled
+    }
+
+    @objc private func orgClicked(_ sender: Any?) {
+        if ManagedViewer.shared.isSignedIn { ManagedViewer.shared.signOut() } else { onSignIn?() }
+    }
+
     private func refresh() {
+        refreshOrg()
         let c: ViewerConfig
         do { c = try ViewerStore.load() } catch {
             remap.isEnabled = false

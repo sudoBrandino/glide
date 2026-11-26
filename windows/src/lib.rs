@@ -9,6 +9,7 @@ pub mod audio;
 pub mod bench;
 pub mod blockcode;
 pub mod clipboard;
+pub mod cloud;
 pub mod config;
 pub mod connbar;
 pub mod connections;

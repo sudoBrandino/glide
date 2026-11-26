@@ -26,6 +26,29 @@ final class HostStatus: @unchecked Sendable {
         var audio: String?
         /// The viewer negotiated file transfer (§6).
         var files = false
+        /// Managed session (ENTERPRISE.md): who is connected, the cloud session and its permissions.
+        var cloudUser: CloudUser?
+        var cloudSessionId: String?
+        var permissions: CloudPermissions?
+    }
+
+    /// Glide Cloud membership, for the menu and Settings (nil = not managed).
+    struct Managed: Equatable {
+        var summary: String
+        var orgName: String?
+        var deviceName: String?
+        var deviceId: String?
+        var cloudURL: String?
+        var enrolledAt: String?
+        var enrolled = false
+        var connected = false
+        var lanAllowed = true
+        /// Why LAN mode is off ("turned off by Example Corp").
+        var lanOffReason: String?
+        var pairingAllowed = true
+        var updateRequired = false
+        var minAppVersion: String?
+        var problems: [String] = []
     }
 
     /// A finished (or failed) file transfer, for the menu's Recent Transfers.
@@ -59,6 +82,9 @@ final class HostStatus: @unchecked Sendable {
         var hostFingerprint: String?
         /// Newest first, at most 8.
         var transfers: [Transfer] = []
+        var managed: Managed?
+        /// A managed session waiting for the approval prompt's answer (the user's label).
+        var pendingApproval: String?
 
         var phase: Phase {
             if paused { return .paused }
@@ -120,6 +146,10 @@ final class HostStatus: @unchecked Sendable {
             if var n = s.note, n.text == text { n.count += 1; n.at = Date(); s.note = n }
             else { s.note = Note(text: text, at: Date(), warning: warning) }
         }
+    }
+
+    func managedSession(id: Int, grant g: SessionGrant) {
+        updateViewer(id) { $0.cloudUser = g.user; $0.cloudSessionId = g.sessionId; $0.permissions = g.permissions; $0.address = "Glide Cloud" }
     }
 
     func sessionEnded(id: Int) { update { s in if s.viewer?.sessionId == id { s.viewer = nil } } }

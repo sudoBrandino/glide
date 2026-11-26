@@ -175,12 +175,20 @@ pub fn disable() {
     *c.pending.lock().unwrap() = None;
 }
 
+/// Managed session: a `session.clipboard` audit event (direction, kind, size; never contents).
+fn audit(data: &ClipboardData, to_host: bool) {
+    let image = data.png.is_some();
+    let bytes = data.png.as_ref().map(|p| p.len()).or(data.text.as_ref().map(|t| t.len())).unwrap_or(0);
+    super::managed::audit(|q, sid| q.clipboard(sid, to_host, image, bytes));
+}
+
 /// Receiver thread: a Clipboard message from the host.
 pub fn incoming(data: ClipboardData) {
     let Some(c) = CLIP.get() else { return };
     if c.peer.lock().unwrap().is_none() || !is_active() {
         return; // host didn't negotiate (§5), or the user switched sync off: ignore
     }
+    audit(&data, false);
     let _ = c.jobs.lock().unwrap().send(Job::Incoming(data));
 }
 
@@ -435,8 +443,10 @@ fn worker(rx: mpsc::Receiver<Job>) {
                     let sender = c.peer.lock().unwrap().as_ref().filter(|p| p.generation == generation).map(|p| p.sender.clone());
                     if let Some(s) = sender {
                         eprintln!("clipboard -> host: {}", data.describe());
-                        if let Err(e) = s.send(&ClientMsg::Clipboard(data)) {
-                            eprintln!("clipboard: send failed: {e}");
+                        let (image, bytes) = (data.png.is_some(), data.png.as_ref().map(|p| p.len()).or(data.text.as_ref().map(|t| t.len())).unwrap_or(0));
+                        match s.send(&ClientMsg::Clipboard(data)) {
+                            Ok(()) => super::managed::audit(|q, sid| q.clipboard(sid, true, image, bytes)),
+                            Err(e) => eprintln!("clipboard: send failed: {e}"),
                         }
                     }
                 }

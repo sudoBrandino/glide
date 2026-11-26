@@ -16,6 +16,11 @@ final class ClipboardSync: @unchecked Sendable {
     /// Also send pasteboard content marked org.nspasteboard.ConcealedType (host.json
     /// `clipboard.syncConcealed`, default false).
     private let syncConcealed: Bool
+    /// Managed session permissions (ENTERPRISE.md §6.3): Mac -> viewer and viewer -> Mac.
+    private let allowSend: Bool
+    private let allowReceive: Bool
+    /// Called after each transfer (managed sessions: the audit event; never the contents).
+    var onTransfer: ((_ toHost: Bool, _ image: Bool, _ bytes: Int) -> Void)?
 
     // Main-thread state.
     private var echo = ClipboardEchoGuard()
@@ -23,9 +28,11 @@ final class ClipboardSync: @unchecked Sendable {
     private var seq: UInt32 = 0
     private var stopped = false
 
-    init(sessionId: Int, syncConcealed: Bool = false, send: @escaping (ClipboardData) -> Void) {
+    init(sessionId: Int, syncConcealed: Bool = false, allowSend: Bool = true, allowReceive: Bool = true, send: @escaping (ClipboardData) -> Void) {
         self.sessionId = sessionId
         self.syncConcealed = syncConcealed
+        self.allowSend = allowSend
+        self.allowReceive = allowReceive
         self.sendMessage = send
     }
 
@@ -35,6 +42,10 @@ final class ClipboardSync: @unchecked Sendable {
     func start() {
         DispatchQueue.main.async { [self] in
             guard !stopped, timer == nil else { return }
+            guard allowSend else {
+                log("sync: viewer -> Mac only (this session doesn't allow sending the Mac's clipboard)")
+                return
+            }
             echo.baseline(marker: NSPasteboard.general.changeCount)
             let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.poll() }
             t.tolerance = 0.05
@@ -87,6 +98,7 @@ final class ClipboardSync: @unchecked Sendable {
                 if self.stopped { return }
                 self.log("-> viewer: \(c.summary)")
                 self.sendMessage(c)
+                self.onTransfer?(false, c.png != nil && c.text == nil, c.payloadBytes)
             case let .failure(r): self.log(r.reason)
             }
         }
@@ -103,6 +115,7 @@ final class ClipboardSync: @unchecked Sendable {
 
     /// Apply a clipboard received from the viewer. Callable from any thread.
     func apply(_ c: ClipboardData) {
+        guard allowReceive else { return log("<- viewer: dropped (this session doesn't allow the viewer's clipboard)") }
         work.async { [self] in
             switch ClipboardPasteboard.prepare(c) {
             case let .failure(r): log("\(r.reason) (seq \(c.seq))")
@@ -116,6 +129,7 @@ final class ClipboardSync: @unchecked Sendable {
                     }
                     echo.didApply(hash: hash, marker: ClipboardPasteboard.write(data, tiff: tiff, to: pb))
                     log("<- viewer: \(data.summary)")
+                    onTransfer?(true, c.png != nil && c.text == nil, c.payloadBytes)
                 }
             }
         }

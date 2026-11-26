@@ -22,18 +22,31 @@ pub struct TrayActions {
     pub unpair: Box<dyn Fn(&str) + Send>,
     pub config_path: std::path::PathBuf,
     pub quit: Box<dyn Fn() + Send>,
+    /// The organization's pairing setting allows "Pair New Mac…" (managed mode).
+    pub pairing_allowed: Box<dyn Fn() -> bool + Send>,
+    /// Managed mode status line ("Managed by Acme (Glide Cloud)"); None = not managed.
+    pub cloud_status: Box<dyn Fn() -> Option<String> + Send>,
+    /// The managed session's indicator ("Ada (ada@example.com) is connected"), if one runs.
+    pub cloud_session: Box<dyn Fn() -> Option<String> + Send>,
+    /// End the managed session.
+    pub end_session: Box<dyn Fn() + Send>,
 }
 
 const WM_TRAY: u32 = WM_APP + 1;
 const ID_PAIR: usize = 1;
 const ID_CONFIG: usize = 2;
 const ID_QUIT: usize = 3;
+const ID_END_SESSION: usize = 4;
+/// Refreshes the tooltip (the managed session indicator).
+const TIP_TIMER: usize = 1;
+const DEFAULT_TIP: &str = "Glide Host — this PC can be controlled from a paired Mac";
 const ID_UNPAIR_BASE: usize = 100;
 
 struct State {
     actions: TrayActions,
     keys: Vec<(String, String)>,
     icon: HICON,
+    tip: String,
 }
 
 thread_local! {
@@ -55,6 +68,10 @@ fn wcopy(dst: &mut [u16], s: &str) {
 }
 
 fn icon_data(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
+    icon_data_tip(hwnd, icon, DEFAULT_TIP)
+}
+
+fn icon_data_tip(hwnd: HWND, icon: HICON, tip: &str) -> NOTIFYICONDATAW {
     let mut d = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
@@ -64,7 +81,7 @@ fn icon_data(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
         hIcon: icon,
         ..Default::default()
     };
-    wcopy(&mut d.szTip, "Glide Host — this PC can be controlled from a paired Mac");
+    wcopy(&mut d.szTip, tip);
     d.Anonymous.uVersion = NOTIFYICON_VERSION_4;
     d
 }
@@ -86,13 +103,14 @@ pub fn start(actions: TrayActions) {
         };
         let size = GetSystemMetrics(SM_CXSMICON);
         let icon = crate::win::prompt::app_icon(size).or_else(|| LoadIconW(None, IDI_APPLICATION).ok()).unwrap_or_default();
-        STATE.with(|s| *s.borrow_mut() = Some(State { actions, keys: Vec::new(), icon }));
+        STATE.with(|s| *s.borrow_mut() = Some(State { actions, keys: Vec::new(), icon, tip: DEFAULT_TIP.into() }));
         let d = icon_data(hwnd, icon);
         if Shell_NotifyIconW(NIM_ADD, &d).as_bool() {
             let _ = Shell_NotifyIconW(NIM_SETVERSION, &d);
         } else {
             log("tray: couldn't add the notification icon (no shell?); use the console commands");
         }
+        SetTimer(Some(hwnd), TIP_TIMER, 1000, None);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -114,12 +132,36 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             LRESULT(0)
         }
+        WM_TIMER if wp.0 == TIP_TIMER => {
+            // The persistent "NAME (email) is connected" indicator of a managed session (§3.2).
+            STATE.with(|s| {
+                let mut s = s.borrow_mut();
+                let Some(st) = s.as_mut() else { return };
+                let tip = match (st.actions.cloud_session)() {
+                    Some(label) => format!("Glide Host — {label}"),
+                    None => DEFAULT_TIP.to_string(),
+                };
+                if tip != st.tip {
+                    let mut d = icon_data_tip(hwnd, st.icon, &tip);
+                    if tip != DEFAULT_TIP {
+                        // Also say it once in a notification.
+                        d.uFlags |= NIF_INFO;
+                        wcopy(&mut d.szInfoTitle, "Glide Host");
+                        wcopy(&mut d.szInfo, &format!("{} — you can end the session from this icon.", tip.trim_start_matches("Glide Host — ")));
+                    }
+                    let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
+                    st.tip = tip;
+                }
+            });
+            LRESULT(0)
+        }
         WM_COMMAND => {
             let id = wp.0 & 0xFFFF;
             STATE.with(|s| {
                 let s = s.borrow();
                 let Some(st) = s.as_ref() else { return };
                 match id {
+                    ID_END_SESSION => (st.actions.end_session)(),
                     ID_PAIR => (st.actions.pair)(),
                     ID_CONFIG => {
                         let p = wide(&format!("\"{}\"", st.actions.config_path.display()));
@@ -173,9 +215,21 @@ unsafe fn show_menu(hwnd: HWND) {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         let Some(st) = s.as_mut() else { return };
-        match (st.actions.pairing_left)() {
-            Some(left) => add(m, ID_PAIR, &format!("Pair New Mac… (open, {}:{:02} left)", left / 60, left % 60), MF_ENABLED),
-            None => add(m, ID_PAIR, "Pair New Mac…", MF_ENABLED),
+        if let Some(status) = (st.actions.cloud_status)() {
+            add(m, 0, &status.replace('&', "&&"), MF_GRAYED);
+            if let Some(label) = (st.actions.cloud_session)() {
+                add(m, 0, &label.replace('&', "&&"), MF_GRAYED);
+                add(m, ID_END_SESSION, "End session", MF_ENABLED);
+            }
+            let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+        }
+        if !(st.actions.pairing_allowed)() {
+            add(m, ID_PAIR, "Pair New Mac… (turned off by your organization)", MF_GRAYED);
+        } else {
+            match (st.actions.pairing_left)() {
+                Some(left) => add(m, ID_PAIR, &format!("Pair New Mac… (open, {}:{:02} left)", left / 60, left % 60), MF_ENABLED),
+                None => add(m, ID_PAIR, "Pair New Mac…", MF_ENABLED),
+            }
         }
         let paired = (st.actions.paired)();
         st.keys = paired.iter().map(|(n, _, k)| (n.clone(), k.clone())).collect();

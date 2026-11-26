@@ -56,7 +56,7 @@ final class SetupModel: ObservableObject {
 
     var allDone: Bool {
         installer == nil && inApplications && loginItem != .off && loginItem != .needsApproval
-            && screen == .ok && !screenNeedsRestart && accessibility == .ok && !paired.isEmpty
+            && screen == .ok && !screenNeedsRestart && accessibility == .ok && (!paired.isEmpty || status.managed?.enrolled == true)
     }
 
     func start() {
@@ -282,6 +282,7 @@ struct SetupView: View {
         case .onViaScript: state = .done; detail = "Started at login by the LaunchAgent the install script set up."
         case .needsApproval: state = .todo; detail = "Allow Glide Host in System Settings → General → Login Items."
         case .off: state = m.inApplications ? .todo : .waiting; detail = "So the Mac is reachable after a restart, without logging in to open it by hand."
+        case .managed: state = .done; detail = "Managed by your organization: Glide Host starts at login for every user."
         }
         return Row(state: state, title: "Start at login", detail: detail) {
             AnyView(Group {
@@ -354,17 +355,23 @@ struct SetupView: View {
         }
     }
 
-    private var pairRow: some View {
+    private var pairRow: AnyView {
         let s = m.status
         let open = s.pairingUntil.map { $0 > Date() } ?? false
         let detail: String
+        if let g = s.managed, g.enrolled, !g.pairingAllowed {
+            // Managed: viewers come through Glide Cloud; nothing to pair.
+            return AnyView(Row(state: .done, title: "Viewers", detail: "Managed by \(g.orgName ?? "your organization"): people connect through Glide Cloud with their work account.") {
+                EmptyView()
+            })
+        }
         if open { detail = "Pairing is open for 2 minutes. Open Glide on the PC: both screens show the same code; confirm on both." }
         else if m.paired.isEmpty { detail = "The PC proves who it is once, with a code shown on both screens. After that it connects on its own." }
         else { detail = "Paired: " + m.paired.map(\.name).joined(separator: ", ") + "." }
-        return Row(state: m.paired.isEmpty ? (open ? .waiting : .todo) : .done, title: "Pair the PC", detail: detail) {
+        return AnyView(Row(state: m.paired.isEmpty ? (open ? .waiting : .todo) : .done, title: "Pair the PC", detail: detail) {
             if open { Button("Stop Pairing") { m.cancelPairing() } }
             else { Button(m.paired.isEmpty ? "Pair a Viewer…" : "Pair Another Viewer…") { m.pair() } }
-        }
+        })
     }
 }
 
