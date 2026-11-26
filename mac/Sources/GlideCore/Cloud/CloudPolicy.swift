@@ -52,6 +52,22 @@ public enum LANGate {
     }
 }
 
+/// The Mac viewer's side of the LAN settings (§6.7, §7). A managed (relayed) session is never
+/// affected; a LAN one never pairs while pairing is off and ends at once when LAN mode is off.
+public enum ViewerLANGate {
+    /// The viewer may ask for (or go along with) a LAN pairing.
+    public static func mayPair(managedSession: Bool, policy: ManagedPolicy) -> Bool {
+        !managedSession && policy.localPairingAllowed
+    }
+
+    /// A LAN session (connecting, pairing or streaming) must end now: LAN mode is off, or it is
+    /// pairing while pairing is off.
+    public static func mustEnd(managedSession: Bool, pairing: Bool, policy: ManagedPolicy) -> Bool {
+        guard !managedSession else { return false }
+        return !policy.lanAllowed || (pairing && !policy.localPairingAllowed)
+    }
+}
+
 /// Dotted numeric versions ("0.3.1", "1.0", "0.4.0-beta.2": the suffix is ignored).
 public enum AppVersion {
     public static func components(_ v: String) -> [Int] {
@@ -87,6 +103,10 @@ public enum ManagedPermissions {
     /// Host → viewer files (menu, or the viewer's pull of copied files).
     public static func hostSendsFiles(_ p: CloudPermissions) -> Bool { p.files.toViewerAllowed }
     public static func hostSendsAudio(_ p: CloudPermissions) -> Bool { p.audio }
+    /// Whether the viewer's size may change this Mac's display mode or resolution (switching the
+    /// mode, sizing a virtual display). View only (§6.7): the size still drives scaling, nothing
+    /// more. nil = LAN session.
+    public static func hostAdaptsDisplay(_ p: CloudPermissions?) -> Bool { p?.control ?? true }
 
     /// Whether the host processes `m` from the viewer. Dropped messages are ignored silently
     /// (file offers are declined by the transfer engine, whose `receive` is off). ReleaseAll is
@@ -142,7 +162,7 @@ public enum ManagedPermissions {
             case .cancel: return true
             case .caps, .pullResult: return false
             }
-        case .audioEnable(let on): return !on || p.audio
+        case .audioEnable: return p.audio  // §6.7: no AudioEnable at all without audio
         case .hello, .viewSize, .requestKeyframe, .setMode, .ping, .pairConfirm, .latencyEnable, .latencyReport, .selectDisplay:
             return true
         }
@@ -176,7 +196,7 @@ public enum ManagedPermissions {
     }
 }
 
-/// How the host answers a `session_offer` (§6.4).
+/// How the host answers a `session_offer` (§6.4, §6.7).
 public enum OfferDecision: Equatable, Sendable {
     case accept
     /// Show the approval prompt (Decline default, Accept after 1 s, auto-decline after 50 s).
@@ -187,7 +207,8 @@ public enum OfferDecision: Equatable, Sendable {
     public static let promptTimeout: TimeInterval = 50
     public static let acceptDelay: TimeInterval = 1
 
-    /// - busy: a viewer session (LAN or managed) is active or another offer is being prompted.
+    /// - busy: any viewer session (LAN or managed) runs, or another offer is being prompted:
+    ///   declined with `busy` without prompting.
     /// - paused: the host refuses connections (menu bar → Pause).
     public static func decide(_ o: SessionOffer, cloudURL: URL, busy: Bool, paused: Bool, updateRequired: Bool, now: Date = Date()) -> OfferDecision {
         if updateRequired { return .decline("policy") }
@@ -197,30 +218,39 @@ public enum OfferDecision: Equatable, Sendable {
         }
         if let exp = CloudTime.parse(o.expiresAt), exp <= now { return .decline("timeout") }
         if paused { return .decline("declined") }
+        if busy { return .decline("busy") }
         switch o.approval {
-        case .none: return busy ? .decline("busy") : .accept
+        case .none: return .accept
         case .required: return .prompt
         }
     }
+
+    /// After the prompt: accepted in time and still idle, else the decline reason.
+    public static func afterPrompt(accepted: Bool, reason: String, expiresAt: String?, busy: Bool, now: Date = Date()) -> OfferDecision {
+        guard accepted else { return .decline(reason.isEmpty ? "declined" : reason) }
+        if let exp = CloudTime.parse(expiresAt), exp <= now { return .decline("timeout") }
+        if busy { return .decline("busy") }
+        return .accept
+    }
 }
 
-/// The relay socket URL: `relay_url` + `?ticket=` (§6.2, §6.5). The relay must be on the cloud's
-/// own host (wss, or ws for a loopback development cloud) and its path must end in the session
-/// id: a ticket is never sent anywhere else.
+/// The relay socket URL: `relay_url` + `?ticket=` (§6.2, §6.5, §6.7). It must be exactly
+/// `wss://<CloudURL host:port>/v1/relay/<session_id>` (ws only for a loopback development cloud
+/// on plain http), with no query, fragment or user info: a ticket is never sent anywhere else.
 public enum RelayEndpoint {
     public static func url(_ relayURL: String, ticket: String, sessionId: String, cloudURL: URL) -> URL? {
         guard var c = URLComponents(string: relayURL), let scheme = c.scheme?.lowercased(), let host = c.host?.lowercased(),
-              let cloudHost = cloudURL.host?.lowercased(), host == cloudHost, c.user == nil, c.password == nil else { return nil }
+              let cloudHost = cloudURL.host?.lowercased(), host == cloudHost, c.user == nil, c.password == nil,
+              c.query == nil, c.fragment == nil else { return nil }
         let cloudSecure = cloudURL.scheme?.lowercased() == "https"
         switch scheme {
         case "wss": break
         case "ws" where !cloudSecure && ManagedConfig.isLoopback(host): break
         default: return nil
         }
-        guard CloudID.isValid(sessionId), c.path.hasSuffix("/" + sessionId), (c.port ?? defaultPort(scheme)) == (cloudURL.port ?? defaultPort(cloudURL.scheme ?? "")) else { return nil }
-        var items = (c.queryItems ?? []).filter { $0.name != "ticket" }
-        items.append(URLQueryItem(name: "ticket", value: ticket))
-        c.queryItems = items
+        guard CloudID.isValid(sessionId), c.percentEncodedPath == "/v1/relay/" + sessionId,
+              (c.port ?? defaultPort(scheme)) == (cloudURL.port ?? defaultPort(cloudURL.scheme ?? "")) else { return nil }
+        c.queryItems = [URLQueryItem(name: "ticket", value: ticket)]
         // `+` is legal in a query but some servers read it as a space: encode it.
         c.percentEncodedQuery = c.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         return c.url
@@ -261,4 +291,25 @@ public struct CloudBackoff: Sendable {
     }
 
     public mutating func reset() { attempt = 0 }
+}
+
+/// The host's approval prompt text (§6.4, §6.7): it names the user (and email), says "see and
+/// control" or "see (view only)" according to `permissions.control`, and shows only cleaned
+/// names (CloudText).
+public enum ApprovalText {
+    public static func title(_ o: SessionOffer) -> String { "Allow \(o.user.label) to connect to this Mac?" }
+
+    /// "see and control this Mac" / "see this Mac (view only)".
+    public static func access(_ p: CloudPermissions) -> String {
+        p.control ? "see and control this Mac" : "see this Mac (view only)"
+    }
+
+    public static func body(_ o: SessionOffer, orgName: String?) -> String {
+        let viewer = CloudText.name(o.viewer.name, fallback: "unnamed viewer")
+        let org = CloudText.name(orgName ?? "", fallback: "your organization")
+        return ["\(o.user.label) asked to \(access(o.permissions)) from “\(viewer)” through \(org)'s Glide Cloud.",
+                "Allowed: \(o.permissions.summary).",
+                "You can end the session at any time from the Glide menu. If you didn't expect this, click Decline."]
+            .joined(separator: "\n\n")
+    }
 }

@@ -193,16 +193,26 @@ public final class CloudClient: @unchecked Sendable {
     }
 
     /// Waits for the host's answer: up to 60 s with approval (§5.3), so the request may take 75 s.
+    /// An answer missing a security field is rejected (§6.7); when its `session_id` is known the
+    /// session is ended at once, since this side won't use it.
     public func createSession(hostId: String, viewOnly: Bool = false) async throws -> SessionResponse {
         guard CloudID.isValid(hostId) else { throw CloudError.invalid("bad host id") }
         let body = try encode(SessionRequest(hostId: hostId, viewOnly: viewOnly ? true : nil))
-        return try decode(SessionResponse.self, try await call("POST", "/v1/sessions", auth: .user, body: body, timeout: 75))
+        let data = try await call("POST", "/v1/sessions", auth: .user, body: body, timeout: 75)
+        do { return try decode(SessionResponse.self, data) } catch {
+            struct Probe: Decodable { let session_id: String? }
+            if let sid = (try? JSONDecoder().decode(Probe.self, from: data))?.session_id, CloudID.isValid(sid) {
+                try? await endSession(sid, as: .user)
+            }
+            throw error
+        }
     }
 
-    /// `as`: `.user` for the session's viewer, `.device` for its host.
+    /// `as`: `.user` for the session's viewer, `.device` for its host. Idempotent; a `404` (the
+    /// session is gone, or this side isn't part of it any more) counts as ended.
     public func endSession(_ id: String, as auth: Auth) async throws {
         guard CloudID.isValid(id) else { throw CloudError.invalid("bad session id") }
-        try await call("POST", "/v1/sessions/\(id)/end", auth: auth, body: Data("{}".utf8))
+        do { try await call("POST", "/v1/sessions/\(id)/end", auth: auth, body: Data("{}".utf8)) } catch let e as CloudError where e.status == 404 {}
     }
 
     /// The hub socket request (`GET /v1/hub`, device bearer).
@@ -216,44 +226,84 @@ public final class CloudClient: @unchecked Sendable {
     }
 }
 
-/// The viewer's polling of `POST /v1/auth/device/token` (RFC 8628 §3.5).
+/// The viewer's polling of `POST /v1/auth/device/token` (RFC 8628 §3.5, ENTERPRISE.md §6.7).
 public enum DeviceAuthPoll: Equatable {
+    /// Pending or slow_down: poll again after `interval` (the new steady interval).
     case keepPolling(interval: TimeInterval)
+    /// A network error, `429` or `5xx`: try again after `after` (at least the interval, backing
+    /// off); the steady interval is unchanged.
+    case retry(after: TimeInterval)
     case failed(String)
 
-    /// What to do after a poll failed with `error`; `interval` is the current interval.
-    public static func next(after error: CloudError, interval: TimeInterval) -> DeviceAuthPoll {
+    /// Longest wait between retries after transient failures (unless the interval is longer).
+    public static let maxRetryDelay: TimeInterval = 60
+
+    /// A failure worth retrying: network, `429`, `5xx`.
+    public static func isTransient(_ e: CloudError) -> Bool {
+        switch e {
+        case .transport: return true
+        case let .http(status, _, _): return status == 429 || (500..<600).contains(status)
+        case .decoding, .invalid: return false
+        }
+    }
+
+    /// What to do after a poll failed with `error`; `interval` is the current interval and
+    /// `failures` the transient failures in a row before this one.
+    public static func next(after error: CloudError, interval: TimeInterval, failures: Int = 0) -> DeviceAuthPoll {
         switch error.code {
         case "authorization_pending": return .keepPolling(interval: interval)
         case "slow_down": return .keepPolling(interval: interval + 5)
         case "expired_token": return .failed("The sign-in code expired. Start again.")
         case "access_denied": return .failed("Sign-in was denied.")
         default:
-            if case .transport = error { return .keepPolling(interval: interval) }  // a network hiccup: try again
-            return .failed(error.description)
+            guard isTransient(error) else { return .failed(error.description) }
+            let backoff = interval * pow(2, Double(min(failures + 1, 10)))
+            return .retry(after: max(interval, min(backoff, maxRetryDelay)))
         }
     }
 
-    /// Polls until approved, failed, expired (`expiresIn`) or `isCancelled()`.
-    public static func run(client: CloudClient, start: DeviceAuthStart, isCancelled: @escaping () -> Bool) async -> Result<DeviceTokenResponse, CloudError> {
+    /// Polls until approved, failed, expired (`expiresIn`) or `isCancelled()`. A final HTTP error
+    /// other than the RFC 8628 codes comes back as is (a `401` means the device was revoked).
+    /// `now` and `sleep` are injectable for tests.
+    public static func run(client: CloudClient, start: DeviceAuthStart, isCancelled: @escaping () -> Bool,
+                           now: @escaping () -> Date = Date.init,
+                           sleep: @escaping (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1e9)) }) async -> Result<DeviceTokenResponse, CloudError> {
         var interval = TimeInterval(max(start.interval, 1))
-        let deadline = Date().addingTimeInterval(TimeInterval(max(start.expiresIn, 30)))
-        while Date() < deadline {
-            try? await Task.sleep(nanoseconds: UInt64(interval * 1e9))
+        var wait = interval
+        var failures = 0
+        let deadline = now().addingTimeInterval(TimeInterval(max(start.expiresIn, 30)))
+        while now() < deadline {
+            await sleep(wait)
             if isCancelled() { return .failure(.invalid("cancelled")) }
+            if now() >= deadline { break }
             do {
                 return .success(try await client.deviceAuthToken(deviceCode: start.deviceCode))
             } catch let e as CloudError {
-                switch next(after: e, interval: interval) {
-                case let .keepPolling(i): interval = i
-                case let .failed(why): return .failure(.invalid(why))
+                switch next(after: e, interval: interval, failures: failures) {
+                case let .keepPolling(i): interval = i; wait = i; failures = 0
+                case let .retry(after): wait = after; failures += 1
+                case let .failed(why):
+                    if case .http = e, e.code != "expired_token", e.code != "access_denied" { return .failure(e) }
+                    return .failure(.invalid(why))
                 }
             } catch {
-                return .failure(.transport("\(error)"))
+                wait = interval; failures += 1
             }
         }
         return .failure(.invalid("The sign-in code expired. Start again."))
     }
+}
+
+/// Enrollment retries (§6.7): final only on `401 invalid_enrollment_token` or `409
+/// device_revoked`; everything else retries with backoff from 5 s doubling to 10 min (±20 %).
+public enum EnrollRetry {
+    public static func backoff() -> CloudBackoff { CloudBackoff(initial: 5, max: 600, jitter: 0.2) }
+
+    /// The token was refused for good.
+    public static func isTokenRefused(_ e: CloudError) -> Bool { e.status == 401 && e.code == "invalid_enrollment_token" }
+    /// This device's key was revoked.
+    public static func isRevoked(_ e: CloudError) -> Bool { e.status == 409 && e.code == "device_revoked" }
+    public static func isFinal(_ e: CloudError) -> Bool { isTokenRefused(e) || isRevoked(e) }
 }
 
 /// This Mac, for enrollment and heartbeats.

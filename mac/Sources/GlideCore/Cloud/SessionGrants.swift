@@ -22,7 +22,7 @@ public struct SessionGrant: Equatable, Sendable {
         guard o.viewer.publicKey.count == 64, let key = Data(hex: o.viewer.publicKey), key.count == 32 else { return nil }
         let cap = now.addingTimeInterval(maxLifetime)
         let exp = CloudTime.parse(o.expiresAt).map { min($0, cap) } ?? cap
-        self.init(sessionId: o.sessionId, viewerKey: key, viewerName: PairedViewer.displayName(o.viewer.name), user: o.user,
+        self.init(sessionId: o.sessionId, viewerKey: key, viewerName: CloudText.name(o.viewer.name, fallback: "unnamed viewer"), user: o.user,
                   permissions: o.permissions, expiresAt: exp)
     }
 }
@@ -75,7 +75,7 @@ public struct RelayPin: Equatable, Sendable {
         guard CloudID.isValid(r.sessionId), r.host.publicKey.count == 64, let k = Data(hex: r.host.publicKey), k.count == 32 else { return nil }
         sessionId = r.sessionId
         hostKey = k
-        hostName = PairedViewer.displayName(r.host.name)
+        hostName = CloudText.name(r.host.name, fallback: "the computer")
     }
 
     public var target: String { "relay:\(sessionId)" }

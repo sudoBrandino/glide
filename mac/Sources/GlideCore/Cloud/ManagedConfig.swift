@@ -6,6 +6,9 @@ import Foundation
 /// Preferences`; tests pass a dictionary.
 public protocol ManagedConfigSource {
     func value(forKey key: String) -> Any?
+    /// True when an administrator set `key` (a configuration profile), not a user or a process
+    /// writing ordinary preferences (ENTERPRISE.md §6.7).
+    func isForced(_ key: String) -> Bool
 }
 
 /// `CFPreferencesCopyAppValue` in a preference domain (sees managed preferences first).
@@ -24,15 +27,21 @@ public struct PreferencesSource: ManagedConfigSource {
     public func isForced(_ key: String) -> Bool { CFPreferencesAppValueIsForced(key as CFString, domain as CFString) }
 }
 
-/// A fixed set of values (tests, `GLIDE_CLOUD_*` development overrides).
+/// A fixed set of values (tests). `forced`: the keys an administrator set; nil = every key
+/// (as if all came from a configuration profile).
 public struct DictionarySource: ManagedConfigSource {
     public var values: [String: Any]
-    public init(_ values: [String: Any]) { self.values = values }
+    public var forced: Set<String>?
+    public init(_ values: [String: Any], forced: Set<String>? = nil) { self.values = values; self.forced = forced }
     public func value(forKey key: String) -> Any? { values[key] }
+    public func isForced(_ key: String) -> Bool { forced?.contains(key) ?? (values[key] != nil) }
 }
 
-/// The managed configuration (ENTERPRISE.md §11.1). A device is configured for Glide Cloud when
-/// both `CloudURL` and `EnrollmentToken` are valid; `DisableLANMode` applies on its own.
+/// The managed configuration (ENTERPRISE.md §11.1, §6.7). A device is configured for Glide Cloud
+/// when both `CloudURL` and `EnrollmentToken` are valid. Those (and `DeviceName` and `Tags`, which
+/// go into the enrollment) count only when an administrator forced them; a value a user or another
+/// process wrote to ordinary preferences is ignored. `DisableLANMode` is read from anywhere: it
+/// can only make things stricter.
 public struct ManagedConfig: Equatable, Sendable {
     public var cloudURL: URL?
     public var enrollmentToken: String?
@@ -57,7 +66,16 @@ public struct ManagedConfig: Equatable, Sendable {
 
     public static func read(_ source: ManagedConfigSource = PreferencesSource()) -> ManagedConfig {
         var c = ManagedConfig()
-        if let raw = source.value(forKey: keys.cloudURL) {
+        // Only administrator-set values (a configuration profile) for what enrolls this Mac.
+        func managed(_ key: String) -> Any? {
+            guard let v = source.value(forKey: key) else { return nil }
+            guard source.isForced(key) else {
+                c.problems.append("\(key) ignored: not set by a configuration profile")
+                return nil
+            }
+            return v
+        }
+        if let raw = managed(keys.cloudURL) {
             if let s = raw as? String, !s.trimmingCharacters(in: .whitespaces).isEmpty {
                 switch parseCloudURL(s) {
                 case let .success(u): c.cloudURL = u
@@ -67,7 +85,7 @@ public struct ManagedConfig: Equatable, Sendable {
                 c.problems.append("CloudURL ignored: not a string")
             }
         }
-        if let raw = source.value(forKey: keys.enrollmentToken) {
+        if let raw = managed(keys.enrollmentToken) {
             let t = (raw as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if t.isEmpty || t.count > 512 || t.contains(where: { $0.isWhitespace || $0.isNewline }) {
                 c.problems.append("EnrollmentToken ignored: empty, too long or contains spaces")
@@ -75,11 +93,11 @@ public struct ManagedConfig: Equatable, Sendable {
                 c.enrollmentToken = t
             }
         }
-        if let raw = source.value(forKey: keys.deviceName) as? String {
+        if let raw = managed(keys.deviceName) as? String {
             let n = clean(raw, max: 64)
             if !n.isEmpty { c.deviceName = n }
         }
-        if let raw = source.value(forKey: keys.tags) {
+        if let raw = managed(keys.tags) {
             if let a = raw as? [Any] {
                 var seen = Set<String>()
                 for case let s as String in a {
@@ -99,22 +117,28 @@ public struct ManagedConfig: Equatable, Sendable {
         return c
     }
 
-    /// `https://host[:port][/base]`. Plain `http` only for a loopback host (a development cloud
-    /// on this machine): tokens must never cross a network unencrypted.
+    /// An origin (§6.7): `https://host[:port]`, no path (a lone `/` is allowed), query, fragment
+    /// or user info. Plain `http` only when the host is a loopback IP address (a development cloud
+    /// on this machine): tokens must never cross a network unencrypted. Returns the origin without
+    /// the trailing slash.
     public static func parseCloudURL(_ raw: String) -> Result<URL, CloudURLProblem> {
-        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        while s.hasSuffix("/") { s.removeLast() }
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let c = URLComponents(string: s), let scheme = c.scheme?.lowercased(), let host = c.host, !host.isEmpty else {
             return .failure(.notAURL)
         }
-        guard c.user == nil, c.password == nil, c.query == nil, c.fragment == nil else { return .failure(.extraParts) }
+        guard c.user == nil, c.password == nil, c.query == nil, c.fragment == nil, c.path.isEmpty || c.path == "/" else {
+            return .failure(.extraParts)
+        }
         switch scheme {
         case "https": break
         case "http" where isLoopback(host): break
-        case "http": return .failure(.notHTTPS)
         default: return .failure(.notHTTPS)
         }
-        guard let u = c.url else { return .failure(.notAURL) }
+        var o = URLComponents()
+        o.scheme = scheme
+        o.percentEncodedHost = c.percentEncodedHost
+        o.port = c.port
+        guard let u = o.url else { return .failure(.notAURL) }
         return .success(u)
     }
 
@@ -124,22 +148,30 @@ public struct ManagedConfig: Equatable, Sendable {
             switch self {
             case .notAURL: return "not a URL"
             case .notHTTPS: return "must start with https://"
-            case .extraParts: return "must not contain a user name, query or fragment"
+            case .extraParts: return "must be an origin only (https://host[:port]), without a path, user name, query or fragment"
             }
         }
     }
 
+    /// The host parses as a loopback IP address: 127.0.0.0/8 or ::1 (`127.example.com` and
+    /// `localhost` are names, not loopback addresses).
     public static func isLoopback(_ host: String) -> Bool {
-        let h = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        return h == "localhost" || h == "127.0.0.1" || h == "::1" || h.hasPrefix("127.")
+        var h = host
+        if h.hasPrefix("["), h.hasSuffix("]") { h = String(h.dropFirst().dropLast()) }
+        var v4 = in_addr()
+        if inet_pton(AF_INET, h, &v4) == 1 {
+            return UInt32(bigEndian: v4.s_addr) >> 24 == 127
+        }
+        var v6 = in6_addr()
+        if inet_pton(AF_INET6, h, &v6) == 1 {
+            return withUnsafeBytes(of: &v6) { b in b.prefix(15).allSatisfy { $0 == 0 } && b[15] == 1 }
+        }
+        return false
     }
 
-    /// Control characters removed, trimmed, at most `max` characters.
-    static func clean(_ s: String, max: Int) -> String {
-        let t = String(s.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }.map(Character.init))
-            .trimmingCharacters(in: .whitespaces)
-        return t.count > max ? String(t.prefix(max)) : t
-    }
+    /// The CloudText rules (controls, bidi and format characters, separators, tag characters and
+    /// variation selectors removed, whitespace collapsed, trimmed), at most `max` characters.
+    public static func clean(_ s: String, max: Int) -> String { CloudText.clean(s, max: max) }
 
     static func boolValue(_ v: Any?) -> Bool? {
         switch v {

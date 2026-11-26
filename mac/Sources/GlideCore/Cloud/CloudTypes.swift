@@ -2,8 +2,10 @@ import Foundation
 
 // Glide Cloud wire formats (docs/ENTERPRISE.md §6–7): the device API bodies, the hub's JSON
 // frames and the relay's control frames. Field names are the spec's (snake_case) through explicit
-// coding keys. Clients ignore unknown fields; an unknown or missing value in a security-relevant
-// field decodes to its most restrictive meaning.
+// coding keys. Decoding follows ENTERPRISE.md §6.7: unknown fields are ignored; missing display or
+// optional fields take defaults; missing permission fields are the most restrictive value, missing
+// `approval` is "required" and missing settings are the §7 defaults; only a missing security field
+// (`session_id`, a public key, `ticket`, `relay_url`, a credential) rejects the frame or response.
 
 // MARK: Permissions (§6.3)
 
@@ -133,12 +135,15 @@ public struct OrgRef: Codable, Equatable, Sendable {
     public var name: String
     public init(id: String, slug: String, name: String) { self.id = id; self.slug = slug; self.name = name }
     enum CodingKeys: String, CodingKey { case id, slug, name }
+    /// Display fields: all optional (`org.id` too).
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decode(String.self, forKey: .id)
-        slug = try c.decodeIfPresent(String.self, forKey: .slug) ?? ""
-        name = try c.decodeIfPresent(String.self, forKey: .name) ?? slug
+        id = (try? c.decodeIfPresent(String.self, forKey: .id)) ?? ""
+        slug = CloudText.clean((try? c.decodeIfPresent(String.self, forKey: .slug)) ?? "")
+        name = CloudText.name((try? c.decodeIfPresent(String.self, forKey: .name)) ?? "", fallback: slug)
     }
+
+    public static let unknown = OrgRef(id: "", slug: "", name: "")
 }
 
 public struct CloudUser: Codable, Equatable, Sendable {
@@ -152,16 +157,23 @@ public struct CloudUser: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey { case id, email, name, groups }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
-        email = try c.decodeIfPresent(String.self, forKey: .email) ?? ""
-        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
-        groups = try c.decodeIfPresent([String].self, forKey: .groups)
+        id = (try? c.decodeIfPresent(String.self, forKey: .id)) ?? ""
+        email = (try? c.decodeIfPresent(String.self, forKey: .email)) ?? ""
+        name = (try? c.decodeIfPresent(String.self, forKey: .name)) ?? ""
+        groups = try? c.decodeIfPresent([String].self, forKey: .groups)
     }
 
-    /// "Ada Lovelace (ada@example.com)", control characters removed.
+    /// An offer without `user` (§6.7): shown as "an organization user".
+    public static let unknown = CloudUser(id: "", email: "", name: "")
+    public static let unknownLabel = "an organization user"
+
+    /// "Ada Lovelace (ada@example.com)", cleaned by the CloudText rules (name and email at most
+    /// 64 characters each; an email keeps its whole domain); "an organization user" when the
+    /// cloud named nobody.
     public var label: String {
-        let n = PairedViewer.displayName(name.isEmpty ? email : name)
-        let e = ManagedConfig.clean(email, max: 120)
+        let e = CloudText.email(email)
+        let n = CloudText.clean(name).isEmpty ? e : CloudText.clean(name)
+        guard !n.isEmpty else { return Self.unknownLabel }
         return e.isEmpty || n == e ? n : "\(n) (\(e))"
     }
 }
@@ -199,6 +211,17 @@ public struct EnrollResponse: Codable, Equatable, Sendable {
     public var org: OrgRef
     public var settings: OrgSettings
     enum CodingKeys: String, CodingKey { case deviceId = "device_id", deviceToken = "device_token", org, settings }
+    public init(deviceId: String, deviceToken: String, org: OrgRef, settings: OrgSettings) {
+        self.deviceId = deviceId; self.deviceToken = deviceToken; self.org = org; self.settings = settings
+    }
+    /// The credentials are required; `org` and `settings` default (§6.7).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        deviceId = try c.decode(String.self, forKey: .deviceId)
+        deviceToken = try c.decode(String.self, forKey: .deviceToken)
+        org = (try? c.decodeIfPresent(OrgRef.self, forKey: .org)) ?? .unknown
+        settings = try c.decodeIfPresent(OrgSettings.self, forKey: .settings) ?? OrgSettings()
+    }
 }
 
 /// `GET /v1/device`.
@@ -212,11 +235,11 @@ public struct DeviceInfo: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey { case deviceId = "device_id", kind, name, tags, org, settings }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        deviceId = try c.decode(String.self, forKey: .deviceId)
+        deviceId = (try? c.decodeIfPresent(String.self, forKey: .deviceId)) ?? ""
         kind = try? c.decodeIfPresent(DeviceKind.self, forKey: .kind)
-        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
-        tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
-        org = try c.decode(OrgRef.self, forKey: .org)
+        name = CloudText.clean((try? c.decodeIfPresent(String.self, forKey: .name)) ?? "")
+        tags = ((try? c.decodeIfPresent([String].self, forKey: .tags)) ?? []).map { CloudText.clean($0) }.filter { !$0.isEmpty }
+        org = (try? c.decodeIfPresent(OrgRef.self, forKey: .org)) ?? .unknown
         settings = try c.decodeIfPresent(OrgSettings.self, forKey: .settings) ?? OrgSettings()
     }
 }
@@ -307,9 +330,10 @@ public struct CloudHost: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
-        name = try c.decodeIfPresent(String.self, forKey: .name) ?? id
-        platform = try c.decodeIfPresent(String.self, forKey: .platform) ?? ""
-        tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
+        // Display fields are cleaned here, so every list and menu shows safe text (§6.7).
+        name = CloudText.name((try? c.decodeIfPresent(String.self, forKey: .name)) ?? "", fallback: id)
+        platform = (try? c.decodeIfPresent(String.self, forKey: .platform)) ?? ""
+        tags = ((try? c.decodeIfPresent([String].self, forKey: .tags)) ?? []).map { CloudText.clean($0) }.filter { !$0.isEmpty }
         online = try c.decodeIfPresent(Bool.self, forKey: .online) ?? false
         lastSeen = try c.decodeIfPresent(String.self, forKey: .lastSeen)
         permissions = try c.decodeIfPresent(CloudPermissions.self, forKey: .permissions) ?? .none
@@ -334,6 +358,13 @@ public struct SessionHostInfo: Codable, Equatable, Sendable {
     /// 64 hex chars: the key the viewer pins for `relay:<session_id>`.
     public var publicKey: String
     enum CodingKeys: String, CodingKey { case id, name, publicKey = "public_key" }
+    /// `public_key` is required; `id` and `name` are display fields.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        publicKey = try c.decode(String.self, forKey: .publicKey)
+        id = (try? c.decodeIfPresent(String.self, forKey: .id)) ?? ""
+        name = (try? c.decodeIfPresent(String.self, forKey: .name)) ?? ""
+    }
 }
 
 /// `201` of `POST /v1/sessions`.
@@ -384,6 +415,13 @@ public struct OfferViewer: Codable, Equatable, Sendable {
     public var name: String
     public var publicKey: String
     enum CodingKeys: String, CodingKey { case deviceId = "device_id", name, publicKey = "public_key" }
+    /// `public_key` is required; `device_id` and `name` are display fields.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        publicKey = try c.decode(String.self, forKey: .publicKey)
+        deviceId = (try? c.decodeIfPresent(String.self, forKey: .deviceId)) ?? ""
+        name = (try? c.decodeIfPresent(String.self, forKey: .name)) ?? ""
+    }
 }
 
 public struct SessionOffer: Codable, Equatable, Sendable {
@@ -402,12 +440,12 @@ public struct SessionOffer: Codable, Equatable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         sessionId = try c.decode(String.self, forKey: .sessionId)
         viewer = try c.decode(OfferViewer.self, forKey: .viewer)
-        user = try c.decode(CloudUser.self, forKey: .user)
-        permissions = try c.decodeIfPresent(CloudPermissions.self, forKey: .permissions) ?? .none
-        approval = try c.decodeIfPresent(ApprovalMode.self, forKey: .approval) ?? .required
+        user = (try? c.decodeIfPresent(CloudUser.self, forKey: .user)) ?? .unknown
+        permissions = (try? c.decodeIfPresent(CloudPermissions.self, forKey: .permissions)) ?? .none
+        approval = (try? c.decodeIfPresent(ApprovalMode.self, forKey: .approval)) ?? .required
         relayURL = try c.decode(String.self, forKey: .relayURL)
         ticket = try c.decode(String.self, forKey: .ticket)
-        expiresAt = try c.decodeIfPresent(String.self, forKey: .expiresAt)
+        expiresAt = try? c.decodeIfPresent(String.self, forKey: .expiresAt)
     }
 }
 
@@ -415,6 +453,9 @@ public struct SessionOffer: Codable, Equatable, Sendable {
 public enum HubServerFrame: Equatable, Sendable {
     case hello(deviceId: String, settings: OrgSettings, serverTime: String?)
     case sessionOffer(SessionOffer)
+    /// A `session_offer` missing a security field (§6.7): declined with `policy` when its
+    /// `session_id` is known.
+    case invalidOffer(sessionId: String?, why: String)
     case sessionCancel(sessionId: String, reason: String)
     case settings(OrgSettings)
     case revoked(reason: String)
@@ -424,10 +465,11 @@ public enum HubServerFrame: Equatable, Sendable {
 
     private struct Head: Decodable { let type: String }
     private struct Hello: Decodable {
-        let device_id: String
-        let settings: OrgSettings
+        let device_id: String?
         let server_time: String?
     }
+    private struct HelloSettings: Decodable { let settings: OrgSettings? }
+    private struct SessionIdProbe: Decodable { let session_id: String? }
     private struct Cancel: Decodable { let session_id: String; let reason: String? }
     private struct Settings: Decodable { let settings: OrgSettings }
     private struct Revoked: Decodable { let reason: String? }
@@ -439,9 +481,15 @@ public enum HubServerFrame: Equatable, Sendable {
         let type = try dec.decode(Head.self, from: d).type
         switch type {
         case "hello":
-            let h = try dec.decode(Hello.self, from: d)
-            return .hello(deviceId: h.device_id, settings: h.settings, serverTime: h.server_time)
-        case "session_offer": return .sessionOffer(try dec.decode(SessionOffer.self, from: d))
+            // Display fields default; missing settings are the §7 defaults.
+            let h = (try? dec.decode(Hello.self, from: d))
+            let st = try dec.decode(HelloSettings.self, from: d).settings ?? OrgSettings()
+            return .hello(deviceId: h?.device_id ?? "", settings: st, serverTime: h?.server_time)
+        case "session_offer":
+            do { return .sessionOffer(try dec.decode(SessionOffer.self, from: d)) } catch {
+                let sid = (try? dec.decode(SessionIdProbe.self, from: d))?.session_id
+                return .invalidOffer(sessionId: sid, why: "\(error)")
+            }
         case "session_cancel":
             let c = try dec.decode(Cancel.self, from: d)
             return .sessionCancel(sessionId: c.session_id, reason: c.reason ?? "")

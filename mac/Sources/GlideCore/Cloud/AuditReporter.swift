@@ -1,8 +1,10 @@
 import Foundation
 
 /// Client audit events (docs/ENTERPRISE.md §9), batched to `POST /v1/audit`: at most 100 events
-/// and 256 KiB per batch, sent a few seconds after the first queued event. Failed batches are
-/// retried with the next flush; at most `maxQueued` events wait (oldest dropped).
+/// and 256 KiB per batch, sent a few seconds after the first queued event. A batch that failed
+/// for a network error, `401`, `429` or `5xx` is retried later; one rejected with any other `4xx`
+/// would be rejected again, so it is dropped and logged locally (§6.7). At most `maxQueued` events
+/// wait (oldest dropped).
 public final class AuditReporter: @unchecked Sendable {
     public static let maxBatch = 100
     public static let maxBatchBytes = 256 * 1024
@@ -17,6 +19,8 @@ public final class AuditReporter: @unchecked Sendable {
     public var send: (AuditBatch) async throws -> Void
     /// File names in `session.file_*` (org setting `audit_file_names`).
     public var includeFileNames = true
+    /// Local log (dropped batches).
+    public var log: (String) -> Void = { _ in }
 
     public init(delay: TimeInterval = 5, send: @escaping (AuditBatch) async throws -> Void) {
         self.delay = delay
@@ -88,6 +92,12 @@ public final class AuditReporter: @unchecked Sendable {
         return out
     }
 
+    /// A `4xx` other than `401` and `429`: sending the batch again can't succeed.
+    public static func isRejected(_ e: CloudError) -> Bool {
+        guard let st = e.status else { return false }
+        return (400..<500).contains(st) && st != 401 && st != 429
+    }
+
     private func scheduleFlush() {
         guard !flushScheduled else { return }
         flushScheduled = true
@@ -105,10 +115,18 @@ public final class AuditReporter: @unchecked Sendable {
         let send = self.send
         Task {
             var ok = true
-            do { try await send(first) } catch { ok = false }
+            var drop: CloudError?
+            do { try await send(first) } catch {
+                ok = false
+                if let e = error as? CloudError, Self.isRejected(e) { drop = e }
+            }
             queue.async { [self] in
                 sending = false
-                if ok {
+                if let e = drop {
+                    log("audit: Glide Cloud rejected \(n) event(s) (\(e)); dropped: \(first.events.map(\.type).joined(separator: ", "))")
+                    events.removeFirst(min(n, events.count))
+                    if !events.isEmpty { scheduleFlush() }
+                } else if ok {
                     events.removeFirst(min(n, events.count))
                     if !events.isEmpty { scheduleFlush() }
                 } else {

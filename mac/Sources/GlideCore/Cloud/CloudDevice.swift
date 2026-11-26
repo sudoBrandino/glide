@@ -14,7 +14,8 @@ public final class CloudDevice: @unchecked Sendable {
         case enrolled(connected: Bool)
         /// Can't enroll or connect right now (retrying unless `final`).
         case failed(String, final: Bool)
-        /// The cloud revoked this device (or its token stopped working); the enrollment was deleted.
+        /// The cloud revoked this device (or its token stopped working): the credentials were
+        /// deleted; the last org settings still apply (§6.7).
         case revoked(String)
     }
 
@@ -24,9 +25,10 @@ public final class CloudDevice: @unchecked Sendable {
         public var orgName: String?
         public var orgSlug: String?
         public var deviceName: String?
+        public var tags: [String] = []
         public var deviceId: String?
         public var enrolledAt: String?
-        /// Last known org settings (nil when not enrolled).
+        /// Last known org settings (nil when never enrolled). Kept after a revocation.
         public var settings: OrgSettings?
         public var policy: ManagedPolicy
         /// Problems in the managed configuration.
@@ -69,7 +71,7 @@ public final class CloudDevice: @unchecked Sendable {
     private let transport: CloudHTTPTransport
     private let wsFactory: CloudWebSocketFactory
     private var hub: HubClient?
-    private var enrollBackoff = CloudBackoff(initial: 5, max: 600)
+    private var enrollBackoff = EnrollRetry.backoff()
     private var heartbeatTimer: DispatchSourceTimer?
     private var lastHeartbeat: Date?
     private var started = false
@@ -90,7 +92,11 @@ public final class CloudDevice: @unchecked Sendable {
         status.disableLANMode = config.disableLANMode
         // The cached settings apply right away (before any network), so `lan_mode: false` holds
         // from launch.
-        if let url = config.cloudURL, let e = try? store.load(), e.isFor(url) { apply(enrollment: e, state: .enrolled(connected: false)) }
+        if let url = config.cloudURL {
+            if let e = try? store.load(), e.isFor(url) { apply(enrollment: e, state: .enrolled(connected: false)) }
+            else if let r = store.loadRevoked(), r.isFor(url) { apply(revoked: r) }
+        }
+        audit.log = { [weak self] m in self?.log(m) }
         audit.send = { [weak self] b in
             guard let c = self?.queue.sync(execute: { self?.client }) else { throw CloudError.invalid("not enrolled") }
             try await c.audit(b)
@@ -113,6 +119,12 @@ public final class CloudDevice: @unchecked Sendable {
             if let e = stored, e.isFor(url) {
                 apply(enrollment: e, state: .enrolled(connected: false))
                 connect(e)
+            } else if stored == nil, let r = store.loadRevoked(), r.isFor(url) {
+                // Revoked for this cloud: keep its last settings; no enrollment until the managed
+                // CloudURL changes (the key is refused anyway, §5.1).
+                log("cloud: this device was removed from the organization at \(url.absoluteString); its last settings still apply")
+                apply(revoked: r)
+                onStatus(status)
             } else {
                 if stored != nil { log("cloud: the stored enrollment is for another cloud (\(stored!.cloudURL)); enrolling with \(url.absoluteString)") }
                 enroll()
@@ -189,16 +201,15 @@ public final class CloudDevice: @unchecked Sendable {
 
     private func enrollFailed(_ e: CloudError) {
         guard started else { return }
-        switch e.code {
-        case "device_revoked":
+        if EnrollRetry.isRevoked(e) {
             log("cloud: enrollment refused: this device was revoked")
-            setState(.revoked("revoked by an administrator"))
+            revoked("revoked by an administrator")
             return
-        case "invalid_token", "token_expired", "token_exhausted", "invalid_enrollment_token":
+        }
+        if EnrollRetry.isTokenRefused(e) {
             log("cloud: enrollment refused: \(e)")
             setState(.failed("the enrollment token was refused (\(e.code ?? ""))", final: true))
             return
-        default: break
         }
         let delay = enrollBackoff.next()
         log("cloud: enrollment failed (\(e)); retrying in \(Int(delay)) s")
@@ -236,21 +247,30 @@ public final class CloudDevice: @unchecked Sendable {
             if status.isEnrolled { setState(.enrolled(connected: false)) }
             log("cloud: hub disconnected (\(why)); reconnecting in \(Int(retryIn.rounded())) s")
             onHubEvent(ev)
-        case .offer, .cancel:
+        case .offer, .invalidOffer, .cancel:
             onHubEvent(ev)
         }
     }
 
+    /// Deletes the credentials but keeps `{cloud_url, revoked: true, settings}` and keeps
+    /// applying those settings (§6.7): `lan_mode: false` stays in force.
     private func revoked(_ reason: String) {
         guard status.state != .unmanaged else { return }
-        log("cloud: this device is no longer enrolled (\(reason)); deleting the enrollment")
+        if case .revoked = status.state { return }
+        log("cloud: this device is no longer enrolled (\(reason)); deleting its credentials, keeping the last org settings")
         hub?.stop(); hub = nil
         heartbeatTimer?.cancel(); heartbeatTimer = nil
         client = nil
-        store.wipe()
-        status.settings = nil
+        if let url = config.cloudURL {
+            let r = RevokedEnrollment(cloudURL: url.absoluteString, settings: status.settings, orgName: status.orgName, revokedAt: CloudTime.format(Date()))
+            do { try store.markRevoked(r) } catch {
+                log("cloud: \(error); deleting the enrollment instead")
+                store.wipe()
+            }
+        } else {
+            store.wipe()
+        }
         status.deviceId = nil
-        status.policy = ManagedPolicy(settings: nil, disableLANMode: config.disableLANMode, appVersion: appVersion)
         setState(.revoked(reason == "unauthorized" ? "its token is no longer valid" : reason))
         onRevoked(reason)
     }
@@ -265,17 +285,27 @@ public final class CloudDevice: @unchecked Sendable {
         onStatus(status)
     }
 
-    /// Org and device names (they can change in the console).
+    /// `GET /v1/device` on each hub connection (§6.7): name, tags and org name (they can change in
+    /// the console), and the settings. A `401` means the device was revoked.
     private func refreshDevice() {
         guard let c = client else { return }
         Task {
-            guard let d = try? await c.device() else { return }
+            let d: DeviceInfo
+            do { d = try await c.device() } catch let e as CloudError where e.isUnauthorized {
+                queue.async { [self] in if client === c { revoked("unauthorized") } }
+                return
+            } catch {
+                log("cloud: GET /v1/device failed: \(error)")
+                return
+            }
             queue.async { [self] in
                 guard client === c else { return }
-                status.orgName = d.org.name
-                status.orgSlug = d.org.slug
-                status.deviceName = d.name
-                _ = try? store.update { $0.orgName = d.org.name; $0.orgSlug = d.org.slug; $0.deviceName = d.name }
+                if !d.org.name.isEmpty { status.orgName = d.org.name }
+                if !d.org.slug.isEmpty { status.orgSlug = d.org.slug }
+                if !d.name.isEmpty { status.deviceName = d.name }
+                status.tags = d.tags
+                let st = status
+                _ = try? store.update { $0.orgName = st.orgName; $0.orgSlug = st.orgSlug; $0.deviceName = st.deviceName; $0.tags = st.tags }
                 setSettings(d.settings)
                 onStatus(status)
             }
@@ -306,12 +336,21 @@ public final class CloudDevice: @unchecked Sendable {
         status.orgName = e.orgName
         status.orgSlug = e.orgSlug
         status.deviceName = e.deviceName
+        status.tags = e.tags ?? []
         status.deviceId = e.deviceId
         status.enrolledAt = e.enrolledAt
         status.settings = e.settings
         status.policy = ManagedPolicy(settings: e.settings, disableLANMode: config.disableLANMode, appVersion: appVersion)
         audit.includeFileNames = status.policy.auditFileNames
         status.state = state
+    }
+
+    private func apply(revoked r: RevokedEnrollment) {
+        status.orgName = r.orgName
+        status.deviceId = nil
+        status.settings = r.settings
+        status.policy = ManagedPolicy(settings: r.settings, disableLANMode: config.disableLANMode, appVersion: appVersion)
+        status.state = .revoked("removed by an administrator")
     }
 
     private func setState(_ s: State) {

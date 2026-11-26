@@ -187,6 +187,10 @@ public final class RelayBridge: @unchecked Sendable {
     private var closed = false
     /// Who closed first, for the log and audit.
     public private(set) var closeReason: String?
+    /// The bridge closed because something went wrong (relay refused or lost, protocol violation,
+    /// the other side never joined…), not because a side ended the session: the apps report it as
+    /// `client.error` (§6.7). Set before `onClosed` runs.
+    public private(set) var failed = false
     public private(set) var bytesToRelay: UInt64 = 0
     public private(set) var bytesFromRelay: UInt64 = 0
 
@@ -213,7 +217,7 @@ public final class RelayBridge: @unchecked Sendable {
 
     /// Ends the bridge (the relay socket with 1000, the loopback pair).
     public func close(_ reason: String = "closed locally") {
-        queue.async { [self] in shutdown(reason, code: RelayCloseCode.normal) }
+        queue.async { [self] in shutdown(reason, code: RelayCloseCode.normal, failure: false) }
     }
 
     public var isClosed: Bool { queue.sync { closed } }
@@ -226,10 +230,11 @@ public final class RelayBridge: @unchecked Sendable {
                 switch r {
                 case let .failure(e):
                     let why: String
+                    var failure = true
                     if let st = self.socket.upgradeStatus { why = "the relay refused the connection (HTTP \(st))" }
-                    else if let c = self.socket.closeCode { why = RelayCloseCode.text(c) }
+                    else if let c = self.socket.closeCode { why = RelayCloseCode.text(c); failure = !RelayBridge.isOrderlyClose(c) }
                     else { why = "relay connection lost (\((e as NSError).localizedDescription))" }
-                    self.shutdown(why, code: nil)
+                    self.shutdown(why, code: nil, failure: failure)
                 case let .success(.text(t)):
                     switch RelayControl.decode(t) {
                     case .waiting?: self.onStatus(.waiting)
@@ -238,7 +243,7 @@ public final class RelayBridge: @unchecked Sendable {
                         self.onStatus(.joined)
                         self.makePair(sessionQueue: sessionQueue, ready: ready)
                     case .peerLeft?:
-                        self.shutdown("the other side left", code: RelayCloseCode.normal)
+                        self.shutdown("the other side left", code: RelayCloseCode.normal, failure: false)
                         return
                     default: break  // unknown control frames are ignored
                     }
@@ -281,7 +286,7 @@ public final class RelayBridge: @unchecked Sendable {
                     self.dialed = d
                     a.stateUpdateHandler = { [weak self] st in
                         switch st {
-                        case .failed, .cancelled: self?.queue.async { self?.shutdown("the session closed", code: RelayCloseCode.normal) }
+                        case .failed, .cancelled: self?.queue.async { self?.shutdown("the session closed", code: RelayCloseCode.normal, failure: false) }
                         default: break
                         }
                     }
@@ -306,23 +311,30 @@ public final class RelayBridge: @unchecked Sendable {
                         guard let self else { return }
                         self.queue.async {
                             if e != nil { self.shutdown("relay send failed", code: nil); return }
-                            if complete || err != nil { self.shutdown("the session closed", code: RelayCloseCode.normal); return }
+                            if complete || err != nil { self.shutdown("the session closed", code: RelayCloseCode.normal, failure: false); return }
                             self.pumpToRelay(a)
                         }
                     }
                     return
                 }
-                if complete || err != nil { self.shutdown("the session closed", code: RelayCloseCode.normal); return }
+                if complete || err != nil { self.shutdown("the session closed", code: RelayCloseCode.normal, failure: false); return }
                 self.pumpToRelay(a)
             }
         }
     }
 
+    /// Relay close codes that end a session in an orderly way: normal, ended by an administrator
+    /// (or revoked), time limit.
+    public static func isOrderlyClose(_ code: Int) -> Bool {
+        code == RelayCloseCode.normal || code == RelayCloseCode.endedByAdmin || code == RelayCloseCode.timeLimit
+    }
+
     /// `code` nil: the relay socket is already gone.
-    private func shutdown(_ reason: String, code: Int?) {
+    private func shutdown(_ reason: String, code: Int?, failure: Bool = true) {
         guard !closed else { return }
         closed = true
         closeReason = reason
+        failed = failure
         socket.close(code: code ?? RelayCloseCode.normal)
         accepted?.stateUpdateHandler = nil
         accepted?.cancel()

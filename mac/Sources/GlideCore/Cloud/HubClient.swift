@@ -5,6 +5,8 @@ public enum HubEvent: Equatable, Sendable {
     /// `hello`: connected; the current org settings.
     case connected(deviceId: String, settings: OrgSettings)
     case offer(SessionOffer)
+    /// An offer missing a security field (§6.7) whose `session_id` is known: decline with `policy`.
+    case invalidOffer(sessionId: String, why: String)
     case cancel(sessionId: String, reason: String)
     case settings(OrgSettings)
     /// A `revoked` frame, or `401` on the upgrade: the device is no longer enrolled. The client has
@@ -123,6 +125,8 @@ public final class HubClient: @unchecked Sendable {
             backoff.reset()
             onEvent(.connected(deviceId: deviceId, settings: settings))
         case let .sessionOffer(o): onEvent(.offer(o))
+        case let .invalidOffer(sid?, why) where CloudID.isValid(sid): onEvent(.invalidOffer(sessionId: sid, why: why))
+        case .invalidOffer: break  // nothing to answer
         case let .sessionCancel(id, reason): onEvent(.cancel(sessionId: id, reason: reason))
         case let .settings(st): onEvent(.settings(st))
         case let .revoked(reason):

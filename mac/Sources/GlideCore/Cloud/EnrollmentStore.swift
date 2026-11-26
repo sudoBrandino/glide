@@ -22,6 +22,7 @@ public struct Enrollment: Codable, Equatable, Sendable {
     public var deviceName: String?
     public var user: CloudUser?
     public var settings: OrgSettings?
+    public var tags: [String]?
 
     public init(cloudURL: String, orgId: String, deviceId: String, deviceToken: String, enrolledAt: String,
                 orgName: String? = nil, orgSlug: String? = nil, deviceName: String? = nil, settings: OrgSettings? = nil) {
@@ -33,7 +34,7 @@ public struct Enrollment: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case cloudURL = "cloud_url", orgId = "org_id", deviceId = "device_id", deviceToken = "device_token"
         case enrolledAt = "enrolled_at", userToken = "user_token", userTokenExpires = "user_token_expires"
-        case orgName = "org_name", orgSlug = "org_slug", deviceName = "device_name", user, settings
+        case orgName = "org_name", orgSlug = "org_slug", deviceName = "device_name", user, settings, tags
     }
 
     /// Same cloud as the managed `CloudURL` (scheme/host/port/path, case-insensitive host).
@@ -51,6 +52,28 @@ public struct Enrollment: Codable, Equatable, Sendable {
         if let exp = CloudTime.parse(userTokenExpires), exp.timeIntervalSince(now) < 60 { return nil }
         return t
     }
+}
+
+/// What is left of an enrollment after the device was revoked (ENTERPRISE.md §6.7): no
+/// credentials, only `{cloud_url, revoked: true, settings}` (plus the org name, for the UI). The
+/// app keeps applying those last settings, across restarts, until the managed `CloudURL` is
+/// removed or changes.
+public struct RevokedEnrollment: Codable, Equatable, Sendable {
+    public var cloudURL: String
+    public var revoked: Bool
+    public var settings: OrgSettings?
+    public var orgName: String?
+    public var revokedAt: String?
+
+    public init(cloudURL: String, settings: OrgSettings?, orgName: String? = nil, revokedAt: String? = nil) {
+        self.cloudURL = cloudURL; self.revoked = true; self.settings = settings; self.orgName = orgName; self.revokedAt = revokedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case cloudURL = "cloud_url", revoked, settings, orgName = "org_name", revokedAt = "revoked_at"
+    }
+
+    public func isFor(_ url: URL) -> Bool { Enrollment.normalize(cloudURL) == Enrollment.normalize(url.absoluteString) }
 }
 
 /// Reads and writes one enrollment file. All writes go through a temporary file created 0600 and
@@ -75,23 +98,40 @@ public struct EnrollmentStore: Sendable {
         }
     }
 
-    /// nil when there is none. A file that can't be decoded throws (the caller re-enrolls only on
-    /// purpose; the device token in it may still be valid).
+    private struct RevokedProbe: Decodable { let revoked: Bool? }
+
+    /// nil when there is none (or only a revoked record). A file that can't be decoded throws (the
+    /// caller re-enrolls only on purpose; the device token in it may still be valid).
     public func load() throws -> Enrollment? {
+        guard let data = try readData() else { return nil }
+        if (try? JSONDecoder().decode(RevokedProbe.self, from: data))?.revoked == true { return nil }
+        do { return try JSONDecoder().decode(Enrollment.self, from: data) } catch {
+            throw Failure.unreadable("\(url.path) is not a valid enrollment (\(error))")
+        }
+    }
+
+    /// The revoked record, if that is what the file holds.
+    public func loadRevoked() -> RevokedEnrollment? {
+        guard let data = try? readData(), (try? JSONDecoder().decode(RevokedProbe.self, from: data))?.revoked == true else { return nil }
+        return try? JSONDecoder().decode(RevokedEnrollment.self, from: data)
+    }
+
+    /// Replaces the enrollment (and its credentials) with the revoked record.
+    public func markRevoked(_ r: RevokedEnrollment) throws { try write(r) }
+
+    private func readData() throws -> Data? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         // Tighten a file someone loosened (it holds a bearer token).
         if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
            let mode = (attrs[.posixPermissions] as? NSNumber)?.intValue, mode & 0o077 != 0 {
             chmod(url.path, 0o600)
         }
-        let data: Data
-        do { data = try Data(contentsOf: url) } catch { throw Failure.unreadable("\(url.path): \(error.localizedDescription)") }
-        do { return try JSONDecoder().decode(Enrollment.self, from: data) } catch {
-            throw Failure.unreadable("\(url.path) is not a valid enrollment (\(error))")
-        }
+        do { return try Data(contentsOf: url) } catch { throw Failure.unreadable("\(url.path): \(error.localizedDescription)") }
     }
 
-    public func save(_ e: Enrollment) throws {
+    public func save(_ e: Enrollment) throws { try write(e) }
+
+    private func write<T: Encodable>(_ e: T) throws {
         let dir = url.deletingLastPathComponent()
         let fm = FileManager.default
         if !fm.fileExists(atPath: dir.path) {
@@ -107,7 +147,7 @@ public struct EnrollmentStore: Sendable {
         unlink(tmp)
         let fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { throw Failure.unwritable("\(tmp): \(String(cString: strerror(errno)))") }
-        let written = data.withUnsafeBytes { p -> Int in write(fd, p.baseAddress, p.count) }
+        let written = data.withUnsafeBytes { p -> Int in Darwin.write(fd, p.baseAddress, p.count) }
         fchmod(fd, 0o600)
         fsync(fd)
         close(fd)
@@ -119,7 +159,7 @@ public struct EnrollmentStore: Sendable {
         }
     }
 
-    /// Removes the enrollment (revoked, or signed out of a different cloud). Missing is fine.
+    /// Removes the file (enrollment or revoked record). Missing is fine.
     public func wipe() {
         unlink(url.path)
     }
