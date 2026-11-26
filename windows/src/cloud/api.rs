@@ -11,18 +11,83 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 // ------------------------------------------------------------------ display strings (§6.7)
 
-/// A character that must never reach a label: C0 and C1 controls (and DEL), the bidirectional
-/// embedding / override / isolate controls (U+202A–202E, U+2066–2069) and marks (U+200E, U+200F,
-/// U+061C).
-pub fn unsafe_display_char(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+/// Unicode `General_Category=Cf` (format characters, Unicode 15.1), as ranges. Among them: the
+/// soft hyphen, zero-width space / non-joiner / joiner (U+200B–200D), the bidirectional marks,
+/// embeddings, overrides and isolates (U+200E/200F, U+202A–202E, U+2066–2069, U+061C), the
+/// invisible operators (U+2060–2064), the deprecated format controls (U+206A–206F), the BOM
+/// (U+FEFF), interlinear annotation controls and the tag characters.
+const FORMAT_CHARS: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+];
+
+/// Other invisible characters that can disguise text: the line and paragraph separators
+/// (`Zl`/`Zp`, U+2028/2029), the whole tag block (U+E0000–E007F), and variation selectors
+/// (U+FE00–FE0F, U+E0100–E01EF, and the Mongolian free variation selectors U+180B–180F).
+const INVISIBLE_CHARS: &[(u32, u32)] = &[(0x180B, 0x180F), (0x2028, 0x2029), (0xFE00, 0xFE0F), (0xE0000, 0xE007F), (0xE0100, 0xE01EF)];
+
+fn in_ranges(c: char, ranges: &[(u32, u32)]) -> bool {
+    let c = c as u32;
+    ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&c))
 }
 
-/// `s` without control and bidirectional-override characters, trimmed.
-pub fn clean_display(s: &str) -> String {
-    let c: String = s.chars().filter(|&c| !unsafe_display_char(c)).collect();
-    c.trim().to_string()
+/// A character that must never reach a label (§6.7): C0 and C1 controls and DEL (`Cc`), every
+/// format character (`Cf`: bidirectional controls and marks, zero-width characters, BOM, soft
+/// hyphen, tags…), line and paragraph separators, and variation selectors.
+pub fn unsafe_display_char(c: char) -> bool {
+    c.is_control() || in_ranges(c, FORMAT_CHARS) || in_ranges(c, INVISIBLE_CHARS)
 }
+
+/// `s` without the characters of `unsafe_display_char`, with each run of whitespace collapsed to
+/// one space, trimmed. Every display string from the cloud goes through this.
+pub fn clean_display(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut space = false;
+    for c in s.chars().filter(|&c| !unsafe_display_char(c)) {
+        if c.is_whitespace() {
+            space = !out.is_empty();
+        } else {
+            if space {
+                out.push(' ');
+                space = false;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `s` cut to at most `max` characters, the last one an ellipsis when it was longer (on a char
+/// boundary, like `host::trust::display_name`).
+pub fn truncate_display(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+    } else {
+        s.to_string()
+    }
+}
+
+/// Longest user name or email shown in a label.
+pub const LABEL_PART_MAX: usize = 64;
 
 /// serde: a display string, cleaned; `null` reads as empty.
 fn de_display<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -159,9 +224,10 @@ pub struct User {
 
 impl User {
     /// "Ada Lovelace (ada@example.com)", or just the email; "an organization user" without
-    /// either. Control and bidirectional-override characters are removed (§6.7).
+    /// either. Cleaned with `clean_display` (§6.7); name and email are each cut to
+    /// `LABEL_PART_MAX` characters.
     pub fn label(&self) -> String {
-        let (n, e) = (clean_display(&self.name), clean_display(&self.email));
+        let (n, e) = (truncate_display(&clean_display(&self.name), LABEL_PART_MAX), truncate_display(&clean_display(&self.email), LABEL_PART_MAX));
         match (n.is_empty(), e.is_empty()) {
             (false, false) if n != e => format!("{n} ({e})"),
             (false, _) => n,
@@ -640,7 +706,27 @@ mod tests {
         for c in ['\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{0}', '\u{1f}', '\u{80}', '\u{9f}'] {
             assert!(unsafe_display_char(c), "{:04x}", c as u32);
         }
-        assert!(!unsafe_display_char('\u{200D}'), "ZWJ (emoji sequences) is fine");
+        // Every format character, separators, tags and variation selectors too.
+        for c in [
+            '\u{AD}', '\u{600}', '\u{6DD}', '\u{70F}', '\u{180B}', '\u{180E}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{2028}', '\u{2029}', '\u{2060}', '\u{2061}', '\u{2064}',
+            '\u{206A}', '\u{206F}', '\u{FE00}', '\u{FE0F}', '\u{FEFF}', '\u{FFF9}', '\u{FFFB}', '\u{110BD}', '\u{13430}', '\u{1BCA0}', '\u{1D173}', '\u{E0000}', '\u{E0001}',
+            '\u{E0020}', '\u{E0041}', '\u{E007F}', '\u{E0100}', '\u{E01EF}',
+        ] {
+            assert!(unsafe_display_char(c), "{:04x}", c as u32);
+        }
+        for c in ['a', ' ', 'é', '日', '😀', '\u{2065}', '\u{FE10}', '\u{E0080}', '\u{E01F0}', '\u{2027}', '\u{202F}', '\u{FFFC}'] {
+            assert!(!unsafe_display_char(c), "{:04x}", c as u32);
+        }
+        assert_eq!(clean_display("pay\u{200B}pal\u{FEFF}.com\u{AD}"), "paypal.com");
+        assert_eq!(clean_display("ad\u{E0061}\u{E0064}min\u{FE0F}\u{E0100}"), "admin", "tags and variation selectors");
+        assert_eq!(clean_display("Ada\u{2028}\u{2029}Lovelace"), "AdaLovelace", "separators are removed");
+        // Whitespace runs collapse to one space; the ends are trimmed.
+        assert_eq!(clean_display("  Ada \u{3000}\u{A0}  Lovelace\u{2003} "), "Ada Lovelace");
+        assert_eq!(clean_display(" \u{200B} \u{2066} "), "");
+        // Truncation on a char boundary with an ellipsis.
+        assert_eq!(truncate_display("abcdef", 4), "abc…");
+        assert_eq!(truncate_display("abcd", 4), "abcd");
+        assert_eq!(truncate_display("日本語テキスト", 3), "日本…");
 
         let u: User = serde_json::from_str("{\"id\":\"usr_1\",\"email\":\"ada@example.com\\u202e\",\"name\":\"\\u202eecalevoL adA\\u0007\"}").unwrap();
         assert_eq!((u.name.as_str(), u.email.as_str()), ("ecalevoL adA", "ada@example.com"));
@@ -651,6 +737,14 @@ mod tests {
         assert_eq!(User { name: "\u{202e}".into(), ..Default::default() }.label(), "an organization user");
         let u: User = serde_json::from_str(r#"{"id":"u","email":null,"name":null}"#).unwrap();
         assert_eq!(u.label(), "an organization user", "null display fields are empty");
+        // Name and email are each capped at 64 characters.
+        let long = User { name: "N".repeat(100), email: format!("{}@example.com", "e".repeat(80)), ..Default::default() };
+        let l = long.label();
+        assert_eq!(l, format!("{}… ({}…)", "N".repeat(63), "e".repeat(63)));
+        let u: User = serde_json::from_str("{\"name\":\"Ada\\u200b\\u2028  Lovelace\",\"email\":\"ada\\ufeff@example.com\"}").unwrap();
+        assert_eq!(u.label(), "Ada Lovelace (ada@example.com)");
+        let d: DeviceInfo = serde_json::from_str("{\"name\":\"Front\\u00a0\\u00a0desk\\ufe0f\",\"tags\":[\"\\udb40\\udc01\"]}").unwrap();
+        assert_eq!((d.name.as_str(), d.tags.len()), ("Front desk", 0), "tags-only tag is dropped");
 
         let d: DeviceInfo = serde_json::from_str("{\"name\":\"PC\\u202e1\",\"tags\":[\"lab\\u0000\",\"\\u2066\"],\"org\":{\"id\":\"o\",\"slug\":\"s\",\"name\":\"Acme\\u202e\"}}").unwrap();
         assert_eq!((d.name.as_str(), d.tags.clone(), d.org.name.as_str()), ("PC1", vec!["lab".to_string()], "Acme"));
