@@ -1,7 +1,8 @@
 # Glide for organizations (Glide Cloud)
 
-Status: draft, normative for `cloud/` and for the managed-mode code in `mac/` and `windows/`.
-If code and this file disagree, fix one of them. The peer-to-peer wire protocol is unchanged and
+Status: draft, normative for the managed-mode code in `mac/` and `windows/` and for the Glide Cloud
+service's client-facing behaviour. If code and this file disagree, fix one of them. The service
+itself is developed and operated separately; its internals are not part of this repository. The peer-to-peer wire protocol is unchanged and
 stays in [`PROTOCOL.md`](PROTOCOL.md); this file specifies what sits around it.
 
 Glide Cloud is a hosted service on Cloudflare (Workers, Durable Objects, D1). It gives an
@@ -48,11 +49,7 @@ managed sessions (they are always relayed).
 
 | Piece | What |
 |---|---|
-| `cloud/` | TypeScript Worker `glide-cloud`: API, admin console, OIDC client, Durable Objects, D1 migrations, tests (Vitest + `@cloudflare/vitest-pool-workers`) |
-| D1 `glide` | All durable state (§10) |
-| DO `DeviceHub` | One per enrolled device (`idFromName(device_id)`): holds the device's hub WebSocket (hibernation API), delivers session offers and settings pushes, records last-seen |
-| DO `Relay` | One per session (`idFromName(session_id)`): accepts one host and one viewer WebSocket, pumps bytes, reports start, end and byte counts |
-| Secrets | `TICKET_KEY` (HMAC for relay tickets), `DATA_KEY` (AES-GCM for OIDC client secrets at rest), `OPERATOR_TOKEN` (operator API) |
+| Glide Cloud | The hosted service: API, admin console, OIDC client, and the `DeviceHub` (one per device: presence, push) and `Relay` (one per session: byte pump) Durable Objects, with state in D1. Developed and operated separately from this repository |
 | Client, Rust | `windows/src/cloud/`: managed config, API client, hub, relay bridge, grants. WinHTTP on Windows (system proxy and trust store) |
 | Client, Swift | `mac/Sources/GlideCore/Cloud/` plus glue in `glide-host` and `glide-viewer`. `URLSession` (system proxy and trust store) |
 
@@ -160,8 +157,8 @@ close ────────────────────────�
 
 ### 5.4 Org onboarding (operator-provisioned)
 
-1. The operator calls `POST /v1/operator/orgs` (bearer `OPERATOR_TOKEN`) with
-   `{slug, name, owner_email}` and gets a one-time **setup link** (`/setup/<token>`, 7 days).
+1. The Glide Cloud operator creates the org (slug, name, owner email) and sends the owner a
+   one-time **setup link** (`/setup/<token>`, valid 7 days).
 2. The owner opens it and enters the OIDC issuer URL, client ID, client secret and allowed email
    domains; the page shows the redirect URI to register (`https://<cloud>/auth/callback`). The
    cloud validates the issuer with OIDC discovery.
@@ -190,11 +187,11 @@ with a matching HTTP status. Clients ignore unknown fields.
 |---|---|---|---|
 | Device token | `gd_` + 43 base64url chars (32 random bytes) | `Authorization: Bearer gd_…` | until revoked or re-enrolled |
 | User token | `gu_` + 43 base64url chars | `X-Glide-User: gu_…` together with the device bearer | `user_session_hours` |
-| Relay ticket | `base64url(payload JSON) "." base64url(HMAC-SHA256(TICKET_KEY, first part))` | `?ticket=` on the relay URL | 120 s |
+| Relay ticket | opaque URL-safe string, signed by the service; clients pass it on unchanged and never parse it | `?ticket=` on the relay URL (percent-encoded) | 120 s |
 | Console session | 32 random bytes in cookie `glide_console` (`HttpOnly; Secure; SameSite=Lax; Path=/`); mutations also need the `X-CSRF-Token` header (or form field) from the page | cookie | 8 h idle, 24 h absolute |
 
 The cloud stores only SHA-256 hashes of device, user, console, setup and enrollment tokens.
-Relay ticket payload: `{"sid":"ses_…","role":"host"|"viewer","dev":"dev_…","exp":<unix s>}`.
+A ticket names one session, one role (host or viewer) and one device.
 
 ### 6.2 Device API
 
@@ -421,14 +418,20 @@ The console filters by time, type, user, device and session, and exports CSV or 
 (`GET /console/audit/export?format=csv&from=…&to=…`). A daily cron deletes events older than
 `audit_retention_days`.
 
-## 10. Data model (D1)
+## 10. Data the service keeps
 
-Tables (`cloud/migrations/`): `orgs`, `org_sso` (issuer, client_id, encrypted client_secret,
-groups_claim, allowed_domains), `org_settings`, `users`, `user_groups`, `admin_roles`,
-`console_sessions`, `devices`, `enrollment_tokens`, `device_codes`, `user_tokens`, `policies`
-(ordered, JSON body), `sessions`, `audit_events` (indexed by `(org_id, ts)` and
-`(org_id, session_id)`), `setup_links`, `oidc_states`. Every row carries `org_id` (except
-operator-level rows) and every query is scoped by it.
+For an organization's privacy review. Glide Cloud stores, per org:
+
+- the org's name, slug, settings (§7), policies (§8) and OIDC configuration (issuer, client ID,
+  groups claim, allowed email domains; the client secret is encrypted at rest);
+- users: IdP issuer and subject, email, name, groups, console role;
+- devices: name, kind, platform, OS and app version, tags, public key, last-seen time and IP;
+- sessions: who, which host, when, permissions, approval outcome, duration and byte counts;
+- the audit log (§9), for `audit_retention_days`.
+
+Device, user, console, setup and enrollment tokens are stored only as SHA-256 hashes. Session
+contents (screen, input, clipboard, files, audio) never reach the service in readable form: the
+relay carries only Noise ciphertext (§3). Every record is scoped to its org.
 
 ## 11. Managed configuration and local state
 
@@ -481,6 +484,6 @@ force a new sign-in.
 
 ## 13. Operating Glide Cloud
 
-[`cloud/README.md`](../cloud/README.md) covers the Cloudflare account requirements (the Workers
-Paid plan for production Durable Object volume), deployment with `wrangler`, secrets, the custom
-domain, migrations, the operator API, and backups (D1 Time Travel).
+Glide Cloud is operated by the Glide maintainers on Cloudflare (Workers, Durable Objects, D1).
+Organizations run no part of it: they deploy the apps (see [`DEPLOYMENT.md`](DEPLOYMENT.md)) and
+configure their identity provider.
