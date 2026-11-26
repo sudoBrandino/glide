@@ -46,12 +46,10 @@ public struct PairedViewer: Codable, Equatable {
 
     public var fingerprint: String { keyData.map(GlideHandshake.fingerprint) ?? "invalid key" }
 
-    /// Display name: control characters removed, at most 40 characters.
+    /// Display name: the CloudText rules (controls, bidi and format characters, separators, tag
+    /// characters and variation selectors removed, whitespace collapsed), at most 40 characters.
     public static func displayName(_ raw: String) -> String {
-        let clean = String(raw.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }.map(Character.init))
-            .trimmingCharacters(in: .whitespaces)
-        let s = clean.isEmpty ? "unnamed viewer" : clean
-        return s.count > 40 ? String(s.prefix(39)) + "…" : s
+        CloudText.name(raw, fallback: "unnamed viewer", max: 40)
     }
 }
 
