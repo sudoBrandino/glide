@@ -504,31 +504,46 @@ tested on real hardware: rotated monitors, every vendor's encoder MFT.
 
 Organizations deploy both programs with Group Policy or Intune and point them at their Glide Cloud
 tenant (`../docs/ENTERPRISE.md`). The policy is read at start from `HKLM\SOFTWARE\Policies\Glide`, then
-`HKCU\SOFTWARE\Policies\Glide`: `CloudURL` (REG_SZ, `https://…`; plain `http://` only to a loopback
-address), `EnrollmentToken` (REG_SZ), `DeviceName` (REG_SZ), `Tags` (REG_MULTI_SZ), `DisableLANMode`
+`HKCU\SOFTWARE\Policies\Glide`: `CloudURL` (REG_SZ, an origin `https://host[:port]` with no path, query
+or fragment; plain `http://` only to a loopback IP address; anything else is a configuration error and
+the program runs unmanaged), `EnrollmentToken` (REG_SZ), `DeviceName` (REG_SZ), `Tags` (REG_MULTI_SZ), `DisableLANMode`
 (REG_DWORD). The enrollment values come as one set from the first key that has a `CloudURL` (machine
 policy wins, nothing is mixed between the two); `DisableLANMode` applies if either key sets it.
 
 - **Enrollment.** With no stored enrollment (or one for another `CloudURL`) the program enrolls with the
   token and its public key. The result is `cloud-viewer.dpapi` / `cloud-host.dpapi` next to `config.json` /
   `host.json` (DPAPI, current user), with the last org settings, so `lan_mode: false` applies from launch.
-  `401 invalid_enrollment_token` and `409 device_revoked` stop it; anything else is retried (1 s doubling to
-  60 s, ±20 %). A `revoked` hub frame, or a 401 for the device token, deletes the file.
+  `401 invalid_enrollment_token` and `409 device_revoked` stop it; anything else is retried (5 s doubling to
+  10 min, ±20 %).
+- **Revocation.** A `revoked` hub frame, or a 401 for the device token (hub, `GET /v1/device`), deletes the
+  credentials but keeps `{cloud_url, revoked: true, settings}` in the file: the last org settings (e.g.
+  `lan_mode: false`) keep applying, across restarts, and the program doesn't enroll again until the
+  `CloudURL` changes; removing the `CloudURL` deletes the record.
 - **Transport.** WinHTTP: the system proxy (automatic proxy / PAC), the Windows certificate store (an
-  organization's TLS-inspection root works), TLS 1.2+, redirects refused. The hub WebSocket reconnects with
-  the same backoff; heartbeat at the first hub connection, then every 6 h; client audit events (files sent and
-  received, clipboard transfers without contents, a session ended locally, errors) are batched every 10 s.
+  organization's TLS-inspection root works), TLS 1.2+, redirects refused. The hub WebSocket reconnects
+  (1 s doubling to 60 s, ±20 %); on each connection the program refreshes its name, tags and org name with
+  `GET /v1/device`; heartbeat at the first hub connection, then every 6 h; client audit events (files sent and
+  received, clipboard transfers without contents, a session ended locally, relay and handshake errors) are
+  batched every 10 s (a batch refused with a 4xx other than 401/429 is dropped).
+- **Display strings.** Names, emails, device, host and org names from the cloud are shown without control,
+  format (bidirectional, zero-width…), separator, tag or variation-selector characters; long emails are
+  shortened in their local part so the real domain stays visible.
 - **Viewer.** Tray and Connections window: *Sign in to your organization…* opens the browser on the
-  sign-in page and shows the code it should display; the dialog closes once you approve (device
-  authorization grant). The Connections window then lists the organization's computers in an
+  sign-in page (only an `https` page on the `CloudURL`'s host) and shows the code it should display; the
+  dialog closes once you approve (device authorization grant; polling backs off on network and server
+  errors). The Connections window then lists the organization's computers in an
   *Organization* group (online first, "asks for approval", "view only"); the status line shows the
-  organization and who is signed in. **Connect** shows "Waiting for NAME to approve…" while the person at
-  the host decides, then "Connecting … through Glide Cloud". The session runs once: it is never redialed.
-  *Sign out* is in the tray and the Connections window.
-- **Host.** An offer is declined as `busy` while another session runs, as `policy` if the app is older than
-  the org's `min_app_version` or the relay URL isn't the tenant's own; with `approval: required` the PC shows
-  "NAME (email) … asks to see and control this PC" (Decline is the default, Accept is enabled after 1 s, it
-  declines itself after 50 s). While a managed session runs, the tray tooltip says "NAME (email) is
+  organization and who is signed in. **Connect** (or **Connect (view only)**) shows "Waiting for NAME to
+  approve…" while the person at the host decides, then "Connecting … through Glide Cloud". The session runs
+  once: it is never redialed. Whenever the viewer's side closes a session (including failures and the host
+  ending it) it tells the cloud (`POST /v1/sessions/{id}/end`). *Sign out* is in the tray and the
+  Connections window.
+- **Host.** An offer is declined as `timeout` once its `expires_at` has passed, as `busy` (without a prompt)
+  while another session runs, and as `policy` if it lacks a security field, the app is older than the org's
+  `min_app_version` or the relay URL isn't the tenant's own; with `approval: required` the PC shows
+  "NAME (email) … asks to see and control this PC" ("see this PC (view only)" for a view-only session;
+  Decline is the default, Accept is enabled after 1 s, it declines itself after 50 s). The grant lives from
+  acceptance until the earlier of `expires_at` and 120 s later. While a managed session runs, the tray tooltip says "NAME (email) is
   connected" (also announced once), and the tray menu has **End session**; console: `status`, `end`.
 - **Trust.** The viewer pins the host key the cloud names for target `relay:<session_id>`, in memory only.
   The host accepts exactly one Noise session for the session id, from the granted viewer key, never pairs on
@@ -537,7 +552,8 @@ policy wins, nothing is mixed between the two); `DisableLANMode` applies if eith
 - **Permissions.** Enforced on both sides, at the transport (`cloud::perms`): view only drops every input
   message on the host and stops the viewer sending any; clipboard and file data are refused in a
   direction the session doesn't allow, whichever side sends (a refused file offer gets a decline); no audio
-  without `audio`. Features a session doesn't allow at all aren't advertised in ClientHello.
+  (and no `AudioEnable(true)`) without `audio`. View only also stops `SetDisplayPreference`; the host never
+  changes the PC's display mode or resolution for a viewer (the viewer's size only scales the stream). Features a session doesn't allow at all aren't advertised in ClientHello.
 - **Org settings.** `lan_mode: false` (or `DisableLANMode`): no LAN listening or dialing (the host closes
   its listeners and ends LAN sessions; the viewer stops at once). `allow_local_pairing: false`: the host's
   pairing window can't open, the viewer won't pair a new Mac or PC.
