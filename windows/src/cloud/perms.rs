@@ -9,7 +9,9 @@
 //!   host's ids have bit 31 set), so every message of a forbidden transfer is refused, whichever
 //!   way it travels — except declines (`FileAnswer` with a nonzero status) and `FileCancel`,
 //!   which only ever stop a transfer.
-//! - `audio`: AudioConfig / AudioFrame (host → viewer).
+//! - `audio`: AudioConfig / AudioFrame (host → viewer), and the viewer's `AudioEnable(true)`.
+//! - View only also stops `SetDisplayPreference` (§6.7: the host never changes its display mode
+//!   for a view-only viewer; `ViewSize`, which only scales the stream, still flows).
 
 use super::api::{Direction, Permissions};
 use crate::protocol::*;
@@ -82,6 +84,11 @@ impl Permissions {
                 // ReleaseAll lets nothing new happen; it is always fine.
                 p.control || ty == MSG_RELEASE_ALL
             }
+            // View only: the viewer never asks the host to change its display mode (§6.7); the
+            // host still scales to the viewer's size (ViewSize is fine).
+            MSG_SET_DISPLAY_PREFERENCE if viewer => p.control,
+            // No audio: the viewer never asks for it (turning it off is always fine).
+            MSG_AUDIO_ENABLE if viewer => p.audio || pt.get(1) == Some(&0),
             MSG_CLIPBOARD => {
                 if viewer {
                     p.clipboard.to_host()
@@ -155,10 +162,14 @@ mod tests {
         assert!(!view.allows(Flow::FromViewer, &ClientMsg::File(offer(1)).encode()));
         assert!(view.allows(Flow::FromViewer, &ClientMsg::File(FileMsg::Ack { id: FILE_HOST_ID_BIT | 1, bytes: 1 }).encode()));
         assert_eq!(view.effective().files, Direction::ToViewer);
-        // Video control and pings are always fine.
+        // Video control and pings are always fine (the host scales to the viewer's size).
         for m in [ClientMsg::Ping { client_time_us: 1 }, ClientMsg::RequestKeyframe, ClientMsg::ViewSize { view_w: 100, view_h: 100 }] {
             assert!(view.allows(Flow::FromViewer, &m.encode()));
         }
+        // ...but view only never changes the host's display mode.
+        let pref = ClientMsg::SetDisplayPreference { mode: DISPLAY_PREF_RETINA }.encode();
+        assert!(!view.allows(Flow::FromViewer, &pref));
+        assert!(full.allows(Flow::FromViewer, &pref));
     }
 
     #[test]
@@ -216,6 +227,10 @@ mod tests {
         assert!(!no_audio.allows(Flow::FromHost, &[MSG_AUDIO_FRAME, 0, 0]));
         assert!(!no_audio.allows(Flow::FromHost, &[MSG_AUDIO_CONFIG]));
         assert!(no_audio.allows(Flow::FromViewer, &ClientMsg::AudioEnable { enabled: false }.encode()));
+        assert!(!no_audio.allows(Flow::FromViewer, &ClientMsg::AudioEnable { enabled: true }.encode()), "audio: false → no AudioEnable(true)");
+        assert!(!no_audio.allows(Flow::FromViewer, &[MSG_AUDIO_ENABLE]), "truncated");
+        let with_audio = p(false, Direction::Off, Direction::Off, true);
+        assert!(with_audio.allows(Flow::FromViewer, &ClientMsg::AudioEnable { enabled: true }.encode()));
         let all = CAP_HEVC_420 | CAP_CLIPBOARD | CAP_FILES | CAP_AUDIO_PCM | CAP_DISPLAYS;
         assert_eq!(no_audio.filter_caps(all), all & !CAP_AUDIO_PCM);
         assert_eq!(Permissions::default().filter_caps(all), CAP_HEVC_420 | CAP_DISPLAYS);
