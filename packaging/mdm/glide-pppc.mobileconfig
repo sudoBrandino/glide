@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Privacy Preferences Policy Control (PPPC) for Glide Host (docs/ENTERPRISE.md §11.1).
+  TEMPLATE: run tools/fill-mdm-profiles.sh on the signed Glide Host.app first. It puts in the
+  app's real designated requirement (codesign -dr -) and your organization's name, and gives every
+  payload a fresh PayloadUUID. The requirement below is a placeholder (TEAMID).
+
+  - Accessibility: allowed (Glide injects the viewer's keyboard and mouse input).
+  - Screen Recording: Apple doesn't let an MDM grant it. AllowStandardUserToSetSystemService lets
+    a standard user (not only an admin) switch Glide Host on in System Settings, and the host's
+    setup window walks them there.
+  Must be delivered by an MDM (user-approved or ADE enrollment); installed by hand it is ignored.
+-->
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadDescription</key>
+      <string>Allows Glide Host to control the keyboard and mouse, and lets standard users allow its screen recording.</string>
+      <key>PayloadDisplayName</key>
+      <string>Privacy Preferences Policy Control</string>
+      <key>PayloadIdentifier</key>
+      <string>dev.brandino.glide.pppc.tcc</string>
+      <key>PayloadType</key>
+      <string>com.apple.TCC.configuration-profile-policy</string>
+      <key>PayloadUUID</key>
+      <string>62812CEF-2176-4911-8C63-D053FC0BB111</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+      <key>Services</key>
+      <dict>
+        <key>Accessibility</key>
+        <array>
+          <dict>
+            <key>Allowed</key>
+            <true/>
+            <key>CodeRequirement</key>
+            <string>identifier "dev.brandino.glide.host" and anchor apple generic and certificate leaf[subject.OU] = "TEAMID"</string>
+            <key>Comment</key>
+            <string>Glide Host: remote keyboard and mouse input</string>
+            <key>Identifier</key>
+            <string>dev.brandino.glide.host</string>
+            <key>IdentifierType</key>
+            <string>bundleID</string>
+          </dict>
+        </array>
+        <key>ScreenCapture</key>
+        <array>
+          <dict>
+            <key>Authorization</key>
+            <string>AllowStandardUserToSetSystemService</string>
+            <key>CodeRequirement</key>
+            <string>identifier "dev.brandino.glide.host" and anchor apple generic and certificate leaf[subject.OU] = "TEAMID"</string>
+            <key>Comment</key>
+            <string>Glide Host: screen sharing (the user still switches it on)</string>
+            <key>Identifier</key>
+            <string>dev.brandino.glide.host</string>
+            <key>IdentifierType</key>
+            <string>bundleID</string>
+          </dict>
+        </array>
+      </dict>
+    </dict>
+  </array>
+  <key>PayloadDescription</key>
+  <string>Privacy permissions for Glide Host (remote desktop).</string>
+  <key>PayloadDisplayName</key>
+  <string>Glide Host: privacy permissions</string>
+  <key>PayloadIdentifier</key>
+  <string>dev.brandino.glide.pppc</string>
+  <key>PayloadOrganization</key>
+  <string>ORGANIZATION</string>
+  <key>PayloadRemovalDisallowed</key>
+  <true/>
+  <key>PayloadScope</key>
+  <string>System</string>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadUUID</key>
+  <string>BA7A5542-45BF-459B-AA5C-B0BEC9912DD8</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+</dict>
+</plist>

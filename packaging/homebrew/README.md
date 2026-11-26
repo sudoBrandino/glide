@@ -44,7 +44,7 @@ cask.
 - Leaves the LaunchAgent to `glide-setup`: cask steps run in Homebrew's sandbox (with a
   temporary `$HOME`), where they can't install or start a per-user agent.
 - `uninstall launchctl` stops the host and removes the agent (under the current bundle id,
-  `dev.brandino.glide.host`, and the one releases up to 0.3.x used), on `brew uninstall` and also
+  `dev.brandino.glide.host`, and the one releases up to 0.4.x used), on `brew uninstall` and also
   on `brew upgrade` (Homebrew skips only `signal` directives on upgrades). So the caveat asks for
   `glide-setup` after every upgrade: it restarts the host and, for ad-hoc-signed builds (each new
   build needs its Screen Recording and Accessibility grants again), re-requests the grants.

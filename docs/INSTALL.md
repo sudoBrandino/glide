@@ -18,6 +18,18 @@ side: `glide-host.exe` is in the Windows zip and `glide-viewer` is inside `Glide
 The host and the viewer must be the same release, or at least speak the same protocol version.
 `glide-host --version` and `glide-client.exe --version` print both.
 
+**Deploying to many machines?** Organizations use the `.pkg` installers (Mac) and the `.msi`
+(Windows) with an MDM, Intune, Group Policy or Configuration Manager, and connect them to Glide
+Cloud for single sign-on, policies and relayed sessions: see [DEPLOYMENT.md](DEPLOYMENT.md).
+
+**Signed builds.** When the release notes say so, the Mac apps are signed with Glide's Apple
+Developer ID and notarized by Apple, and the Windows exes and MSI are code-signed (Azure Artifact
+Signing). Then macOS opens the app without a warning, Windows shows a verified publisher, and the
+quarantine and SmartScreen steps below don't apply. Check a download yourself:
+`spctl -a -vv -t exec "/Applications/Glide Host.app"` should say `source=Notarized Developer ID`;
+on Windows, `Get-AuthenticodeSignature .\glide-client.exe` should say `Valid`. Releases without a
+Developer ID are signed ad hoc or with the project's own certificate, as described below.
+
 **Before you start:**
 
 - Glide connects the two machines directly, with no relay server, on TCP port 7420. Either side
@@ -39,9 +51,9 @@ No Terminal needed. Both apps have a setup window that walks through everything 
 
 1. Download `Glide-Host-<version>-macos-arm64.dmg`, open it and drag **Glide Host** to
    **Applications**.
-2. Open Glide Host from Applications. The app is signed ad hoc, not notarized, so the first time
-   macOS says it can't check it: open **System Settings → Privacy & Security**, scroll down and
-   click **Open Anyway**.
+2. Open Glide Host from Applications. A notarized release (see *Signed builds* above) just opens.
+   Otherwise, the first time macOS says it can't check it: open **System Settings → Privacy &
+   Security**, scroll down and click **Open Anyway**.
 3. The **Glide Host Setup** window opens. From top to bottom:
    - **Start at Login**, so the Mac is reachable after a restart.
    - **Screen Recording → Allow…**, switch on Glide Host, then **Restart Glide Host** when the
@@ -58,12 +70,16 @@ The window opens again by itself while something is missing, and any time from t
 **Set Up Glide Host…**. Opening a newer download while Glide Host runs offers to replace it,
 keeping the settings and pairings.
 
-**Signing.** Releases are signed with the project's own certificate, "Glide Release Signing", so
-macOS keeps the Screen Recording and Accessibility grants from one release to the next. (Builds
-signed ad hoc, as pull-request builds are, need both again after every update.) It is not an Apple
-Developer ID, so Gatekeeper still asks once, on the first launch. After an update, open Glide Host
-once if it doesn't start at login by itself: macOS ties the login item to the exact build, and
-opening the new one registers it again (replacing it from the setup window does this for you).
+**Signing.** Releases are signed either with Glide's Apple Developer ID (notarized) or, before
+that is in place, with the project's own certificate, "Glide Release Signing". Both keep the
+signature's identity the same from release to release, so macOS keeps the Screen Recording and
+Accessibility grants across updates. (Builds signed ad hoc, as pull-request builds are, need both
+again after every update.) Only the Developer ID avoids Gatekeeper's question on the first launch.
+The first release with the bundle id `dev.brandino.glide.host` (earlier:
+`io.github.sudobrandino.glide.host`) asks for both permissions once more. After an update, open
+Glide Host once if it doesn't start at login by itself: macOS ties the login item to the exact
+build, and opening the new one registers it again (replacing it from the setup window does this
+for you).
 
 **Windows**
 
@@ -137,7 +153,8 @@ installed and signed in, and doesn't install a download that fails it.
 
 ### 2.1 Unzip and clear the quarantine flag
 
-The app is **signed ad hoc and not notarized** by Apple. macOS blocks such an app when it was
+A **notarized** release (see *Signed builds* at the top) needs no extra step: unzip it and move
+it to `~/Applications`. A release that is **not notarized** is blocked by macOS when it was
 downloaded with a browser: it says the app "is damaged" or that Apple "could not verify" it. To
 allow it, remove the quarantine flag that the browser added:
 
@@ -168,7 +185,7 @@ curl -fsSL https://raw.githubusercontent.com/sudoBrandino/glide/main/install.sh 
 From a clone of the repository, `./install.sh --app …` does the same.
 
 **Option B: by hand.** This creates the same LaunchAgent as `install.sh`. The label must be the
-app's bundle identifier, `dev.brandino.glide.host` (releases up to 0.3.x: `io.github.sudobrandino.glide.host`). `KeepAlive` restarts the host
+app's bundle identifier, `dev.brandino.glide.host` (releases up to 0.4.x: `io.github.sudobrandino.glide.host`). `KeepAlive` restarts the host
 whenever it exits, as long as the app is still there:
 
 ```sh
@@ -243,8 +260,9 @@ PC. Allow it if the PC should be able to connect to the Mac. Only with `"listen"
    path, so don't run it from the Downloads folder or from inside the zip.
 2. Run `glide-client.exe`. It is a single self-contained file; nothing else is installed.
 
-**SmartScreen.** The exe is not code-signed, so the first run may show "Windows protected your
-PC". Click **More info → Run anyway**. You can also clear the download mark before the first run:
+**SmartScreen.** A signed release shows a verified publisher; SmartScreen may still warn while
+a new signing identity builds reputation. An unsigned exe may show "Windows protected your PC" on
+the first run: click **More info → Run anyway**. You can also clear the download mark before the first run:
 right-click the exe → **Properties** → tick **Unblock** → OK, or in PowerShell:
 
 ```powershell
@@ -379,10 +397,11 @@ Run the installer again (`install.sh` or `install.ps1`, see [Quick install](#qui
 1. Mac: unzip the new app and clear its quarantine flag ([2.1](#21-unzip-and-clear-the-quarantine-flag)).
    Quit the old host (menu bar → **Quit Until Next Login**, which unloads the LaunchAgent),
    replace `~/Applications/Glide Host.app`, and load the agent again:
-   `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.sudobrandino.glide.host.plist`
-   (or log out and back in).
-2. Because the app is signed ad hoc, macOS treats each release as a new app and may ignore the
-   old permissions. If capture or input stops working, remove *Glide Host* from **Screen
+   `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.brandino.glide.host.plist`
+   (or log out and back in). Coming from 0.4.x or earlier, the agent was
+   `io.github.sudobrandino.glide.host.plist`: `install.sh` moves it to the new label for you.
+2. A release signed ad hoc counts as a new app for macOS, which may ignore the old permissions
+   (Developer ID and "Glide Release Signing" builds keep them). If capture or input stops working, remove *Glide Host* from **Screen
    Recording** and **Accessibility** in System Settings (the **−** button), then repeat
    [2.3](#23-grant-screen-recording-and-accessibility).
 3. PC: close the viewer and replace `glide-client.exe` at the same path, so firewall rules keep
@@ -396,16 +415,22 @@ Pairings and settings survive updates.
 `--purge` the rest; with Homebrew, `brew uninstall --zap glide-host`. By hand:
 
 ```sh
-launchctl bootout gui/$(id -u)/io.github.sudobrandino.glide.host
-rm -f ~/Library/LaunchAgents/io.github.sudobrandino.glide.host.plist
+launchctl bootout gui/$(id -u)/dev.brandino.glide.host
+rm -f ~/Library/LaunchAgents/dev.brandino.glide.host.plist
 rm -rf ~/Applications/Glide\ Host.app
 # Optional: settings, this Mac's key and the paired viewers; the log; the privacy grants
 rm -rf ~/Library/Application\ Support/Glide ~/Library/Logs/glide-host.log
-tccutil reset ScreenCapture io.github.sudobrandino.glide.host
-tccutil reset Accessibility io.github.sudobrandino.glide.host
+tccutil reset ScreenCapture dev.brandino.glide.host
+tccutil reset Accessibility dev.brandino.glide.host
 ```
 
-**PC.** Run the installer with `-Uninstall` (add `-Purge` for the settings):
+(Releases up to 0.4.x used `io.github.sudobrandino.glide.host` in place of
+`dev.brandino.glide.host`. A Mac installed from the `.pkg` uses
+`sudo "/Applications/Glide Host.app/Contents/Resources/glide-uninstall"`: see
+[DEPLOYMENT.md](DEPLOYMENT.md#8-uninstall).)
+
+**PC.** If Glide came with the MSI (it lives in `C:\Program Files\Glide`), remove it in
+**Settings → Apps → Glide**, or ask whoever deployed it. Otherwise run the installer with `-Uninstall` (add `-Purge` for the settings):
 `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sudoBrandino/glide/main/install.ps1))) -Uninstall`.
 By hand: quit the viewer (tray → **Quit Glide**), turn off **Start Glide when I sign in** in its
 setup window, delete its folder and its Start menu shortcut, and optionally delete
@@ -419,7 +444,7 @@ the PC, run `glide-client.exe` from a terminal to see its messages.
 | Symptom | What to do |
 |---|---|
 | macOS says *Glide Host* "is damaged" or "can't be opened" | The quarantine flag is still set: `xattr -dr com.apple.quarantine ~/Applications/Glide\ Host.app` ([2.1](#21-unzip-and-clear-the-quarantine-flag)) |
-| No menu-bar icon | Check that the agent is loaded: `launchctl print gui/$(id -u)/io.github.sudobrandino.glide.host`. Read the log for errors |
+| No menu-bar icon | Check that the agent is loaded: `launchctl print gui/$(id -u)/dev.brandino.glide.host`. Read the log for errors |
 | Black screen, or "Screen recording NOT granted" in the log | Grant Screen Recording ([2.3](#23-grant-screen-recording-and-accessibility)), then **Restart Glide Host**. After an update, remove and re-add the grant |
 | The picture works but the mouse and keyboard don't | Grant Accessibility to *Glide Host* ([2.3](#23-grant-screen-recording-and-accessibility)) |
 | "capture unavailable" in the log | The display is asleep, locked or being reconfigured. The host wakes it and retries every 2 s |

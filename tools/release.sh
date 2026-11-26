@@ -19,6 +19,8 @@
 #                                    (packaging/homebrew/README.md)
 #   tools/release.sh check           version consistency + CHANGELOG entry, nothing is built
 #
+# The Windows MSI is built on Windows, after viewer-build: pwsh packaging/windows/build-msi.ps1.
+#
 # Options (environment):
 #   GLIDE_RELEASE_OUT=DIR     output folder (default: dist/release/<version>)
 #   GLIDE_SKIP_TESTS=1        skip glide-selftest and cargo test before packaging
@@ -142,8 +144,8 @@ cmd_host() {
   [[ "$got" == "glide-host $VERSION ("*")"* ]] || die "glide-host --version says '$got', expected $VERSION"
   echo "$got"
   [[ -x "$app/Contents/MacOS/glide-viewer" ]] || die "Glide Host.app holds no glide-viewer"
-  [[ "$(lipo -archs "$app/Contents/MacOS/glide-viewer")" == "$archs" ]] \
-    || die "glide-viewer is built for $(lipo -archs "$app/Contents/MacOS/glide-viewer"), glide-host for $archs"
+  [[ "$(lipo -archs "$app/Contents/MacOS/glide-viewer")" == "$(lipo -archs "$bin")" ]] \
+    || die "glide-viewer is built for $(lipo -archs "$app/Contents/MacOS/glide-viewer"), glide-host for $(lipo -archs "$bin")"
   [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" == "$VERSION" ]] \
     || die "Info.plist CFBundleShortVersionString != $VERSION"
   local zip="$OUT/Glide-Host-$VERSION-macos-$arch_name.zip"
@@ -209,6 +211,11 @@ build_pkg() {
   codesign --verify --strict "$app" || die "Glide $kind.app in $zip has a broken signature"
   id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")"
   local scripts=()
+  # No extended attributes (quarantine, Finder info) in the payload: pkgbuild ships them as ._
+  # AppleDouble entries. The signature and a stapled ticket live in files, not xattrs. (A developer
+  # Mac re-attaches com.apple.provenance, which can't be cleared; CI runners don't set it.)
+  xattr -cr "$root"
+  codesign --verify --strict "$app" || die "Glide $kind.app lost its signature without xattrs"
   if [[ $kind == Host ]]; then
     # The packaging files name the public bundle id; a custom one (GLIDE_RELEASE_CUSTOM_ID) is
     # substituted so the agent label, the postinstall and the app agree.

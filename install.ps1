@@ -11,6 +11,10 @@ adds a Start menu shortcut, optionally starts the viewer at sign-in, and starts 
 Run it again to update. No administrator rights are needed except for the optional firewall rule,
 which asks for them separately.
 
+If Glide was installed for all users with the MSI (Glide-<version>-windows-x64.msi, usually by an
+organization: docs/DEPLOYMENT.md), this script steps aside: it neither installs a second copy nor
+removes that one. Update or remove it with the MSI (Settings -> Apps, or msiexec).
+
 The viewer dials the Mac when it knows the Mac's address, and also listens on TCP port 7420 so
 the Mac can connect to it (unless that is turned off). Whichever direction the network allows
 connects.
@@ -226,6 +230,28 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
         } catch { @() }
     }
 
+    # Folder of a per-machine MSI install (packaging/windows/wix/Glide.wxs writes
+    # HKLM\SOFTWARE\Glide\Installer InstallDir), if its viewer is there; else $null. Read from the
+    # 64-bit registry view even in a 32-bit PowerShell.
+    function Get-MsiInstallDir {
+        try {
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+            $key = $base.OpenSubKey('SOFTWARE\Glide\Installer')
+            if (-not $key) { return $null }
+            $dir = [string]$key.GetValue('InstallDir')
+            $key.Close()
+            if ($dir -and (Test-Path -LiteralPath (Join-Path $dir $ExeName))) { return $dir.TrimEnd('\') }
+        } catch { }
+        return $null
+    }
+
+    function Show-MsiInstall([string]$MsiDir) {
+        Info "Glide is installed for all users in $MsiDir (the Glide MSI, usually deployed by your"
+        Info 'organization). This script leaves that installation alone and does not add a second copy.'
+        Info 'Start it from the Start menu (Glide Viewer). Update it with a newer MSI; remove it in'
+        Info 'Settings -> Apps -> Glide, or ask your IT department.'
+    }
+
     # Where an existing viewer lives: the running one, a firewall rule, a shortcut, the sign-in
     # entry, or the default. Downloads and temp folders don't count: the viewer shouldn't live
     # there (docs/INSTALL.md).
@@ -317,6 +343,13 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
 
     function Install-Viewer {
         Write-Host 'Glide viewer setup' -NoNewline; Write-Host " ($Repo)" -ForegroundColor DarkGray
+
+        $msiDir = Get-MsiInstallDir
+        if ($msiDir) {
+            Step 'Glide is already installed for all users'
+            Show-MsiInstall $msiDir
+            return
+        }
 
         if (-not [Environment]::Is64BitOperatingSystem) { throw 'the Glide viewer needs 64-bit Windows 10 or 11.' }
         if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') {
@@ -489,6 +522,11 @@ Options, with the script saved to a file (.\install.ps1 -Mac 192.168.1.50) or in
     function Uninstall-Viewer {
         Step 'Uninstalling the Glide viewer'
         $target = if ($Dir) { $Dir } else { Find-InstallDir }
+        $msiDir = Get-MsiInstallDir
+        if ($msiDir -and ($target.TrimEnd('\') -eq $msiDir)) {
+            Show-MsiInstall $msiDir
+            return
+        }
         if (-not (Stop-Viewer)) { throw 'the viewer is still running' }
         $exe = Join-Path $target $ExeName
         if (Test-Path $exe) {

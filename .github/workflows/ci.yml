@@ -49,10 +49,22 @@ jobs:
           python3 tools/mock_host.py --file-vectors "$RUNNER_TEMP/f.json"     # §6 file messages + name rules
           cmp "$RUNNER_TEMP/f.json" docs/file-transfer-vectors.json
           python3 tools/mock_host.py --selftest                               # Python reference self-checks
-      - name: Installers (shellcheck install.sh, parse install.ps1)
+      - name: Installers and packaging (shellcheck, parse the PowerShell, well-formed XML)
         run: |
-          shellcheck -x -s bash install.sh tools/install-host.sh tools/test-install.sh
-          pwsh -NoProfile -Command '$e = $null; [void][Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$null, [ref]$e); if ($e) { $e | ForEach-Object { "{0}: {1}" -f $_.Extent.StartLineNumber, $_.Message }; exit 1 }'
+          shellcheck -x -s bash install.sh tools/install-host.sh tools/test-install.sh \
+            tools/release.sh tools/build-env.sh tools/mac-sign.sh tools/make-host-app.sh \
+            tools/make-viewer-app.sh tools/notarize.sh tools/fill-mdm-profiles.sh \
+            packaging/macos/uninstall.sh packaging/macos/scripts/host/postinstall
+          # shellcheck disable=SC2016  # the PowerShell is single-quoted on purpose
+          for PS_FILE in install.ps1 packaging/windows/build-msi.ps1; do
+            PS_FILE="$PS_FILE" pwsh -NoProfile -Command '$e = $null; [void][Management.Automation.Language.Parser]::ParseFile("$PWD/$env:PS_FILE", [ref]$null, [ref]$e); if ($e) { $e | ForEach-Object { "{0}: {1}" -f $_.Extent.StartLineNumber, $_.Message }; exit 1 }'
+          done
+          # WiX source, ADMX/ADML, pkg distribution template, LaunchAgent and profiles
+          python3 -c 'import sys, xml.dom.minidom as m; [m.parse(f) for f in sys.argv[1:]]' \
+            packaging/windows/wix/Glide.wxs packaging/windows/admx/Glide.admx \
+            packaging/windows/admx/en-US/Glide.adml packaging/macos/distribution.xml.in \
+            packaging/macos/*.plist packaging/macos/*.entitlements packaging/mdm/*.mobileconfig \
+            packaging/mdm/*.plist
       - name: No personal paths in the tree
         # Examples and tests use placeholders such as %USERPROFILE% or C:\Users\me; see CONTRIBUTING.md.
         run: |
@@ -105,7 +117,8 @@ jobs:
         run: |
           swiftc -O tools/display-mode.swift -o "$RUNNER_TEMP/glide-display-mode"
           swiftc -O tools/compare.swift -o "$RUNNER_TEMP/glide-compare"
-          for f in tools/*.sh install.sh; do bash -n "$f"; done
+          for f in tools/*.sh install.sh packaging/macos/uninstall.sh packaging/macos/scripts/host/postinstall; do bash -n "$f"; done
+          plutil -lint packaging/macos/*.plist packaging/macos/*.entitlements packaging/mdm/*.mobileconfig packaging/mdm/*.plist
           python3 -m py_compile tools/mock_host.py tools/gen_vectors.py tools/glide_noise.py
 
   # Rust viewer: platform-independent unit tests on Linux, plus the MinGW cross-build of the exe.

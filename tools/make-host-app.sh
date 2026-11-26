@@ -101,9 +101,8 @@ cat > "$OUT/Contents/Library/LaunchAgents/$GLIDE_BUNDLE_ID.plist" <<PLIST
 </plist>
 PLIST
 plutil -lint "$OUT/Contents/Library/LaunchAgents/$GLIDE_BUNDLE_ID.plist" >/dev/null
-# Hardened runtime entitlements: none are needed (packaging/macos/glide-host.entitlements says why).
+# Hardened runtime entitlements: none are needed (packaging/macos/*.entitlements say why).
 # Nested code first: the bundle's signature seals glide-viewer, which needs its own signature.
-glide_sign_app "$OUT/Contents/MacOS/glide-viewer" "${GLIDE_BUNDLE_ID%.host}.viewer" \
-  "$ROOT/packaging/macos/glide-viewer.entitlements"
+glide_sign_app "$OUT/Contents/MacOS/glide-viewer" "$GLIDE_VIEWER_BUNDLE_ID" "$ROOT/packaging/macos/glide-viewer.entitlements"
 glide_sign_app "$OUT" "$GLIDE_BUNDLE_ID" "$ROOT/packaging/macos/glide-host.entitlements"
 echo "built $OUT ($VERSION, $GLIDE_BUILD_COMMIT, $(lipo -archs "$OUT/Contents/MacOS/glide-host"), $GLIDE_BUNDLE_ID)"

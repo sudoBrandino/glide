@@ -14,7 +14,7 @@
 set -u
 
 LABEL="dev.brandino.glide.host"
-LEGACY_LABELS="io.github.sudobrandino.glide.host"   # bundle ids of releases up to 0.3.x
+LEGACY_LABELS="io.github.sudobrandino.glide.host"   # bundle ids of releases up to 0.4.x
 APP="/Applications/Glide Host.app"
 BIN="$APP/Contents/MacOS/glide-host"
 AGENT="/Library/LaunchAgents/$LABEL.plist"
@@ -27,7 +27,8 @@ with_timeout() {
   shift
   "$@" &
   pid=$!
-  ( sleep "$secs"; kill "$pid" 2>/dev/null ) &
+  # The watcher must not hold the caller's stdout: $(with_timeout …) would wait for its sleep.
+  ( sleep "$secs"; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   watcher=$!
   wait "$pid" 2>/dev/null || rc=$?
   kill "$watcher" 2>/dev/null
@@ -35,10 +36,14 @@ with_timeout() {
   return "$rc"
 }
 
-# Users with a GUI session now (fast user switching: possibly several). Each has a loginwindow
-# process running as that user; the login window itself runs as root.
+# Users with a GUI session now: the console user, and with fast user switching the others too.
+# Each session has a loginwindow process running as that user; the login window itself (nobody
+# logged in) runs as root, and then /dev/console belongs to root.
 gui_uids() {
-  ps -axo uid=,comm= | awk '$2 ~ /(^|\/)loginwindow$/ && $1 != 0 { print $1 }' | sort -u
+  {
+    stat -f %u /dev/console 2>/dev/null
+    ps -axo uid=,comm= | awk '$2 ~ /(^|\/)loginwindow$/ { print $1 }'
+  } | awk '$1 > 0' | sort -un
 }
 
 home_of() { dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | awk 'NR == 1 { print $2 }'; }
@@ -60,6 +65,15 @@ main() {
   [[ -f "$AGENT" ]] || { log "missing $AGENT"; exit 1; }
   chown root:wheel "$AGENT"
   chmod 0644 "$AGENT"
+  # A system-wide agent under an earlier label (not shipped by Glide, but an admin may have
+  # written one): it would start a second host at every login.
+  local l=""
+  for l in $LEGACY_LABELS; do
+    if [[ -f "/Library/LaunchAgents/$l.plist" ]]; then
+      rm -f "/Library/LaunchAgents/$l.plist"
+      log "removed /Library/LaunchAgents/$l.plist"
+    fi
+  done
 
   # 1. Per-user agents of every local user (not only those logged in), so nobody gets a second
   #    job with the same label at their next login. Loaded ones are stopped in step 2.
@@ -78,7 +92,6 @@ main() {
 
   # Grants recorded for an earlier bundle id no longer apply (System Settings would list Glide Host
   # twice). Screen Recording and Accessibility live in the system TCC database.
-  local l=""
   for l in $LEGACY_LABELS; do
     tccutil reset ScreenCapture "$l" >/dev/null 2>&1 || true
     tccutil reset Accessibility "$l" >/dev/null 2>&1 || true

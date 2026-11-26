@@ -36,7 +36,7 @@ cask "glide-host" do
     run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{appdir}}/Glide Host.app"], must_succeed: false
   end
 
-  # The current bundle id and the one releases up to 0.3.x used (an upgrade from those moves the
+  # The current bundle id and the one releases up to 0.4.x used (an upgrade from those moves the
   # host to the new id; glide-setup then asks for the permissions once more).
   uninstall launchctl: [
     "dev.brandino.glide.host",

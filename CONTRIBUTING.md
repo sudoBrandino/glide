@@ -115,6 +115,9 @@ To cut a release (maintainers):
 Running the workflow by hand (Actions → Release → Run workflow) is a dry run: it builds everything
 and attaches the files to the run, but creates no release.
 
+Signing (Developer ID, notarization, Azure Artifact Signing), the secrets it needs and how to get
+them, and the Windows MSI build are described in [`docs/RELEASING.md`](docs/RELEASING.md).
+
 ## License
 
 Glide is released under the [MIT License](LICENSE). By contributing, you agree that your

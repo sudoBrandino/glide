@@ -19,8 +19,8 @@ glide_find_identity() {
         'index($0, name) || toupper($2) == id { print $2; exit }'
 }
 
-# glide_sign_app APP IDENTIFIER [ENTITLEMENTS]: sign APP (one executable, no nested code) and print
-# its designated requirement.
+# glide_sign_app PATH IDENTIFIER [ENTITLEMENTS]: sign PATH (an app or a bare executable) and print
+# its designated requirement. Sign nested code first: the outer signature seals it.
 glide_sign_app() {
   local app="$1" ident="$2" ent="${3:-}" id="$GLIDE_SIGN_ID" hash=""
   local flags=(--timestamp=none)
