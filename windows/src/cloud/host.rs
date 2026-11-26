@@ -1,0 +1,667 @@
+//! The Windows host's managed-mode agent (docs/ENTERPRISE.md §5.1, §5.3, §6.3–§6.6): enrollment,
+//! hub, heartbeat, session offers (approval prompt, busy, policy), the relay bridge for accepted
+//! sessions, revocation, settings and audit. The session itself runs in the existing host code
+//! through `HostHooks::run_session`, which gets the loopback end of the bridge.
+
+use super::api::{decline, DeviceFrame, HeartbeatRequest, Permissions, ServerFrame, SessionOffer, Settings, User};
+use super::audit::AuditQueue;
+use super::backoff::Backoff;
+use super::bridge::{self, Bridge};
+use super::client::CloudClient;
+use super::enroll::{self, DeviceFacts, EnrollError};
+use super::grants::{Grant, GrantStore};
+use super::hub::{self, HubExit, HubHandler, HubLink};
+use super::managed::ManagedConfig;
+use super::settings::{app_version, version_ok};
+use super::store::Store;
+use super::transport::Http;
+use crate::host::log;
+use std::collections::HashMap;
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
+
+/// The approval prompt declines by itself after this long (§6.4).
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(50);
+/// Heartbeat once on the first hub connect, then this often (the hub itself shows presence).
+pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(6 * 3600);
+pub const AUDIT_FLUSH_EVERY: Duration = Duration::from_secs(10);
+
+/// When to send `POST /v1/device/heartbeat`.
+#[derive(Default)]
+pub struct Heartbeat {
+    last: Mutex<Option<Instant>>,
+}
+
+impl Heartbeat {
+    /// The hub connected: true the first time only.
+    pub fn on_connect(&self) -> bool {
+        let mut l = self.last.lock().unwrap();
+        if l.is_none() {
+            *l = Some(Instant::now());
+            return true;
+        }
+        false
+    }
+
+    /// The periodic check: true every `HEARTBEAT_EVERY` after the first one.
+    pub fn due(&self) -> bool {
+        self.due_at(Instant::now())
+    }
+
+    pub fn due_at(&self, now: Instant) -> bool {
+        let mut l = self.last.lock().unwrap();
+        match *l {
+            Some(t) if now.saturating_duration_since(t) >= HEARTBEAT_EVERY => {
+                *l = Some(now);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What the person at the host answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    Accept,
+    Decline,
+}
+
+/// The host's UI for managed sessions.
+pub trait HostUi: Send + Sync {
+    /// The approval prompt naming the user and email (Decline default, Accept enabled after 1 s).
+    /// Blocks; must return `Decline` soon after `cancel` becomes true (timeout or cancelled).
+    fn approve(&self, offer: &SessionOffer, cancel: Arc<AtomicBool>) -> Approval;
+    /// A managed session started or ended: refresh the "NAME (email) is connected" indicator.
+    fn session_changed(&self) {}
+    /// Something to tell the user (balloon / log).
+    fn notice(&self, _text: &str) {}
+}
+
+/// The running managed session (the tray indicator, End session).
+pub struct ActiveSession {
+    pub session_id: String,
+    pub user: User,
+    pub viewer_name: String,
+    pub permissions: Permissions,
+    bridge: Bridge,
+    link: Arc<HubLink>,
+    ended: AtomicBool,
+    authenticated: AtomicBool,
+}
+
+impl ActiveSession {
+    /// "Ada Lovelace (ada@example.com) is connected".
+    pub fn label(&self) -> String {
+        format!("{} is connected", self.user.label())
+    }
+
+    /// The session may continue (not ended here, by the cloud or by the relay).
+    pub fn live(&self) -> bool {
+        !self.ended.load(Ordering::SeqCst) && !self.bridge.is_closed()
+    }
+
+    /// Called by the host once the viewer authenticated (Noise + grant): `session_state connected`.
+    pub fn authenticated(&self) {
+        if !self.authenticated.swap(true, Ordering::SeqCst) {
+            let _ = self.link.send(&DeviceFrame::SessionState { session_id: self.session_id.clone(), state: "connected".into(), detail: None });
+        }
+    }
+
+    fn end(&self) {
+        self.ended.store(true, Ordering::SeqCst);
+        self.bridge.close();
+    }
+}
+
+/// Integration points with the host program.
+pub struct HostHooks {
+    /// Another session (LAN or managed) is running.
+    pub busy: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Runs one accepted managed session on the loopback end of the bridge (handshake against the
+    /// grant, then streaming) and returns when it ends. Must call `ActiveSession::authenticated`
+    /// after the handshake and stop once `ActiveSession::live` turns false.
+    pub run_session: Box<dyn Fn(TcpStream, Arc<ActiveSession>) + Send + Sync>,
+    /// Org settings arrived or changed (LAN mode, local pairing).
+    pub settings: Box<dyn Fn(&Settings) + Send + Sync>,
+}
+
+/// Managed mode as glide-host sees it: the agent once enrolled, and a status line.
+pub struct HostCloud {
+    pub agent: OnceLock<Arc<HostAgent>>,
+    status: Mutex<String>,
+    pub grants: Arc<GrantStore>,
+    stop: Arc<AtomicBool>,
+}
+
+impl HostCloud {
+    pub fn status(&self) -> String {
+        self.status.lock().unwrap().clone()
+    }
+    fn set_status(&self, s: &str) {
+        log(&format!("cloud: {s}"));
+        *self.status.lock().unwrap() = s.to_string();
+    }
+    pub fn active(&self) -> Option<Arc<ActiveSession>> {
+        self.agent.get().and_then(|a| a.active())
+    }
+    /// End session (tray).
+    pub fn end_session(&self) {
+        if let Some(a) = self.agent.get() {
+            a.end_active_locally();
+        }
+    }
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(a) = self.agent.get() {
+            a.link.close();
+        }
+    }
+}
+
+/// Starts managed mode in the background: enroll (retrying), then the hub, heartbeat and audit.
+pub fn start(managed: ManagedConfig, store: Store, http: Arc<dyn Http>, facts: DeviceFacts, grants: Arc<GrantStore>, ui: Arc<dyn HostUi>, hooks: HostHooks) -> Arc<HostCloud> {
+    let cloud = Arc::new(HostCloud { agent: OnceLock::new(), status: Mutex::new("Glide Cloud: enrolling…".into()), grants: grants.clone(), stop: Arc::new(AtomicBool::new(false)) });
+    // The last known settings apply until the hub sends fresh ones.
+    if let Ok(Some(e)) = store.load() {
+        if e.cloud_url == managed.cloud_url {
+            if let Some(s) = &e.settings {
+                (hooks.settings)(s);
+            }
+        }
+    }
+    let c = cloud.clone();
+    thread::Builder::new()
+        .name("glide-cloud".into())
+        .spawn(move || {
+            let client0 = CloudClient::new(&managed.cloud_url, http);
+            let sleep = hub::sleeper(c.stop.clone());
+            let mut backoff = Backoff::default();
+            let enrollment = loop {
+                match enroll::ensure(&managed, &store, &client0, &facts) {
+                    Ok(e) => break e,
+                    Err(EnrollError::Retry(e)) => {
+                        c.set_status(&format!("Glide Cloud: can't enroll yet ({e}); retrying"));
+                        if !sleep(backoff.next_delay()) {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        c.set_status(&format!("Glide Cloud: {e}"));
+                        return;
+                    }
+                }
+            };
+            let org = if enrollment.org_name.is_empty() { "your organization".to_string() } else { enrollment.org_name.clone() };
+            c.set_status(&format!("Managed by {org} (Glide Cloud)"));
+            let agent = Arc::new(HostAgent {
+                client: client0.with_device(&enrollment.device_token),
+                store,
+                grants,
+                link: Arc::new(HubLink::default()),
+                ui,
+                hooks,
+                audit: Arc::new(AuditQueue::default()),
+                pending: Mutex::new(HashMap::new()),
+                active: Mutex::new(None),
+                accepting: AtomicBool::new(false),
+                settings: Mutex::new(enrollment.settings.clone().unwrap_or_default()),
+                stop: c.stop.clone(),
+                os_version: facts.os_version.clone(),
+                beat: Heartbeat::default(),
+            });
+            let _ = c.agent.set(agent.clone());
+            agent.spawn_background();
+            match hub::run(&agent.client, &AgentHub(agent.clone()), &agent.link, &c.stop, &sleep) {
+                HubExit::Stopped => {}
+                HubExit::Revoked(reason) => {
+                    agent.revoked(&reason);
+                    c.set_status(&format!("Removed from {org}: this PC is no longer managed ({reason})"));
+                }
+            }
+        })
+        .expect("spawn cloud thread");
+    cloud
+}
+
+pub struct HostAgent {
+    client: CloudClient,
+    store: Store,
+    grants: Arc<GrantStore>,
+    link: Arc<HubLink>,
+    ui: Arc<dyn HostUi>,
+    hooks: HostHooks,
+    pub audit: Arc<AuditQueue>,
+    /// Cancel flags of offers waiting for an answer, by session id.
+    pending: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    active: Mutex<Option<Arc<ActiveSession>>>,
+    /// An offer is being accepted (between the answer and the session starting).
+    accepting: AtomicBool,
+    settings: Mutex<Settings>,
+    stop: Arc<AtomicBool>,
+    os_version: String,
+    beat: Heartbeat,
+}
+
+/// The hub's view of the agent.
+pub struct AgentHub(pub Arc<HostAgent>);
+
+impl HubHandler for AgentHub {
+    fn frame(&self, f: ServerFrame, _link: &HubLink) {
+        match f {
+            ServerFrame::Hello { settings, .. } | ServerFrame::Settings { settings } => self.0.apply_settings(settings),
+            ServerFrame::SessionOffer(o) => {
+                // `frame` runs on the hub thread; the offer may wait for a person for 50 s.
+                let me = self.0.clone();
+                thread::spawn(move || me.handle_offer(*o));
+            }
+            ServerFrame::SessionCancel { session_id, reason } => self.0.cancel(&session_id, &reason),
+            _ => {}
+        }
+    }
+    fn connected(&self) {
+        log("cloud: hub connected");
+        if self.0.beat.on_connect() {
+            let _ = self.0.heartbeat();
+        }
+    }
+    fn disconnected(&self, why: &str) {
+        log(&format!("cloud: hub disconnected ({why})"));
+    }
+}
+
+impl HostAgent {
+    fn spawn_background(self: &Arc<Self>) {
+        let me = self.clone();
+        thread::spawn(move || {
+            let sleep = hub::sleeper(me.stop.clone());
+            while sleep(AUDIT_FLUSH_EVERY) {
+                let _ = me.audit.flush(&me.client);
+                if me.beat.due() {
+                    if let Err(e) = me.heartbeat() {
+                        if e.is_unauthorized() {
+                            // The hub sees the same 401 on its next upgrade and ends with Revoked.
+                            me.link.close();
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn heartbeat(&self) -> Result<(), super::client::CloudError> {
+        self.client.heartbeat(&HeartbeatRequest { app_version: app_version().into(), os_version: self.os_version.clone(), name: None })
+    }
+
+    pub fn settings(&self) -> Settings {
+        self.settings.lock().unwrap().clone()
+    }
+
+    fn apply_settings(&self, s: Settings) {
+        self.audit.set_file_names(s.audit_file_names);
+        enroll::remember_settings(&self.store, &s);
+        (self.hooks.settings)(&s);
+        *self.settings.lock().unwrap() = s;
+    }
+
+    pub fn active(&self) -> Option<Arc<ActiveSession>> {
+        self.active.lock().unwrap().clone()
+    }
+
+    fn answer(&self, session_id: &str, accept: bool, reason: Option<&str>) -> bool {
+        let r = self.link.send(&DeviceFrame::SessionAnswer { session_id: session_id.into(), accept, reason: reason.map(str::to_string) });
+        if let Err(e) = &r {
+            log(&format!("cloud: couldn't answer the offer for {session_id}: {e}"));
+        }
+        r.is_ok()
+    }
+
+    /// Decides an offer and, if accepted, runs the session (blocks until it ends).
+    pub fn handle_offer(&self, o: SessionOffer) {
+        let who = o.user.label();
+        log(&format!("cloud: session {} requested by {who} from “{}”", o.session_id, o.viewer.name));
+        let settings = self.settings();
+        if !version_ok(app_version(), settings.min_app_version.as_deref()) {
+            log(&format!("cloud: declining {}: this app is older than the org's minimum {:?}", o.session_id, settings.min_app_version));
+            self.ui.notice(&super::settings::update_required(settings.min_app_version.as_deref().unwrap_or("")));
+            self.answer(&o.session_id, false, Some(decline::POLICY));
+            return;
+        }
+        let Some(grant) = Grant::from_offer(&o, Instant::now(), SystemTime::now()) else {
+            log(&format!("cloud: declining {}: the offer has no valid viewer key", o.session_id));
+            self.answer(&o.session_id, false, Some(decline::POLICY));
+            return;
+        };
+        // The ticket only ever goes to this cloud's own relay for this session.
+        if let Err(e) = super::client::check_relay_url(&self.client.base, &o.relay_url, &o.session_id) {
+            log(&format!("cloud: declining {}: {e}", o.session_id));
+            self.answer(&o.session_id, false, Some(decline::POLICY));
+            return;
+        }
+        if (self.hooks.busy)() || self.active().is_some() || self.accepting.swap(true, Ordering::SeqCst) {
+            log(&format!("cloud: declining {}: busy with another session", o.session_id));
+            self.answer(&o.session_id, false, Some(decline::BUSY));
+            return;
+        }
+        let _accepting = ResetOnDrop(&self.accepting);
+        if o.approval_required() {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let timed_out = Arc::new(AtomicBool::new(false));
+            self.pending.lock().unwrap().insert(o.session_id.clone(), cancel.clone());
+            {
+                let (cancel, timed_out) = (cancel.clone(), timed_out.clone());
+                thread::spawn(move || {
+                    let end = Instant::now() + APPROVAL_TIMEOUT;
+                    while Instant::now() < end && !cancel.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    if !cancel.swap(true, Ordering::SeqCst) {
+                        timed_out.store(true, Ordering::SeqCst);
+                    }
+                });
+            }
+            let answer = self.ui.approve(&o, cancel.clone());
+            let was_cancelled = cancel.swap(true, Ordering::SeqCst);
+            self.pending.lock().unwrap().remove(&o.session_id);
+            if timed_out.load(Ordering::SeqCst) {
+                log(&format!("cloud: {} not answered in {} s; declined", o.session_id, APPROVAL_TIMEOUT.as_secs()));
+                self.answer(&o.session_id, false, Some(decline::TIMEOUT));
+                return;
+            }
+            if was_cancelled && answer == Approval::Decline {
+                log(&format!("cloud: {} was cancelled", o.session_id));
+                return; // session_cancel: nobody waits for an answer
+            }
+            if answer == Approval::Decline {
+                log(&format!("cloud: {} declined here", o.session_id));
+                self.answer(&o.session_id, false, Some(decline::DECLINED));
+                return;
+            }
+        }
+        self.accept(o, grant);
+    }
+
+    fn accept(&self, o: SessionOffer, grant: Grant) {
+        let sid = o.session_id.clone();
+        self.grants.insert(grant.clone(), Instant::now());
+        if !self.answer(&sid, true, None) {
+            self.grants.cancel(&sid);
+            return;
+        }
+        log(&format!("cloud: accepted {sid}; opening the relay"));
+        let ws = match self.client.relay(&o.relay_url, &sid, &o.ticket) {
+            Ok(ws) => ws,
+            Err(e) => {
+                log(&format!("cloud: relay for {sid}: {e}"));
+                self.audit.client_error(Some(&sid), "relay_connect", &e.to_string());
+                self.grants.cancel(&sid);
+                return;
+            }
+        };
+        let (stream, bridge) = match bridge::open(ws, &|| log(&format!("cloud: {sid}: waiting for the viewer on the relay"))) {
+            Ok(x) => x,
+            Err(e) => {
+                log(&format!("cloud: relay for {sid}: {e}"));
+                self.grants.cancel(&sid);
+                return;
+            }
+        };
+        let active = Arc::new(ActiveSession {
+            session_id: sid.clone(),
+            user: grant.user.clone(),
+            viewer_name: grant.viewer_name.clone(),
+            permissions: grant.permissions,
+            bridge,
+            link: self.link.clone(),
+            ended: AtomicBool::new(false),
+            authenticated: AtomicBool::new(false),
+        });
+        *self.active.lock().unwrap() = Some(active.clone());
+        self.accepting.store(false, Ordering::SeqCst);
+        self.ui.session_changed();
+        (self.hooks.run_session)(stream, active.clone());
+        active.end();
+        active.bridge.join();
+        self.grants.cancel(&sid);
+        let detail = active.bridge.close_reason().map(|(c, r)| format!("{c} {r}").trim().to_string());
+        let _ = self.link.send(&DeviceFrame::SessionState { session_id: sid.clone(), state: "ended".into(), detail });
+        *self.active.lock().unwrap() = None;
+        self.ui.session_changed();
+        log(&format!("cloud: session {sid} ended"));
+        let _ = self.audit.flush(&self.client);
+    }
+
+    fn cancel(&self, session_id: &str, reason: &str) {
+        log(&format!("cloud: session {session_id} cancelled ({reason})"));
+        if let Some(c) = self.pending.lock().unwrap().remove(session_id) {
+            c.store(true, Ordering::SeqCst);
+        }
+        self.grants.cancel(session_id);
+        if let Some(a) = self.active().filter(|a| a.session_id == session_id) {
+            a.end();
+        }
+    }
+
+    /// End session from the tray: audited as ended by the host user.
+    pub fn end_active_locally(&self) {
+        let Some(a) = self.active() else { return };
+        log(&format!("cloud: ending session {} here", a.session_id));
+        self.audit.local_end(&a.session_id, true);
+        a.end();
+        if let Err(e) = self.client.end_session(&a.session_id, false) {
+            log(&format!("cloud: end session: {e}"));
+        }
+    }
+
+    /// `revoked` frame or 401: delete the enrollment, end everything.
+    fn revoked(&self, reason: &str) {
+        log(&format!("cloud: this device was revoked ({reason}); deleting the enrollment"));
+        if let Err(e) = self.store.wipe() {
+            log(&format!("cloud: {e}"));
+        }
+        self.grants.clear();
+        for (_, c) in self.pending.lock().unwrap().drain() {
+            c.store(true, Ordering::SeqCst);
+        }
+        if let Some(a) = self.active() {
+            a.end();
+        }
+        self.stop.store(true, Ordering::SeqCst);
+        // The last org settings stay in force for this run (a revoked device doesn't get LAN
+        // access back that the organization had turned off); a restart without the policy is
+        // unmanaged again.
+        self.ui.notice("This PC was removed from your organization's Glide Cloud.");
+    }
+}
+
+struct ResetOnDrop<'a>(&'a AtomicBool);
+impl Drop for ResetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::cloud::api::OfferViewer;
+    use crate::cloud::client::fake::FakeHttp;
+    use crate::cloud::store::{temp_dir, Plain};
+    use crate::cloud::transport::fake::{pair, FakeWs};
+    use crate::cloud::transport::{WebSocket, WsMsg};
+    use std::io::{Read, Write};
+
+    pub(crate) struct ScriptUi {
+        pub answer: Option<Approval>,
+        pub asked: Mutex<Vec<String>>,
+    }
+    impl HostUi for ScriptUi {
+        fn approve(&self, o: &SessionOffer, cancel: Arc<AtomicBool>) -> Approval {
+            self.asked.lock().unwrap().push(o.user.label());
+            loop {
+                if cancel.load(Ordering::SeqCst) {
+                    return Approval::Decline;
+                }
+                if let Some(a) = self.answer {
+                    return a;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    pub(crate) fn offer(sid: &str, approval: &str) -> SessionOffer {
+        SessionOffer {
+            session_id: sid.into(),
+            viewer: OfferViewer { device_id: "dev_v".into(), name: "Viewer PC".into(), public_key: "ab".repeat(32) },
+            user: User { id: "usr_1".into(), email: "ada@example.com".into(), name: "Ada".into(), groups: None },
+            permissions: Permissions { control: true, ..Default::default() },
+            approval: approval.into(),
+            relay_url: format!("wss://c.example.com/v1/relay/{sid}"),
+            ticket: "tick.et".into(),
+            expires_at: String::new(),
+        }
+    }
+
+    struct Fixture {
+        agent: Arc<HostAgent>,
+        hub_server: Arc<FakeWs>,
+        http: Arc<FakeHttp>,
+        sessions: Arc<Mutex<Vec<String>>>,
+        dir: std::path::PathBuf,
+    }
+
+    fn fixture(answer: Option<Approval>, busy: bool) -> Fixture {
+        let http = Arc::new(FakeHttp::default());
+        let dir = temp_dir("hostagent");
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let s2 = sessions.clone();
+        let agent = Arc::new(HostAgent {
+            client: CloudClient::new("https://c.example.com", http.clone()).with_device("gd_x"),
+            store: Store::new(&dir, "cloud-host.dpapi", Arc::new(Plain)),
+            grants: Arc::new(GrantStore::default()),
+            link: Arc::new(HubLink::default()),
+            ui: Arc::new(ScriptUi { answer, asked: Mutex::new(vec![]) }),
+            hooks: HostHooks {
+                busy: Box::new(move || busy),
+                run_session: Box::new(move |mut stream: TcpStream, a: Arc<ActiveSession>| {
+                    s2.lock().unwrap().push(a.session_id.clone());
+                    a.authenticated();
+                    let _ = stream.write_all(b"host-bytes");
+                    let mut b = [0u8; 4];
+                    let _ = stream.read_exact(&mut b);
+                }),
+                settings: Box::new(|_| {}),
+            },
+            audit: Arc::new(AuditQueue::default()),
+            pending: Mutex::new(HashMap::new()),
+            active: Mutex::new(None),
+            accepting: AtomicBool::new(false),
+            settings: Mutex::new(Settings::default()),
+            stop: Arc::new(AtomicBool::new(false)),
+            os_version: "10".into(),
+            beat: Heartbeat::default(),
+        });
+        let (hub_client, hub_server) = pair();
+        agent.link.set_for_test(hub_client);
+        Fixture { agent, hub_server, http, sessions, dir }
+    }
+
+    fn answers(ws: &FakeWs) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(WsMsg::Text(t)) = recv_timeout(ws) {
+            out.push(serde_json::from_str(&t).unwrap());
+        }
+        out
+    }
+
+    fn recv_timeout(ws: &FakeWs) -> std::io::Result<WsMsg> {
+        // Everything the agent sent has been sent by the time we look.
+        ws.try_recv().ok_or_else(|| std::io::ErrorKind::WouldBlock.into())
+    }
+
+    #[test]
+    fn approval_none_accepts_and_runs_the_session_over_the_relay() {
+        let f = fixture(None, false);
+        let (relay_client, relay_server) = pair();
+        f.http.sockets.lock().unwrap().push_back(Ok(relay_client.clone()));
+        relay_server.send(WsMsg::Text(r#"{"type":"peer_joined"}"#.into())).unwrap();
+        relay_server.send(WsMsg::Binary(b"ping".to_vec())).unwrap();
+        f.agent.handle_offer(offer("ses_1", "none"));
+        assert_eq!(*f.sessions.lock().unwrap(), vec!["ses_1"]);
+        let a = answers(&f.hub_server);
+        assert_eq!(a[0], serde_json::json!({"type":"session_answer","session_id":"ses_1","accept":true}));
+        assert_eq!(a[1]["state"], "connected");
+        assert_eq!(a[2]["state"], "ended");
+        assert_eq!(f.http.ws_urls.lock().unwrap()[0].0, "wss://c.example.com/v1/relay/ses_1?ticket=tick.et");
+        // What the session wrote went to the relay; the grant is gone either way.
+        assert!(relay_client.sent.lock().unwrap().iter().any(|m| matches!(m, WsMsg::Binary(b) if b == b"host-bytes")));
+        assert!(f.agent.grants.is_empty());
+        assert!(f.agent.active().is_none());
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[test]
+    fn busy_declined_policy_timeout() {
+        let f = fixture(None, true);
+        f.agent.handle_offer(offer("ses_b", "none"));
+        assert_eq!(answers(&f.hub_server)[0], serde_json::json!({"type":"session_answer","session_id":"ses_b","accept":false,"reason":"busy"}));
+
+        let f = fixture(Some(Approval::Decline), false);
+        f.agent.handle_offer(offer("ses_d", "required"));
+        assert_eq!(answers(&f.hub_server)[0]["reason"], "declined");
+        assert!(f.agent.grants.is_empty(), "no grant without acceptance");
+
+        let f = fixture(None, false);
+        *f.agent.settings.lock().unwrap() = Settings { min_app_version: Some("999.0".into()), ..Settings::default() };
+        f.agent.handle_offer(offer("ses_p", "none"));
+        assert_eq!(answers(&f.hub_server)[0]["reason"], "policy");
+
+        let f = fixture(None, false);
+        let mut o = offer("ses_k", "none");
+        o.viewer.public_key = "zz".into();
+        f.agent.handle_offer(o);
+        assert_eq!(answers(&f.hub_server)[0]["reason"], "policy");
+        assert!(f.sessions.lock().unwrap().is_empty());
+
+        // A relay URL that isn't this cloud's own relay for the session: declined, ticket never sent.
+        let f = fixture(None, false);
+        let mut o = offer("ses_r", "none");
+        o.relay_url = "wss://elsewhere.example.com/v1/relay/ses_r".into();
+        f.agent.handle_offer(o);
+        assert_eq!(answers(&f.hub_server)[0]["reason"], "policy");
+        assert!(f.http.ws_urls.lock().unwrap().is_empty());
+        assert!(f.agent.grants.is_empty());
+
+        // Heartbeat: once on the first connect, then every 6 h.
+        let hb = Heartbeat::default();
+        assert!(!hb.due(), "nothing before the first connect");
+        assert!(hb.on_connect());
+        assert!(!hb.on_connect(), "reconnects don't heartbeat");
+        assert!(!hb.due());
+        assert!(hb.due_at(Instant::now() + HEARTBEAT_EVERY));
+    }
+
+    #[test]
+    fn cancel_closes_the_prompt_without_an_answer() {
+        let f = fixture(None, false); // never answers by itself
+        let a2 = f.agent.clone();
+        let h = thread::spawn(move || a2.handle_offer(offer("ses_c", "required")));
+        while f.agent.pending.lock().unwrap().is_empty() {
+            thread::sleep(Duration::from_millis(5));
+        }
+        f.agent.cancel("ses_c", "viewer gave up");
+        h.join().unwrap();
+        assert!(answers(&f.hub_server).is_empty());
+        assert!(f.sessions.lock().unwrap().is_empty());
+    }
+
+    impl HubLink {
+        pub(crate) fn set_for_test(&self, ws: Arc<dyn WebSocket>) {
+            self.set(Some(ws));
+        }
+    }
+}

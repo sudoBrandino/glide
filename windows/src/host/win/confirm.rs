@@ -36,3 +36,42 @@ impl LocalConfirm for DialogConfirm {
         }
     }
 }
+
+/// The managed-mode approval prompt (docs/ENTERPRISE.md §6.4): the same dialog, naming the user
+/// and email. Decline is the default button, Accept is enabled after 1 s, and the agent cancels
+/// it after 50 s (the countdown shows that). If the dialog can't be shown, the request is declined.
+pub struct CloudPrompt;
+
+impl crate::cloud::host::HostUi for CloudPrompt {
+    fn approve(&self, o: &crate::cloud::api::SessionOffer, cancel: Arc<AtomicBool>) -> crate::cloud::host::Approval {
+        use crate::cloud::host::{Approval, APPROVAL_TIMEOUT};
+        use crate::win::prompt::{ask, PromptSpec};
+        let start = std::time::Instant::now();
+        let viewer = crate::host::trust::display_name(&o.viewer.name);
+        let spec = PromptSpec {
+            title: "Glide — Remote session request".into(),
+            t: PairText {
+                text: format!("{} from your organization asks to see and control this PC (from “{viewer}”).\nAccept only if you expect this.", o.user.label()),
+                code: String::new(),
+                detail: format!("This session: {}.\nYou can end it at any time from the Glide Host icon (End session).", o.permissions.describe()),
+            },
+            confirm: "Accept".into(),
+            cancel: "Decline".into(),
+            code_pt: 12,
+            on_confirm: None,
+            live_code: Some(Box::new(move || format!("Declines automatically in {} s", APPROVAL_TIMEOUT.saturating_sub(start.elapsed()).as_secs()))),
+        };
+        match ask(None, spec, cancel) {
+            Ok(true) => Approval::Accept,
+            Ok(false) => Approval::Decline,
+            Err(e) => {
+                log(&format!("managed session request: {e}; declining"));
+                Approval::Decline
+            }
+        }
+    }
+
+    fn notice(&self, text: &str) {
+        log(text);
+    }
+}

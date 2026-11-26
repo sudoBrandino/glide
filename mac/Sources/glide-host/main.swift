@@ -311,7 +311,14 @@ final class Server: @unchecked Sendable {
     private var settingsValue: HostSettings
     /// What the next session starts with (`updateSharing` changes it; a running session keeps its own).
     var settings: HostSettings { lock.lock(); defer { lock.unlock() }; return settingsValue }
-    let listener: NWListener
+    /// The LAN listener (nil while not listening: `listen: false`, or LAN mode off).
+    private var listener: NWListener?
+    /// host.json / command line want the LAN listener.
+    private var wantsListen = false
+    /// Org policy (ENTERPRISE.md §7): LAN mode on. Off = no listener, no dialer.
+    private var lanAllowed = true
+    /// The dial target set while LAN mode was off, restored when it comes back.
+    private var dialTargetBeforeLANOff: String??
     /// Active session + connections still authenticating (an unauthenticated connection never
     /// touches the active session; see SessionRegistry).
     let sessions = SessionRegistry<Session>(maxPending: 4)
@@ -332,7 +339,6 @@ final class Server: @unchecked Sendable {
 
     init(settings: HostSettings) throws {
         settingsValue = settings
-        listener = try NWListener(using: SecureChannel.tcpParameters(), on: NWEndpoint.Port(rawValue: settings.port)!)
     }
 
     /// Last dial error logged, so an unreachable PC doesn't log the same line every 2 s.
@@ -344,6 +350,12 @@ final class Server: @unchecked Sendable {
     /// running either way, so whichever direction the network allows connects.
     func setDialTarget(_ target: String?) {
         lock.lock()
+        if !lanAllowed, target != nil {
+            dialTargetBeforeLANOff = .some(target)
+            lock.unlock()
+            log("dialer: not dialing \(target!): LAN connections are turned off by the organization")
+            return
+        }
         dialGeneration += 1
         pendingRedial?.work.cancel(); pendingRedial = nil
         dialFailures = 0
@@ -369,7 +381,7 @@ final class Server: @unchecked Sendable {
     func dial(host: String, port: UInt16) {
         lock.lock()
         guard let t = dialTarget, t.host == host, t.port == port else { lock.unlock(); return }
-        let isPaused = paused
+        let isPaused = paused || !lanAllowed
         let generation = dialGeneration
         lock.unlock()
         let action = DialPolicy.next(paused: isPaused, sessionActive: sessions.current != nil,
@@ -421,7 +433,16 @@ final class Server: @unchecked Sendable {
             switch st {
             case .ready where !sessionStarted:
                 sessionStarted = true
-                self.lock.lock(); self.lastDialError = nil; self.lock.unlock()
+                self.lock.lock()
+                self.lastDialError = nil
+                let current = self.dialGeneration, lan = self.lanAllowed
+                self.lock.unlock()
+                // A dial that was in flight when the target changed or LAN mode turned off is dropped.
+                guard LANGate.adoptsDialed(generation: generation, current: current, lanAllowed: lan) else {
+                    log("dialer: dropping a connection to \(host):\(port) that is no longer wanted\(lan ? "" : " (LAN mode is off)")")
+                    conn.cancel()
+                    return
+                }
                 // Hand the live connection to a Session (it re-installs its own state handler).
                 self.adopt(conn, queue: queue, outbound: true) { [weak self] s in
                     guard let self else { return }
@@ -506,14 +527,34 @@ final class Server: @unchecked Sendable {
         }
     }
 
+    /// A managed session's bridged connection (ENTERPRISE.md §6.6): adopted like one the host
+    /// dialed (never charged to the inbound rate limiter), accepted only for `sessionId`'s grant.
+    func adoptRelay(_ conn: NWConnection, queue: DispatchQueue, sessionId: String, grants: GrantStore, audit: AuditReporter?,
+                    onAuthenticated: @escaping (Session) -> Void, onEnd: @escaping (Session) -> Void) {
+        adopt(conn, queue: queue, outbound: true, configure: { s in
+            s.relaySessionId = sessionId
+            s.grants = grants
+            s.audit = audit
+        }, onAuth: onAuthenticated, onEnd: onEnd)
+    }
+
     /// `outbound`: the dialer opened `conn`; the session then stays out of the inbound rate limiter
     /// (the dialer has its own backoff, see `scheduleRedial`).
-    private func adopt(_ conn: NWConnection, queue: DispatchQueue? = nil, outbound: Bool = false, onEnd extra: ((Session) -> Void)? = nil) {
+    private func adopt(_ conn: NWConnection, queue: DispatchQueue? = nil, outbound: Bool = false, configure: ((Session) -> Void)? = nil,
+                       onAuth: ((Session) -> Void)? = nil, onEnd extra: ((Session) -> Void)? = nil) {
         lock.lock()
         let id = nextId; nextId += 1
         lock.unlock()
         let s = Session(id: id, connection: conn, settings: settings, queue: queue)
         s.outbound = outbound
+        configure?(s)
+        // LAN mode is enforced at admission (ENTERPRISE.md §7): a LAN connection accepted by the
+        // listener just before it stopped is refused here.
+        guard LANGate.admits(relaySessionId: s.relaySessionId, lanAllowed: isLANAllowed) else {
+            conn.cancel()
+            return
+        }
+        s.lanAllowed = { [weak self] in self?.isLANAllowed ?? false }
         // A paused host still answers the handshake preamble (status 2) so the viewer can say why.
         s.isPaused = { [weak self] in
             guard let self else { return true }
@@ -532,9 +573,13 @@ final class Server: @unchecked Sendable {
             guard let self else { return }
             self.lock.lock(); let isPaused = self.paused; self.lock.unlock()
             if isPaused { log("server: paused; closing session \(s.id)"); s.end(); return }
+            if !LANGate.admits(relaySessionId: s.relaySessionId, lanAllowed: self.isLANAllowed) {
+                log("server: LAN mode is off; closing LAN session \(s.id)"); s.end(); return
+            }
             // Only now may the new viewer replace the active one.
             let r = self.sessions.authenticated(s)
             if let old = r.replaced { log("server: session \(s.id) replaces session \(old.id)"); old.end() }
+            onAuth?(s)
         }
         s.onEnd = { [weak self] ended in
             self?.sessions.ended(ended)
@@ -570,11 +615,67 @@ final class Server: @unchecked Sendable {
         if needDial, let t = target { dial(host: t.host, port: t.port) }
     }
 
+    var isPaused: Bool { lock.lock(); defer { lock.unlock() }; return paused }
+
+    /// Org policy changed (ENTERPRISE.md §7). Off: stop listening and dialing, end LAN sessions
+    /// (managed sessions continue). On: listen and dial again as configured.
+    func setLANAllowed(_ on: Bool) {
+        lock.lock()
+        guard on != lanAllowed else { lock.unlock(); return }
+        lanAllowed = on
+        let listen = wantsListen
+        let restore = dialTargetBeforeLANOff
+        dialTargetBeforeLANOff = nil
+        let current = dialTarget
+        lock.unlock()
+        if on {
+            log("server: LAN mode on")
+            if listen { startListening() }
+            if let r = restore { setDialTarget(r) } else if let t = current { dial(host: t.host, port: t.port) }
+        } else {
+            log("server: LAN mode turned off by the organization: not listening or dialing; managed sessions only")
+            stopListening()
+            lock.lock()
+            dialTargetBeforeLANOff = .some(current.map { "\($0.host):\($0.port)" })
+            dialGeneration += 1
+            pendingRedial?.work.cancel(); pendingRedial = nil
+            dialLoopActive = false
+            dialTarget = nil
+            lock.unlock()
+            HostStatus.shared.update { $0.dialTarget = nil; $0.dialDetail = nil; $0.listenPort = nil }
+            if PairingController.shared.window.isOpen() { PairingController.shared.cancelWindow(source: "LAN mode turned off") }
+            for s in sessions.all where s.relaySessionId == nil {
+                log("server: ending LAN session \(s.id) (LAN mode turned off)")
+                s.end()
+            }
+        }
+    }
+
+    var isLANAllowed: Bool { lock.lock(); defer { lock.unlock() }; return lanAllowed }
+
+    /// Listen on the LAN port (if LAN mode allows it now; otherwise once it is turned back on).
     func start() {
-        listener.newConnectionHandler = { [weak self] conn in
+        lock.lock(); wantsListen = true; let on = lanAllowed; lock.unlock()
+        if on { startListening() } else { log("server: not listening: LAN mode is turned off by the organization") }
+    }
+
+    private func stopListening() {
+        lock.lock(); let l = listener; listener = nil; lock.unlock()
+        l?.cancel()
+    }
+
+    private func startListening() {
+        let l: NWListener
+        do { l = try NWListener(using: SecureChannel.tcpParameters(), on: NWEndpoint.Port(rawValue: settings.port)!) } catch {
+            log("server: can't create the listener: \(error)")
+            HostStatus.shared.update { $0.serverError = "Can't listen on port \(self.settings.port): \(error)" }
+            return
+        }
+        lock.lock(); listener = l; lock.unlock()
+        l.newConnectionHandler = { [weak self] conn in
             self?.adopt(conn)
         }
-        listener.stateUpdateHandler = { st in
+        l.stateUpdateHandler = { st in
             switch st {
             case .ready:
                 log("server: listening on port \(self.settings.port)")
@@ -585,11 +686,14 @@ final class Server: @unchecked Sendable {
                 log("server: listener failed: \(e)")
                 HostStatus.shared.update { $0.serverError = "Can't listen on port \(self.settings.port): \(e)" }
                 self.lock.lock(); let dialing = self.dialTarget != nil; self.lock.unlock()
-                if !dialing { exit(1) }
+                // A managed host still takes sessions through Glide Cloud.
+                if !dialing && !ManagedHost.shared.isManaged { exit(1) }
+            case .cancelled:
+                HostStatus.shared.update { $0.listenPort = nil }
             default: break
             }
         }
-        listener.start(queue: DispatchQueue(label: "glide.listener"))
+        l.start(queue: DispatchQueue(label: "glide.listener"))
     }
 }
 
@@ -607,10 +711,18 @@ if !hostTestMode {
 }
 let pairing = PairingController.shared
 pairing.showAlerts = !hostTestMode
+// Managed mode (ENTERPRISE.md): the managed settings and the cached org policy apply before the
+// listener starts; the cloud connection starts after it.
+let managed = ManagedHost.shared
+if !hostTestMode { managed.prepare(identity: identity) }
+managed.applyInitialPolicy(to: server)
+pairing.pairingAllowed = { managed.policy.localPairingAllowed }
 pairing.onOpen = { server.kickDialer() }
 pairing.onRemove = { gone in server.endSessions(of: gone.compactMap(\.keyData)) }
 pairing.startControlSocket()
-let statusMenu = StatusMenu(actions: .init(disconnect: { server.disconnect() }, setPaused: { server.setPaused($0) },
+let statusMenu = StatusMenu(actions: .init(disconnect: {
+                                               if let s = server.current, s.relaySessionId != nil { managed.endByHostUser(s) } else { server.disconnect() }
+                                           }, setPaused: { server.setPaused($0) },
                                            openPairing: { pairing.openWindow(source: "menu") },
                                            cancelPairing: { pairing.cancelWindow(source: "menu") },
                                            removeViewer: { v in
@@ -689,6 +801,7 @@ if config.listensAtLaunch(cli: cliConnect, noListenFlag: noListenFlag) { server.
 if !hostTestMode { DispatchQueue.main.async { Instance.reviveLoginItemIfNeeded() } }
 if let target = config.launchDialTarget(cli: cliConnect) { server.setDialTarget(target) }
 else if let saved = config.connect { log("dialer: not dialing \(saved) at launch (connectAtLaunch is off); menu bar → Connect to PC, or Settings → Connection, dials it") }
+if !hostTestMode { managed.start(server: server) }
 // SIGTERM (launchctl, install scripts) and SIGINT: give the Mac its display arrangement back,
 // remove the virtual display and restore the monitor's own mode before exiting (a mirror set whose
 // master vanishes is dissolved by macOS, which can leave the monitor in another mode). Handled on

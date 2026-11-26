@@ -106,6 +106,23 @@ pub fn dispatch(pt: &[u8]) -> Result<Action, String> {
     })
 }
 
+/// `dispatch` within a managed session's permissions (docs/ENTERPRISE.md §6.3): what the session
+/// doesn't allow — input when `control` is false, clipboard or file data toward the host — is
+/// dropped here, whatever the viewer sends. `perms` None = a LAN session (no restrictions).
+pub fn dispatch_permitted(pt: &[u8], perms: Option<&crate::cloud::Permissions>) -> Result<Action, String> {
+    if let Some(p) = perms {
+        if !p.allows(crate::cloud::perms::Flow::FromViewer, pt) {
+            use crate::protocol::*;
+            return Ok(Action::Ignore(match pt.first().copied() {
+                Some(MSG_CLIPBOARD) => "clipboard (not allowed in this session)",
+                Some(MSG_FILE_CAPS..=MSG_FILE_PULL_RESULT) => "file transfer (not allowed in this session)",
+                _ => "input (view-only session)",
+            }));
+        }
+    }
+    dispatch(pt)
+}
+
 /// A shared, thread-safe writer for an authenticated session (record counter shared by video,
 /// cursor and Pong).
 pub fn sender(stream: &TcpStream, sealer: Sealer) -> std::io::Result<Sender> {
@@ -197,6 +214,11 @@ impl SessionSlot {
         stop
     }
 
+    /// A session holds the slot.
+    pub fn busy(&self) -> bool {
+        self.state.lock().unwrap().current.is_some()
+    }
+
     pub fn leave(&self, id: u64) {
         let mut g = self.state.lock().unwrap();
         if g.current.as_ref().is_some_and(|(c, _)| *c == id) {
@@ -216,8 +238,12 @@ impl SessionSlot {
 /// `--test-mode`: ServerHello with a placeholder config, then Pong for Ping until the viewer
 /// leaves. Never captures the screen or injects input.
 pub fn run_test_session(a: Authed, host_name: &str, stop: Arc<AtomicBool>) {
-    let Authed { stream, sealer, mut opener, conn_id, .. } = a;
+    let Authed { stream, sealer, mut opener, conn_id, grant, .. } = a;
+    let perms = grant.map(|g| g.permissions);
     let Ok(tx) = sender(&stream, sealer) else { return };
+    if let Some(p) = perms {
+        tx.set_filter(crate::cloud::perms::filter(p, crate::cloud::perms::Flow::FromHost));
+    }
     let cfg = VideoConfig { width: 640, height: 360, codec: Codec::H264, chroma: 0, color: 0, scale: 1.0 };
     if tx
         .send_plaintext(&HostMsg::ServerHello { version: crate::protocol::PROTOCOL_VERSION, host_name: host_name.into(), config: cfg }.encode())
@@ -238,7 +264,7 @@ pub fn run_test_session(a: Authed, host_name: &str, stop: Arc<AtomicBool>) {
                 break;
             }
         };
-        match dispatch(&pt) {
+        match dispatch_permitted(&pt, perms.as_ref()) {
             Ok(Action::Pong { client_time_us }) => {
                 let _ = tx.send_plaintext(&HostMsg::Pong { client_time_us, host_time_us: crate::util::now_us() }.encode());
             }
@@ -258,6 +284,27 @@ mod tests {
 
     fn d(m: ClientMsg) -> Result<Action, String> {
         dispatch(&m.encode())
+    }
+
+    #[test]
+    fn view_only_session_drops_input_on_the_host() {
+        use crate::cloud::{Direction, Permissions};
+        let view = Permissions { control: false, clipboard: Direction::Both, files: Direction::Both, audio: true };
+        let key = ClientMsg::Key { hid_usage: 4, down: true }.encode();
+        assert_eq!(dispatch_permitted(&key, Some(&view)), Ok(Action::Ignore("input (view-only session)")));
+        assert_eq!(dispatch_permitted(&key, None), Ok(Action::Input(InputEvent::Key { usage: 4, down: true })));
+        let full = Permissions { control: true, ..view };
+        assert_eq!(dispatch_permitted(&key, Some(&full)), Ok(Action::Input(InputEvent::Key { usage: 4, down: true })));
+        // Pings, view size and keyframe requests still work in a view-only session.
+        assert_eq!(dispatch_permitted(&ClientMsg::Ping { client_time_us: 7 }.encode(), Some(&view)), Ok(Action::Pong { client_time_us: 7 }));
+        assert_eq!(dispatch_permitted(&ClientMsg::RequestKeyframe.encode(), Some(&view)), Ok(Action::RequestKeyframe));
+        assert_eq!(dispatch_permitted(&ClientMsg::ReleaseAll.encode(), Some(&view)), Ok(Action::Input(InputEvent::ReleaseAll)));
+        // Clipboard / files toward the host are refused before they are even decoded.
+        let clip = ClientMsg::Clipboard(crate::protocol::ClipboardData { seq: 1, text: Some("x".into()), png: None }).encode();
+        assert_eq!(dispatch_permitted(&clip, Some(&view)), Ok(Action::Ignore("clipboard (not allowed in this session)")));
+        let offer = ClientMsg::File(FileMsg::Offer { id: 1, total_bytes: 0, files: vec![] }).encode();
+        let no_files = Permissions { files: Direction::Off, ..full };
+        assert_eq!(dispatch_permitted(&offer, Some(&no_files)), Ok(Action::Ignore("file transfer (not allowed in this session)")), "files off");
     }
 
     #[test]

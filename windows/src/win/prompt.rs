@@ -50,6 +50,21 @@ pub struct PairText {
     pub detail: String,
 }
 
+/// The same dialog for other confirmations (managed-mode approval, organization sign-in): the
+/// labels, the size of the big middle line, and what the confirm button does.
+pub struct PromptSpec {
+    pub title: String,
+    pub t: PairText,
+    pub confirm: String,
+    pub cancel: String,
+    /// Point size of the big middle line (`code`).
+    pub code_pt: i32,
+    /// Some: the confirm button runs this and the dialog stays open (e.g. "Open browser again").
+    pub on_confirm: Option<Box<dyn Fn()>>,
+    /// Updates the middle line while open (polled every 200 ms), e.g. a countdown.
+    pub live_code: Option<Box<dyn Fn() -> String>>,
+}
+
 struct Ctx {
     t: PairText,
     title: String,
@@ -57,6 +72,11 @@ struct Ctx {
     answer: bool,
     icons: Vec<HICON>,
     font: Option<HFONT>,
+    confirm_label: String,
+    cancel_label: String,
+    code_pt: i32,
+    on_confirm: Option<Box<dyn Fn()>>,
+    live_code: Option<Box<dyn Fn() -> String>>,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -83,10 +103,37 @@ pub fn ask_pairing(owner: Option<HWND>, t: PairText, cancel: Arc<AtomicBool>) ->
 
 /// `ask_pairing` with another window title (the Windows host's prompt pairs with a Mac viewer).
 pub fn ask_pairing_titled(owner: Option<HWND>, t: PairText, cancel: Arc<AtomicBool>, title: &str) -> Result<bool, String> {
+    let spec = PromptSpec {
+        title: title.to_string(),
+        t,
+        confirm: "Codes Match — Pair".into(),
+        cancel: "Cancel".into(),
+        code_pt: 30,
+        on_confirm: None,
+        live_code: None,
+    };
+    ask(owner, spec, cancel)
+}
+
+/// Shows `spec` in the pairing dialog's layout (Cancel default, confirm enabled after 1 s, no
+/// focus stealing, closes when `cancel` is set). Ok(true) = confirmed.
+pub fn ask(owner: Option<HWND>, spec: PromptSpec, cancel: Arc<AtomicBool>) -> Result<bool, String> {
     if cancel.load(Ordering::SeqCst) {
         return Ok(false);
     }
-    let mut ctx = Ctx { t, title: title.to_string(), cancel, answer: false, icons: Vec::new(), font: None };
+    let mut ctx = Ctx {
+        t: spec.t,
+        title: spec.title,
+        cancel,
+        answer: false,
+        icons: Vec::new(),
+        font: None,
+        confirm_label: spec.confirm,
+        cancel_label: spec.cancel,
+        code_pt: spec.code_pt,
+        on_confirm: spec.on_confirm,
+        live_code: spec.live_code,
+    };
     let r = unsafe {
         let hinst = GetModuleHandleW(None).map_err(|e| e.to_string())?;
         DialogBoxParamW(Some(HINSTANCE(hinst.0)), PCWSTR(IDD_PAIR as usize as *const u16), owner, Some(dlg_proc), LPARAM(&mut ctx as *mut Ctx as isize))
@@ -138,11 +185,12 @@ unsafe extern "system" fn dlg_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             let _ = SetDlgItemTextW(h, IDC_PAIR_TEXT, PCWSTR(wide(&ctx.t.text).as_ptr()));
             let _ = SetDlgItemTextW(h, IDC_PAIR_CODE, PCWSTR(wide(&ctx.t.code).as_ptr()));
             let _ = SetDlgItemTextW(h, IDC_PAIR_DETAIL, PCWSTR(wide(&ctx.t.detail).as_ptr()));
-            let _ = SetDlgItemTextW(h, IDOK.0, PCWSTR(wide("Codes Match — Pair").as_ptr()));
+            let _ = SetDlgItemTextW(h, IDOK.0, PCWSTR(wide(&ctx.confirm_label).as_ptr()));
+            let _ = SetDlgItemTextW(h, IDCANCEL.0, PCWSTR(wide(&ctx.cancel_label).as_ptr()));
             let dpi = GetDpiForWindow(h).max(96);
             // The code: large, monospaced digits.
             let font = CreateFontW(
-                -((30 * dpi as i32) / 72),
+                -((ctx.code_pt * dpi as i32) / 72),
                 0,
                 0,
                 0,
@@ -221,8 +269,12 @@ unsafe extern "system" fn dlg_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             1
         }
         WM_TIMER if wp.0 == POLL_TIMER => {
-            if ctx_of(h).is_some_and(|c| c.cancel.load(Ordering::SeqCst)) {
-                let _ = EndDialog(h, 2);
+            if let Some(c) = ctx_of(h) {
+                if c.cancel.load(Ordering::SeqCst) {
+                    let _ = EndDialog(h, 2);
+                } else if let Some(f) = &c.live_code {
+                    let _ = SetDlgItemTextW(h, IDC_PAIR_CODE, PCWSTR(wide(&f()).as_ptr()));
+                }
             }
             1
         }
@@ -252,6 +304,10 @@ unsafe extern "system" fn dlg_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                     return 1; // still held off: ignore, whatever sent it
                 }
                 if let Some(ctx) = ctx_of(h) {
+                    if let Some(f) = &ctx.on_confirm {
+                        f();
+                        return 1;
+                    }
                     ctx.answer = true;
                 }
                 let _ = EndDialog(h, 1);

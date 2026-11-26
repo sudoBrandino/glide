@@ -30,8 +30,12 @@
 #   --label ID             LaunchAgent label for --uninstall when the app is already gone
 #   -h, --help
 #
-# Environment: GLIDE_REPO (default sudoBrandino/glide), NO_COLOR, GLIDE_HOST_CONFIG_DIR and
-# GLIDE_APPLICATIONS_DIR (tests: stand in for the settings folder and /Applications).
+# Environment: GLIDE_REPO (default sudoBrandino/glide), NO_COLOR, GLIDE_HOST_CONFIG_DIR,
+# GLIDE_APPLICATIONS_DIR and GLIDE_SYSTEM_AGENTS_DIR (tests: stand in for the settings folder,
+# /Applications and /Library/LaunchAgents).
+#
+# A Mac where the .pkg installed Glide Host (usually through MDM: docs/DEPLOYMENT.md) is managed
+# by its administrator: this script then changes nothing and says so.
 #
 # Everything runs from main() at the bottom, so a download that stops halfway runs nothing.
 # Keep this file compatible with macOS's /bin/bash 3.2.
@@ -39,7 +43,12 @@
 set -euo pipefail
 
 GLIDE_REPO="${GLIDE_REPO:-sudoBrandino/glide}"
-DEFAULT_LABEL="io.github.sudobrandino.glide.host"
+DEFAULT_LABEL="dev.brandino.glide.host"
+# Bundle ids (= LaunchAgent labels) of earlier releases. Their agent and app are replaced without
+# asking, also with --yes: it's the same program under its old name.
+LEGACY_LABELS="io.github.sudobrandino.glide.host"
+# Where the .pkg (MDM deployments, packaging/macos/) puts its LaunchAgent: for every user.
+SYSTEM_AGENTS="${GLIDE_SYSTEM_AGENTS_DIR:-/Library/LaunchAgents}"
 DEFAULT_PORT=7420
 MIN_MACOS=14
 SYS_APPS="${GLIDE_APPLICATIONS_DIR:-/Applications}"
@@ -111,6 +120,16 @@ config_dir() { printf "%s" "${GLIDE_HOST_CONFIG_DIR:-$HOME/Library/Application S
 config_get() { # config_get KEY: a top-level string from host.json, or nothing
   local f; f="$(config_dir)/host.json"
   [[ -f "$f" ]] && plutil -extract "$1" raw -o - "$f" 2>/dev/null || true
+}
+
+is_legacy_label() { case " $LEGACY_LABELS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# The LaunchAgent the .pkg installs for all users (/Library/LaunchAgents/*.glide.host.plist), if
+# any: then the Mac's administrator manages Glide Host.
+system_agent() {
+  local f=""
+  for f in "$SYSTEM_AGENTS/"*.glide.host.plist; do [[ -e "$f" ]] && { printf '%s' "$f"; return 0; }; done
+  return 0
 }
 
 agent_loaded() { launchctl print "gui/$(id -u)/$1" >/dev/null 2>&1; }
@@ -269,16 +288,22 @@ download_release() {
   SRC_DESC="release v$ver"
 }
 
-# The installed Glide Host.app with this bundle id (LABEL), if any: the one its LaunchAgent runs,
-# else the one in /Applications (where the .dmg and the app's own Install put it), else the one
-# in ~/Applications.
+# The installed Glide Host.app with this bundle id (LABEL) or an earlier one (LEGACY_LABELS), if
+# any: the one its LaunchAgent runs, else the one in /Applications (where the .dmg and the app's
+# own Install put it), else the one in ~/Applications.
 existing_app() {
-  local a="" from_agent=""
+  local a="" from_agent="" id="" l=""
   from_agent="$(plutil -extract ProgramArguments.0 raw -o - "$PLIST" 2>/dev/null || true)"
+  for l in $LEGACY_LABELS; do
+    [[ -z "$from_agent" ]] || break
+    from_agent="$(plutil -extract ProgramArguments.0 raw -o - "$HOME/Library/LaunchAgents/$l.plist" 2>/dev/null || true)"
+  done
   from_agent="${from_agent%/Contents/MacOS/glide-host}"
   [[ "$from_agent" == */"Glide Host.app" ]] || from_agent=""
   for a in "$from_agent" "$SYS_APPS/Glide Host.app" "$HOME/Applications/Glide Host.app"; do
-    if [[ -n "$a" && -x "$a/Contents/MacOS/glide-host" && "$(plist_get "$a" CFBundleIdentifier)" == "$LABEL" ]]; then
+    [[ -n "$a" && -x "$a/Contents/MacOS/glide-host" ]] || continue
+    id="$(plist_get "$a" CFBundleIdentifier)"
+    if [[ "$id" == "$LABEL" ]] || is_legacy_label "$id"; then
       printf '%s' "$a"; return 0
     fi
   done
@@ -340,7 +365,12 @@ inspect_app() {
 remove_other_agents() {
   local others=() f="" other_label=""
   for f in "$HOME/Library/LaunchAgents/"*.glide.host.plist; do
-    [[ -e "$f" && "$f" != "$PLIST" ]] && others+=("$f")
+    [[ -e "$f" && "$f" != "$PLIST" ]] || continue
+    if is_legacy_label "$(basename "$f" .plist)"; then
+      migrate_legacy_agent "$f"
+    else
+      others+=("$f")
+    fi
   done
   [[ ${#others[@]} -gt 0 ]] || return 0
   step "Another Glide Host is installed"
@@ -358,6 +388,22 @@ remove_other_agents() {
     rm -f "$f"
     ok "removed $other_label (its settings and pairings in $(config_dir) stay)"
   done
+}
+
+# An agent of an earlier release, under its old bundle id: stop and remove it, and clear the
+# privacy grants recorded for the old id (they no longer apply, and System Settings would list
+# Glide Host twice). Settings and pairings are in the same folder for both ids and stay.
+migrate_legacy_agent() {
+  local f="$1" l=""
+  l="$(basename "$f" .plist)"
+  step "Moving Glide Host to its new bundle id"
+  info "$l → $LABEL"
+  stop_agent "$l"
+  rm -f "$f"
+  tccutil reset ScreenCapture "$l" >/dev/null 2>&1 || true
+  tccutil reset Accessibility "$l" >/dev/null 2>&1 || true
+  ok "removed LaunchAgent $l (settings and pairings in $(config_dir) stay)"
+  info "macOS asks for Screen Recording and Accessibility again, once, for $LABEL."
 }
 
 install_files() {
@@ -402,8 +448,9 @@ install_files() {
     rm -rf "$STAGE"; STAGE=""
     ok "$APP"
   fi
-  # Releases are signed ad hoc and not notarized: a quarantine flag (set by browsers and by
-  # Homebrew) would make Gatekeeper refuse to start the app. curl downloads don't carry one.
+  # Builds that aren't notarized (ad hoc or self-signed: forks, local builds, releases without the
+  # Developer ID) would be refused by Gatekeeper while they carry a quarantine flag (set by
+  # browsers and by Homebrew). curl downloads don't carry one; a notarized app doesn't need this.
   xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
   label_x="$(xml_escape "$LABEL")" app_x="$(xml_escape "$APP")" home_x="$(xml_escape "$HOME")"
   # KeepAlive PathState: launchd restarts the host whenever it exits, but only while the binary
@@ -648,7 +695,24 @@ summary() {
   fi
 }
 
+# Installed with the .pkg (MDM): /Library/LaunchAgents starts the host for every user, and the
+# administrator updates it. A per-user agent next to it would be a second job with the same label.
+managed_check() {
+  local sys=""
+  sys="$(system_agent)"
+  [[ -n "$sys" ]] || return 0
+  printf '\n'
+  info "Glide Host on this Mac was installed by its administrator (the .pkg; $sys)."
+  info "It starts at login for every user, and updates come from the administrator."
+  info "Grant Screen Recording and Accessibility, and see its status, from the menu-bar icon."
+  if [[ $OPT_UNINSTALL == 1 ]]; then
+    info "To remove it (administrator rights): sudo \"$SYS_APPS/Glide Host.app/Contents/Resources/glide-uninstall\""
+  fi
+  exit 0
+}
+
 uninstall() {
+  managed_check
   local labels=() f="" l="" app=""
   if [[ -n "$OPT_LABEL" ]]; then
     labels=("$OPT_LABEL")
@@ -656,6 +720,13 @@ uninstall() {
     for f in "$HOME/Library/LaunchAgents/"*.glide.host.plist; do [[ -e "$f" ]] && labels+=("$(basename "$f" .plist)"); done
   fi
   [[ ${#labels[@]} -gt 0 ]] || labels=("$DEFAULT_LABEL")
+  # --purge: also the privacy grants recorded under the earlier bundle ids.
+  if [[ $OPT_PURGE == 1 && -z "$OPT_LABEL" ]]; then
+    for l in $LEGACY_LABELS; do
+      tccutil reset ScreenCapture "$l" >/dev/null 2>&1 || true
+      tccutil reset Accessibility "$l" >/dev/null 2>&1 || true
+    done
+  fi
   step "Uninstalling Glide Host"
   for l in "${labels[@]}"; do
     f="$HOME/Library/LaunchAgents/$l.plist"
@@ -696,6 +767,7 @@ main() {
   if [[ $OPT_UNINSTALL == 1 ]]; then uninstall; return; fi
 
   printf '%sGlide host setup%s %s(%s)%s\n' "$B" "$N" "$D" "$GLIDE_REPO" "$N"
+  managed_check
   preflight
   obtain_app
   inspect_app

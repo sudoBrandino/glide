@@ -16,8 +16,7 @@ use crate::handshake::fingerprint;
 use crate::host::auth::Authed;
 use crate::host::input::PxRect;
 use crate::host::log;
-use crate::host::stream::{dispatch, sender, Action};
-use crate::host::trust::TrustStore;
+use crate::host::stream::{dispatch_permitted, sender, Action};
 use crate::host::video::{choose_codec, default_bitrate_kbps, encode_size, video_config};
 use crate::net::Sender;
 use crate::protocol::{Codec, HostMsg, VideoConfig, FRAME_FLAG_KEYFRAME, PROTOCOL_VERSION};
@@ -44,11 +43,14 @@ struct Control {
     fps: AtomicU32,
 }
 
-pub fn run(a: Authed, opts: &SessionOpts, trust: &TrustStore, stop: Arc<AtomicBool>) {
+/// `authorized` is asked every 2 s: false ends the session (the viewer was unpaired, or the managed
+/// session was ended or revoked).
+pub fn run(a: Authed, opts: &SessionOpts, authorized: &dyn Fn() -> bool, stop: Arc<AtomicBool>) {
     unsafe {
         let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
     }
-    let Authed { stream, sealer, opener, viewer_key, hello, conn_id: id, viewer_name, .. } = a;
+    let Authed { stream, sealer, opener, viewer_key, hello, conn_id: id, viewer_name, grant, .. } = a;
+    let perms = grant.map(|g| g.permissions);
     let tx = match sender(&stream, sealer) {
         Ok(t) => t,
         Err(e) => {
@@ -56,6 +58,11 @@ pub fn run(a: Authed, opts: &SessionOpts, trust: &TrustStore, stop: Arc<AtomicBo
             return;
         }
     };
+    if let Some(p) = perms {
+        // Managed session: never send what it doesn't allow (this host sends no clipboard, files or
+        // audio today; the filter keeps that true if it ever does).
+        tx.set_filter(crate::cloud::perms::filter(p, crate::cloud::perms::Flow::FromHost));
+    }
     let view_w = crate::host::video::clamp_view(hello.view_w, hello.view_h).map(|v| v.0);
     let hevc = hello.codec_caps & crate::protocol::CAP_HEVC_420 != 0 && encoder::available(Codec::Hevc);
     let codec = choose_codec(hello.codec_caps, hevc);
@@ -103,7 +110,7 @@ pub fn run(a: Authed, opts: &SessionOpts, trust: &TrustStore, stop: Arc<AtomicBo
                 return;
             }
         };
-        thread::spawn(move || receive(id, stream, opener, tx, stop, control, injector))
+        thread::spawn(move || receive(id, stream, opener, tx, stop, control, injector, perms))
     };
     let cursor_thread = {
         let (tx, shared, stop) = (tx.clone(), cursor_shared.clone(), stop.clone());
@@ -115,8 +122,8 @@ pub fn run(a: Authed, opts: &SessionOpts, trust: &TrustStore, stop: Arc<AtomicBo
     while !stop.load(Ordering::SeqCst) && !tx.is_closed() {
         if last_trust_check.elapsed() >= Duration::from_secs(2) {
             last_trust_check = Instant::now();
-            if !trust.is_paired(&viewer_key) {
-                log(&format!("session {id}: viewer {} was unpaired; ending the session", fingerprint(&viewer_key)));
+            if !authorized() {
+                log(&format!("session {id}: viewer {} is no longer authorized (unpaired, or the managed session ended); ending the session", fingerprint(&viewer_key)));
                 break;
             }
         }
@@ -138,6 +145,7 @@ fn receive(
     stop: Arc<AtomicBool>,
     control: Arc<Control>,
     injector: Arc<Mutex<Injector>>,
+    perms: Option<crate::cloud::Permissions>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let mut r = &stream;
@@ -155,7 +163,7 @@ fn receive(
                 break;
             }
         };
-        match dispatch(&pt) {
+        match dispatch_permitted(&pt, perms.as_ref()) {
             Ok(Action::Input(ev)) => injector.lock().unwrap().handle(&ev),
             Ok(Action::Pong { client_time_us }) => {
                 let _ = tx.send_plaintext(&HostMsg::Pong { client_time_us, host_time_us: now_us() }.encode());
