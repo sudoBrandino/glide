@@ -225,13 +225,13 @@ build_pkg() {
   # the MDM profiles expect it.
   pkgbuild --analyze --root "$root" "$stage/component.plist" >/dev/null
   local i=0
-  while /usr/libexec/PlistBuddy -c "Print :$i" "$stage/component.plist" >/dev/null 2>&1; do
-    /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" \
-      -c "Set :$i:BundleOverwriteAction upgrade" "$stage/component.plist"
+  while plutil -extract "$i" raw -o - "$stage/component.plist" >/dev/null 2>&1; do
+    plutil -replace "$i.BundleIsRelocatable" -bool NO "$stage/component.plist"
+    plutil -replace "$i.BundleOverwriteAction" -string upgrade "$stage/component.plist"
     i=$((i + 1))
   done
   pkgbuild --quiet --root "$root" --component-plist "$stage/component.plist" --install-location / \
-    --identifier "$id.pkg" --version "$VERSION" "${scripts[@]}" "$stage/pkgs/component.pkg"
+    --identifier "$id.pkg" --version "$VERSION" ${scripts[@]+"${scripts[@]}"} "$stage/pkgs/component.pkg"
   sed -e "s/@TITLE@/Glide $kind $VERSION/" -e "s/@PKG_ID@/$id.pkg/g" -e "s/@VERSION@/$VERSION/" \
       -e "s/@ARCHS@/$archs/" "$ROOT/packaging/macos/distribution.xml.in" > "$stage/distribution.xml"
   pkg="$OUT/Glide-$kind-$VERSION-macos-$arch.pkg"
@@ -241,7 +241,7 @@ build_pkg() {
     sign=(--sign "$GLIDE_INSTALLER_SIGN_ID" --timestamp)
     [[ -n "${GLIDE_SIGN_KEYCHAIN:-}" ]] && sign+=(--keychain "$GLIDE_SIGN_KEYCHAIN")
   fi
-  productbuild --quiet --distribution "$stage/distribution.xml" --package-path "$stage/pkgs" "${sign[@]}" "$pkg"
+  productbuild --quiet --distribution "$stage/distribution.xml" --package-path "$stage/pkgs" ${sign[@]+"${sign[@]}"} "$pkg"
   rm -rf "$stage"
   if [[ ${#sign[@]} -gt 0 ]]; then
     pkgutil --check-signature "$pkg" | sed -n '1,4p'
@@ -274,7 +274,7 @@ cmd_dmg() {
         id="$(glide_find_identity "$GLIDE_SIGN_KEYCHAIN" "$GLIDE_SIGN_ID")"
         kc=(--keychain "$GLIDE_SIGN_KEYCHAIN")
       fi
-      codesign --force --timestamp --sign "$id" "${kc[@]}" "$dmg"
+      codesign --force --timestamp --sign "$id" ${kc[@]+"${kc[@]}"} "$dmg"
     fi
     echo "wrote $dmg"
   done
