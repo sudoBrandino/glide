@@ -645,8 +645,18 @@ pub(crate) mod tests {
         let (relay_client, relay_server) = pair();
         f.http.sockets.lock().unwrap().push_back(Ok(relay_client.clone()));
         relay_server.send(WsMsg::Text(r#"{"type":"peer_joined"}"#.into())).unwrap();
-        relay_server.send(WsMsg::Binary(b"ping".to_vec())).unwrap();
+        // The viewer answers once the host's bytes reached the relay (the session then ends;
+        // ending earlier could drop bytes still in the loopback socket).
+        let (rc, rs) = (relay_client.clone(), relay_server.clone());
+        let replier = thread::spawn(move || {
+            let t = Instant::now();
+            while !rc.sent.lock().unwrap().iter().any(|m| matches!(m, WsMsg::Binary(b) if b == b"host-bytes")) && t.elapsed() < Duration::from_secs(10) {
+                thread::sleep(Duration::from_millis(2));
+            }
+            rs.send(WsMsg::Binary(b"ping".to_vec())).unwrap();
+        });
         f.agent.handle_offer(offer("ses_1", "none"));
+        replier.join().unwrap();
         assert_eq!(*f.sessions.lock().unwrap(), vec!["ses_1"]);
         let a = answers(&f.hub_server);
         assert_eq!(a[0], serde_json::json!({"type":"session_answer","session_id":"ses_1","accept":true}));
