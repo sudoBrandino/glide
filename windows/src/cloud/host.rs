@@ -9,7 +9,7 @@ use super::backoff::Backoff;
 use super::bridge::{self, Bridge};
 use super::client::CloudClient;
 use super::enroll::{self, DeviceFacts, EnrollError};
-use super::grants::{Grant, GrantStore};
+use super::grants::{expired, parse_key, Grant, GrantStore};
 use super::hub::{self, HubExit, HubHandler, HubLink};
 use super::managed::ManagedConfig;
 use super::settings::{app_version, version_ok};
@@ -333,8 +333,17 @@ impl HostAgent {
 
     /// Decides an offer and, if accepted, runs the session (blocks until it ends).
     pub fn handle_offer(&self, o: SessionOffer) {
+        if o.session_id.trim().is_empty() {
+            log("cloud: ignoring an offer without a session_id (it can't be answered)");
+            return;
+        }
         let who = o.user.label();
         log(&format!("cloud: session {} requested by {who} from “{}”", o.session_id, o.viewer.name));
+        if let Some(field) = o.missing_security_field() {
+            log(&format!("cloud: declining {}: the offer has no {field}", o.session_id));
+            self.answer(&o.session_id, false, Some(decline::POLICY));
+            return;
+        }
         let settings = self.settings();
         if !version_ok(app_version(), settings.min_app_version.as_deref()) {
             log(&format!("cloud: declining {}: this app is older than the org's minimum {:?}", o.session_id, settings.min_app_version));
@@ -342,15 +351,20 @@ impl HostAgent {
             self.answer(&o.session_id, false, Some(decline::POLICY));
             return;
         }
-        let Some(grant) = Grant::from_offer(&o, Instant::now(), SystemTime::now()) else {
+        if parse_key(&o.viewer.public_key).is_none() {
             log(&format!("cloud: declining {}: the offer has no valid viewer key", o.session_id));
             self.answer(&o.session_id, false, Some(decline::POLICY));
             return;
-        };
+        }
         // The ticket only ever goes to this cloud's own relay for this session.
         if let Err(e) = super::client::check_relay_url(&self.client.base, &o.relay_url, &o.session_id) {
             log(&format!("cloud: declining {}: {e}", o.session_id));
             self.answer(&o.session_id, false, Some(decline::POLICY));
+            return;
+        }
+        if expired(&o.expires_at, SystemTime::now()) {
+            log(&format!("cloud: declining {}: the offer expired at {}", o.session_id, o.expires_at));
+            self.answer(&o.session_id, false, Some(decline::TIMEOUT));
             return;
         }
         if (self.hooks.busy)() || self.active().is_some() || self.accepting.swap(true, Ordering::SeqCst) {
@@ -393,12 +407,23 @@ impl HostAgent {
                 return;
             }
         }
-        self.accept(o, grant);
+        // The grant's lifetime starts now, at acceptance (§6.7).
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        if expired(&o.expires_at, wall) {
+            log(&format!("cloud: declining {}: accepted after the offer expired at {}", o.session_id, o.expires_at));
+            self.answer(&o.session_id, false, Some(decline::TIMEOUT));
+            return;
+        }
+        let Some(grant) = Grant::from_offer(&o, now, wall) else {
+            self.answer(&o.session_id, false, Some(decline::POLICY));
+            return;
+        };
+        self.accept(o, grant, now);
     }
 
-    fn accept(&self, o: SessionOffer, grant: Grant) {
+    fn accept(&self, o: SessionOffer, grant: Grant, now: Instant) {
         let sid = o.session_id.clone();
-        self.grants.insert(grant.clone(), Instant::now());
+        self.grants.insert(grant.clone(), now);
         if !self.answer(&sid, true, None) {
             self.grants.cancel(&sid);
             return;
@@ -509,10 +534,12 @@ pub(crate) mod tests {
     pub(crate) struct ScriptUi {
         pub answer: Option<Approval>,
         pub asked: Mutex<Vec<String>>,
+        pub delay: Duration,
     }
     impl HostUi for ScriptUi {
         fn approve(&self, o: &SessionOffer, cancel: Arc<AtomicBool>) -> Approval {
             self.asked.lock().unwrap().push(o.user.label());
+            thread::sleep(self.delay);
             loop {
                 if cancel.load(Ordering::SeqCst) {
                     return Approval::Decline;
@@ -543,23 +570,34 @@ pub(crate) mod tests {
         hub_server: Arc<FakeWs>,
         http: Arc<FakeHttp>,
         sessions: Arc<Mutex<Vec<String>>>,
+        /// The grant's expiry as the session started.
+        grant_expiry: Arc<Mutex<Option<Instant>>>,
         dir: std::path::PathBuf,
     }
 
     fn fixture(answer: Option<Approval>, busy: bool) -> Fixture {
+        fixture_with(answer, busy, Duration::ZERO)
+    }
+
+    /// `delay`: how long the person takes to answer the prompt.
+    fn fixture_with(answer: Option<Approval>, busy: bool, delay: Duration) -> Fixture {
         let http = Arc::new(FakeHttp::default());
         let dir = temp_dir("hostagent");
         let sessions = Arc::new(Mutex::new(Vec::new()));
         let s2 = sessions.clone();
+        let grants = Arc::new(GrantStore::default());
+        let grant_expiry = Arc::new(Mutex::new(None));
+        let (g2, e2) = (grants.clone(), grant_expiry.clone());
         let agent = Arc::new(HostAgent {
             client: CloudClient::new("https://c.example.com", http.clone()).with_device("gd_x"),
             store: Store::new(&dir, "cloud-host.dpapi", Arc::new(Plain)),
-            grants: Arc::new(GrantStore::default()),
+            grants,
             link: Arc::new(HubLink::default()),
-            ui: Arc::new(ScriptUi { answer, asked: Mutex::new(vec![]) }),
+            ui: Arc::new(ScriptUi { answer, asked: Mutex::new(vec![]), delay }),
             hooks: HostHooks {
                 busy: Box::new(move || busy),
                 run_session: Box::new(move |mut stream: TcpStream, a: Arc<ActiveSession>| {
+                    *e2.lock().unwrap() = g2.expires_of(&a.session_id);
                     s2.lock().unwrap().push(a.session_id.clone());
                     a.authenticated();
                     let _ = stream.write_all(b"host-bytes");
@@ -579,7 +617,7 @@ pub(crate) mod tests {
         });
         let (hub_client, hub_server) = pair();
         agent.link.set_for_test(hub_client);
-        Fixture { agent, hub_server, http, sessions, dir }
+        Fixture { agent, hub_server, http, sessions, grant_expiry, dir }
     }
 
     fn answers(ws: &FakeWs) -> Vec<serde_json::Value> {
@@ -655,6 +693,87 @@ pub(crate) mod tests {
         assert!(!hb.on_connect(), "reconnects don't heartbeat");
         assert!(!hb.due());
         assert!(hb.due_at(Instant::now() + HEARTBEAT_EVERY));
+    }
+
+    fn rfc3339_in(secs: i64) -> String {
+        let now = SystemTime::now();
+        let t = if secs >= 0 { now + Duration::from_secs(secs as u64) } else { now - Duration::from_secs((-secs) as u64) };
+        crate::config::rfc3339_utc(t)
+    }
+
+    #[test]
+    fn expired_offers_are_declined_before_prompting() {
+        let f = fixture(Some(Approval::Accept), false);
+        let mut o = offer("ses_e", "required");
+        o.expires_at = rfc3339_in(-5);
+        f.agent.handle_offer(o);
+        assert_eq!(answers(&f.hub_server)[0], serde_json::json!({"type":"session_answer","session_id":"ses_e","accept":false,"reason":"timeout"}));
+        // (The scripted prompt would have accepted: it was never shown.)
+        assert!(f.sessions.lock().unwrap().is_empty() && f.agent.grants.is_empty());
+        assert!(f.http.ws_urls.lock().unwrap().is_empty(), "the relay is never opened");
+        // Busy still wins over prompting (no prompt, reason busy).
+        let f = fixture(Some(Approval::Accept), true);
+        f.agent.handle_offer(offer("ses_busy", "required"));
+        assert_eq!(answers(&f.hub_server)[0]["reason"], "busy");
+    }
+
+    #[test]
+    fn offers_missing_security_fields_are_declined_with_policy() {
+        for strip in ["viewer.public_key", "relay_url", "ticket"] {
+            let f = fixture(Some(Approval::Accept), false);
+            let mut o = offer("ses_m", "none");
+            match strip {
+                "viewer.public_key" => o.viewer.public_key.clear(),
+                "relay_url" => o.relay_url.clear(),
+                _ => o.ticket.clear(),
+            }
+            f.agent.handle_offer(o);
+            assert_eq!(answers(&f.hub_server), vec![serde_json::json!({"type":"session_answer","session_id":"ses_m","accept":false,"reason":"policy"})], "{strip}");
+            assert!(f.http.ws_urls.lock().unwrap().is_empty() && f.agent.grants.is_empty());
+        }
+        // Without a session id there is nothing to answer.
+        let f = fixture(Some(Approval::Accept), false);
+        let mut o = offer("ses_x", "none");
+        o.session_id.clear();
+        f.agent.handle_offer(o);
+        assert!(answers(&f.hub_server).is_empty());
+        // From the wire: the hub decodes an offer without a ticket, and the agent declines it.
+        let o: SessionOffer = serde_json::from_str(&format!(r#"{{"session_id":"ses_w","viewer":{{"public_key":"{}"}},"relay_url":"wss://c.example.com/v1/relay/ses_w"}}"#, "ab".repeat(32))).unwrap();
+        let f = fixture(Some(Approval::Accept), false);
+        f.agent.handle_offer(o);
+        assert_eq!(answers(&f.hub_server)[0]["reason"], "policy");
+    }
+
+    #[test]
+    fn grant_lifetime_starts_at_acceptance() {
+        // The person takes 400 ms to accept; expires_at is far off, so the grant lives 120 s from
+        // acceptance, not from the offer's arrival.
+        let f = fixture_with(Some(Approval::Accept), false, Duration::from_millis(400));
+        let (relay_client, relay_server) = pair();
+        f.http.sockets.lock().unwrap().push_back(Ok(relay_client));
+        relay_server.send(WsMsg::Text(r#"{"type":"peer_joined"}"#.into())).unwrap();
+        relay_server.send(WsMsg::Binary(b"ping".to_vec())).unwrap();
+        let mut o = offer("ses_g", "required");
+        o.expires_at = rfc3339_in(3600);
+        let arrived = Instant::now();
+        f.agent.handle_offer(o);
+        assert_eq!(*f.sessions.lock().unwrap(), vec!["ses_g"]);
+        let exp = f.grant_expiry.lock().unwrap().expect("grant while the session starts");
+        assert!(exp >= arrived + crate::cloud::grants::MAX_TTL + Duration::from_millis(400), "lifetime counted from acceptance");
+        assert!(exp <= Instant::now() + crate::cloud::grants::MAX_TTL);
+
+        // expires_at sooner than 120 s caps it.
+        let f = fixture(None, false);
+        let (relay_client, relay_server) = pair();
+        f.http.sockets.lock().unwrap().push_back(Ok(relay_client));
+        relay_server.send(WsMsg::Text(r#"{"type":"peer_joined"}"#.into())).unwrap();
+        relay_server.send(WsMsg::Binary(b"ping".to_vec())).unwrap();
+        let mut o = offer("ses_h", "none");
+        o.expires_at = rfc3339_in(30);
+        let t0 = Instant::now();
+        f.agent.handle_offer(o);
+        let exp = f.grant_expiry.lock().unwrap().unwrap();
+        assert!(exp <= t0 + Duration::from_secs(31), "capped at expires_at");
     }
 
     #[test]

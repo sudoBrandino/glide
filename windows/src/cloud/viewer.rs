@@ -363,7 +363,18 @@ impl ViewerAgent {
             self.on_user_error(&e);
             e.user_message()
         })?;
-        let host_key = parse_key(&r.host.public_key).ok_or("Glide Cloud sent an invalid host key")?;
+        if let Some(field) = r.missing_security_field() {
+            // Rejected (§6.7); a session the cloud did create is ended right away.
+            log(&format!("cloud: the session answer has no {field}; refusing it"));
+            if !r.session_id.trim().is_empty() {
+                self.end_session(&c, &r.session_id);
+            }
+            return Err(format!("Glide Cloud sent an incomplete session answer (no {field})"));
+        }
+        let Some(host_key) = parse_key(&r.host.public_key) else {
+            self.end_session(&c, &r.session_id);
+            return Err("Glide Cloud sent an invalid host key".into());
+        };
         let host_name = if r.host.name.trim().is_empty() { host_label.to_string() } else { r.host.name.clone() };
         status(format!("Connecting to {host_name} through Glide Cloud…"));
         let ws = c.relay(&r.relay_url, &r.session_id, &r.ticket).map_err(|e| {
@@ -372,6 +383,15 @@ impl ViewerAgent {
         })?;
         let (stream, bridge) = bridge::open(ws, &|| status(format!("Waiting for {host_name} to join…"))).map_err(|e| format!("{e}"))?;
         Ok(ManagedSession { stream, session_id: r.session_id, host_key, host_name, permissions: r.permissions, bridge })
+    }
+
+    /// `POST /v1/sessions/{id}/end` (idempotent; `404`, a session already gone, is fine).
+    fn end_session(&self, c: &CloudClient, session_id: &str) {
+        match c.end_session(session_id, true) {
+            Ok(()) => {}
+            Err(e) if e.status() == Some(404) => {}
+            Err(e) => log(&format!("cloud: end session {session_id}: {e}")),
+        }
     }
 
     /// The session ended. `by_user`: this viewer's user ended it (audited, and the cloud told).
@@ -654,6 +674,18 @@ mod tests {
         http.on("POST /v1/sessions", 201, &format!(r#"{{"session_id":"ses_1","relay_url":"wss://evil.example.com/v1/relay/ses_1","ticket":"t","host":{{"id":"h","name":"S","public_key":"{}"}}}}"#, "00".repeat(32)));
         assert!(a.connect("dev_h", "Studio", &|_| {}).is_err());
         assert!(http.ws_urls.lock().unwrap().is_empty());
+        // A session answer missing a security field is rejected, and the session ended at once.
+        http.routes.lock().unwrap().clear();
+        http.on("POST /v1/sessions", 201, r#"{"session_id":"ses_2","relay_url":"wss://c.example.com/v1/relay/ses_2","host":{"id":"h","name":"S","public_key":"00"}}"#);
+        http.on("POST /v1/sessions/ses_2/end", 404, r#"{"error":{"code":"not_found","message":"x"}}"#);
+        let e = a.connect("dev_h", "Studio", &|_| {}).err().unwrap();
+        assert!(e.contains("no ticket"), "{e}");
+        assert_eq!(http.count("POST /v1/sessions/ses_2/end"), 1);
+        assert!(http.ws_urls.lock().unwrap().is_empty());
+        // Without even a session id there is nothing to end.
+        http.routes.lock().unwrap().clear();
+        http.on("POST /v1/sessions", 201, r#"{"relay_url":"x"}"#);
+        assert!(a.connect("dev_h", "Studio", &|_| {}).err().unwrap().contains("no session_id"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

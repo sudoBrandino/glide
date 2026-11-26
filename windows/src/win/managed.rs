@@ -207,7 +207,7 @@ pub fn sign_in(owner: HWND) {
         Err(e) => return message(owner, &format!("Can't start signing in: {e}"), MB_ICONWARNING),
     };
     let cloud_url = agent.cloud_url().to_string();
-    open_url(&cloud_url, &start.verification_uri_complete);
+    open_url(&cloud_url, start.browser_uri());
     let close = Arc::new(AtomicBool::new(false));
     let stop_poll = Arc::new(AtomicBool::new(false));
     let result: Arc<Mutex<Option<Result<crate::cloud::api::User, SignInError>>>> = Arc::new(Mutex::new(None));
@@ -219,7 +219,7 @@ pub fn sign_in(owner: HWND) {
             close.store(true, Ordering::SeqCst);
         });
     }
-    let url = start.verification_uri_complete.clone();
+    let url = start.browser_uri().to_string();
     let spec = super::prompt::PromptSpec {
         title: format!("Glide — Sign in to {}", agent.org_name()),
         t: super::prompt::PairText {

@@ -340,11 +340,20 @@ pub struct DeviceStartResponse {
     pub device_code: String,
     pub user_code: String,
     pub verification_uri: String,
-    pub verification_uri_complete: String,
+    /// Optional: `verification_uri` is opened without it (§6.7 tolerant decoding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_uri_complete: Option<String>,
     #[serde(default = "default_interval")]
     pub interval: u64,
     #[serde(default = "default_expires")]
     pub expires_in: u64,
+}
+
+impl DeviceStartResponse {
+    /// The page to open: `verification_uri_complete`, else `verification_uri`.
+    pub fn browser_uri(&self) -> &str {
+        self.verification_uri_complete.as_deref().map(str::trim).filter(|u| !u.is_empty()).unwrap_or(&self.verification_uri)
+    }
 }
 
 fn default_interval() -> u64 {
@@ -413,21 +422,45 @@ pub struct SessionHost {
     pub id: String,
     #[serde(deserialize_with = "de_display")]
     pub name: String,
+    #[serde(deserialize_with = "de_string")]
     pub public_key: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+/// The security fields (`session_id`, `relay_url`, `ticket`, `host.public_key`) decode as empty
+/// when missing; `missing_security_field` names the first one that is, and such a response is
+/// rejected (§6.7).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(default)]
 pub struct SessionResponse {
+    #[serde(deserialize_with = "de_string")]
     pub session_id: String,
+    #[serde(deserialize_with = "de_string")]
     pub relay_url: String,
+    #[serde(deserialize_with = "de_string")]
     pub ticket: String,
     pub host: SessionHost,
-    #[serde(default)]
     pub permissions: Permissions,
-    #[serde(default)]
     pub approval_required: bool,
-    #[serde(default)]
     pub expires_at: String,
+}
+
+impl SessionResponse {
+    pub fn missing_security_field(&self) -> Option<&'static str> {
+        [("session_id", &self.session_id), ("relay_url", &self.relay_url), ("ticket", &self.ticket), ("host.public_key", &self.host.public_key)]
+            .into_iter()
+            .find(|(_, v)| v.trim().is_empty())
+            .map(|(k, _)| k)
+    }
+}
+
+/// serde: a string where `null` reads as empty (then caught as a missing field).
+fn de_string<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
+/// serde: `null` reads as the default (e.g. the most restrictive permissions).
+fn de_or_default<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default>(d: D) -> Result<T, D::Error> {
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
 // ------------------------------------------------------------------ hub (§6.4)
@@ -438,23 +471,30 @@ pub struct OfferViewer {
     pub device_id: String,
     #[serde(deserialize_with = "de_display")]
     pub name: String,
+    #[serde(deserialize_with = "de_string")]
     pub public_key: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+/// A `session_offer`. The security fields (`session_id`, `viewer.public_key`, `relay_url`,
+/// `ticket`) decode as empty when missing; the host declines such an offer with `policy` (§6.7).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct SessionOffer {
+    #[serde(default, deserialize_with = "de_string")]
     pub session_id: String,
+    #[serde(default, deserialize_with = "de_or_default")]
     pub viewer: OfferViewer,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_or_default")]
     pub user: User,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_or_default")]
     pub permissions: Permissions,
-    /// "none" | "required"; anything else is treated as "required".
-    #[serde(default)]
+    /// "none" | "required"; anything else (or missing) is treated as "required".
+    #[serde(default, deserialize_with = "de_string")]
     pub approval: String,
+    #[serde(default, deserialize_with = "de_string")]
     pub relay_url: String,
+    #[serde(default, deserialize_with = "de_string")]
     pub ticket: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string")]
     pub expires_at: String,
 }
 
@@ -462,6 +502,24 @@ impl SessionOffer {
     pub fn approval_required(&self) -> bool {
         self.approval != "none"
     }
+
+    /// The first security field the offer lacks (it is then declined with `policy`).
+    pub fn missing_security_field(&self) -> Option<&'static str> {
+        [("session_id", &self.session_id), ("viewer.public_key", &self.viewer.public_key), ("relay_url", &self.relay_url), ("ticket", &self.ticket)]
+            .into_iter()
+            .find(|(_, v)| v.trim().is_empty())
+            .map(|(k, _)| k)
+    }
+}
+
+/// The `session_id` of a `session_offer` frame that doesn't decode at all (a field of the wrong
+/// type), so the host can still decline it with `policy` (§6.7).
+pub fn undecodable_offer_session_id(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if v.get("type")?.as_str()? != "session_offer" {
+        return None;
+    }
+    v.get("session_id")?.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 /// Server → device hub frames. Unknown types parse as `Unknown` (ignored).
@@ -721,6 +779,55 @@ mod tests {
         assert_eq!(serde_json::from_str::<RelayControl>(r#"{"type":"peer_left"}"#).unwrap(), RelayControl::PeerLeft);
         assert_eq!(serde_json::from_str::<RelayControl>(r#"{"type":"later"}"#).unwrap(), RelayControl::Unknown);
         assert_eq!(close::describe(4005), "the session reached its time limit");
+    }
+
+    #[test]
+    fn tolerant_decoding() {
+        // verification_uri_complete is optional.
+        let ds: DeviceStartResponse = rt(r#"{"device_code":"dc","user_code":"ABCD-EFGH","verification_uri":"https://c/auth/device","interval":5,"expires_in":600}"#);
+        assert_eq!((ds.verification_uri_complete.clone(), ds.browser_uri()), (None, "https://c/auth/device"));
+        let ds: DeviceStartResponse = serde_json::from_str(r#"{"device_code":"dc","user_code":"U","verification_uri":"https://c/a","verification_uri_complete":" "}"#).unwrap();
+        assert_eq!(ds.browser_uri(), "https://c/a");
+        let ds: DeviceStartResponse = serde_json::from_str(r#"{"device_code":"dc","user_code":"U","verification_uri":"https://c/a","verification_uri_complete":"https://c/a?user_code=U"}"#).unwrap();
+        assert_eq!(ds.browser_uri(), "https://c/a?user_code=U");
+
+        // An offer missing security fields still decodes (so it can be declined), and says which.
+        let o: SessionOffer = serde_json::from_str(r#"{"session_id":"ses_1","viewer":{"device_id":"v","name":"PC","public_key":"aa"},"relay_url":"wss://c/v1/relay/ses_1","ticket":"t"}"#).unwrap();
+        assert_eq!(o.missing_security_field(), None);
+        assert_eq!(o.user.label(), "an organization user", "no user: shown generically");
+        assert_eq!(o.permissions, Permissions::default(), "no permissions: most restrictive");
+        assert!(o.approval_required(), "no approval: required");
+        for (body, missing) in [
+            (r#"{"session_id":"ses_1","viewer":{"name":"PC"},"relay_url":"u","ticket":"t"}"#, "viewer.public_key"),
+            (r#"{"session_id":"ses_1","relay_url":"u","ticket":"t"}"#, "viewer.public_key"),
+            (r#"{"session_id":"ses_1","viewer":{"public_key":"aa"},"ticket":"t"}"#, "relay_url"),
+            (r#"{"session_id":"ses_1","viewer":{"public_key":"aa"},"relay_url":"u","ticket":null}"#, "ticket"),
+            (r#"{"viewer":{"public_key":"aa"},"relay_url":"u","ticket":"t"}"#, "session_id"),
+        ] {
+            let o: SessionOffer = serde_json::from_str(body).unwrap_or_else(|e| panic!("{body}: {e}"));
+            assert_eq!(o.missing_security_field(), Some(missing), "{body}");
+        }
+        let o: SessionOffer = serde_json::from_str(r#"{"session_id":"s","viewer":null,"user":null,"permissions":null,"approval":null,"relay_url":"u","ticket":"t"}"#).unwrap();
+        assert_eq!((o.missing_security_field(), o.permissions, o.approval_required()), (Some("viewer.public_key"), Permissions::default(), true));
+        // As a hub frame.
+        let f: ServerFrame = serde_json::from_str(r#"{"type":"session_offer","session_id":"ses_2","viewer":{"name":"PC"}}"#).unwrap();
+        assert!(matches!(f, ServerFrame::SessionOffer(ref o) if o.missing_security_field() == Some("viewer.public_key")));
+        // A frame that doesn't decode at all still yields its session id.
+        let bad = r#"{"type":"session_offer","session_id":"ses_3","ticket":7}"#;
+        assert!(serde_json::from_str::<ServerFrame>(bad).is_err());
+        assert_eq!(undecodable_offer_session_id(bad).as_deref(), Some("ses_3"));
+        assert_eq!(undecodable_offer_session_id(r#"{"type":"session_offer","session_id":5}"#), None);
+        assert_eq!(undecodable_offer_session_id(r#"{"type":"settings","session_id":"x"}"#), None);
+        assert_eq!(undecodable_offer_session_id("nope"), None);
+
+        // A session response missing a security field is rejected by the viewer.
+        let s: SessionResponse = serde_json::from_str(r#"{"session_id":"ses_9","relay_url":"wss://c/v1/relay/ses_9","ticket":"tk","host":{"id":"h","name":"S"}}"#).unwrap();
+        assert_eq!(s.missing_security_field(), Some("host.public_key"));
+        assert_eq!(s.permissions, Permissions::default());
+        let s: SessionResponse = serde_json::from_str(r#"{"session_id":"ses_9"}"#).unwrap();
+        assert_eq!(s.missing_security_field(), Some("relay_url"));
+        let s: SessionResponse = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(s.missing_security_field(), Some("session_id"));
     }
 
     #[test]

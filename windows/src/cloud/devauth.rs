@@ -91,7 +91,7 @@ mod tests {
             device_code: "dc".into(),
             user_code: "ABCD-EFGH".into(),
             verification_uri: "https://c/auth/device".into(),
-            verification_uri_complete: "https://c/auth/device?user_code=ABCD-EFGH".into(),
+            verification_uri_complete: Some("https://c/auth/device?user_code=ABCD-EFGH".into()),
             interval: 5,
             expires_in: 600,
         }
