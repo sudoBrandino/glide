@@ -213,7 +213,7 @@ All with `Authorization: Bearer gd_…` unless noted; "user" = also needs `X-Gli
 | `GET /v1/me` | user → `{user:{id,email,name,groups}, org}` |
 | `GET /v1/hosts` | user → `{hosts:[{id, name, platform, tags, online, last_seen, permissions, approval}]}`: the hosts this user may reach and what a session would allow |
 | `POST /v1/sessions` | user. `{host_id, view_only?}` → `201 {session_id, relay_url, ticket, host:{id,name,public_key}, permissions, approval_required, expires_at}`. Errors: `403 not_allowed`, `409 host_offline`, `403 denied_by_host`, `409 host_busy`, `504 host_no_answer` |
-| `POST /v1/sessions/{id}/end` | user (the session's viewer) or the session's host device → `204`; idempotent (an ended or unknown-to-this-device session also answers `204` / `404`) |
+| `POST /v1/sessions/{id}/end` | user (the session's viewer) or the session's host device → `204`; idempotent: an already-ended session also answers `204`; a session the caller is not part of answers `404` |
 
 `relay_url` is `wss://<cloud>/v1/relay/<session_id>`; the client appends `?ticket=<ticket>`.
 
