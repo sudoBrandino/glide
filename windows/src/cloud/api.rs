@@ -2,8 +2,128 @@
 //! API, hub frames, relay control frames, org settings, session permissions and the error
 //! envelope. JSON, with unknown fields ignored (§6). Where a field is missing the most restrictive
 //! value is assumed for permissions; settings fall back to the documented defaults (§7).
+//!
+//! Display strings from the cloud (names, emails, device and org names, error messages) are
+//! cleaned of control and bidirectional-override characters as they are decoded (§6.7), so no UI
+//! or tray text can be spoofed with them.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+// ------------------------------------------------------------------ display strings (§6.7)
+
+/// Unicode `General_Category=Cf` (format characters, Unicode 15.1), as ranges. Among them: the
+/// soft hyphen, zero-width space / non-joiner / joiner (U+200B–200D), the bidirectional marks,
+/// embeddings, overrides and isolates (U+200E/200F, U+202A–202E, U+2066–2069, U+061C), the
+/// invisible operators (U+2060–2064), the deprecated format controls (U+206A–206F), the BOM
+/// (U+FEFF), interlinear annotation controls and the tag characters.
+const FORMAT_CHARS: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+];
+
+/// Other invisible characters that can disguise text: the line and paragraph separators
+/// (`Zl`/`Zp`, U+2028/2029), the whole tag block (U+E0000–E007F), and variation selectors
+/// (U+FE00–FE0F, U+E0100–E01EF, and the Mongolian free variation selectors U+180B–180F).
+const INVISIBLE_CHARS: &[(u32, u32)] = &[(0x180B, 0x180F), (0x2028, 0x2029), (0xFE00, 0xFE0F), (0xE0000, 0xE007F), (0xE0100, 0xE01EF)];
+
+fn in_ranges(c: char, ranges: &[(u32, u32)]) -> bool {
+    let c = c as u32;
+    ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&c))
+}
+
+/// A character that must never reach a label (§6.7): C0 and C1 controls and DEL (`Cc`), every
+/// format character (`Cf`: bidirectional controls and marks, zero-width characters, BOM, soft
+/// hyphen, tags…), line and paragraph separators, and variation selectors.
+pub fn unsafe_display_char(c: char) -> bool {
+    c.is_control() || in_ranges(c, FORMAT_CHARS) || in_ranges(c, INVISIBLE_CHARS)
+}
+
+/// `s` without the characters of `unsafe_display_char`, with each run of whitespace collapsed to
+/// one space, trimmed. Every display string from the cloud goes through this.
+pub fn clean_display(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut space = false;
+    for c in s.chars().filter(|&c| !unsafe_display_char(c)) {
+        if c.is_whitespace() {
+            space = !out.is_empty();
+        } else {
+            if space {
+                out.push(' ');
+                space = false;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `s` cut to at most `max` characters, the last one an ellipsis when it was longer (on a char
+/// boundary, like `host::trust::display_name`).
+pub fn truncate_display(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+    } else {
+        s.to_string()
+    }
+}
+
+/// Longest user name or email shown in a label.
+pub const LABEL_PART_MAX: usize = 64;
+
+/// An email cut to at most `max` characters without ever hiding its real domain: the whole
+/// domain is kept and only the local part is shortened (`loc…@example.com`). A domain that alone
+/// is too long keeps its end, the registrable part (`…@…company.example`). Without an `@` the
+/// end is kept the same way (`…tail`).
+pub fn truncate_email(e: &str, max: usize) -> String {
+    let n = e.chars().count();
+    if n <= max {
+        return e.to_string();
+    }
+    let tail = |s: &str, keep: usize| -> String {
+        let len = s.chars().count();
+        s.chars().skip(len.saturating_sub(keep)).collect()
+    };
+    let Some((local, domain)) = e.rsplit_once('@') else {
+        return format!("…{}", tail(e, max.saturating_sub(1)));
+    };
+    let domain_len = domain.chars().count();
+    if domain_len + 2 <= max {
+        // local part + "…" + "@" + domain
+        let keep = max - 2 - domain_len;
+        format!("{}…@{domain}", local.chars().take(keep).collect::<String>())
+    } else {
+        format!("…@…{}", tail(domain, max.saturating_sub(3)))
+    }
+}
+
+/// serde: a display string, cleaned; `null` reads as empty.
+fn de_display<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.map(|s| clean_display(&s)).unwrap_or_default())
+}
+
+/// serde: a list of display strings (tags), cleaned; `null` reads as empty.
+fn de_display_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(Option::<Vec<String>>::deserialize(d)?.unwrap_or_default().iter().map(|s| clean_display(s)).filter(|s| !s.is_empty()).collect())
+}
 
 // ------------------------------------------------------------------ errors
 
@@ -17,6 +137,7 @@ pub struct ErrorEnvelope {
 #[serde(default)]
 pub struct ErrorBody {
     pub code: String,
+    #[serde(deserialize_with = "de_display")]
     pub message: String,
 }
 
@@ -109,7 +230,9 @@ pub struct Permissions {
 #[serde(default)]
 pub struct Org {
     pub id: String,
+    #[serde(deserialize_with = "de_display")]
     pub slug: String,
+    #[serde(deserialize_with = "de_display")]
     pub name: String,
 }
 
@@ -117,20 +240,25 @@ pub struct Org {
 #[serde(default)]
 pub struct User {
     pub id: String,
+    #[serde(deserialize_with = "de_display")]
     pub email: String,
+    #[serde(deserialize_with = "de_display")]
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub groups: Option<Vec<String>>,
 }
 
 impl User {
-    /// "Ada Lovelace (ada@example.com)", or just the email.
+    /// "Ada Lovelace (ada@example.com)", or just the email; "an organization user" without
+    /// either. Cleaned with `clean_display` (§6.7); name and email are each cut to
+    /// `LABEL_PART_MAX` characters (the name at its end, the email in its local part, so the
+    /// domain shown is always the real one: `truncate_email`).
     pub fn label(&self) -> String {
-        let (n, e) = (self.name.trim(), self.email.trim());
+        let (n, e) = (truncate_display(&clean_display(&self.name), LABEL_PART_MAX), truncate_email(&clean_display(&self.email), LABEL_PART_MAX));
         match (n.is_empty(), e.is_empty()) {
             (false, false) if n != e => format!("{n} ({e})"),
-            (false, _) => n.to_string(),
-            (true, false) => e.to_string(),
+            (false, _) => n,
+            (true, false) => e,
             (true, true) => "an organization user".into(),
         }
     }
@@ -171,7 +299,9 @@ pub struct EnrollResponse {
 pub struct DeviceInfo {
     pub device_id: String,
     pub kind: String,
+    #[serde(deserialize_with = "de_display")]
     pub name: String,
+    #[serde(deserialize_with = "de_display_list")]
     pub tags: Vec<String>,
     pub org: Org,
     pub settings: Settings,
@@ -210,11 +340,20 @@ pub struct DeviceStartResponse {
     pub device_code: String,
     pub user_code: String,
     pub verification_uri: String,
-    pub verification_uri_complete: String,
+    /// Optional: `verification_uri` is opened without it (§6.7 tolerant decoding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_uri_complete: Option<String>,
     #[serde(default = "default_interval")]
     pub interval: u64,
     #[serde(default = "default_expires")]
     pub expires_in: u64,
+}
+
+impl DeviceStartResponse {
+    /// The page to open: `verification_uri_complete`, else `verification_uri`.
+    pub fn browser_uri(&self) -> &str {
+        self.verification_uri_complete.as_deref().map(str::trim).filter(|u| !u.is_empty()).unwrap_or(&self.verification_uri)
+    }
 }
 
 fn default_interval() -> u64 {
@@ -251,8 +390,10 @@ pub struct MeResponse {
 #[serde(default)]
 pub struct HostEntry {
     pub id: String,
+    #[serde(deserialize_with = "de_display")]
     pub name: String,
     pub platform: String,
+    #[serde(deserialize_with = "de_display_list")]
     pub tags: Vec<String>,
     pub online: bool,
     pub last_seen: Option<String>,
@@ -279,22 +420,47 @@ pub struct SessionRequest {
 #[serde(default)]
 pub struct SessionHost {
     pub id: String,
+    #[serde(deserialize_with = "de_display")]
     pub name: String,
+    #[serde(deserialize_with = "de_string")]
     pub public_key: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+/// The security fields (`session_id`, `relay_url`, `ticket`, `host.public_key`) decode as empty
+/// when missing; `missing_security_field` names the first one that is, and such a response is
+/// rejected (§6.7).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(default)]
 pub struct SessionResponse {
+    #[serde(deserialize_with = "de_string")]
     pub session_id: String,
+    #[serde(deserialize_with = "de_string")]
     pub relay_url: String,
+    #[serde(deserialize_with = "de_string")]
     pub ticket: String,
     pub host: SessionHost,
-    #[serde(default)]
     pub permissions: Permissions,
-    #[serde(default)]
     pub approval_required: bool,
-    #[serde(default)]
     pub expires_at: String,
+}
+
+impl SessionResponse {
+    pub fn missing_security_field(&self) -> Option<&'static str> {
+        [("session_id", &self.session_id), ("relay_url", &self.relay_url), ("ticket", &self.ticket), ("host.public_key", &self.host.public_key)]
+            .into_iter()
+            .find(|(_, v)| v.trim().is_empty())
+            .map(|(k, _)| k)
+    }
+}
+
+/// serde: a string where `null` reads as empty (then caught as a missing field).
+fn de_string<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
+/// serde: `null` reads as the default (e.g. the most restrictive permissions).
+fn de_or_default<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default>(d: D) -> Result<T, D::Error> {
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
 // ------------------------------------------------------------------ hub (§6.4)
@@ -303,24 +469,32 @@ pub struct SessionResponse {
 #[serde(default)]
 pub struct OfferViewer {
     pub device_id: String,
+    #[serde(deserialize_with = "de_display")]
     pub name: String,
+    #[serde(deserialize_with = "de_string")]
     pub public_key: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+/// A `session_offer`. The security fields (`session_id`, `viewer.public_key`, `relay_url`,
+/// `ticket`) decode as empty when missing; the host declines such an offer with `policy` (§6.7).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct SessionOffer {
+    #[serde(default, deserialize_with = "de_string")]
     pub session_id: String,
+    #[serde(default, deserialize_with = "de_or_default")]
     pub viewer: OfferViewer,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_or_default")]
     pub user: User,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_or_default")]
     pub permissions: Permissions,
-    /// "none" | "required"; anything else is treated as "required".
-    #[serde(default)]
+    /// "none" | "required"; anything else (or missing) is treated as "required".
+    #[serde(default, deserialize_with = "de_string")]
     pub approval: String,
+    #[serde(default, deserialize_with = "de_string")]
     pub relay_url: String,
+    #[serde(default, deserialize_with = "de_string")]
     pub ticket: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string")]
     pub expires_at: String,
 }
 
@@ -328,6 +502,24 @@ impl SessionOffer {
     pub fn approval_required(&self) -> bool {
         self.approval != "none"
     }
+
+    /// The first security field the offer lacks (it is then declined with `policy`).
+    pub fn missing_security_field(&self) -> Option<&'static str> {
+        [("session_id", &self.session_id), ("viewer.public_key", &self.viewer.public_key), ("relay_url", &self.relay_url), ("ticket", &self.ticket)]
+            .into_iter()
+            .find(|(_, v)| v.trim().is_empty())
+            .map(|(k, _)| k)
+    }
+}
+
+/// The `session_id` of a `session_offer` frame that doesn't decode at all (a field of the wrong
+/// type), so the host can still decline it with `policy` (§6.7).
+pub fn undecodable_offer_session_id(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if v.get("type")?.as_str()? != "session_offer" {
+        return None;
+    }
+    v.get("session_id")?.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 /// Server → device hub frames. Unknown types parse as `Unknown` (ignored).
@@ -352,7 +544,7 @@ pub enum ServerFrame {
         settings: Settings,
     },
     Revoked {
-        #[serde(default)]
+        #[serde(default, deserialize_with = "de_display")]
         reason: String,
     },
     Ping {
@@ -587,5 +779,134 @@ mod tests {
         assert_eq!(serde_json::from_str::<RelayControl>(r#"{"type":"peer_left"}"#).unwrap(), RelayControl::PeerLeft);
         assert_eq!(serde_json::from_str::<RelayControl>(r#"{"type":"later"}"#).unwrap(), RelayControl::Unknown);
         assert_eq!(close::describe(4005), "the session reached its time limit");
+    }
+
+    #[test]
+    fn tolerant_decoding() {
+        // verification_uri_complete is optional.
+        let ds: DeviceStartResponse = rt(r#"{"device_code":"dc","user_code":"ABCD-EFGH","verification_uri":"https://c/auth/device","interval":5,"expires_in":600}"#);
+        assert_eq!((ds.verification_uri_complete.clone(), ds.browser_uri()), (None, "https://c/auth/device"));
+        let ds: DeviceStartResponse = serde_json::from_str(r#"{"device_code":"dc","user_code":"U","verification_uri":"https://c/a","verification_uri_complete":" "}"#).unwrap();
+        assert_eq!(ds.browser_uri(), "https://c/a");
+        let ds: DeviceStartResponse = serde_json::from_str(r#"{"device_code":"dc","user_code":"U","verification_uri":"https://c/a","verification_uri_complete":"https://c/a?user_code=U"}"#).unwrap();
+        assert_eq!(ds.browser_uri(), "https://c/a?user_code=U");
+
+        // An offer missing security fields still decodes (so it can be declined), and says which.
+        let o: SessionOffer = serde_json::from_str(r#"{"session_id":"ses_1","viewer":{"device_id":"v","name":"PC","public_key":"aa"},"relay_url":"wss://c/v1/relay/ses_1","ticket":"t"}"#).unwrap();
+        assert_eq!(o.missing_security_field(), None);
+        assert_eq!(o.user.label(), "an organization user", "no user: shown generically");
+        assert_eq!(o.permissions, Permissions::default(), "no permissions: most restrictive");
+        assert!(o.approval_required(), "no approval: required");
+        for (body, missing) in [
+            (r#"{"session_id":"ses_1","viewer":{"name":"PC"},"relay_url":"u","ticket":"t"}"#, "viewer.public_key"),
+            (r#"{"session_id":"ses_1","relay_url":"u","ticket":"t"}"#, "viewer.public_key"),
+            (r#"{"session_id":"ses_1","viewer":{"public_key":"aa"},"ticket":"t"}"#, "relay_url"),
+            (r#"{"session_id":"ses_1","viewer":{"public_key":"aa"},"relay_url":"u","ticket":null}"#, "ticket"),
+            (r#"{"viewer":{"public_key":"aa"},"relay_url":"u","ticket":"t"}"#, "session_id"),
+        ] {
+            let o: SessionOffer = serde_json::from_str(body).unwrap_or_else(|e| panic!("{body}: {e}"));
+            assert_eq!(o.missing_security_field(), Some(missing), "{body}");
+        }
+        let o: SessionOffer = serde_json::from_str(r#"{"session_id":"s","viewer":null,"user":null,"permissions":null,"approval":null,"relay_url":"u","ticket":"t"}"#).unwrap();
+        assert_eq!((o.missing_security_field(), o.permissions, o.approval_required()), (Some("viewer.public_key"), Permissions::default(), true));
+        // As a hub frame.
+        let f: ServerFrame = serde_json::from_str(r#"{"type":"session_offer","session_id":"ses_2","viewer":{"name":"PC"}}"#).unwrap();
+        assert!(matches!(f, ServerFrame::SessionOffer(ref o) if o.missing_security_field() == Some("viewer.public_key")));
+        // A frame that doesn't decode at all still yields its session id.
+        let bad = r#"{"type":"session_offer","session_id":"ses_3","ticket":7}"#;
+        assert!(serde_json::from_str::<ServerFrame>(bad).is_err());
+        assert_eq!(undecodable_offer_session_id(bad).as_deref(), Some("ses_3"));
+        assert_eq!(undecodable_offer_session_id(r#"{"type":"session_offer","session_id":5}"#), None);
+        assert_eq!(undecodable_offer_session_id(r#"{"type":"settings","session_id":"x"}"#), None);
+        assert_eq!(undecodable_offer_session_id("nope"), None);
+
+        // A session response missing a security field is rejected by the viewer.
+        let s: SessionResponse = serde_json::from_str(r#"{"session_id":"ses_9","relay_url":"wss://c/v1/relay/ses_9","ticket":"tk","host":{"id":"h","name":"S"}}"#).unwrap();
+        assert_eq!(s.missing_security_field(), Some("host.public_key"));
+        assert_eq!(s.permissions, Permissions::default());
+        let s: SessionResponse = serde_json::from_str(r#"{"session_id":"ses_9"}"#).unwrap();
+        assert_eq!(s.missing_security_field(), Some("relay_url"));
+        let s: SessionResponse = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(s.missing_security_field(), Some("session_id"));
+    }
+
+    #[test]
+    fn display_strings_are_cleaned() {
+        // RLO / isolates / marks / C0 / C1 / DEL never reach a label.
+        assert_eq!(clean_display("  Ada\u{202E}gnp.exe\u{202C} "), "Adagnp.exe");
+        assert_eq!(clean_display("a\u{2066}b\u{2067}c\u{2068}d\u{2069}e\u{200E}f\u{200F}g\u{061C}h"), "abcdefgh");
+        assert_eq!(clean_display("x\u{0}\u{7}\n\r\t\u{1b}[31my\u{7f}\u{85}\u{9b}z"), "x[31myz");
+        assert_eq!(clean_display("Zoë 日本 😀"), "Zoë 日本 😀", "ordinary text is kept");
+        for c in ['\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{0}', '\u{1f}', '\u{80}', '\u{9f}'] {
+            assert!(unsafe_display_char(c), "{:04x}", c as u32);
+        }
+        // Every format character, separators, tags and variation selectors too.
+        for c in [
+            '\u{AD}', '\u{600}', '\u{6DD}', '\u{70F}', '\u{180B}', '\u{180E}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{2028}', '\u{2029}', '\u{2060}', '\u{2061}', '\u{2064}',
+            '\u{206A}', '\u{206F}', '\u{FE00}', '\u{FE0F}', '\u{FEFF}', '\u{FFF9}', '\u{FFFB}', '\u{110BD}', '\u{13430}', '\u{1BCA0}', '\u{1D173}', '\u{E0000}', '\u{E0001}',
+            '\u{E0020}', '\u{E0041}', '\u{E007F}', '\u{E0100}', '\u{E01EF}',
+        ] {
+            assert!(unsafe_display_char(c), "{:04x}", c as u32);
+        }
+        for c in ['a', ' ', 'é', '日', '😀', '\u{2065}', '\u{FE10}', '\u{E0080}', '\u{E01F0}', '\u{2027}', '\u{202F}', '\u{FFFC}'] {
+            assert!(!unsafe_display_char(c), "{:04x}", c as u32);
+        }
+        assert_eq!(clean_display("pay\u{200B}pal\u{FEFF}.com\u{AD}"), "paypal.com");
+        assert_eq!(clean_display("ad\u{E0061}\u{E0064}min\u{FE0F}\u{E0100}"), "admin", "tags and variation selectors");
+        assert_eq!(clean_display("Ada\u{2028}\u{2029}Lovelace"), "AdaLovelace", "separators are removed");
+        // Whitespace runs collapse to one space; the ends are trimmed.
+        assert_eq!(clean_display("  Ada \u{3000}\u{A0}  Lovelace\u{2003} "), "Ada Lovelace");
+        assert_eq!(clean_display(" \u{200B} \u{2066} "), "");
+        // Truncation on a char boundary with an ellipsis.
+        assert_eq!(truncate_display("abcdef", 4), "abc…");
+        assert_eq!(truncate_display("abcd", 4), "abcd");
+        assert_eq!(truncate_display("日本語テキスト", 3), "日本…");
+
+        let u: User = serde_json::from_str("{\"id\":\"usr_1\",\"email\":\"ada@example.com\\u202e\",\"name\":\"\\u202eecalevoL adA\\u0007\"}").unwrap();
+        assert_eq!((u.name.as_str(), u.email.as_str()), ("ecalevoL adA", "ada@example.com"));
+        assert_eq!(u.label(), "ecalevoL adA (ada@example.com)");
+        // label() cleans even a User built by hand.
+        let u = User { name: "\u{2067}Bo\u{2069}".into(), email: "\u{202d}".into(), ..Default::default() };
+        assert_eq!(u.label(), "Bo");
+        assert_eq!(User { name: "\u{202e}".into(), ..Default::default() }.label(), "an organization user");
+        let u: User = serde_json::from_str(r#"{"id":"u","email":null,"name":null}"#).unwrap();
+        assert_eq!(u.label(), "an organization user", "null display fields are empty");
+        // Name and email are each capped at 64 characters.
+        let long = User { name: "N".repeat(100), email: format!("{}@example.com", "e".repeat(80)), ..Default::default() };
+        let l = long.label();
+        assert_eq!(l, format!("{}… ({}…@example.com)", "N".repeat(63), "e".repeat(51)));
+        // A long email never hides its real domain.
+        let spoof = format!("it{}@yourcompany.com.evil.example", "x".repeat(60));
+        let shown = User { email: spoof.clone(), ..Default::default() }.label();
+        assert!(shown.ends_with("@yourcompany.com.evil.example"), "{shown}");
+        assert_eq!(shown.chars().count(), LABEL_PART_MAX);
+        assert_eq!(shown, format!("it{}…@yourcompany.com.evil.example", "x".repeat(32)));
+        // The domain alone too long: its end (the registrable part) is kept.
+        let long_domain = format!("it@{}.yourcompany.com.evil.example", "sub.".repeat(20));
+        let shown = User { email: long_domain, ..Default::default() }.label();
+        assert!(shown.starts_with("…@…") && shown.ends_with(".evil.example"), "{shown}");
+        assert_eq!(shown.chars().count(), LABEL_PART_MAX);
+        assert_eq!(truncate_email("it@yourcompany.com.evil.example", 20), "…@….com.evil.example");
+        assert_eq!(truncate_email("ada@example.com", 64), "ada@example.com");
+        assert_eq!(truncate_email("lovelace@example.com", 16), "lov…@example.com");
+        assert_eq!(truncate_email("ab@example.com", 13), "…@example.com", "no room for the local part");
+        assert_eq!(truncate_email("a@b@company.example", 16), "…@…mpany.example", "the last @ starts the domain");
+        assert_eq!(truncate_email("no-at-sign-but-very-long", 10), "…very-long");
+        assert_eq!(truncate_email("Zoë.日本@例え.テスト", 9), "Z…@例え.テスト", "char boundaries");
+        let u: User = serde_json::from_str("{\"name\":\"Ada\\u200b\\u2028  Lovelace\",\"email\":\"ada\\ufeff@example.com\"}").unwrap();
+        assert_eq!(u.label(), "Ada Lovelace (ada@example.com)");
+        let d: DeviceInfo = serde_json::from_str("{\"name\":\"Front\\u00a0\\u00a0desk\\ufe0f\",\"tags\":[\"\\udb40\\udc01\"]}").unwrap();
+        assert_eq!((d.name.as_str(), d.tags.len()), ("Front desk", 0), "tags-only tag is dropped");
+
+        let d: DeviceInfo = serde_json::from_str("{\"name\":\"PC\\u202e1\",\"tags\":[\"lab\\u0000\",\"\\u2066\"],\"org\":{\"id\":\"o\",\"slug\":\"s\",\"name\":\"Acme\\u202e\"}}").unwrap();
+        assert_eq!((d.name.as_str(), d.tags.clone(), d.org.name.as_str()), ("PC1", vec!["lab".to_string()], "Acme"));
+        let h: HostsResponse = serde_json::from_str("{\"hosts\":[{\"id\":\"dev_h\",\"name\":\"Stu\\u202edio\"}]}").unwrap();
+        assert_eq!(h.hosts[0].name, "Studio");
+        let o: SessionOffer = serde_json::from_str("{\"session_id\":\"s\",\"viewer\":{\"name\":\"\\u202eCP\"},\"relay_url\":\"u\",\"ticket\":\"t\"}").unwrap();
+        assert_eq!(o.viewer.name, "CP");
+        let e: ErrorEnvelope = serde_json::from_str("{\"error\":{\"code\":\"x\",\"message\":\"bad\\u202e\\u001b[0m\"}}").unwrap();
+        assert_eq!(e.error.message, "bad[0m");
+        let f: ServerFrame = serde_json::from_str("{\"type\":\"revoked\",\"reason\":\"gone\\u202e\"}").unwrap();
+        assert_eq!(f, ServerFrame::Revoked { reason: "gone".into() });
     }
 }

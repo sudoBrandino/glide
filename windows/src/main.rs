@@ -242,9 +242,15 @@ impl PairingUi for ConsolePairing {
 #[cfg(windows)]
 fn start_managed_mode(cfg_dir: Option<&std::path::Path>, identity: &glide::identity::Identity) {
     use glide::cloud::{enroll, managed, settings, store, viewer::ViewerAgent};
+    // No CloudURL (any more): a revocation record from an earlier one stops applying (§6.7).
+    let forget_revoked = || {
+        if let Some(dir) = cfg_dir {
+            store::Store::new(dir, enroll::Kind::Viewer.file(), store::platform_seal()).forget_revoked();
+        }
+    };
     let m = match managed::load() {
         Ok(Some(m)) => m,
-        Ok(None) => return,
+        Ok(None) => return forget_revoked(),
         Err(e) => {
             eprintln!("warning: managed configuration ignored: {e}");
             return;
@@ -254,7 +260,10 @@ fn start_managed_mode(cfg_dir: Option<&std::path::Path>, identity: &glide::ident
     if m.disable_lan_mode {
         eprintln!("LAN connections are turned off by policy (DisableLANMode)");
     }
-    let (true, Some(dir), Some(http)) = (m.has_cloud(), cfg_dir, glide::cloud::platform_http()) else { return };
+    if !m.has_cloud() {
+        return forget_revoked();
+    }
+    let (Some(dir), Some(http)) = (cfg_dir, glide::cloud::platform_http()) else { return };
     eprintln!("managed by Glide Cloud at {}", m.cloud_url);
     let facts = enroll::DeviceFacts {
         kind: enroll::Kind::Viewer,

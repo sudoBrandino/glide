@@ -3,7 +3,8 @@
 //! `{"cloud_url", "org_id", "device_id", "device_token", "enrolled_at"}`, plus `user_token` and
 //! `user_token_expires` on the viewer. This app also keeps the org name, the signed-in user and the
 //! last settings it received there (display, and the LAN-mode decision at startup before the hub
-//! has answered; settings from the cloud always replace them).
+//! has answered; settings from the cloud always replace them). After revocation the file holds
+//! only `{cloud_url, revoked: true, settings}` (and the org name), §6.7.
 
 use super::api::{Settings, User};
 use serde::{Deserialize, Serialize};
@@ -35,9 +36,26 @@ pub struct Enrollment {
     pub user: Option<User>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings: Option<Settings>,
+    /// The device's name and tags as the cloud knows them (`GET /v1/device` on each hub
+    /// connection; an admin may rename or retag it).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub device_name: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// The device was revoked (§6.7): the record keeps only `cloud_url`, `settings` (still
+    /// applied, across restarts, until the managed CloudURL is removed or changes) and the org
+    /// name; the credentials are gone.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub revoked: bool,
 }
 
 impl Enrollment {
+    /// What is kept after revocation: `{cloud_url, revoked: true, settings}` (and the org name,
+    /// for the status line). No credentials.
+    pub fn revoked_record(cloud_url: &str, settings: Option<Settings>, org_name: &str) -> Enrollment {
+        Enrollment { cloud_url: cloud_url.into(), settings, org_name: org_name.into(), revoked: true, ..Default::default() }
+    }
+
     /// A user token that hasn't expired at `now` (seconds since the Unix epoch).
     pub fn live_user_token(&self, now: i64) -> Option<&str> {
         let t = self.user_token.as_deref().filter(|t| !t.is_empty())?;
@@ -53,7 +71,7 @@ impl Enrollment {
 
     /// The device token looks like one (`gd_` + 43 base64url characters, §6.1).
     pub fn plausible(&self) -> bool {
-        !self.device_id.is_empty() && self.device_token.starts_with("gd_") && self.device_token.len() >= 10
+        !self.revoked && !self.device_id.is_empty() && self.device_token.starts_with("gd_") && self.device_token.len() >= 10
     }
 }
 
@@ -136,7 +154,29 @@ impl Store {
         std::fs::rename(&tmp, &self.path).map_err(|e| format!("cannot replace {}: {e}", self.path.display()))
     }
 
-    /// Delete the enrollment (revoked, or re-enrolling elsewhere).
+    /// Revoked (§6.7): replace the enrollment with `Enrollment::revoked_record`. The credentials
+    /// must go even if that record can't be written, so the file is then deleted.
+    pub fn mark_revoked(&self, cloud_url: &str, settings: Option<Settings>, org_name: &str) -> Result<(), String> {
+        self.save(&Enrollment::revoked_record(cloud_url, settings, org_name)).or_else(|e| {
+            self.wipe()?;
+            Err(format!("{e} (the enrollment was deleted instead)"))
+        })
+    }
+
+    /// The revocation record for `cloud_url`, if this device was revoked there.
+    pub fn revoked_for(&self, cloud_url: &str) -> Option<Enrollment> {
+        self.load().ok().flatten().filter(|e| e.revoked && e.cloud_url == cloud_url)
+    }
+
+    /// The managed CloudURL was removed: a revocation record stops applying, so it is deleted
+    /// (a live enrollment is kept). Errors are ignored.
+    pub fn forget_revoked(&self) {
+        if self.load().ok().flatten().is_some_and(|e| e.revoked) {
+            let _ = self.wipe();
+        }
+    }
+
+    /// Delete the enrollment (re-enrolling elsewhere).
     pub fn wipe(&self) -> Result<(), String> {
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
@@ -212,6 +252,41 @@ mod tests {
         // A file that doesn't decode is an error, not "not enrolled".
         std::fs::write(&s.path, b"\x00garbage").unwrap();
         assert!(s.load().is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn revocation_record() {
+        let dir = temp_dir("revoked");
+        let s = Store::new(&dir, HOST_FILE, Arc::new(Xor));
+        let e = Enrollment {
+            cloud_url: "https://c.example.com".into(),
+            device_id: "dev_1".into(),
+            device_token: "gd_0123456789012345678901234567890123456789012".into(),
+            user_token: Some("gu_x".into()),
+            ..Default::default()
+        };
+        assert!(e.plausible());
+        s.save(&e).unwrap();
+        let lan_off = Settings { lan_mode: false, ..Settings::default() };
+        s.mark_revoked("https://c.example.com", Some(lan_off.clone()), "Acme").unwrap();
+        let r = s.load().unwrap().unwrap();
+        assert!(r.revoked && !r.plausible());
+        assert_eq!((r.cloud_url.as_str(), r.settings.as_ref(), r.org_name.as_str()), ("https://c.example.com", Some(&lan_off), "Acme"));
+        assert!(r.device_token.is_empty() && r.device_id.is_empty() && r.user_token.is_none(), "credentials deleted");
+        let v: serde_json::Value = serde_json::from_slice(&Xor.open(&std::fs::read(&s.path).unwrap()).unwrap()).unwrap();
+        assert_eq!(v["revoked"], true);
+        assert!(v.get("device_token").is_none_or(|t| t == ""), "{v}");
+        assert_eq!(s.revoked_for("https://c.example.com"), Some(r));
+        assert_eq!(s.revoked_for("https://other.example.com"), None, "only for the same CloudURL");
+        // CloudURL removed: the record goes; a live enrollment would stay.
+        s.forget_revoked();
+        assert_eq!(s.load(), Ok(None));
+        s.save(&e).unwrap();
+        s.forget_revoked();
+        assert_eq!(s.load().unwrap(), Some(e));
+        // A normal enrollment doesn't serialize the flag.
+        assert!(serde_json::to_value(Enrollment::default()).unwrap().get("revoked").is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

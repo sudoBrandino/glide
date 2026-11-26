@@ -49,6 +49,13 @@ pub fn ttl(expires_at: &str, now: SystemTime) -> Duration {
     Duration::from_secs((exp - now_s).max(0) as u64).min(MAX_TTL)
 }
 
+/// The offer's `expires_at` has passed at `now` (§6.7: declined with `timeout`). A missing or
+/// unparsable `expires_at` isn't expired (the grant then lives `MAX_TTL`).
+pub fn expired(expires_at: &str, now: SystemTime) -> bool {
+    let now_s = now.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    parse_time(expires_at).is_some_and(|exp| exp <= now_s)
+}
+
 /// Seconds since the Unix epoch of an RFC 3339 UTC time ("2026-11-25T10:02:00Z", also with
 /// fractional seconds or "+00:00").
 pub fn parse_time(s: &str) -> Option<i64> {
@@ -74,6 +81,8 @@ pub fn parse_key(hex: &str) -> Option<[u8; 32]> {
 }
 
 impl Grant {
+    /// The grant for an offer accepted at `now` / `wall`: its lifetime starts at acceptance and
+    /// ends at the earlier of `expires_at` and acceptance + `MAX_TTL` (§6.7).
     pub fn from_offer(o: &SessionOffer, now: Instant, wall: SystemTime) -> Option<Grant> {
         Some(Grant {
             session_id: o.session_id.clone(),
@@ -132,6 +141,12 @@ impl GrantStore {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// When the grant for `session_id` expires (tests).
+    #[cfg(test)]
+    pub fn expires_of(&self, session_id: &str) -> Option<Instant> {
+        self.grants.lock().unwrap().get(session_id).map(|g| g.expires)
     }
 }
 
@@ -192,6 +207,11 @@ mod tests {
         assert_eq!(ttl("2025-11-25T10:00:30+00:00", wall), Duration::from_secs(30));
         assert_eq!(ttl("garbage", wall), MAX_TTL);
         assert_eq!(parse_time("2025-11-25T10:00:00+02:00"), None, "only UTC");
+        // Expired offers.
+        assert!(expired("2025-11-25T09:59:59Z", wall));
+        assert!(expired("2025-11-25T10:00:00Z", wall), "at the instant");
+        assert!(!expired("2025-11-25T10:00:01Z", wall));
+        assert!(!expired("", wall) && !expired("garbage", wall), "unknown: not expired");
         // Expired grants are purged on insert; the store is bounded.
         for i in 0..40 {
             s.insert(Grant::from_offer(&offer(&format!("ses_x{i}"), &"cd".repeat(32), ""), now, wall).unwrap(), now);

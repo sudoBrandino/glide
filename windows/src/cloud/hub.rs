@@ -102,7 +102,14 @@ pub fn run(client: &CloudClient, handler: &dyn HubHandler, link: &HubLink, stop:
                         }
                         handler.frame(f, link);
                     }
-                    Err(e) => crate::host::log(&format!("cloud hub: ignoring a frame that doesn't parse ({e})")),
+                    Err(e) => match super::api::undecodable_offer_session_id(&t) {
+                        // An offer that doesn't decode is still answered: declined (§6.7).
+                        Some(session_id) => {
+                            crate::host::log(&format!("cloud hub: declining offer {session_id}: it doesn't decode ({e})"));
+                            let _ = link.send(&DeviceFrame::SessionAnswer { session_id, accept: false, reason: Some(super::api::decline::POLICY.into()) });
+                        }
+                        None => crate::host::log(&format!("cloud hub: ignoring a frame that doesn't parse ({e})")),
+                    },
                 },
                 Ok(WsMsg::Binary(_)) => {}
                 Ok(WsMsg::Close(code, reason)) => break format!("closed ({code} {reason})"),
@@ -179,6 +186,7 @@ mod tests {
         s(&server1, json!({"type":"ping","t":42}));
         s(&server1, json!({"type":"brand_new"}));
         s(&server1, json!({"type":"session_offer","session_id":"ses_1","viewer":{"device_id":"v","name":"PC","public_key":"00"},"user":{"id":"u","email":"a@b","name":"A"},"permissions":{},"approval":"none","relay_url":"wss://c/v1/relay/ses_1","ticket":"t","expires_at":""}));
+        s(&server1, json!({"type":"session_offer","session_id":"ses_bad","ticket":7}));
         server1.close(1001, "going away");
         s(&server2, json!({"type":"settings","settings":{"allow_local_pairing":false}}));
         s(&server2, json!({"type":"revoked","reason":"device revoked by admin"}));
@@ -201,6 +209,8 @@ mod tests {
         let sent = texts(&client_end1);
         assert_eq!(sent[0], json!({"type":"pong","t":42}));
         assert_eq!(sent[1], json!({"type":"session_answer","session_id":"ses_1","accept":false,"reason":"busy"}));
+        // An offer that doesn't decode never reaches the handler but is declined.
+        assert_eq!(sent[2], json!({"type":"session_answer","session_id":"ses_bad","accept":false,"reason":"policy"}));
         // Backoff: 1 s after the failed attempt; reset by hello so 1 s again after the drop.
         let d = delays.lock().unwrap();
         assert_eq!(d.len(), 2);

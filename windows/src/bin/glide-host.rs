@@ -324,13 +324,18 @@ fn main() -> ExitCode {
         None => vec![format!("0.0.0.0:{port}"), format!("[::]:{port}")],
     };
     // Managed mode (Glide Cloud, docs/ENTERPRISE.md): the organization's policy, if any.
-    let managed = match glide::cloud::managed::load() {
-        Ok(m) => m,
+    let (managed, policy_read) = match glide::cloud::managed::load() {
+        Ok(m) => (m, true),
         Err(e) => {
             log(&format!("managed configuration ignored: {e}"));
-            None
+            (None, false)
         }
     };
+    if policy_read && !managed.as_ref().is_some_and(|m| m.has_cloud()) {
+        // No CloudURL (any more): a revocation record from an earlier one stops applying (§6.7).
+        use glide::cloud::{enroll, store};
+        store::Store::new(&dir, enroll::Kind::Host.file(), store::platform_seal()).forget_revoked();
+    }
     if managed.as_ref().is_some_and(|m| m.disable_lan_mode) {
         ctx.set_policy(false, false);
         log("LAN connections are turned off by policy (DisableLANMode)");
@@ -402,14 +407,14 @@ fn main() -> ExitCode {
                 }),
                 run_session: Box::new({
                     let (ctx, run_session) = (ctx.clone(), run_session.clone());
-                    move |stream, active: Arc<chost::ActiveSession>| match glide::host::auth::accept_relay(stream, &active.session_id, &ctx) {
-                        Ok(a) => {
-                            log(&format!("managed session {}: {}", active.session_id, active.label()));
-                            active.authenticated();
-                            let live = active.clone();
-                            run_session(a, Box::new(move || live.live()));
-                        }
-                        Err(e) => log(&format!("managed session {}: handshake failed: {e}", active.session_id)),
+                    // A handshake failure is logged and reported as client.error by the agent.
+                    move |stream, active: Arc<chost::ActiveSession>| {
+                        let a = glide::host::auth::accept_relay(stream, &active.session_id, &ctx).map_err(|e| e.to_string())?;
+                        log(&format!("managed session {}: {}", active.session_id, active.label()));
+                        active.authenticated();
+                        let live = active.clone();
+                        run_session(a, Box::new(move || live.live()));
+                        Ok(())
                     }
                 }),
                 settings: Box::new({

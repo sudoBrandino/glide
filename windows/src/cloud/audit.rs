@@ -210,4 +210,35 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(http.requests.lock().unwrap()[1].body.as_ref().unwrap()).unwrap();
         assert_eq!(body["events"].as_array().unwrap().len(), 100);
     }
+
+    #[test]
+    fn flush_drops_batches_refused_with_4xx_but_keeps_401_and_429() {
+        // 400 / 403 / 404 / 413 / 422: dropped (resending the same batch would fail again).
+        for status in [400, 403, 404, 413, 422] {
+            let http = Arc::new(FakeHttp::default());
+            let c = CloudClient::new("https://c.example.com", http.clone()).with_device("gd_x");
+            let q = AuditQueue::default();
+            for _ in 0..150 {
+                q.local_end("s", true);
+            }
+            http.on("POST /v1/audit", status, r#"{"error":{"code":"invalid_request","message":"x"}}"#);
+            assert_eq!(q.flush(&c), Ok(0), "{status}");
+            assert!(q.is_empty(), "{status}: dropped, not retried");
+            assert_eq!(http.count("POST /v1/audit"), 2, "both batches tried once");
+        }
+        // 401, 429, 5xx and no answer: kept for later.
+        for status in [401, 429, 500, 503] {
+            let http = Arc::new(FakeHttp::default());
+            let c = CloudClient::new("https://c.example.com", http.clone()).with_device("gd_x");
+            let q = AuditQueue::default();
+            q.client_error(Some("ses_1"), "handshake", "x");
+            http.on("POST /v1/audit", status, "");
+            assert!(q.flush(&c).is_err(), "{status}");
+            assert_eq!(q.len(), 1, "{status}: kept");
+        }
+        let q = AuditQueue::default();
+        q.client_error(None, "relay", "x");
+        assert!(q.flush(&CloudClient::new("https://c.example.com", Arc::new(FakeHttp::default()))).is_err());
+        assert_eq!(q.len(), 1);
+    }
 }

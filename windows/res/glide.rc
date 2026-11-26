@@ -18,6 +18,7 @@
 #define ES_AUTOHSCROLL    0x80
 #define WS_BORDER         0x00800000L
 #define WS_GROUP          0x00020000L
+#define BS_MULTILINE      0x2000
 #define SS_NOPREFIX       0x80
 #define WS_VSCROLL        0x00200000L
 #define LVS_REPORT        0x1
@@ -73,6 +74,7 @@
 #define IDC_CN_UNPAIR    1306
 #define IDC_CN_STATUS    1307
 #define IDC_CN_ORG       1308
+#define IDC_CN_VIEWONLY  1309
 #define IDD_CONN_EDIT    105
 #define IDC_CE_NAME      1400
 #define IDC_CE_ADDR      1401
@@ -138,8 +140,9 @@ END
 
 // Connections (win/connections.rs): search, the saved Macs (report list view, grouped at runtime
 // when there is more than one group), actions on the right, a status line for the selection.
-// Connect is IDOK (Enter / double-click), Close is IDCANCEL (Esc). IDC_CN_ORG (Sign in... /
-// Sign out of the organization) is hidden at runtime unless Glide is managed. Keep this file ASCII.
+// Connect is IDOK (Enter / double-click), Close is IDCANCEL (Esc). IDC_CN_VIEWONLY ("Connect
+// (view only)" for organization hosts) and IDC_CN_ORG (Sign in... / Sign out of the organization)
+// are hidden at runtime unless Glide is managed. Keep this file ASCII.
 IDD_CONNS DIALOGEX 0, 0, 400, 260
 STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | DS_SETFOREGROUND | WS_POPUP | WS_CAPTION | WS_SYSMENU
 EXSTYLE WS_EX_APPWINDOW
@@ -149,12 +152,13 @@ BEGIN
     EDITTEXT        IDC_CN_SEARCH, 10, 8, 200, 14, ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP | WS_GROUP
     CONTROL         "", IDC_CN_LIST, "SysListView32", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_BORDER | WS_TABSTOP, 10, 26, 312, 192
     DEFPUSHBUTTON   "&Connect", IDOK, 330, 26, 60, 14, WS_TABSTOP | WS_GROUP
-    PUSHBUTTON      "&Add...", IDC_CN_ADD, 330, 48, 60, 14, WS_TABSTOP
-    PUSHBUTTON      "&Edit...", IDC_CN_EDIT, 330, 66, 60, 14, WS_TABSTOP
-    PUSHBUTTON      "D&uplicate", IDC_CN_DUPLICATE, 330, 84, 60, 14, WS_TABSTOP
-    PUSHBUTTON      "&Remove", IDC_CN_REMOVE, 330, 106, 60, 14, WS_TABSTOP
-    PUSHBUTTON      "U&npair", IDC_CN_UNPAIR, 330, 124, 60, 14, WS_TABSTOP
-    PUSHBUTTON      "Sign &in...", IDC_CN_ORG, 330, 146, 60, 14, WS_TABSTOP
+    PUSHBUTTON      "Connect (&view only)", IDC_CN_VIEWONLY, 330, 42, 60, 22, WS_TABSTOP | BS_MULTILINE
+    PUSHBUTTON      "&Add...", IDC_CN_ADD, 330, 70, 60, 14, WS_TABSTOP
+    PUSHBUTTON      "&Edit...", IDC_CN_EDIT, 330, 88, 60, 14, WS_TABSTOP
+    PUSHBUTTON      "D&uplicate", IDC_CN_DUPLICATE, 330, 106, 60, 14, WS_TABSTOP
+    PUSHBUTTON      "&Remove", IDC_CN_REMOVE, 330, 128, 60, 14, WS_TABSTOP
+    PUSHBUTTON      "U&npair", IDC_CN_UNPAIR, 330, 146, 60, 14, WS_TABSTOP
+    PUSHBUTTON      "Sign &in...", IDC_CN_ORG, 330, 168, 60, 14, WS_TABSTOP
     LTEXT           "", IDC_CN_STATUS, 10, 223, 312, 30, SS_NOPREFIX
     PUSHBUTTON      "Close", IDCANCEL, 330, 238, 60, 14, WS_TABSTOP | WS_GROUP
 END

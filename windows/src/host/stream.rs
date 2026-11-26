@@ -116,6 +116,8 @@ pub fn dispatch_permitted(pt: &[u8], perms: Option<&crate::cloud::Permissions>) 
             return Ok(Action::Ignore(match pt.first().copied() {
                 Some(MSG_CLIPBOARD) => "clipboard (not allowed in this session)",
                 Some(MSG_FILE_CAPS..=MSG_FILE_PULL_RESULT) => "file transfer (not allowed in this session)",
+                Some(MSG_SET_DISPLAY_PREFERENCE) => "SetDisplayPreference (view-only session)",
+                Some(MSG_AUDIO_ENABLE) => "AudioEnable (no audio in this session)",
                 _ => "input (view-only session)",
             }));
         }
@@ -299,6 +301,15 @@ mod tests {
         assert_eq!(dispatch_permitted(&ClientMsg::Ping { client_time_us: 7 }.encode(), Some(&view)), Ok(Action::Pong { client_time_us: 7 }));
         assert_eq!(dispatch_permitted(&ClientMsg::RequestKeyframe.encode(), Some(&view)), Ok(Action::RequestKeyframe));
         assert_eq!(dispatch_permitted(&ClientMsg::ReleaseAll.encode(), Some(&view)), Ok(Action::Input(InputEvent::ReleaseAll)));
+        // View only (§6.7): the viewer's size still scales the stream, but its display-mode
+        // request never reaches the display code. (glide-host never changes the PC's display
+        // mode or resolution for a viewer in any session: ViewSize only sets the encode size.)
+        assert_eq!(dispatch_permitted(&ClientMsg::ViewSize { view_w: 1920, view_h: 1080 }.encode(), Some(&view)), Ok(Action::ViewSize { w: 1920, h: 1080 }));
+        let pref = ClientMsg::SetDisplayPreference { mode: 1 }.encode();
+        assert_eq!(dispatch_permitted(&pref, Some(&view)), Ok(Action::Ignore("SetDisplayPreference (view-only session)")));
+        assert_eq!(dispatch_permitted(&pref, Some(&full)), Ok(Action::Ignore("SetDisplayPreference")));
+        let no_audio = Permissions { audio: false, ..full };
+        assert_eq!(dispatch_permitted(&ClientMsg::AudioEnable { enabled: true }.encode(), Some(&no_audio)), Ok(Action::Ignore("AudioEnable (no audio in this session)")));
         // Clipboard / files toward the host are refused before they are even decoded.
         let clip = ClientMsg::Clipboard(crate::protocol::ClipboardData { seq: 1, text: Some("x".into()), png: None }).encode();
         assert_eq!(dispatch_permitted(&clip, Some(&view)), Ok(Action::Ignore("clipboard (not allowed in this session)")));

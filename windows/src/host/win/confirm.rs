@@ -47,14 +47,10 @@ impl crate::cloud::host::HostUi for CloudPrompt {
         use crate::cloud::host::{Approval, APPROVAL_TIMEOUT};
         use crate::win::prompt::{ask, PromptSpec};
         let start = std::time::Instant::now();
-        let viewer = crate::host::trust::display_name(&o.viewer.name);
+        let (text, detail) = crate::cloud::host::approval_text(o);
         let spec = PromptSpec {
             title: "Glide — Remote session request".into(),
-            t: PairText {
-                text: format!("{} from your organization asks to see and control this PC (from “{viewer}”).\nAccept only if you expect this.", o.user.label()),
-                code: String::new(),
-                detail: format!("This session: {}.\nYou can end it at any time from the Glide Host icon (End session).", o.permissions.describe()),
-            },
+            t: PairText { text, code: String::new(), detail },
             confirm: "Accept".into(),
             cancel: "Decline".into(),
             code_pt: 12,
