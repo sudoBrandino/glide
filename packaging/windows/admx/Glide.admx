@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Group Policy / Intune administrative template for Glide (docs/ENTERPRISE.md §11.2,
+  docs/DEPLOYMENT.md). Every policy is available as a Computer and a User policy (class="Both"):
+  Computer writes HKLM\SOFTWARE\Policies\Glide, User writes HKCU\SOFTWARE\Policies\Glide. The
+  apps read the machine values first; the enrollment values (CloudURL, EnrollmentToken, DeviceName,
+  Tags) come as one set from the first scope that has a CloudURL, and DisableLANMode applies if
+  either scope sets it.
+
+  Install: copy Glide.admx to %SystemRoot%\PolicyDefinitions (or the domain's Central Store,
+  \\<domain>\SYSVOL\<domain>\Policies\PolicyDefinitions) and en-US\Glide.adml to its en-US
+  folder. Intune: Devices → Configuration → Import ADMX.
+-->
+<policyDefinitions xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   revision="1.0" schemaVersion="1.0"
+                   xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+  <policyNamespaces>
+    <target prefix="glide" namespace="Glide.Policies.Glide" />
+  </policyNamespaces>
+  <resources minRequiredRevision="1.0" />
+  <supportedOn>
+    <definitions>
+      <definition name="SUPPORTED_GlideManaged" displayName="$(string.SUPPORTED_GlideManaged)" />
+    </definitions>
+  </supportedOn>
+  <categories>
+    <category name="Glide" displayName="$(string.Cat_Glide)" explainText="$(string.Cat_Glide_Help)" />
+  </categories>
+  <policies>
+    <policy name="CloudURL" class="Both" displayName="$(string.CloudURL)" explainText="$(string.CloudURL_Help)"
+            presentation="$(presentation.CloudURL)" key="SOFTWARE\Policies\Glide">
+      <parentCategory ref="Glide" />
+      <supportedOn ref="SUPPORTED_GlideManaged" />
+      <elements>
+        <text id="CloudURL" valueName="CloudURL" required="true" maxLength="512" />
+      </elements>
+    </policy>
+    <policy name="EnrollmentToken" class="Both" displayName="$(string.EnrollmentToken)" explainText="$(string.EnrollmentToken_Help)"
+            presentation="$(presentation.EnrollmentToken)" key="SOFTWARE\Policies\Glide">
+      <parentCategory ref="Glide" />
+      <supportedOn ref="SUPPORTED_GlideManaged" />
+      <elements>
+        <text id="EnrollmentToken" valueName="EnrollmentToken" required="true" maxLength="512" />
+      </elements>
+    </policy>
+    <policy name="DeviceName" class="Both" displayName="$(string.DeviceName)" explainText="$(string.DeviceName_Help)"
+            presentation="$(presentation.DeviceName)" key="SOFTWARE\Policies\Glide">
+      <parentCategory ref="Glide" />
+      <supportedOn ref="SUPPORTED_GlideManaged" />
+      <elements>
+        <text id="DeviceName" valueName="DeviceName" required="true" maxLength="64" />
+      </elements>
+    </policy>
+    <!-- multiText writes one REG_MULTI_SZ value. -->
+    <policy name="Tags" class="Both" displayName="$(string.Tags)" explainText="$(string.Tags_Help)"
+            presentation="$(presentation.Tags)" key="SOFTWARE\Policies\Glide">
+      <parentCategory ref="Glide" />
+      <supportedOn ref="SUPPORTED_GlideManaged" />
+      <elements>
+        <multiText id="Tags" valueName="Tags" required="true" maxLength="1024" maxStrings="32" />
+      </elements>
+    </policy>
+    <policy name="DisableLANMode" class="Both" displayName="$(string.DisableLANMode)" explainText="$(string.DisableLANMode_Help)"
+            key="SOFTWARE\Policies\Glide" valueName="DisableLANMode">
+      <parentCategory ref="Glide" />
+      <supportedOn ref="SUPPORTED_GlideManaged" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+  </policies>
+</policyDefinitions>

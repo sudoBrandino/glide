@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- English strings for Glide.admx. -->
+<policyDefinitionResources xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                           revision="1.0" schemaVersion="1.0"
+                           xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+  <displayName>Glide</displayName>
+  <description>Managed configuration for the Glide viewer and Windows host (Glide Cloud).</description>
+  <resources>
+    <stringTable>
+      <string id="SUPPORTED_GlideManaged">Glide releases with managed mode (Glide Cloud)</string>
+      <string id="Cat_Glide">Glide</string>
+      <string id="Cat_Glide_Help">Connects the Glide viewer (glide-client.exe) and the Windows host (glide-host.exe) to your organization's Glide Cloud. Computer policies apply to everyone on the PC and take precedence over User policies.</string>
+
+      <string id="CloudURL">Glide Cloud URL</string>
+      <string id="CloudURL_Help">The address of your organization's Glide Cloud, for example https://glide.example.com (https only).
+
+With this policy and an enrollment token, Glide enrolls the device in your organization when it starts, and sessions go through Glide Cloud: users sign in with your identity provider, and access follows your organization's policies.
+
+The enrollment values (Glide Cloud URL, enrollment token, device name, tags) are read as one set: from the Computer policy if it sets a Glide Cloud URL, otherwise from the User policy.
+
+Registry: SOFTWARE\Policies\Glide, CloudURL (REG_SZ).</string>
+
+      <string id="EnrollmentToken">Enrollment token</string>
+      <string id="EnrollmentToken_Help">The enrollment token from the Glide Cloud admin console (Enrollment tokens). Glide uses it once, to enroll the device; afterwards the device has its own credential, and you can revoke or rotate the token in the console without affecting enrolled devices.
+
+Anyone who can read this machine's registry can read the token, so limit its use (expiry, maximum uses) in the console.
+
+Registry: SOFTWARE\Policies\Glide, EnrollmentToken (REG_SZ).</string>
+
+      <string id="DeviceName">Device name</string>
+      <string id="DeviceName_Help">The name the device has in Glide Cloud, at most 64 characters. If not configured, the computer name is used.
+
+Registry: SOFTWARE\Policies\Glide, DeviceName (REG_SZ).</string>
+
+      <string id="Tags">Device tags</string>
+      <string id="Tags_Help">Tags added to the device when it enrolls, one per line (for example: finance, floor-3). Access policies in Glide Cloud can match devices by tag. The enrollment token's default tags, if any, apply too.
+
+Registry: SOFTWARE\Policies\Glide, Tags (REG_MULTI_SZ).</string>
+
+      <string id="DisableLANMode">Turn off LAN mode</string>
+      <string id="DisableLANMode_Help">If enabled, Glide does not listen for or make direct connections on the local network (TCP 7420 for the viewer, 7421 for the Windows host): only sessions through Glide Cloud are possible, with your organization's sign-in, policies and audit log.
+
+This can only make Glide stricter than your organization's Glide Cloud setting: if either the Computer or the User policy enables it, LAN mode is off. If disabled or not configured, the Glide Cloud setting decides.
+
+Registry: SOFTWARE\Policies\Glide, DisableLANMode (REG_DWORD, 1 = off).</string>
+    </stringTable>
+    <presentationTable>
+      <presentation id="CloudURL">
+        <textBox refId="CloudURL">
+          <label>Glide Cloud URL:</label>
+        </textBox>
+      </presentation>
+      <presentation id="EnrollmentToken">
+        <textBox refId="EnrollmentToken">
+          <label>Enrollment token:</label>
+        </textBox>
+      </presentation>
+      <presentation id="DeviceName">
+        <textBox refId="DeviceName">
+          <label>Device name:</label>
+        </textBox>
+      </presentation>
+      <presentation id="Tags">
+        <multiTextBox refId="Tags">Tags (one per line):</multiTextBox>
+      </presentation>
+    </presentationTable>
+  </resources>
+</policyDefinitionResources>
