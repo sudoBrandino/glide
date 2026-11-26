@@ -135,8 +135,9 @@ pub struct HostHooks {
     pub busy: Box<dyn Fn() -> bool + Send + Sync>,
     /// Runs one accepted managed session on the loopback end of the bridge (handshake against the
     /// grant, then streaming) and returns when it ends. Must call `ActiveSession::authenticated`
-    /// after the handshake and stop once `ActiveSession::live` turns false.
-    pub run_session: Box<dyn Fn(TcpStream, Arc<ActiveSession>) + Send + Sync>,
+    /// after the handshake and stop once `ActiveSession::live` turns false. `Err` = the handshake
+    /// failed (reported as `client.error`).
+    pub run_session: Box<dyn Fn(TcpStream, Arc<ActiveSession>) -> Result<(), String> + Send + Sync>,
     /// Org settings arrived or changed (LAN mode, local pairing).
     pub settings: Box<dyn Fn(&Settings) + Send + Sync>,
 }
@@ -486,6 +487,7 @@ impl HostAgent {
                 log(&format!("cloud: relay for {sid}: {e}"));
                 self.audit.client_error(Some(&sid), "relay_connect", &e.to_string());
                 self.grants.cancel(&sid);
+                let _ = self.audit.flush(&self.client);
                 return;
             }
         };
@@ -493,7 +495,9 @@ impl HostAgent {
             Ok(x) => x,
             Err(e) => {
                 log(&format!("cloud: relay for {sid}: {e}"));
+                self.audit.client_error(Some(&sid), "relay", &e.to_string());
                 self.grants.cancel(&sid);
+                let _ = self.audit.flush(&self.client);
                 return;
             }
         };
@@ -510,7 +514,10 @@ impl HostAgent {
         *self.active.lock().unwrap() = Some(active.clone());
         self.accepting.store(false, Ordering::SeqCst);
         self.ui.session_changed();
-        (self.hooks.run_session)(stream, active.clone());
+        if let Err(e) = (self.hooks.run_session)(stream, active.clone()) {
+            log(&format!("cloud: session {sid}: handshake failed: {e}"));
+            self.audit.client_error(Some(&sid), "handshake", &e);
+        }
         active.end();
         active.bridge.join();
         self.grants.cancel(&sid);
@@ -654,6 +661,11 @@ pub(crate) mod tests {
                     let _ = stream.write_all(b"host-bytes");
                     let mut b = [0u8; 4];
                     let _ = stream.read_exact(&mut b);
+                    // Sessions named ses_fail* fail their handshake.
+                    if a.session_id.starts_with("ses_fail") {
+                        return Err("the viewer's key isn't the one the cloud granted".into());
+                    }
+                    Ok(())
                 }),
                 settings: Box::new(|_| {}),
             },
@@ -840,6 +852,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn relay_and_handshake_failures_are_client_errors() {
+        let audit_events = |f: &Fixture| -> Vec<serde_json::Value> {
+            f.http.requests.lock().unwrap().iter().filter(|r| r.url.ends_with("/v1/audit")).flat_map(|r| serde_json::from_slice::<serde_json::Value>(r.body.as_ref().unwrap()).unwrap()["events"].as_array().unwrap().clone()).collect()
+        };
+        // The relay can't be opened.
+        let f = fixture(None, false);
+        f.http.on("POST /v1/audit", 202, "");
+        f.agent.handle_offer(offer("ses_r1", "none"));
+        let ev = audit_events(&f);
+        assert_eq!((ev[0]["type"].as_str(), ev[0]["session_id"].as_str(), ev[0]["detail"]["code"].as_str()), (Some("client.error"), Some("ses_r1"), Some("relay_connect")));
+        // The relay opens but the viewer never joins.
+        let f = fixture(None, false);
+        f.http.on("POST /v1/audit", 202, "");
+        let (relay_client, relay_server) = pair();
+        f.http.sockets.lock().unwrap().push_back(Ok(relay_client));
+        relay_server.close(crate::cloud::api::close::PEER_DID_NOT_JOIN, "peer did not join");
+        f.agent.handle_offer(offer("ses_r2", "none"));
+        let ev = audit_events(&f);
+        assert_eq!((ev[0]["type"].as_str(), ev[0]["detail"]["code"].as_str()), (Some("client.error"), Some("relay")));
+        // The handshake fails.
+        let f = fixture(None, false);
+        f.http.on("POST /v1/audit", 202, "");
+        let (relay_client, relay_server) = pair();
+        f.http.sockets.lock().unwrap().push_back(Ok(relay_client));
+        relay_server.send(WsMsg::Text(r#"{"type":"peer_joined"}"#.into())).unwrap();
+        relay_server.send(WsMsg::Binary(b"ping".to_vec())).unwrap();
+        f.agent.handle_offer(offer("ses_fail1", "none"));
+        let ev = audit_events(&f);
+        assert_eq!((ev[0]["type"].as_str(), ev[0]["session_id"].as_str(), ev[0]["detail"]["code"].as_str()), (Some("client.error"), Some("ses_fail1"), Some("handshake")));
+    }
+
+    #[test]
     fn hub_connection_refreshes_the_device() {
         let f = fixture(None, false);
         let enrolled = crate::cloud::store::Enrollment {
@@ -891,7 +935,7 @@ pub(crate) mod tests {
         let managed = ManagedConfig { cloud_url: "https://c.example.com".into(), enrollment_token: Some("enr".into()), ..Default::default() };
         let applied = Arc::new(Mutex::new(Vec::new()));
         let a2 = applied.clone();
-        let hooks = HostHooks { busy: Box::new(|| false), run_session: Box::new(|_, _| {}), settings: Box::new(move |s: &Settings| a2.lock().unwrap().push(s.clone())) };
+        let hooks = HostHooks { busy: Box::new(|| false), run_session: Box::new(|_, _| Ok(())), settings: Box::new(move |s: &Settings| a2.lock().unwrap().push(s.clone())) };
         let ui: Arc<dyn HostUi> = Arc::new(ScriptUi { answer: None, asked: Mutex::new(vec![]), delay: Duration::ZERO });
         let facts = DeviceFacts { kind: enroll::Kind::Host, public_key: [1; 32], name: "PC".into(), os_version: "10".into(), app_version: "0.4.0".into() };
         let cloud = start(managed, f.agent.store.clone(), f.http.clone(), facts, Arc::new(GrantStore::default()), ui, hooks);

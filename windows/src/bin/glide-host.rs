@@ -407,14 +407,14 @@ fn main() -> ExitCode {
                 }),
                 run_session: Box::new({
                     let (ctx, run_session) = (ctx.clone(), run_session.clone());
-                    move |stream, active: Arc<chost::ActiveSession>| match glide::host::auth::accept_relay(stream, &active.session_id, &ctx) {
-                        Ok(a) => {
-                            log(&format!("managed session {}: {}", active.session_id, active.label()));
-                            active.authenticated();
-                            let live = active.clone();
-                            run_session(a, Box::new(move || live.live()));
-                        }
-                        Err(e) => log(&format!("managed session {}: handshake failed: {e}", active.session_id)),
+                    // A handshake failure is logged and reported as client.error by the agent.
+                    move |stream, active: Arc<chost::ActiveSession>| {
+                        let a = glide::host::auth::accept_relay(stream, &active.session_id, &ctx).map_err(|e| e.to_string())?;
+                        log(&format!("managed session {}: {}", active.session_id, active.label()));
+                        active.authenticated();
+                        let live = active.clone();
+                        run_session(a, Box::new(move || live.live()));
+                        Ok(())
                     }
                 }),
                 settings: Box::new({
