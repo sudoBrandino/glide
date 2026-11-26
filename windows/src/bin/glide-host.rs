@@ -324,13 +324,18 @@ fn main() -> ExitCode {
         None => vec![format!("0.0.0.0:{port}"), format!("[::]:{port}")],
     };
     // Managed mode (Glide Cloud, docs/ENTERPRISE.md): the organization's policy, if any.
-    let managed = match glide::cloud::managed::load() {
-        Ok(m) => m,
+    let (managed, policy_read) = match glide::cloud::managed::load() {
+        Ok(m) => (m, true),
         Err(e) => {
             log(&format!("managed configuration ignored: {e}"));
-            None
+            (None, false)
         }
     };
+    if policy_read && !managed.as_ref().is_some_and(|m| m.has_cloud()) {
+        // No CloudURL (any more): a revocation record from an earlier one stops applying (§6.7).
+        use glide::cloud::{enroll, store};
+        store::Store::new(&dir, enroll::Kind::Host.file(), store::platform_seal()).forget_revoked();
+    }
     if managed.as_ref().is_some_and(|m| m.disable_lan_mode) {
         ctx.set_policy(false, false);
         log("LAN connections are turned off by policy (DisableLANMode)");

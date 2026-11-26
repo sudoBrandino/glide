@@ -69,6 +69,8 @@ impl std::fmt::Display for EnrollError {
 /// another cloud) and stores the result.
 pub fn ensure(managed: &ManagedConfig, store: &Store, client: &CloudClient, facts: &DeviceFacts) -> Result<Enrollment, EnrollError> {
     match store.load() {
+        // Revoked at this CloudURL: never enroll again until the CloudURL changes (§6.7).
+        Ok(Some(e)) if e.cloud_url == managed.cloud_url && e.revoked => return Err(EnrollError::Revoked),
         Ok(Some(e)) if e.cloud_url == managed.cloud_url && e.plausible() => return Ok(e),
         Ok(Some(e)) => {
             crate::host::log(&format!("cloud: stored enrollment is for {} (now {}); enrolling again", e.cloud_url, managed.cloud_url));
@@ -88,7 +90,14 @@ pub fn ensure(managed: &ManagedConfig, store: &Store, client: &CloudClient, fact
         app_version: facts.app_version.clone(),
         tags: (!managed.tags.is_empty()).then(|| managed.tags.clone()),
     };
-    let r = client.enroll(&req).map_err(classify)?;
+    let r = client.enroll(&req).map_err(classify).inspect_err(|e| {
+        if *e == EnrollError::Revoked {
+            // 409 device_revoked: remembered, so a restart doesn't ask again.
+            if let Err(err) = store.mark_revoked(&managed.cloud_url, None, "") {
+                crate::host::log(&format!("cloud: {err}"));
+            }
+        }
+    })?;
     let e = Enrollment {
         cloud_url: managed.cloud_url.clone(),
         org_id: r.org.id.clone(),
@@ -175,6 +184,17 @@ mod tests {
         let m = ManagedConfig { enrollment_token: Some("t".into()), ..m };
         http.on("POST /v1/enroll", 409, r#"{"error":{"code":"device_revoked","message":"revoked"}}"#);
         assert_eq!(ensure(&m, &store, &client, &f), Err(EnrollError::Revoked));
+        // Remembered: the next start doesn't ask the cloud again (same CloudURL).
+        assert!(store.revoked_for(&m.cloud_url).is_some());
+        assert_eq!(ensure(&m, &store, &client, &f), Err(EnrollError::Revoked));
+        assert_eq!(http.count("POST /v1/enroll"), 1);
+        // Another CloudURL enrolls afresh.
+        let m2 = ManagedConfig { cloud_url: "https://other.example.com".into(), ..m.clone() };
+        let c2 = CloudClient::new("https://other.example.com", http.clone());
+        http.routes.lock().unwrap().clear();
+        http.on("POST /v1/enroll", 201, OK);
+        assert!(ensure(&m2, &store, &c2, &f).is_ok());
+        store.wipe().unwrap();
         http.routes.lock().unwrap().clear();
         http.on("POST /v1/enroll", 401, r#"{"error":{"code":"invalid_enrollment_token","message":"The enrollment token is not valid."}}"#);
         assert_eq!(ensure(&m, &store, &client, &f), Err(EnrollError::Refused("The enrollment token is not valid.".into())));

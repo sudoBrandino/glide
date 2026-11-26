@@ -201,6 +201,12 @@ pub fn start(managed: ManagedConfig, store: Store, http: Arc<dyn Http>, facts: D
                             return;
                         }
                     }
+                    Err(EnrollError::Revoked) => {
+                        // The last settings (applied above from the revocation record) stay.
+                        let org = store.revoked_for(&managed.cloud_url).map(|r| r.org_name).filter(|n| !n.is_empty()).unwrap_or_else(|| "your organization".into());
+                        c.set_status(&format!("Removed from {org}: this PC is no longer managed by Glide Cloud"));
+                        return;
+                    }
                     Err(e) => {
                         c.set_status(&format!("Glide Cloud: {e}"));
                         return;
@@ -495,8 +501,11 @@ impl HostAgent {
 
     /// `revoked` frame or 401: delete the enrollment, end everything.
     fn revoked(&self, reason: &str) {
-        log(&format!("cloud: this device was revoked ({reason}); deleting the enrollment"));
-        if let Err(e) = self.store.wipe() {
+        log(&format!("cloud: this device was revoked ({reason}); deleting its credentials"));
+        // Keep {cloud_url, revoked, settings}: the last org settings stay in force, across
+        // restarts, until the managed CloudURL is removed or changes (§6.7).
+        let org = self.store.load().ok().flatten().map(|e| e.org_name).unwrap_or_default();
+        if let Err(e) = self.store.mark_revoked(&self.client.base, Some(self.settings()), &org) {
             log(&format!("cloud: {e}"));
         }
         self.grants.clear();
@@ -507,9 +516,6 @@ impl HostAgent {
             a.end();
         }
         self.stop.store(true, Ordering::SeqCst);
-        // The last org settings stay in force for this run (a revoked device doesn't get LAN
-        // access back that the organization had turned off); a restart without the policy is
-        // unmanaged again.
         self.ui.notice("This PC was removed from your organization's Glide Cloud.");
     }
 }
@@ -774,6 +780,41 @@ pub(crate) mod tests {
         f.agent.handle_offer(o);
         let exp = f.grant_expiry.lock().unwrap().unwrap();
         assert!(exp <= t0 + Duration::from_secs(31), "capped at expires_at");
+    }
+
+    #[test]
+    fn revocation_keeps_the_last_settings() {
+        let f = fixture(None, false);
+        let enrolled = crate::cloud::store::Enrollment {
+            cloud_url: "https://c.example.com".into(),
+            device_id: "dev_h".into(),
+            device_token: "gd_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            org_name: "Acme".into(),
+            ..Default::default()
+        };
+        f.agent.store.save(&enrolled).unwrap();
+        let lan_off = Settings { lan_mode: false, allow_local_pairing: false, ..Settings::default() };
+        *f.agent.settings.lock().unwrap() = lan_off.clone();
+        f.agent.revoked("admin");
+        let r = f.agent.store.load().unwrap().unwrap();
+        assert!(r.revoked && r.device_token.is_empty());
+        assert_eq!((r.cloud_url.as_str(), r.settings, r.org_name.as_str()), ("https://c.example.com", Some(lan_off.clone()), "Acme"));
+        // A restart with the same CloudURL: no enrollment, the record's settings apply.
+        let managed = ManagedConfig { cloud_url: "https://c.example.com".into(), enrollment_token: Some("enr".into()), ..Default::default() };
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let a2 = applied.clone();
+        let hooks = HostHooks { busy: Box::new(|| false), run_session: Box::new(|_, _| {}), settings: Box::new(move |s: &Settings| a2.lock().unwrap().push(s.clone())) };
+        let ui: Arc<dyn HostUi> = Arc::new(ScriptUi { answer: None, asked: Mutex::new(vec![]), delay: Duration::ZERO });
+        let facts = DeviceFacts { kind: enroll::Kind::Host, public_key: [1; 32], name: "PC".into(), os_version: "10".into(), app_version: "0.4.0".into() };
+        let cloud = start(managed, f.agent.store.clone(), f.http.clone(), facts, Arc::new(GrantStore::default()), ui, hooks);
+        let t = Instant::now();
+        while !cloud.status().starts_with("Removed") && t.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(cloud.status(), "Removed from Acme: this PC is no longer managed by Glide Cloud");
+        assert_eq!(*applied.lock().unwrap(), vec![lan_off]);
+        assert_eq!(f.http.count("POST /v1/enroll"), 0, "never enrolls again at that CloudURL");
+        let _ = std::fs::remove_dir_all(&f.dir);
     }
 
     #[test]

@@ -49,6 +49,8 @@ struct State {
     problem: Option<String>,
     hosts: Vec<HostEntry>,
     revoked: bool,
+    /// After revocation: the last org settings, still applied (§6.7).
+    revoked_settings: Option<Settings>,
 }
 
 pub struct ViewerAgent {
@@ -71,12 +73,16 @@ fn now_s() -> i64 {
 
 impl ViewerAgent {
     pub fn new(managed: ManagedConfig, store: Store, http: Arc<dyn Http>) -> Arc<ViewerAgent> {
-        let enrollment = store.load().ok().flatten().filter(|e| e.cloud_url == managed.cloud_url && e.plausible());
+        let stored = store.load().ok().flatten().filter(|e| e.cloud_url == managed.cloud_url);
+        // Revoked at this CloudURL: the record's settings keep applying, across restarts (§6.7).
+        let revoked = stored.as_ref().is_some_and(|e| e.revoked);
+        let revoked_settings = stored.as_ref().filter(|e| e.revoked).and_then(|e| e.settings.clone());
+        let enrollment = stored.filter(|e| e.plausible());
         Arc::new(ViewerAgent {
             managed,
             store,
             http,
-            state: Mutex::new(State { enrollment, ..Default::default() }),
+            state: Mutex::new(State { enrollment, revoked, revoked_settings, ..Default::default() }),
             audit: Arc::new(AuditQueue::default()),
             link: Arc::new(HubLink::default()),
             stop: Arc::new(AtomicBool::new(false)),
@@ -117,6 +123,17 @@ impl ViewerAgent {
                         }
                         Err(EnrollError::Refused(err)) => {
                             me.set_problem(Some(format!("Your organization refused this PC's enrollment: {err}")));
+                            return;
+                        }
+                        Err(EnrollError::Revoked) => {
+                            // Revoked here before (or 409 device_revoked): the last settings stay.
+                            log("cloud: this device was revoked by the organization; not enrolling again");
+                            {
+                                let mut st = me.state.lock().unwrap();
+                                st.revoked = true;
+                                st.revoked_settings = me.store.revoked_for(&me.managed.cloud_url).and_then(|r| r.settings).or(st.revoked_settings.take());
+                            }
+                            me.changed();
                             return;
                         }
                         Err(err) => {
@@ -204,8 +221,13 @@ impl ViewerAgent {
         Some(e.user.clone().unwrap_or_default())
     }
 
+    /// The org settings in force: the enrollment's, or after revocation the last ones received.
     pub fn settings(&self) -> Option<Settings> {
-        self.state.lock().unwrap().enrollment.as_ref().and_then(|e| e.settings.clone())
+        let st = self.state.lock().unwrap();
+        match &st.enrollment {
+            Some(e) => e.settings.clone(),
+            None => st.revoked_settings.clone(),
+        }
     }
 
     pub fn local_lan_disabled(&self) -> bool {
@@ -418,16 +440,21 @@ impl ViewerAgent {
         self.changed();
     }
 
+    /// `revoked` frame or 401: delete the credentials, keep `{cloud_url, revoked, settings}` and
+    /// keep applying those settings until the managed CloudURL is removed or changes (§6.7).
     fn revoked(&self, reason: &str) {
-        log(&format!("cloud: this device was revoked ({reason}); deleting the enrollment"));
-        if let Err(e) = self.store.wipe() {
-            log(&format!("cloud: {e}"));
-        }
-        {
+        log(&format!("cloud: this device was revoked ({reason}); deleting its credentials"));
+        let (settings, org) = {
             let mut st = self.state.lock().unwrap();
-            st.enrollment = None;
+            let e = st.enrollment.take();
+            let settings = e.as_ref().and_then(|e| e.settings.clone()).or_else(|| st.revoked_settings.clone());
             st.hosts.clear();
             st.revoked = true;
+            st.revoked_settings = settings.clone();
+            (settings, e.map(|e| e.org_name).unwrap_or_default())
+        };
+        if let Err(e) = self.store.mark_revoked(&self.managed.cloud_url, settings, &org) {
+            log(&format!("cloud: {e}"));
         }
         self.stop.store(true, Ordering::SeqCst);
         self.link.close();
@@ -605,14 +632,34 @@ mod tests {
     }
 
     #[test]
-    fn revoked_device_wipes_enrollment() {
+    fn revoked_device_keeps_the_last_settings() {
         let http = Arc::new(FakeHttp::default());
         let (a, dir) = agent(http.clone(), true);
+        a.apply_settings(Settings { lan_mode: false, ..Settings::default() });
+        assert!(!a.lan_allowed());
         http.on("GET /v1/hosts", 401, "");
         http.on("GET /v1/device", 401, "");
         assert!(a.refresh_hosts().is_err());
         assert!(a.is_revoked() && !a.enrolled());
-        assert_eq!(a.store.load(), Ok(None));
+        // LAN mode stays off: revocation doesn't give back what the org turned off.
+        assert!(!a.lan_allowed() && !a.local_pairing_allowed());
+        let r = a.store.load().unwrap().unwrap();
+        assert!(r.revoked && r.device_token.is_empty() && r.user_token.is_none(), "credentials deleted");
+        assert_eq!(r.settings.as_ref().map(|s| s.lan_mode), Some(false));
+        assert_eq!(a.status_line(), "This PC was removed from your organization's Glide Cloud.");
+
+        // After a restart with the same CloudURL: still revoked, still applied, never enrolls.
+        let m = ManagedConfig { cloud_url: "https://c.example.com".into(), enrollment_token: Some("enr".into()), ..Default::default() };
+        let b = ViewerAgent::new(m.clone(), a.store.clone(), http.clone());
+        assert!(b.is_revoked() && !b.enrolled() && !b.lan_allowed());
+        b.start(DeviceFacts { kind: enroll::Kind::Viewer, public_key: [2; 32], name: "PC".into(), os_version: "10".into(), app_version: "0.4.0".into() });
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(http.count("POST /v1/enroll"), 0);
+        assert!(b.is_revoked() && !b.lan_allowed());
+        b.stop();
+        // Another CloudURL: the record doesn't apply.
+        let c = ViewerAgent::new(ManagedConfig { cloud_url: "https://other.example.com".into(), ..m }, a.store.clone(), http);
+        assert!(!c.is_revoked() && c.lan_allowed());
         let _ = std::fs::remove_dir_all(dir);
     }
 
