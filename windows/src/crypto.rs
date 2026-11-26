@@ -8,6 +8,12 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use std::fmt;
 use std::io::Read;
 
+/// The OS CSPRNG as a rand_core 0.10 `CryptoRng` (what x25519-dalek 3 wants). Like rand_core 0.6's `OsRng`,
+/// it panics if the OS cannot supply entropy rather than returning weak randomness.
+pub fn os_rng() -> getrandom::rand_core::UnwrapErr<getrandom::SysRng> {
+    getrandom::rand_core::UnwrapErr(getrandom::SysRng)
+}
+
 pub const TAG_LEN: usize = 16;
 pub const MIN_RECORD: usize = 17;
 pub const MAX_RECORD: usize = 32 * 1024 * 1024;
@@ -51,7 +57,7 @@ pub struct Sealer {
 
 impl Sealer {
     pub fn new(key: &[u8; 32]) -> Self {
-        Sealer { cipher: ChaCha20Poly1305::new(Key::from_slice(key)), counter: 0 }
+        Sealer { cipher: ChaCha20Poly1305::new(&Key::from(*key)), counter: 0 }
     }
     pub fn counter(&self) -> u64 {
         self.counter
@@ -62,7 +68,7 @@ impl Sealer {
         self.counter += 1;
         let ct = self
             .cipher
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: b"" })
+            .encrypt(&Nonce::from(nonce), Payload { msg: plaintext, aad: b"" })
             .expect("chacha20poly1305 encrypt cannot fail");
         let mut out = Vec::with_capacity(4 + ct.len());
         out.extend_from_slice(&(ct.len() as u32).to_le_bytes());
@@ -79,7 +85,7 @@ pub struct Opener {
 
 impl Opener {
     pub fn new(key: &[u8; 32]) -> Self {
-        Opener { cipher: ChaCha20Poly1305::new(Key::from_slice(key)), counter: 0 }
+        Opener { cipher: ChaCha20Poly1305::new(&Key::from(*key)), counter: 0 }
     }
     pub fn counter(&self) -> u64 {
         self.counter
@@ -92,7 +98,7 @@ impl Opener {
         let nonce = nonce_for(self.counter);
         let pt = self
             .cipher
-            .decrypt(Nonce::from_slice(&nonce), Payload { msg: ciphertext, aad: b"" })
+            .decrypt(&Nonce::from(nonce), Payload { msg: ciphertext, aad: b"" })
             .map_err(|_| CryptoError::DecryptFailed)?;
         self.counter += 1;
         Ok(pt)
@@ -168,5 +174,28 @@ mod tests {
         assert!(matches!(o.read_record(&mut cur, &mut vec![]), Err(CryptoError::BadRecordLength(16))));
         let mut cur = Cursor::new(((32u32 << 20) + 1).to_le_bytes().to_vec());
         assert!(matches!(o.read_record(&mut cur, &mut vec![]), Err(CryptoError::BadRecordLength(_))));
+    }
+
+    /// Record layer known answers from an independent implementation (Python `cryptography`):
+    /// key 00..1f, empty AAD, nonce = 4 zero bytes || u64 LE counter.
+    #[test]
+    fn record_layer_known_answers() {
+        let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let pt = b"Glide dependency bump known-answer test";
+        let cases: [(u64, &str); 3] = [
+            (0, "5fd42b55c8c6c2b463043205ca2d2d5ed8d38698918d3032838f923f4b5b062b177a2819b49d4899edf4d0118d3892cb9c928a007597a6"),
+            (1, "d83b9a3bd00acb7d59d3c03837fbfafee51f9e63374b0bc3ac13db76ec86aed3bd38f6d881bbab9e1aee6eb4e14e203de7634872bf5c7e"),
+            (0x0102030405060708, "b725c480ce198e7d14ce44a8161602c1c06487a9f8642ef03842c970886cd4aa3c0e20c9b7417dabf0701390107e8d74d27934d4cb1f3d"),
+        ];
+        for (counter, want) in cases {
+            let mut s = Sealer::new(&key);
+            s.counter = counter;
+            let rec = s.seal(pt);
+            assert_eq!(rec[..4], (rec.len() as u32 - 4).to_le_bytes());
+            assert_eq!(crate::util::hex(&rec[4..]), want, "counter {counter}");
+            let mut o = Opener::new(&key);
+            o.counter = counter;
+            assert_eq!(o.open(&rec[4..]).unwrap(), pt);
+        }
     }
 }

@@ -6,7 +6,6 @@
 //! Platform independent.
 
 use crate::noise::{public_key, CipherState, HandshakeXX, NoiseError};
-use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use x25519_dalek::StaticSecret;
 
@@ -157,7 +156,7 @@ pub fn fingerprint(public: &[u8; 32]) -> String {
 
 pub fn random32() -> [u8; 32] {
     let mut b = [0u8; 32];
-    OsRng.fill_bytes(&mut b);
+    getrandom::fill(&mut b).expect("OS random number generator unavailable");
     b
 }
 
@@ -557,7 +556,7 @@ mod tests {
         assert_eq!(hex(&p), "474c443202000200".to_string() + &"00".repeat(16));
         assert_eq!(parse_client_preamble(&p), Ok((2, 2)));
         // First flight is long enough that a v1 host (reads exactly 54 bytes) fails fast on the magic.
-        let mut v = ViewerHandshake::new(StaticSecret::random_from_rng(OsRng), "x", None, None);
+        let mut v = ViewerHandshake::new(StaticSecret::random_from_rng(&mut crate::crypto::os_rng()), "x", None, None);
         assert!(v.first_flight().len() >= V1_CLIENT_HS_LEN);
         assert_eq!(parse_host_preamble(&host_preamble(2, ST_OK)), Ok(2));
         assert_eq!(parse_host_preamble(&host_preamble(2, ST_RATE_LIMITED)), Err(HsError::Status { version: 2, status: 3 }));
@@ -579,9 +578,9 @@ mod tests {
 
     #[test]
     fn version_mismatch_inside_msg2_is_detected() {
-        let mut v = ViewerHandshake::new(StaticSecret::random_from_rng(OsRng), "x", None, None);
+        let mut v = ViewerHandshake::new(StaticSecret::random_from_rng(&mut crate::crypto::os_rng()), "x", None, None);
         let f1 = v.first_flight();
-        let mut h = HostHandshake::read_first(StaticSecret::random_from_rng(OsRng), &f1[..24], &f1[26..], None, None).unwrap();
+        let mut h = HostHandshake::read_first(StaticSecret::random_from_rng(&mut crate::crypto::os_rng()), &f1[..24], &f1[26..], None, None).unwrap();
         let f2 = h.write_msg2(0);
         // A tampered preamble claiming another version can't be matched by msg2's authenticated copy.
         assert_eq!(v.read_msg2(&f2[10..], 3).err(), Some(HsError::VersionMismatch));

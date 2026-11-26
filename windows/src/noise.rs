@@ -8,7 +8,7 @@
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
-use rand_core::OsRng;
+use crate::crypto::os_rng;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -73,15 +73,15 @@ impl CipherState {
     }
     pub fn encrypt_with_ad(&mut self, ad: &[u8], pt: &[u8]) -> Vec<u8> {
         let Some(k) = self.k else { return pt.to_vec() };
-        let c = ChaCha20Poly1305::new(Key::from_slice(&k));
-        let out = c.encrypt(Nonce::from_slice(&nonce(self.n)), Payload { msg: pt, aad: ad }).expect("encrypt");
+        let c = ChaCha20Poly1305::new(&Key::from(k));
+        let out = c.encrypt(&Nonce::from(nonce(self.n)), Payload { msg: pt, aad: ad }).expect("encrypt");
         self.n += 1;
         out
     }
     pub fn decrypt_with_ad(&mut self, ad: &[u8], ct: &[u8]) -> Result<Vec<u8>, NoiseError> {
         let Some(k) = self.k else { return Ok(ct.to_vec()) };
-        let c = ChaCha20Poly1305::new(Key::from_slice(&k));
-        let out = c.decrypt(Nonce::from_slice(&nonce(self.n)), Payload { msg: ct, aad: ad }).map_err(|_| NoiseError::Decrypt)?;
+        let c = ChaCha20Poly1305::new(&Key::from(k));
+        let out = c.decrypt(&Nonce::from(nonce(self.n)), Payload { msg: ct, aad: ad }).map_err(|_| NoiseError::Decrypt)?;
         self.n += 1;
         Ok(out)
     }
@@ -162,7 +162,7 @@ impl HandshakeXX {
     }
 
     fn ephemeral(&mut self) -> [u8; 32] {
-        let e = self.e.get_or_insert_with(|| StaticSecret::random_from_rng(OsRng));
+        let e = self.e.get_or_insert_with(|| StaticSecret::random_from_rng(&mut os_rng()));
         *PublicKey::from(&*e).as_bytes()
     }
 
@@ -330,8 +330,8 @@ mod tests {
 
     #[test]
     fn tampering_and_order_are_rejected() {
-        let mut ini = HandshakeXX::new(true, StaticSecret::random_from_rng(OsRng), b"p", None);
-        let mut res = HandshakeXX::new(false, StaticSecret::random_from_rng(OsRng), b"p", None);
+        let mut ini = HandshakeXX::new(true, StaticSecret::random_from_rng(&mut os_rng()), b"p", None);
+        let mut res = HandshakeXX::new(false, StaticSecret::random_from_rng(&mut os_rng()), b"p", None);
         assert_eq!(ini.read_message(&[0; 64]), Err(NoiseError::State));
         let m1 = ini.write_message(&[]).unwrap();
         res.read_message(&m1).unwrap();
@@ -339,13 +339,57 @@ mod tests {
         m2[40] ^= 1; // inside the encrypted static key
         assert_eq!(ini.read_message(&m2), Err(NoiseError::Decrypt));
         // A different prologue breaks message 2 authentication.
-        let mut ini = HandshakeXX::new(true, StaticSecret::random_from_rng(OsRng), b"p1", None);
-        let mut res = HandshakeXX::new(false, StaticSecret::random_from_rng(OsRng), b"p2", None);
+        let mut ini = HandshakeXX::new(true, StaticSecret::random_from_rng(&mut os_rng()), b"p1", None);
+        let mut res = HandshakeXX::new(false, StaticSecret::random_from_rng(&mut os_rng()), b"p2", None);
         res.read_message(&ini.write_message(&[]).unwrap()).unwrap();
         assert_eq!(ini.read_message(&res.write_message(&[]).unwrap()), Err(NoiseError::Decrypt));
         // Low-order ephemeral (all zeros) is rejected.
-        let mut res = HandshakeXX::new(false, StaticSecret::random_from_rng(OsRng), b"", None);
+        let mut res = HandshakeXX::new(false, StaticSecret::random_from_rng(&mut os_rng()), b"", None);
         res.read_message(&[0u8; 32]).unwrap();
         assert_eq!(res.write_message(&[]).err(), Some(NoiseError::BadKey));
+    }
+
+    /// Primitive known-answer tests, independent of the Glide transcripts: they pin the crypto
+    /// crates' behavior (RFC 7748 X25519, SHA-256, RFC 5869 HKDF-SHA256 as Noise uses it, and the
+    /// Noise ChaChaPoly CipherState with the 4-zero-bytes || u64 LE nonce) so a dependency bump
+    /// that silently changed any of them fails here. Expected values come from Python
+    /// `cryptography` (OpenSSL) and RFC 7748 section 6.1.
+    #[test]
+    fn primitive_known_answers() {
+        // RFC 7748 section 6.1 (Alice/Bob).
+        let a = sk("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let b = sk("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+        assert_eq!(hex(&public_key(&a)), "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+        assert_eq!(hex(&public_key(&b)), "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+        let k = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
+        assert_eq!(hex(&dh(&a, &public_key(&b)).unwrap()), k);
+        assert_eq!(hex(&dh(&b, &public_key(&a)).unwrap()), k);
+        // Low-order point (all zeros) is still rejected.
+        assert_eq!(dh(&a, &[0u8; 32]).err(), Some(NoiseError::BadKey));
+
+        // SHA-256("abc"), FIPS 180-2.
+        assert_eq!(hex(&Sha256::digest(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+
+        // Noise HKDF (two outputs, salt = chaining key, empty info).
+        let ck: [u8; 32] = std::array::from_fn(|i| 100 + i as u8);
+        let ikm: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let (o1, o2) = hkdf2(&ck, &ikm);
+        assert_eq!(hex(&o1), "ebd88cc897feccb318891f3706718c7e605ff89cb10bda74651309473bc5e99e");
+        assert_eq!(hex(&o2), "d7b7c00c25348f173026e96791bb73b42823b1a76f143d2feb80f1f04cd79b53");
+
+        // CipherState: ChaCha20-Poly1305, nonce = 4 zero bytes || u64 LE counter, with AD.
+        let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let pt = b"Glide dependency bump known-answer test";
+        let mut enc = CipherState { k: Some(key), n: 5 };
+        let ct = enc.encrypt_with_ad(b"hdr", pt);
+        assert_eq!(
+            hex(&ct),
+            "6464ff6e2005235bfbcf572c40db53dabe5cf62884786a661b42c99c759a0abd6007768e1e0446799d5a0884cc0a4e8df74e8436434793"
+        );
+        assert_eq!(enc.n, 6);
+        let mut dec = CipherState { k: Some(key), n: 5 };
+        assert_eq!(dec.decrypt_with_ad(b"hdr", &ct).unwrap(), pt);
+        let mut wrong_ad = CipherState { k: Some(key), n: 5 };
+        assert_eq!(wrong_ad.decrypt_with_ad(b"hdR", &ct).err(), Some(NoiseError::Decrypt));
     }
 }

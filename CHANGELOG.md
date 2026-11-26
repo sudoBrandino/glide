@@ -16,6 +16,12 @@ changed for them, not how. Delete empty subsections when the release is cut.
 
 ## [Unreleased]
 
+### Changed
+
+- **Windows viewer: updated cryptography libraries** (x25519-dalek 3, chacha20poly1305 0.11, hkdf 0.13,
+  sha2 0.11). The algorithms, key sizes, nonce layout and wire format are unchanged, so viewers and
+  hosts of any version still pair and connect with each other; known-answer tests pin this.
+
 ## [0.4.0] - 2026-11-18
 
 Saved connections on the Windows viewer, and a first preview of the reverse direction: controlling
