@@ -191,7 +191,7 @@ pub fn start(managed: ManagedConfig, store: Store, http: Arc<dyn Http>, facts: D
         .spawn(move || {
             let client0 = CloudClient::new(&managed.cloud_url, http);
             let sleep = hub::sleeper(c.stop.clone());
-            let mut backoff = Backoff::default();
+            let mut backoff = Backoff::enrollment(); // 5 s doubling to 10 min (§6.7)
             let enrollment = loop {
                 match enroll::ensure(&managed, &store, &client0, &facts) {
                     Ok(e) => break e,

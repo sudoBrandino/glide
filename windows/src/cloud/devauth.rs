@@ -58,12 +58,18 @@ pub fn classify(r: Result<DeviceTokenResponse, CloudError>) -> Poll {
     }
 }
 
-/// Polls until done. `sleep(d)` waits and returns false when cancelled.
+/// Longest wait between polls after repeated network or server errors.
+pub const TRANSIENT_MAX: Duration = Duration::from_secs(60);
+
+/// Polls until done (§6.7): every `interval` (5 s more after each `slow_down`); network errors,
+/// `429` and `5xx` are retried with a delay that doubles from `interval` up to `TRANSIENT_MAX`,
+/// until `expires_in`; any other error stops. `sleep(d)` waits and returns false when cancelled.
 pub fn poll(client: &CloudClient, start: &DeviceStartResponse, cancel: &AtomicBool, sleep: &dyn Fn(Duration) -> bool) -> Result<DeviceTokenResponse, SignInError> {
     let deadline = Instant::now() + Duration::from_secs(start.expires_in.clamp(30, 1800));
     let mut interval = Duration::from_secs(start.interval.clamp(1, 60));
+    let mut delay = interval;
     loop {
-        if cancel.load(Ordering::SeqCst) || !sleep(interval) {
+        if cancel.load(Ordering::SeqCst) || !sleep(delay) {
             return Err(SignInError::Cancelled);
         }
         if Instant::now() >= deadline {
@@ -71,8 +77,15 @@ pub fn poll(client: &CloudClient, start: &DeviceStartResponse, cancel: &AtomicBo
         }
         match classify(client.device_token(&start.device_code)) {
             Poll::Done(t) => return Ok(t),
-            Poll::Pending | Poll::Transient(_) => {}
-            Poll::SlowDown => interval += Duration::from_secs(5),
+            Poll::Pending => delay = interval,
+            Poll::Transient(e) => {
+                crate::host::log(&format!("cloud: sign-in poll failed ({e}); retrying"));
+                delay = (delay * 2).min(TRANSIENT_MAX.max(interval));
+            }
+            Poll::SlowDown => {
+                interval += Duration::from_secs(5);
+                delay = interval;
+            }
             Poll::Denied => return Err(SignInError::Denied),
             Poll::Expired => return Err(SignInError::Expired),
             Poll::Failed(e) => return Err(SignInError::Failed(e)),
@@ -116,9 +129,39 @@ mod tests {
         })
         .unwrap();
         assert_eq!(t.user_token, "gu_tok");
-        assert_eq!(*slept.lock().unwrap(), vec![5, 5, 5, 10], "slow_down adds 5 s");
+        assert_eq!(*slept.lock().unwrap(), vec![5, 5, 10, 10], "a 503 backs off; slow_down adds 5 s");
         let body: serde_json::Value = serde_json::from_slice(http.requests.lock().unwrap()[0].body.as_ref().unwrap()).unwrap();
         assert_eq!(body, serde_json::json!({"device_code":"dc"}));
+    }
+
+    #[test]
+    fn transient_errors_back_off_and_retry() {
+        let http = Arc::new(FakeHttp::default());
+        for status in [503, 500, 429, 502, 504, 503] {
+            http.on("POST /v1/auth/device/token", status, "");
+        }
+        http.on("POST /v1/auth/device/token", 400, &err("authorization_pending"));
+        http.on("POST /v1/auth/device/token", 200, r#"{"user_token":"gu_tok","expires_in":43200}"#);
+        let c = CloudClient::new("https://c.example.com", http.clone()).with_device("gd_x");
+        let slept = Mutex::new(Vec::new());
+        let t = poll(&c, &start(), &AtomicBool::new(false), &|d| {
+            slept.lock().unwrap().push(d.as_secs());
+            true
+        })
+        .unwrap();
+        assert_eq!(t.user_token, "gu_tok");
+        // At least `interval` apart, doubling to 60 s, back to `interval` once the cloud answers.
+        assert_eq!(*slept.lock().unwrap(), vec![5, 10, 20, 40, 60, 60, 60, 5]);
+        // Network errors (no route here) are transient too.
+        assert!(matches!(classify(Err(CloudError::Transport("down".into()))), Poll::Transient(_)));
+        // Other errors stop at once.
+        for (status, body) in [(401, String::new()), (403, err("forbidden")), (400, err("invalid_request")), (404, String::new())] {
+            let http = Arc::new(FakeHttp::default());
+            http.on("POST /v1/auth/device/token", status, &body);
+            let c = CloudClient::new("https://c.example.com", http.clone()).with_device("gd_x");
+            assert!(matches!(poll(&c, &start(), &AtomicBool::new(false), &|_| true), Err(SignInError::Failed(_))), "{status}");
+            assert_eq!(http.count("POST /v1/auth/device/token"), 1);
+        }
     }
 
     #[test]

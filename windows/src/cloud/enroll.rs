@@ -205,6 +205,15 @@ mod tests {
         http.routes.lock().unwrap().clear();
         http.on("POST /v1/enroll", 503, "");
         assert!(matches!(ensure(&m, &store, &client, &f), Err(EnrollError::Retry(_))));
+        // Final only for exactly those two codes: other 401 / 409 answers, 429, garbage retry.
+        for (status, body) in [(401, r#"{"error":{"code":"unauthorized","message":"x"}}"#), (409, r#"{"error":{"code":"conflict","message":"x"}}"#), (429, r#"{"error":{"code":"rate_limited","message":"x"}}"#), (401, ""), (201, "{}")] {
+            http.routes.lock().unwrap().clear();
+            http.on("POST /v1/enroll", status, body);
+            assert!(matches!(ensure(&m, &store, &client, &f), Err(EnrollError::Retry(_))), "{status} {body}");
+        }
+        // No server at all: retry.
+        http.routes.lock().unwrap().clear();
+        assert!(matches!(ensure(&m, &store, &client, &f), Err(EnrollError::Retry(_))));
         assert_eq!(store.load(), Ok(None), "nothing stored on failure");
         let _ = std::fs::remove_dir_all(dir);
     }

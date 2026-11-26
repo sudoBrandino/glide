@@ -111,7 +111,7 @@ impl ViewerAgent {
             .spawn(move || {
                 let sleep = hub::sleeper(me.stop.clone());
                 let client0 = CloudClient::new(&me.managed.cloud_url, me.http.clone());
-                let mut backoff = Backoff::default();
+                let mut backoff = Backoff::enrollment(); // 5 s doubling to 10 min (§6.7)
                 let e = loop {
                     match enroll::ensure(&me.managed, &me.store, &client0, &facts) {
                         Ok(e) => break e,
